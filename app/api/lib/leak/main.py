@@ -52,42 +52,85 @@ def get_key_hash(api_key: str) -> str:
         return "default_system_key" # Fallback for your free tier
     return hashlib.sha256(api_key.encode()).hexdigest()
 
-@action(reads=["messages", "tools", "model"], writes=["messages"])
+@action(reads=["messages", "tools", "model", "stream_queue"], writes=["messages"])
 async def chat_model(state: State) -> tuple[dict, State]:
     messages = state["messages"]
     tools = state.get("tools", [])
     model = state["model"]
+    stream_queue = state.get("stream_queue")
 
     logger.info(f"Invoking {model} with {len(tools)} tools.")
 
     response = None
 
-    async with pool_semaphore:
-        if supports_function_calling(model):
-            response = await llm_router.acompletion(
-                model=model,
-                messages=messages,
-                # Only pass tools to LiteLLM if the array actually has items
-                tools=tools if len(tools) > 0 else None,
-                temperature=0.7,
-                stream=False
-            )
-        else:
-            response = await llm_router.acompletion(
-                model=model,
-                messages=messages,
-                temperature=0.7,
-                stream=False,
-            )    
-
-    
-    msg = response.choices[0].message # type: ignore
-    
-    msg_dict : Dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
-    if hasattr(msg, "tool_calls") and msg.tool_calls:
-        msg_dict["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+    try :
+        async with pool_semaphore:
+            if supports_function_calling(model):
+                response = await llm_router.acompletion(
+                    model=model,
+                    messages=messages,
+                    # Only pass tools to LiteLLM if the array actually has items
+                    tools=tools if len(tools) > 0 else None,
+                    temperature=0.3,
+                    stream=True
+                )
+            else:
+                response = await llm_router.acompletion(
+                    model=model,
+                    messages=messages,
+                    temperature=0.3,
+                    stream=True,
+                )    
         
-    return {"response": msg_dict}, state.append(messages=msg_dict)
+        full_content = ""
+        tool_calls_dict = {}
+
+        ''' 
+        # implementation for no streaming     
+        msg = response.choices[0].message # type: ignore
+        
+        msg_dict : Dict[str, Any] = {"role": msg.role, "content": msg.content or ""}
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            msg_dict["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
+            
+        return {"response": msg_dict}, state.append(messages=msg_dict)
+        '''
+
+        async for chunk in response:
+            delta = chunk.choices[0].delta
+
+            # A. Stream Text Thoughts directly to the UI
+            if hasattr(delta, "content") and delta.content:
+                full_content += delta.content
+                if stream_queue:
+                    # Note: We send the accumulated string because your React frontend 
+                    # replaces the whole content block rather than appending raw deltas.
+                    await stream_queue.put(("text_delta", full_content, None, None))
+
+            # B. Reconstruct fragmented tool calls
+            if hasattr(delta, "tool_calls") and delta.tool_calls:
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    if idx not in tool_calls_dict:
+                        tool_calls_dict[idx] = {
+                            "id": tc.id, 
+                            "type": "function", 
+                            "function": {"name": tc.function.name, "arguments": ""}
+                        }
+                    if tc.function and tc.function.arguments:
+                        tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+
+        # 🚨 3. Format the final message for Burr's state tracking
+        msg_dict : Dict[str, Any] = {"role": "assistant", "content": full_content}
+        if tool_calls_dict:
+            msg_dict["tool_calls"] = list(tool_calls_dict.values())
+
+        return {"response": msg_dict}, state.append(messages=msg_dict)
+
+    except Exception as e:
+        logger.error(f"LLM Invocation Failure: {str(e)}")
+        error_msg = {"role": "assistant", "content": f"**System Error:** \n\n`{str(e)}`"}
+        return {"response": error_msg}, state.append(messages=error_msg)
 
 
 @action(reads=["messages", "tool_router"], writes=["messages"])
@@ -223,11 +266,13 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
             except Exception as e:
                 logger.error(f"Failed to load tools for agent: {e}")
 
+        stream_queue = asyncio.Queue()
+
         logger.info(f"Starting Burr App Builder. Routing {len(openai_tools)} tools.")
 
         app_builder = (
             ApplicationBuilder()
-            .with_state(messages=messages, tools=openai_tools, tool_router=tool_router, model=model)
+            .with_state(messages=messages, tools=openai_tools, tool_router=tool_router, model=model, chat_id=chat_id, stream_queue=stream_queue)
             .with_actions(chat_model=chat_model, execute_tools=execute_tools, end=end)
             .with_transitions(
                 ("chat_model", "execute_tools", expr("len(messages[-1].get('tool_calls', [])) > 0")),
@@ -252,7 +297,7 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
             yield f"data: {json.dumps({'type': 'status', 'message': 'Agent booting up...', 'metrics': metrics})}\n\n"
 
             # 2. Create an async queue to decouple the heavy lifting from the stream
-            q = asyncio.Queue()
+            # q = asyncio.Queue()
 
             # 3. Define Burr as a background worker
             async def run_burr():
@@ -262,11 +307,11 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                         act_name = action.name if hasattr(action, 'name') else str(action)
                         print(f"🚨 [PYTHON] processing action:", action)
                         final_state = state
-                        await q.put(("step", act_name, result, state))
-                    await q.put(("done", None, None, final_state))
+                        await stream_queue.put(("step", act_name, result, state))
+                    await stream_queue.put(("done", None, None, final_state))
                 except Exception as e:
                     logger.error(f"Burr iteration error: {e}")
-                    await q.put(("error", str(e), None, None))
+                    await stream_queue.put(("error", str(e), None, None))
 
             # 4. Start Burr in the background
             task = asyncio.create_task(run_burr())
@@ -275,7 +320,12 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                 while True:
                     try:
                         # Wait for Burr's next step, but WAKE UP every 10 seconds
-                        msg_type, action_name, result, state = await asyncio.wait_for(q.get(), timeout=10.0)
+                        msg_type, action_name, result, state = await asyncio.wait_for(stream_queue.get(), timeout=10.0)
+
+                        if msg_type == "text_delta":
+                            # action_name holds the full accumulated string here
+                            yield f"data: {json.dumps({'type': 'text-delta', 'content': action_name})}\n\n"
+                            continue
 
                         if msg_type == "error":
                             yield f"data: {json.dumps({'type': 'error', 'message': action_name})}\n\n"

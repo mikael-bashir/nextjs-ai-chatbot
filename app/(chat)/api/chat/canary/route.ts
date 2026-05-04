@@ -129,6 +129,11 @@ export async function POST(request: Request) {
                       controller.enqueue(encoder.encode(`data: ${JSON.stringify(annotation)}\n\n`))
                     }
 
+                    if (data.type === "text-delta") {
+                      finalContent = data.content // Keep track so we can save to DB at the end
+                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: data.content })}\n\n`))
+                    }
+                    
                     // If it's text, pipe it as a delta
                     if (data.type === "text_response") {
                       finalContent = data.text
