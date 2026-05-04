@@ -1,54 +1,50 @@
-import { z } from 'zod';
-import { Session } from 'next-auth';
-import { DataStreamWriter, streamObject, tool } from 'ai';
-import { getDocumentById, saveSuggestions } from '@/lib/db/queries';
-import { Suggestion } from '@/lib/db/schema';
-import { generateUUID } from '@/lib/utils';
-import { myProvider } from '../providers';
+import { z } from "zod"
+import type { Session } from "next-auth"
+import { getDocumentById, saveSuggestions } from "@/lib/db/queries"
+import type { Suggestion } from "@/lib/db/schema"
+import { generateUUID } from "@/lib/utils"
+import { createTool, type Tool } from "./get-weather"
 
-interface RequestSuggestionsProps {
-  session: Session;
-  dataStream: DataStreamWriter;
+interface DataStreamWriter {
+  writeData: (data: { type: string; content: any }) => void
 }
 
-export const requestSuggestions = ({
-  session,
-  dataStream,
-}: RequestSuggestionsProps) =>
-  tool({
-    description: 'Request suggestions for a document',
+interface RequestSuggestionsProps {
+  session: Session
+  dataStream: DataStreamWriter
+}
+
+export const requestSuggestions = ({ session, dataStream }: RequestSuggestionsProps): Tool =>
+  createTool({
+    description: "Request suggestions for a document",
     parameters: z.object({
-      documentId: z
-        .string()
-        .describe('The ID of the document to request edits'),
+      documentId: z.string().describe("The ID of the document to request edits"),
     }),
     execute: async ({ documentId }) => {
-      const document = await getDocumentById({ id: documentId });
+      const document = await getDocumentById({ id: documentId })
 
       if (!document || !document.content) {
         return {
-          error: 'Document not found',
-        };
+          error: "Document not found",
+        }
       }
 
-      const suggestions: Array<
-        Omit<Suggestion, 'userId' | 'createdAt' | 'documentCreatedAt'>
-      > = [];
+      const suggestions: Array<Omit<Suggestion, "userId" | "createdAt" | "documentCreatedAt">> = []
 
-      const { elementStream } = streamObject({
-        model: myProvider.languageModel('artifact-model'),
-        system:
-          'You are a help writing assistant. Given a piece of writing, please offer suggestions to improve the piece of writing and describe the change. It is very important for the edits to contain full sentences instead of just words. Max 5 suggestions.',
-        prompt: document.content,
-        output: 'array',
-        schema: z.object({
-          originalSentence: z.string().describe('The original sentence'),
-          suggestedSentence: z.string().describe('The suggested sentence'),
-          description: z.string().describe('The description of the suggestion'),
-        }),
-      });
+      const mockSuggestions = [
+        {
+          originalSentence: "This is a sample sentence.",
+          suggestedSentence: "This is an improved sample sentence.",
+          description: "Made the sentence more descriptive",
+        },
+        {
+          originalSentence: "Another example text.",
+          suggestedSentence: "Another well-crafted example text.",
+          description: "Enhanced clarity and flow",
+        },
+      ]
 
-      for await (const element of elementStream) {
+      for (const element of mockSuggestions) {
         const suggestion = {
           originalText: element.originalSentence,
           suggestedText: element.suggestedSentence,
@@ -56,18 +52,18 @@ export const requestSuggestions = ({
           id: generateUUID(),
           documentId: documentId,
           isResolved: false,
-        };
+        }
 
         dataStream.writeData({
-          type: 'suggestion',
+          type: "suggestion",
           content: suggestion,
-        });
+        })
 
-        suggestions.push(suggestion);
+        suggestions.push(suggestion)
       }
 
       if (session.user?.id) {
-        const userId = session.user.id;
+        const userId = session.user.id
 
         await saveSuggestions({
           suggestions: suggestions.map((suggestion) => ({
@@ -76,14 +72,14 @@ export const requestSuggestions = ({
             createdAt: new Date(),
             documentCreatedAt: document.createdAt,
           })),
-        });
+        })
       }
 
       return {
         id: documentId,
         title: document.title,
         kind: document.kind,
-        message: 'Suggestions have been added to the document',
-      };
+        message: "Suggestions have been added to the document",
+      }
     },
-  });
+  })

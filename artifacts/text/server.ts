@@ -1,70 +1,25 @@
-import { smoothStream, streamText } from 'ai';
-import { myProvider } from '@/lib/ai/providers';
-import { createDocumentHandler } from '@/lib/artifacts/server';
-import { updateDocumentPrompt } from '@/lib/ai/prompts';
+import { createDocumentHandler } from "@/lib/artifacts/server"
 
-export const textDocumentHandler = createDocumentHandler<'text'>({
-  kind: 'text',
+export const textDocumentHandler = createDocumentHandler<"text">({
+  kind: "text",
   onCreateDocument: async ({ title, dataStream }) => {
-    let draftContent = '';
+    const content = `# ${title}\n\nThis is a placeholder text document. The content would be generated based on the title: "${title}".`
 
-    const { fullStream } = streamText({
-      model: myProvider.languageModel('artifact-model'),
-      system:
-        'Write about the given topic. Markdown is supported. Use headings wherever appropriate.',
-      experimental_transform: smoothStream({ chunking: 'word' }),
-      prompt: title,
-    });
+    dataStream.writeData({
+      type: "text-delta",
+      content: content,
+    })
 
-    for await (const delta of fullStream) {
-      const { type } = delta;
-
-      if (type === 'text-delta') {
-        const { textDelta } = delta;
-
-        draftContent += textDelta;
-
-        dataStream.writeData({
-          type: 'text-delta',
-          content: textDelta,
-        });
-      }
-    }
-
-    return draftContent;
+    return content
   },
   onUpdateDocument: async ({ document, description, dataStream }) => {
-    let draftContent = '';
+    const updatedContent = `${document.content}\n\n## Update\n\n${description}`
 
-    const { fullStream } = streamText({
-      model: myProvider.languageModel('artifact-model'),
-      system: updateDocumentPrompt(document.content, 'text'),
-      experimental_transform: smoothStream({ chunking: 'word' }),
-      prompt: description,
-      experimental_providerMetadata: {
-        openai: {
-          prediction: {
-            type: 'content',
-            content: document.content,
-          },
-        },
-      },
-    });
+    dataStream.writeData({
+      type: "text-delta",
+      content: updatedContent,
+    })
 
-    for await (const delta of fullStream) {
-      const { type } = delta;
-
-      if (type === 'text-delta') {
-        const { textDelta } = delta;
-
-        draftContent += textDelta;
-        dataStream.writeData({
-          type: 'text-delta',
-          content: textDelta,
-        });
-      }
-    }
-
-    return draftContent;
+    return updatedContent
   },
-});
+})

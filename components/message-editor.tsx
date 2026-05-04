@@ -1,47 +1,43 @@
-'use client';
+"use client"
 
-import { ChatRequestOptions, Message } from 'ai';
-import { Button } from './ui/button';
-import { Dispatch, SetStateAction, useEffect, useRef, useState } from 'react';
-import { Textarea } from './ui/textarea';
-import { deleteTrailingMessages } from '@/app/(chat)/actions';
-import { UseChatHelpers } from '@ai-sdk/react';
+import type React from "react"
+
+import { Button } from "./ui/button"
+import { type Dispatch, type SetStateAction, useEffect, useRef, useState } from "react"
+import { Textarea } from "./ui/textarea"
+import { deleteTrailingMessages } from "@/app/(chat)/actions"
+import type { UIMessage } from "@/hooks/use-leak-chat"
 
 export type MessageEditorProps = {
-  message: Message;
-  setMode: Dispatch<SetStateAction<'view' | 'edit'>>;
-  setMessages: UseChatHelpers['setMessages'];
-  reload: UseChatHelpers['reload'];
-};
+  message: UIMessage
+  setMode: Dispatch<SetStateAction<"view" | "edit">>
+  setMessages: (messages: UIMessage[] | ((messages: UIMessage[]) => UIMessage[])) => void
+  reload: () => Promise<string | null | undefined>
+}
 
-export function MessageEditor({
-  message,
-  setMode,
-  setMessages,
-  reload,
-}: MessageEditorProps) {
-  const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
+export function MessageEditor({ message, setMode, setMessages, reload }: MessageEditorProps) {
+  const [isSubmitting, setIsSubmitting] = useState<boolean>(false)
 
-  const [draftContent, setDraftContent] = useState<string>(message.content);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const [draftContent, setDraftContent] = useState<string>(message.content)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => {
     if (textareaRef.current) {
-      adjustHeight();
+      adjustHeight()
     }
-  }, []);
+  }, [])
 
   const adjustHeight = () => {
     if (textareaRef.current) {
-      textareaRef.current.style.height = 'auto';
-      textareaRef.current.style.height = `${textareaRef.current.scrollHeight + 2}px`;
+      textareaRef.current.style.height = "auto"
+      textareaRef.current.style.height = `${textareaRef.current.scrollHeight + 2}px`
     }
-  };
+  }
 
   const handleInput = (event: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setDraftContent(event.target.value);
-    adjustHeight();
-  };
+    setDraftContent(event.target.value)
+    adjustHeight()
+  }
 
   return (
     <div className="flex flex-col gap-2 w-full">
@@ -56,9 +52,9 @@ export function MessageEditor({
       <div className="flex flex-row gap-2 justify-end">
         <Button
           variant="outline"
-          className="h-fit py-2 px-3"
+          className="h-fit py-2 px-3 bg-transparent"
           onClick={() => {
-            setMode('view');
+            setMode("view")
           }}
         >
           Cancel
@@ -69,36 +65,35 @@ export function MessageEditor({
           className="h-fit py-2 px-3"
           disabled={isSubmitting}
           onClick={async () => {
-            setIsSubmitting(true);
+            setIsSubmitting(true)
 
             await deleteTrailingMessages({
               id: message.id,
-            });
+            })
 
-            // @ts-expect-error todo: support UIMessage in setMessages
             setMessages((messages) => {
-              const index = messages.findIndex((m) => m.id === message.id);
+              const index = messages.findIndex((m) => m.id === message.id)
 
               if (index !== -1) {
                 const updatedMessage = {
                   ...message,
                   content: draftContent,
-                  parts: [{ type: 'text', text: draftContent }],
-                };
+                  parts: [{ type: "text" as const, text: draftContent }],
+                }
 
-                return [...messages.slice(0, index), updatedMessage];
+                return [...messages.slice(0, index), updatedMessage]
               }
 
-              return messages;
-            });
+              return messages
+            })
 
-            setMode('view');
-            reload();
+            setMode("view")
+            await reload()
           }}
         >
-          {isSubmitting ? 'Sending...' : 'Send'}
+          {isSubmitting ? "Sending..." : "Send"}
         </Button>
       </div>
     </div>
-  );
+  )
 }

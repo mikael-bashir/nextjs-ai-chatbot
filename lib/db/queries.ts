@@ -11,8 +11,13 @@ import {
   lt,
   type SQL,
 } from 'drizzle-orm';
-import { drizzle } from 'drizzle-orm/postgres-js';
-import postgres from 'postgres';
+
+// import { drizzle } from 'drizzle-orm/postgres-js';
+// import postgres from 'postgres';
+
+import { sql } from '@vercel/postgres'; // Vercel's SDK
+// Use the Neon HTTP adapter which is suitable for serverless
+import { drizzle } from 'drizzle-orm/vercel-postgres';
 
 import {
   user,
@@ -26,16 +31,24 @@ import {
   type DBMessage,
   type Chat,
 } from './schema';
+
 import type { ArtifactKind } from '@/components/artifact';
 import { generateHashedPassword } from './utils';
 
-// Optionally, if not using email/pass login, you can
-// use the Drizzle adapter for Auth.js / NextAuth
-// https://authjs.dev/reference/adapter/drizzle
+if (!process.env.POSTGRES_URL) {
+  throw new Error('POSTGRES_URL environment variable is not set.');
+}
 
-// biome-ignore lint: Forbidden non-null assertion.
-const client = postgres(process.env.POSTGRES_URL!);
-const db = drizzle(client);
+const schema = {
+  user,
+  chat,
+  document,
+  suggestion,
+  message,
+  vote,
+}
+
+const db = drizzle(sql, { schema });
 
 export async function getUser(email: string): Promise<Array<User>> {
   try {

@@ -6,10 +6,12 @@ import { generateUUID } from '@/lib/utils';
 import { DataStreamHandler } from '@/components/data-stream-handler';
 
 export default async function Page() {
-  const id = generateUUID();
+
 
   const cookieStore = await cookies();
   const modelIdFromCookie = cookieStore.get('chat-model');
+  const id = generateUUID();
+
 
   if (!modelIdFromCookie) {
     return (

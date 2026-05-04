@@ -1,44 +1,41 @@
-import { DataStreamWriter, tool } from 'ai';
-import { Session } from 'next-auth';
-import { z } from 'zod';
-import { getDocumentById, saveDocument } from '@/lib/db/queries';
-import { documentHandlersByArtifactKind } from '@/lib/artifacts/server';
+import type { Session } from "next-auth"
+import { z } from "zod"
+import { getDocumentById } from "@/lib/db/queries"
+import { documentHandlersByArtifactKind, type DataStreamWriter } from "@/lib/artifacts/server"
+import { createTool, type Tool } from "./get-weather"
 
 interface UpdateDocumentProps {
-  session: Session;
-  dataStream: DataStreamWriter;
+  session: Session
+  dataStream: DataStreamWriter
 }
 
-export const updateDocument = ({ session, dataStream }: UpdateDocumentProps) =>
-  tool({
-    description: 'Update a document with the given description.',
+export const updateDocument = ({ session, dataStream }: UpdateDocumentProps): Tool =>
+  createTool({
+    description: "Update a document with the given description.",
     parameters: z.object({
-      id: z.string().describe('The ID of the document to update'),
-      description: z
-        .string()
-        .describe('The description of changes that need to be made'),
+      id: z.string().describe("The ID of the document to update"),
+      description: z.string().describe("The description of changes that need to be made"),
     }),
     execute: async ({ id, description }) => {
-      const document = await getDocumentById({ id });
+      const document = await getDocumentById({ id })
 
       if (!document) {
         return {
-          error: 'Document not found',
-        };
+          error: "Document not found",
+        }
       }
 
       dataStream.writeData({
-        type: 'clear',
+        type: "clear",
         content: document.title,
-      });
+      })
 
       const documentHandler = documentHandlersByArtifactKind.find(
-        (documentHandlerByArtifactKind) =>
-          documentHandlerByArtifactKind.kind === document.kind,
-      );
+        (documentHandlerByArtifactKind) => documentHandlerByArtifactKind.kind === document.kind,
+      )
 
       if (!documentHandler) {
-        throw new Error(`No document handler found for kind: ${document.kind}`);
+        throw new Error(`No document handler found for kind: ${document.kind}`)
       }
 
       await documentHandler.onUpdateDocument({
@@ -46,15 +43,15 @@ export const updateDocument = ({ session, dataStream }: UpdateDocumentProps) =>
         description,
         dataStream,
         session,
-      });
+      })
 
-      dataStream.writeData({ type: 'finish', content: '' });
+      dataStream.writeData({ type: "finish", content: "" })
 
       return {
         id,
         title: document.title,
         kind: document.kind,
-        content: 'The document has been updated successfully.',
-      };
+        content: "The document has been updated successfully.",
+      }
     },
-  });
+  })

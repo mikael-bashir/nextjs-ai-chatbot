@@ -1,20 +1,18 @@
-'use client';
+"use client"
 
-import type { Attachment, UIMessage } from 'ai';
-import { useChat } from '@ai-sdk/react';
-import { useState } from 'react';
-import useSWR, { useSWRConfig } from 'swr';
-import { ChatHeader } from '@/components/chat-header';
-import type { Vote } from '@/lib/db/schema';
-import { fetcher, generateUUID } from '@/lib/utils';
-import { Artifact } from './artifact';
-import { MultimodalInput } from './multimodal-input';
-import { Messages } from './messages';
-import type { VisibilityType } from './visibility-selector';
-import { useArtifactSelector } from '@/hooks/use-artifact';
-import { toast } from 'sonner';
-import { unstable_serialize } from 'swr/infinite';
-import { getChatHistoryPaginationKey } from './sidebar-history';
+import { useState, useEffect } from "react"
+import useSWR, { useSWRConfig } from "swr"
+import { ChatHeader } from "@/components/chat-header"
+import type { Vote } from "@/lib/db/schema"
+import { fetcher } from "@/lib/utils"
+import { Artifact } from "./artifact"
+import { MultimodalInput } from "./multimodal-input"
+import { Messages } from "./messages"
+import type { VisibilityType } from "./visibility-selector"
+import { useArtifactSelector } from "@/hooks/use-artifact"
+import { unstable_serialize } from "swr/infinite"
+import { getChatHistoryPaginationKey } from "./sidebar-history"
+import { useLeakChat, type UIMessage, type Attachment } from "@/hooks/use-leak-chat"
 
 export function Chat({
   id,
@@ -23,46 +21,52 @@ export function Chat({
   selectedVisibilityType,
   isReadonly,
 }: {
-  id: string;
-  initialMessages: Array<UIMessage>;
-  selectedChatModel: string;
-  selectedVisibilityType: VisibilityType;
-  isReadonly: boolean;
+  id: string
+  initialMessages: Array<UIMessage>
+  selectedChatModel: string
+  selectedVisibilityType: VisibilityType
+  isReadonly: boolean
 }) {
-  const { mutate } = useSWRConfig();
+  const { mutate } = useSWRConfig()
 
-  const {
-    messages,
-    setMessages,
-    handleSubmit,
-    input,
-    setInput,
-    append,
-    status,
-    stop,
-    reload,
-  } = useChat({
+  const { messages, setMessages, handleSubmit, input, setInput, append, status, stop, reload } = useLeakChat({
     id,
-    body: { id, selectedChatModel: selectedChatModel },
     initialMessages,
-    experimental_throttle: 100,
-    sendExtraMessageFields: true,
-    generateId: generateUUID,
+    body: { id, selectedChatModel },
     onFinish: () => {
-      mutate(unstable_serialize(getChatHistoryPaginationKey));
+      mutate(unstable_serialize(getChatHistoryPaginationKey))
     },
-    onError: () => {
-      toast.error('An error occurred, please try again!');
-    },
-  });
+  })
 
-  const { data: votes } = useSWR<Array<Vote>>(
-    messages.length >= 2 ? `/api/vote?chatId=${id}` : null,
-    fetcher,
-  );
+  const { data: votes } = useSWR<Array<Vote>>(messages.length >= 2 ? `/api/vote?chatId=${id}` : null, fetcher)
 
-  const [attachments, setAttachments] = useState<Array<Attachment>>([]);
-  const isArtifactVisible = useArtifactSelector((state) => state.isVisible);
+  const [attachments, setAttachments] = useState<Array<Attachment>>([])
+  const isArtifactVisible = useArtifactSelector((state) => state.isVisible)
+
+  // 1. Extract the latest metrics from the active agent stream
+  const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant")
+  const annotations = (lastAssistantMsg?.annotations || []) as Array<any>
+  const latestStatus = annotations.length > 0 ? annotations[annotations.length - 1] : null
+
+  const [localTime, setLocalTime] = useState(0)
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout
+    if (status === "streaming") {
+      interval = setInterval(() => {
+        setLocalTime((prev) => prev + 1)
+      }, 1000)
+    } else if (status === "ready" && messages.length <= 1) {
+      setLocalTime(0) // Only reset if the chat is cleared
+    }
+    return () => clearInterval(interval)
+  }, [status, messages.length])
+
+  useEffect(() => {
+    if (latestStatus?.metrics?.time_elapsed !== undefined) {
+      setLocalTime(Math.floor(latestStatus.metrics.time_elapsed))
+    }
+  }, [latestStatus?.metrics?.time_elapsed])
 
   return (
     <>
@@ -85,7 +89,33 @@ export function Chat({
           isArtifactVisible={isArtifactVisible}
         />
 
-        <form className="flex mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
+        <form className="flex flex-col mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
+          {/* 2. The Real-Time Agent HUD */}
+          {/* 2. The Agent HUD (Persistent) */}
+          {latestStatus && latestStatus.thought && (
+            <div 
+              className={`flex items-center gap-2 text-xs text-muted-foreground px-3 py-1.5 bg-muted/50 rounded-md w-fit border border-border/50 shadow-sm transition-all duration-300 ${
+                status === "streaming" ? "animate-pulse" : "opacity-80"
+              }`}
+            >
+              {/* Dynamic Status Dot: Blue when thinking, Green when done */}
+              <span 
+                className={`w-2 h-2 rounded-full ${
+                  status === "streaming" ? "bg-blue-500" : "bg-green-500"
+                }`}
+              ></span>
+              
+              <span className="font-medium">{latestStatus.thought}</span>
+              <span className="opacity-50">|</span>
+
+              <span>{localTime}s elapsed</span>
+              <span className="opacity-50">|</span>
+              <span>{latestStatus.metrics?.tools_invoked || 0} Tool calls</span>
+              <span className="opacity-50">|</span>
+              <span>{latestStatus.metrics?.llm_invocations || 0} LLM calls</span>
+            </div>
+          )}
+
           {!isReadonly && (
             <MultimodalInput
               chatId={id}
@@ -121,5 +151,5 @@ export function Chat({
         isReadonly={isReadonly}
       />
     </>
-  );
+  )
 }

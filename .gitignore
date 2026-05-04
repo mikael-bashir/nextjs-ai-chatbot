@@ -28,16 +28,19 @@ yarn-error.log*
 .env.development.local
 .env.test.local
 .env.production.local
+.env
 
 # turbo
 .turbo
 
-.env
 .vercel
 .env*.local
+/.history/
 
 # Playwright
 /test-results/
 /playwright-report/
 /blob-report/
 /playwright/*
+
+.dev.notes.txt
