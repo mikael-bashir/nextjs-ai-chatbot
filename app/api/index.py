@@ -9,7 +9,6 @@ nest_asyncio.apply()
 from quart import Quart, request, jsonify #, redirect
 from quart_session import Session
 from quart_cors import cors
-
 import logging
 import uuid
 import redis # <-- NEW: Import the redis library
@@ -17,7 +16,6 @@ import os # <-- NEW: Import os to read the environment variable
 from typing import Dict, Any
 from app.api.lib.leak.main import prompt_leak_agent
 import httpx
-
 from fastmcp import Client
 from fastmcp.client.transports import SSETransport
 from contextlib import AsyncExitStack
@@ -36,13 +34,13 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - [MCP Backend] %(message)s'
 )
+
 logger = logging.getLogger(__name__)
-# authenticated_clients: Dict[str, Any] = {}
 
 # ==========================================
 # 1. THE AUTH & CONNECTION MANAGER
 # ==========================================
-    
+
 class MCPConnectionManager:
     """Centralized manager for all MCP server connections, auth states, and tool caching."""
     def __init__(self):
@@ -162,11 +160,9 @@ class MCPConnectionManager:
         result = await client.call_tool(tool_name, arguments)
         logger.info(f"Tool '{tool_name}' executed successfully.")
         return result.dict() if hasattr(result, 'dict') else str(result)
-
+    
 # Instantiate the Singleton Manager
 mcp_manager = MCPConnectionManager() 
-
-
 
 # ==========================================
 # 2. THE API ROUTES
@@ -230,7 +226,7 @@ async def call_mcp_tool(server_id):
         return jsonify({"success": True, "result": result})
 
     except Exception as e: 
-        logger.error(f"Error calling tool {data.get('tool_name')}: {e}")
+        logger.error(f"Error calling tool: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 

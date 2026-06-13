@@ -14,7 +14,7 @@ export const myProvider = isTestEnvironment
   : {
       languageModels: {
         "chat-model": "grok-2-vision-1212",
-        "chat-model-reasoning": "grok-3-mini-beta",
+        "chat-model-reasoning": "grok-4",
         "title-model": "grok-2-1212",
         "artifact-model": "grok-2-1212",
       },

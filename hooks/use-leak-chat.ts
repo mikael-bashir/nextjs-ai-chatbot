@@ -1,7 +1,7 @@
 "use client"
 
 import type React from "react"
-import { useState, useCallback } from "react"
+import { useState, useCallback, useRef } from "react"
 import { generateUUID } from "@/lib/utils"
 import { toast } from "sonner"
 
@@ -44,6 +44,8 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
   const [input, setInput] = useState("")
   const [status, setStatus] = useState<ChatStatus>("ready")
 
+  const abortControllerRef = useRef<AbortController | null>(null)
+
   const handleSubmit = useCallback(
     async (
       e?: React.FormEvent,
@@ -66,12 +68,14 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
       setInput("")
       setStatus("streaming")
 
+      abortControllerRef.current = new AbortController()
       try {
         const response = await fetch("/api/chat/canary", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
+          signal: abortControllerRef.current.signal,
           body: JSON.stringify({
             id,
             messages: [...messages, userMessage],
@@ -156,7 +160,12 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
         setStatus("ready")
         onFinish?.()
         return assistantMessage.content
-      } catch (error) {
+      } catch (error: any) {
+        if (error?.name === "AbortError") {
+          console.log("Chat cancelled by user.")
+          setStatus("ready")
+          return null
+        }
         console.error("Chat error:", error)
         setStatus("error")
         onError?.()
@@ -166,6 +175,14 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
     },
     [input, messages, id, body, onFinish, onError],
   )
+
+  const stop = useCallback(() => {
+    // 🚨 NEW: Trigger the abort when the stop function is called
+    if (abortControllerRef.current) {
+        abortControllerRef.current.abort()
+    }
+    setStatus("ready")
+  }, [])
 
   const setMessagesWrapper = useCallback(
     (messagesOrUpdater: UIMessage[] | ((messages: UIMessage[]) => UIMessage[])) => {
@@ -186,10 +203,6 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
   const reload = useCallback(async (): Promise<string | null | undefined> => {
     console.log("Reload not implemented yet")
     return null
-  }, [])
-
-  const stop = useCallback(() => {
-    setStatus("ready")
   }, [])
 
   return {

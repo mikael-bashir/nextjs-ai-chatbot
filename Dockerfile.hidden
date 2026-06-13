@@ -1,0 +1,20 @@
+# Dockerfile.python
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+# Assuming your requirements file is in the root or inside the api folder. 
+# Adjust the COPY path if it is specifically inside api/
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the entire app so hypercorn can find app.api.index
+COPY . .
+
+EXPOSE 5328
+
+# Using 2-4 workers depending on your VPS cores for true production scaling
+CMD ["hypercorn", "app.api.index:app", "--bind", "0.0.0.0:5328", "--workers", "2", "--access-log", "-"]

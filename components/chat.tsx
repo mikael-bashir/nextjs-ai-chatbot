@@ -49,6 +49,7 @@ export function Chat({
   const latestStatus = annotations.length > 0 ? annotations[annotations.length - 1] : null
 
   const [localTime, setLocalTime] = useState(0)
+  const [isThoughtsExpanded, setIsThoughtsExpanded] = useState(false)
 
   useEffect(() => {
     let interval: NodeJS.Timeout
@@ -90,29 +91,67 @@ export function Chat({
         />
 
         <form className="flex flex-col mx-auto px-4 bg-background pb-4 md:pb-6 gap-2 w-full md:max-w-3xl">
-          {/* 2. The Real-Time Agent HUD */}
           {/* 2. The Agent HUD (Persistent) */}
-          {latestStatus && latestStatus.thought && (
-            <div 
-              className={`flex items-center gap-2 text-xs text-muted-foreground px-3 py-1.5 bg-muted/50 rounded-md w-fit border border-border/50 shadow-sm transition-all duration-300 ${
-                status === "streaming" ? "animate-pulse" : "opacity-80"
-              }`}
-            >
-              {/* Dynamic Status Dot: Blue when thinking, Green when done */}
-              <span 
-                className={`w-2 h-2 rounded-full ${
-                  status === "streaming" ? "bg-blue-500" : "bg-green-500"
-                }`}
-              ></span>
+          {annotations.length > 0 && (
+            <div className="flex flex-col w-full gap-2 transition-all duration-300">
               
-              <span className="font-medium">{latestStatus.thought}</span>
-              <span className="opacity-50">|</span>
+              <div className="flex items-center justify-between w-full">
+                {/* Expand/Collapse Button */}
+                <button
+                  type="button"
+                  onClick={() => setIsThoughtsExpanded(!isThoughtsExpanded)}
+                  className={`flex items-center gap-2 text-xs text-muted-foreground px-3 py-1.5 bg-muted/50 hover:bg-muted/80 rounded-md border border-border/50 shadow-sm transition-colors w-fit`}
+                >
+                  <span 
+                    className={`w-2 h-2 rounded-full ${
+                      status === "streaming" ? "bg-blue-500 animate-pulse" : "bg-green-500"
+                    }`}
+                  ></span>
+                  <span className="font-medium max-w-[200px] md:max-w-sm truncate text-left">
+                    {latestStatus?.thought || "Agent Activity"}
+                  </span>
+                  <span className="opacity-50">|</span>
+                  <span>{localTime}s elapsed</span>
+                  <span className="opacity-50">|</span>
+                  <span>{latestStatus?.metrics?.tools_invoked || 0} Tools</span>
+                  <span className="opacity-50">|</span>
+                  <span>{latestStatus?.metrics?.llm_invocations || 0} LLMs</span>
+                  
+                  {/* Simple Dropdown Arrow */}
+                  <span className="ml-1 opacity-70">
+                    {isThoughtsExpanded ? "▲" : "▼"}
+                  </span>
+                </button>
 
-              <span>{localTime}s elapsed</span>
-              <span className="opacity-50">|</span>
-              <span>{latestStatus.metrics?.tools_invoked || 0} Tool calls</span>
-              <span className="opacity-50">|</span>
-              <span>{latestStatus.metrics?.llm_invocations || 0} LLM calls</span>
+                {/* 🚨 NEW: Explicit Stop Button */}
+                {status === "streaming" && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      stop();
+                    }}
+                    className="flex items-center gap-1 text-xs font-semibold text-red-500 hover:text-red-600 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-md border border-red-200 transition-colors"
+                  >
+                    <span className="w-2 h-2 bg-red-500 rounded-sm"></span>
+                    Stop Agent
+                  </button>
+                )}
+              </div>
+
+              {/* 🚨 NEW: The Full Receipt of Thoughts (Scrollable) */}
+              {isThoughtsExpanded && (
+                <div className="flex flex-col gap-1 p-3 bg-muted/30 border border-border/50 rounded-md max-h-64 overflow-y-auto text-xs font-mono text-muted-foreground shadow-inner">
+                  {annotations.map((ann, idx) => (
+                    <div key={idx} className="flex gap-3 border-b border-border/20 last:border-0 pb-1 last:pb-0">
+                      <span className="opacity-40 min-w-[24px]">[{idx + 1}]</span>
+                      <span className={`${ann.type === 'error' ? 'text-red-500' : ''} ${ann.type === 'status' ? 'text-blue-500/80 font-semibold' : ''}`}>
+                        {ann.thought || ann.message || (ann.tool ? `Executed tool: ${ann.tool}` : JSON.stringify(ann))}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 
