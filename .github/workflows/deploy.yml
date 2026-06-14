@@ -9,6 +9,7 @@ concurrency:
   group: production-deployment
   cancel-in-progress: true
 
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -23,6 +24,21 @@ jobs:
             cd ~/nextjs-ai-chatbot
             
             git pull origin main
+
+            echo "POSTGRES_URL=${{ secrets.POSTGRES_URL }}" > .env
+            echo "AUTH_SECRET=${{ secrets.AUTH_SECRET }}" >> .env
+            echo "BLOB_READ_WRITE_TOKEN=${{ secrets.BLOB_READ_WRITE_TOKEN }}" >> .env
+            echo "GOOGLE_GENERATIVE_AI_API_KEY=${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}" >> .env
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
+            echo "XAI_API_KEY=${{ secrets.XAI_API_KEY }}" >> .env
+            echo "XAI_FREE_KEY_1=${{ secrets.XAI_FREE_KEY_1 }}" >> .env
+            echo "XAI_FREE_KEY_2=${{ secrets.XAI_FREE_KEY_2 }}" >> .env
+            echo "XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}" >> .env
+            echo "MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}" >> .env
+            echo "FLASK_APP=${{ secrets.FLASK_APP }}" >> .env
+            echo "REDIS_URL=${{ secrets.REDIS_URL }}" >> .env
+            echo "HUGGINGFACE_TOKEN=${{ secrets.HUGGINGFACE_TOKEN }}" >> .env
             
             sudo docker compose up -d --build
             

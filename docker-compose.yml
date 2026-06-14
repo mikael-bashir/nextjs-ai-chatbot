@@ -5,6 +5,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.next
+    env_file:
+      - .env
     container_name: nextjs-proxy
     ports:
       - "3000:3000"
