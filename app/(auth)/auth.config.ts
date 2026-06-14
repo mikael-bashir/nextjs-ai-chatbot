@@ -43,8 +43,13 @@ export const authConfig = {
 
         const loginUrl = new URL(mainSiteUrl);
         
-        // Attach the exact page they were trying to visit on 'leak'
-        loginUrl.searchParams.set("callbackUrl", nextUrl.href);
+        // // Attach the exact page they were trying to visit on 'leak'
+        // loginUrl.searchParams.set("callbackUrl", nextUrl.href);
+
+        const leakDomain = useSecureCookies ? process.env.AUTH_URL : 'http://localhost:3000';
+        const intendedPath = nextUrl.pathname + nextUrl.search; // e.g., "/chat/123"
+        
+        loginUrl.searchParams.set("callbackUrl", `${leakDomain}${intendedPath}`);
 
         return Response.redirect(loginUrl);
       }

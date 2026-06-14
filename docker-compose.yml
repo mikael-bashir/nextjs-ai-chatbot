@@ -20,6 +20,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.hidden
+    env_file:
+      - .env
     container_name: python-backend
     expose:
       - "5328"
