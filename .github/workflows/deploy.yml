@@ -27,6 +27,7 @@ jobs:
 
             echo "POSTGRES_URL=${{ secrets.POSTGRES_URL }}" > .env
             echo "AUTH_SECRET=${{ secrets.AUTH_SECRET }}" >> .env
+            echo "AUTH_URL=${{ secrets.AUTH_URL }}" >> .env
             echo "BLOB_READ_WRITE_TOKEN=${{ secrets.BLOB_READ_WRITE_TOKEN }}" >> .env
             echo "GOOGLE_GENERATIVE_AI_API_KEY=${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}" >> .env
             echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
