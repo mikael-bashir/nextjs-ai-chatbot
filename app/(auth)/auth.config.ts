@@ -28,6 +28,12 @@ export const authConfig = {
     authorized({ auth, request: { nextUrl } }) {
       const isLoggedIn = !!auth?.user;
 
+      // let anyone hit this endpoint
+      const isApiAuthRoute = nextUrl.pathname.startsWith('/api/auth');
+      if (isApiAuthRoute) {
+        return true;
+      }
+
       // If they are not logged in, kick them to the main site
       if (!isLoggedIn) {
         // Automatically switch between local testing and production
