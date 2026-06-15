@@ -9,3 +9,4 @@ nest_asyncio
 mcp[cli]
 httpx
 sse-starlette
+quart-session
