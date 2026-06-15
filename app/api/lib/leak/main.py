@@ -6,7 +6,7 @@ import logging
 import time
 import json
 from typing import Dict, Any
-import torch
+# import torch
 from litellm.exceptions import RateLimitError
 import asyncio
 from quart import request, jsonify, Response
