@@ -25,21 +25,23 @@ jobs:
             
             git pull origin main
 
-            echo "POSTGRES_URL=${{ secrets.POSTGRES_URL }}" > .env
-            echo "AUTH_SECRET=${{ secrets.AUTH_SECRET }}" >> .env
-            echo "AUTH_URL=${{ secrets.AUTH_URL }}" >> .env
-            echo "BLOB_READ_WRITE_TOKEN=${{ secrets.BLOB_READ_WRITE_TOKEN }}" >> .env
-            echo "GOOGLE_GENERATIVE_AI_API_KEY=${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}" >> .env
-            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
-            echo "OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}" >> .env
-            echo "XAI_API_KEY=${{ secrets.XAI_API_KEY }}" >> .env
-            echo "XAI_FREE_KEY_1=${{ secrets.XAI_FREE_KEY_1 }}" >> .env
-            echo "XAI_FREE_KEY_2=${{ secrets.XAI_FREE_KEY_2 }}" >> .env
-            echo "XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}" >> .env
-            echo "MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}" >> .env
-            echo "FLASK_APP=${{ secrets.FLASK_APP }}" >> .env
-            echo "REDIS_URL=${{ secrets.REDIS_URL }}" >> .env
-            echo "HUGGINGFACE_TOKEN=${{ secrets.HUGGINGFACE_TOKEN }}" >> .env
+            cat << 'EOF' > .env
+            POSTGRES_URL=${{ secrets.POSTGRES_URL }}
+            AUTH_SECRET=${{ secrets.AUTH_SECRET }}
+            AUTH_URL=${{ secrets.AUTH_URL }}
+            BLOB_READ_WRITE_TOKEN=${{ secrets.BLOB_READ_WRITE_TOKEN }}
+            GOOGLE_GENERATIVE_AI_API_KEY=${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+            XAI_API_KEY=${{ secrets.XAI_API_KEY }}
+            XAI_FREE_KEY_1=${{ secrets.XAI_FREE_KEY_1 }}
+            XAI_FREE_KEY_2=${{ secrets.XAI_FREE_KEY_2 }}
+            XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}
+            MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}
+            FLASK_APP=${{ secrets.FLASK_APP }}
+            REDIS_URL=${{ secrets.REDIS_URL }}
+            HUGGINGFACE_TOKEN=${{ secrets.HUGGINGFACE_TOKEN }}
+            EOF
             
             sudo docker compose up -d --build
             
