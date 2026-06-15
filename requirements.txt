@@ -12,4 +12,3 @@ httpx
 sse-starlette
 redis
 fastmcp
-torch

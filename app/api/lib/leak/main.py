@@ -27,7 +27,7 @@ from app.api.lib.leak_utils import (
     pool_semaphore,
     get_key_hash
 )
-from app.api.lib.instincts import train_v_network, score_and_update_tree_func
+# from app.api.lib.instincts import train_v_network, score_and_update_tree_func
 
 logger = logging.getLogger(__name__)
 
@@ -341,9 +341,9 @@ async def execute_tools(state: State) -> tuple[dict, State]:
     return {"tool_results": tool_results}, new_state.update(is_solved=is_solved)
 
 
-@action(reads=["tree", "current_node_id", "messages", "stream_queue", "chat_id"], writes=["tree", "messages", "is_solved"])
-async def score_and_update_tree(state: State) -> tuple[dict, State]:
-    return await score_and_update_tree_func(state)
+# @action(reads=["tree", "current_node_id", "messages", "stream_queue", "chat_id"], writes=["tree", "messages", "is_solved"])
+# async def score_and_update_tree(state: State) -> tuple[dict, State]:
+#     return await score_and_update_tree_func(state)
 
 @action(reads=["messages"], writes=["messages"])
 async def nudge_agent(state: State) -> tuple[dict, State]:
@@ -360,7 +360,7 @@ async def end(state: State) -> tuple[dict, State]:
     skip_rl = state.get("skip_rl", False)
     if not skip_rl:
         is_solved = state.get("is_solved", False)
-        train_v_network(state["chat_id"], is_solved, state["tree"], state["current_node_id"])
+        # train_v_network(state["chat_id"], is_solved, state["tree"], state["current_node_id"])
     else:
         logger.warning("Skipping RL update due to missing MCP tools or environment errors.")
     return {}, state
@@ -487,7 +487,7 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                 expand_strategic_branches, 
                 chat_model, 
                 execute_tools, 
-                score_and_update_tree, 
+                # score_and_update_tree, 
                 nudge_agent,
                 end
             )
