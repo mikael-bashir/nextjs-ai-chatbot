@@ -625,7 +625,7 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
 
                         elif action_name == "execute_tools":
                             for tr in result.get("tool_results", []):
-                                yield f"data: {json.dumps({'type': 'tool_result', 'tool': tr['name'], 'message': f'Received output from {tr['name']}. Analyzing...', 'metrics': metrics})}\n\n"
+                                yield f"data: {json.dumps({'type': 'tool_result', 'tool': tr['name'], 'message': f"Received output from {tr['name']}. Analyzing...", 'metrics': metrics})}\n\n"
 
                     except (asyncio.TimeoutError, TimeoutError):
                         elapsed = round(time.time() - start_time, 1)
