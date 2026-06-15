@@ -270,7 +270,7 @@ async def expand_strategic_branches(state: State) -> tuple[dict, State]:
         tree[current_id]["children"].append(child_id)
         new_children_ids.append(child_id)
         
-    await stream_queue.put(("status", f"Created 3 new branches. Exploring...", None, None))
+    await stream_queue.put(('status', f"Created 3 new branches. Exploring...", None, None))
         
     return {"strategies": strategies}, state.update(tree=tree)
 
@@ -625,7 +625,13 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
 
                         elif action_name == "execute_tools":
                             for tr in result.get("tool_results", []):
-                                yield f"data: {json.dumps({'type': 'tool_result', 'tool': tr['name'], 'message': f"Received output from {tr['name']}. Analyzing...", 'metrics': metrics})}\n\n"
+                                status_msg = f"Received output from {tr['name']}. Analyzing..."
+
+                                # Build the payload dictionary
+                                payload = {'type': 'tool_result', 'tool': tr['name'], 'message': status_msg, 'metrics': metrics}
+
+                                # Dump it cleanly without nested f-string collisions
+                                yield f"data: {json.dumps(payload)}\n\n"
 
                     except (asyncio.TimeoutError, TimeoutError):
                         elapsed = round(time.time() - start_time, 1)
