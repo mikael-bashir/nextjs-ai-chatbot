@@ -47,7 +47,7 @@ const nextConfig: NextConfig = {
     return [
       {
         source: "/api/flask/:path*",
-        destination: process.env.NODE_ENV === "development" ? "http://127.0.0.1:5328/api/:path*" : "/api/",
+        destination: process.env.NODE_ENV === "development" ? "http://127.0.0.1:5328/api/:path*" : "http://python-backend:5328/api/:path*",
       },
     ]
   },

@@ -50,8 +50,8 @@ class MCPFlaskService {
     })
 
     if (!response.ok) {
-      // throw new Error(`Authentication failed: ${response.statusText}`)
-      throw new Error(`Authentication failed: MCP Server ${serverData.name} might be unavailable`)
+      throw new Error(`Authentication failed: ${response.statusText}`)
+      // throw new Error(`Authentication failed: MCP Server ${serverData.name} might be unavailable`)
     }
 
     return response.json()
