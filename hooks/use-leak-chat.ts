@@ -4,6 +4,7 @@ import type React from "react"
 import { useState, useCallback, useRef } from "react"
 import { generateUUID } from "@/lib/utils"
 import { toast } from "sonner"
+import { useApiClient } from "@/lib/hooks/useApiClient"
 
 export interface UIMessage {
   id: string
@@ -46,6 +47,8 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
 
   const abortControllerRef = useRef<AbortController | null>(null)
 
+  const apiClient = useApiClient();
+
   const handleSubmit = useCallback(
     async (
       e?: React.FormEvent,
@@ -70,7 +73,7 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
 
       abortControllerRef.current = new AbortController()
       try {
-        const response = await fetch("/api/chat/canary", {
+        const response = await apiClient("/api/chat/canary", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",

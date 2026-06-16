@@ -23,6 +23,7 @@ import { sheetArtifact } from "@/artifacts/sheet/client"
 import { textArtifact } from "@/artifacts/text/client"
 import equal from "fast-deep-equal"
 import type { UIMessage, Attachment } from "@/hooks/use-leak-chat"
+import { useApiClient } from "@/lib/hooks/useApiClient"
 
 export const artifactDefinitions = [textArtifact, codeArtifact, imageArtifact, sheetArtifact]
 export type ArtifactKind = (typeof artifactDefinitions)[number]["kind"]
@@ -41,6 +42,8 @@ export interface UIArtifact {
     height: number
   }
 }
+
+
 
 type ChatStatus = "ready" | "streaming" | "submitted" | "error"
 
@@ -91,6 +94,8 @@ function PureArtifact({
     fetcher,
   )
 
+  const apiClient = useApiClient()
+
   const [mode, setMode] = useState<"edit" | "diff">("edit")
   const [document, setDocument] = useState<Document | null>(null)
   const [currentVersionIndex, setCurrentVersionIndex] = useState(-1)
@@ -136,7 +141,7 @@ function PureArtifact({
           }
 
           if (currentDocument.content !== updatedContent) {
-            await fetch(`/api/document?id=${artifact.documentId}`, {
+            await apiClient(`/api/document?id=${artifact.documentId}`, {
               method: "POST",
               body: JSON.stringify({
                 title: artifact.title,

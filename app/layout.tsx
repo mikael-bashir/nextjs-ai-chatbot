@@ -2,13 +2,15 @@ import { Toaster } from 'sonner';
 import type { Metadata } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import { ThemeProvider } from '@/components/theme-provider';
+import { GlobalProvisioningListener } from '@/components/global-provisioning-listener';
+import { AppSessionProvider } from '@/components/session-provider';
 
 import './globals.css';
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://chat.vercel.ai'),
-  title: 'Next.js Chatbot Template',
-  description: 'Next.js chatbot template using the AI SDK.',
+  metadataBase: new URL('https://leak.competemath.com'),
+  title: 'Leak',
+  description: 'Official Leak Platform',
 };
 
 export const viewport = {
@@ -70,15 +72,32 @@ export default async function RootLayout({
         />
       </head>
       <body className="antialiased">
-        <ThemeProvider
+        <AppSessionProvider>
+          <ThemeProvider
+            attribute="class"
+            defaultTheme="system"
+            enableSystem
+            disableTransitionOnChange
+          >
+            <Toaster position="top-center" />
+
+            <GlobalProvisioningListener />
+            
+            {children}
+          </ThemeProvider>
+        </AppSessionProvider>
+        {/* <ThemeProvider
           attribute="class"
           defaultTheme="system"
           enableSystem
           disableTransitionOnChange
         >
           <Toaster position="top-center" />
+
+          <GlobalProvisioningListener />
+
           {children}
-        </ThemeProvider>
+        </ThemeProvider> */}
       </body>
     </html>
   );

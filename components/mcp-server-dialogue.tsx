@@ -20,7 +20,9 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { PlusIcon } from "./icons"
 import { toast } from "sonner"
 import type { MCPAuthConfig } from "@/lib/types/mcp"
-import { mcpFlaskService } from "@/lib/services/mcp-flask-service"
+// import { mcpFlaskService } from "@/lib/services/mcp-flask-service"
+import { useMcpService } from "@/lib/services/mcp-flask-service"
+import { useApiClient } from "@/lib/hooks/useApiClient"
 
 interface MCPServerDialogProps {
   onServerAdded?: () => void
@@ -40,6 +42,9 @@ export function MCPServerDialog({ onServerAdded }: MCPServerDialogProps) {
     },
   })
 
+  const mcpFlaskService = useMcpService();
+  const apiClient = useApiClient()
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setIsLoading(true)
@@ -56,7 +61,7 @@ export function MCPServerDialog({ onServerAdded }: MCPServerDialogProps) {
         throw new Error(authResult.message || "Failed to authenticate FastMCP server")
       }
 
-      const saveResponse = await fetch("/api/mcp/servers", {
+      const saveResponse = await apiClient("/api/mcp/servers", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

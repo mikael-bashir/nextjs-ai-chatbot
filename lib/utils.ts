@@ -15,6 +15,9 @@ interface ApplicationError extends Error {
 export const fetcher = async (url: string) => {
   const res = await fetch(url)
 
+  if ( res.status === 401 ) {
+    return { chats: [], hasMore: false };
+  }
   if (!res.ok) {
     const error = new Error("An error occurred while fetching the data.") as ApplicationError
 

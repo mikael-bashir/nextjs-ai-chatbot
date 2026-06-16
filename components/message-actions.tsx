@@ -12,6 +12,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./ui/t
 import { memo } from "react"
 import equal from "fast-deep-equal"
 import { toast } from "sonner"
+import { useApiClient } from "@/lib/hooks/useApiClient"
 
 export function PureMessageActions({
   chatId,
@@ -26,6 +27,7 @@ export function PureMessageActions({
 }) {
   const { mutate } = useSWRConfig()
   const [_, copyToClipboard] = useCopyToClipboard()
+  const apiClient = useApiClient();
 
   if (isLoading) return null
   if (message.role === "user") return null
@@ -68,7 +70,7 @@ export function PureMessageActions({
               disabled={vote?.isUpvoted}
               variant="outline"
               onClick={async () => {
-                const upvote = fetch("/api/vote", {
+                const upvote = apiClient("/api/vote", {
                   method: "PATCH",
                   body: JSON.stringify({
                     chatId,
@@ -119,7 +121,7 @@ export function PureMessageActions({
               variant="outline"
               disabled={vote && !vote.isUpvoted}
               onClick={async () => {
-                const downvote = fetch("/api/vote", {
+                const downvote = apiClient("/api/vote", {
                   method: "PATCH",
                   body: JSON.stringify({
                     chatId,

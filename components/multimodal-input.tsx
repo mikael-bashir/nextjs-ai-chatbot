@@ -22,6 +22,7 @@ import { Button } from "./ui/button"
 import { Textarea } from "./ui/textarea"
 import { SuggestedActions } from "./suggested-actions"
 import equal from "fast-deep-equal"
+import { useApiClient } from "@/lib/hooks/useApiClient"
 
 export interface Attachment {
   name: string
@@ -64,6 +65,7 @@ function PureMultimodalInput({
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const { width } = useWindowSize()
+  const apiClient = useApiClient()
 
   useEffect(() => {
     if (textareaRef.current) {
@@ -132,7 +134,7 @@ function PureMultimodalInput({
     formData.append("file", file)
 
     try {
-      const response = await fetch("/api/files/upload", {
+      const response = await apiClient("/api/files/upload", {
         method: "POST",
         body: formData,
       })

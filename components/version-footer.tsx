@@ -8,6 +8,7 @@ import { useWindowSize } from 'usehooks-ts';
 
 import type { Document } from '@/lib/db/schema';
 import { getDocumentTimestampByIndex } from '@/lib/utils';
+import { useApiClient } from '@/lib/hooks/useApiClient';
 
 import { LoaderIcon } from './icons';
 import { Button } from './ui/button';
@@ -28,6 +29,8 @@ export const VersionFooter = ({
 
   const { width } = useWindowSize();
   const isMobile = width < 768;
+
+  const apiClient = useApiClient();
 
   const { mutate } = useSWRConfig();
   const [isMutating, setIsMutating] = useState(false);
@@ -57,7 +60,7 @@ export const VersionFooter = ({
 
             mutate(
               `/api/document?id=${artifact.documentId}`,
-              await fetch(
+              await apiClient(
                 `/api/document?id=${artifact.documentId}&timestamp=${getDocumentTimestampByIndex(
                   documents,
                   currentVersionIndex,

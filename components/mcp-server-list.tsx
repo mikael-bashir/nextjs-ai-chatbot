@@ -8,8 +8,11 @@ import { Switch } from "@/components/ui/switch"
 import { TrashIcon } from "./icons"
 import { toast } from "sonner"
 import type { MCPServer } from "@/lib/types/mcp"
-import { mcpFlaskService, type MCPTool } from "@/lib/services/mcp-flask-service"
+import { type MCPTool } from "@/lib/services/mcp-flask-service"
+import { useMcpService } from "@/lib/services/mcp-flask-service"
 import { except } from "drizzle-orm/mysql-core"
+import { useApiClient } from "@/lib/hooks/useApiClient"
+import { useSession } from "next-auth/react"
 
 interface MCPServerListProps {
   refreshTrigger?: number
@@ -24,16 +27,32 @@ interface ExtendedMCPServer extends MCPServer {
 export function MCPServerList({ refreshTrigger }: MCPServerListProps) {
   const [servers, setServers] = useState<ExtendedMCPServer[]>([])
   const [isLoading, setIsLoading] = useState(true)
+
+  const { data: session, status } = useSession();
   
   // THE FIX: Track connections currently in-flight to prevent race conditions
   const connectingServers = useRef<Set<string>>(new Set())
 
+  const mcpFlaskService = useMcpService();
+  const apiClient = useApiClient()
+
   const fetchServers = async () => {
+    if (status === "loading") {
+      setIsLoading(false);
+      return;
+    }
+    
+    if (!session?.user?.hasLeakAccount) {
+      console.log("[MCP List] User is unauthenticated or unprovisioned. Skipping background sync.");
+      setIsLoading(false); // Make sure your UI doesn't spin forever
+      return; 
+    }
+
     console.log("[MCP List] Starting full server fetch sync...")
     setIsLoading(true)
     try {
       const [dbResponse, flaskServers] = await Promise.all([
-        fetch("/api/mcp/servers"),
+        apiClient("/api/mcp/servers"),
         mcpFlaskService.getAuthenticatedServers().catch((err) => {
           console.error("[MCP List] Failed to fetch active servers from Python backend:", err)
           return []
@@ -164,7 +183,7 @@ export function MCPServerList({ refreshTrigger }: MCPServerListProps) {
         newFlaskServerId = undefined
       }
 
-      const response = await fetch(`/api/mcp/servers/${serverId}`, {
+      const response = await apiClient(`/api/mcp/servers/${serverId}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ isActive }),
@@ -203,7 +222,7 @@ export function MCPServerList({ refreshTrigger }: MCPServerListProps) {
         await mcpFlaskService.disconnectServer(server.flaskServerId)
       }
 
-      const response = await fetch(`/api/mcp/servers/${serverId}`, { method: "DELETE" })
+      const response = await apiClient(`/api/mcp/servers/${serverId}`, { method: "DELETE" })
       if (!response.ok) throw new Error("Failed to delete server")
 
       setServers(servers.filter((server) => server.id !== serverId))

@@ -59,16 +59,16 @@ export async function getUser(email: string): Promise<Array<User>> {
   }
 }
 
-export async function createUser(email: string, password: string) {
-  const hashedPassword = generateHashedPassword(password);
+// export async function createUser(email: string, password: string) {
+//   const hashedPassword = generateHashedPassword(password);
 
-  try {
-    return await db.insert(user).values({ email, password: hashedPassword });
-  } catch (error) {
-    console.error('Failed to create user in database');
-    throw error;
-  }
-}
+//   try {
+//     return await db.insert(user).values({ email, password: hashedPassword });
+//   } catch (error) {
+//     console.error('Failed to create user in database');
+//     throw error;
+//   }
+// }
 
 export async function saveChat({
   id,
@@ -88,6 +88,39 @@ export async function saveChat({
     });
   } catch (error) {
     console.error('Failed to save chat in database.', error);
+    throw error;
+  }
+}
+
+export async function leakAccountProvisioned({
+  id
+}: {
+  id: string;
+}) {
+  return await db.query.user.findFirst({
+    where: eq(user.id, id)
+  });
+}
+
+export async function provisionLeakUser({
+  id,
+  email,
+}: {
+  id: string;
+  email: string;
+}) {
+  try {
+    // onConflictDoNothing prevents 500 errors if a user accidentally 
+    // double-clicks the "Complete Setup" button in the modal.
+    return await db.insert(user)
+      .values({
+        id,
+        email,
+        // Add any other default fields your schema requires here (e.g., createdAt: new Date())
+      })
+      .onConflictDoNothing({ target: user.id }); 
+  } catch (error) {
+    console.error('Failed to provision user in database', error);
     throw error;
   }
 }

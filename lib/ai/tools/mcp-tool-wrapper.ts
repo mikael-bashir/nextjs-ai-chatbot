@@ -1,5 +1,5 @@
 import { z } from "zod"
-import { mcpFlaskService } from "@/lib/services/mcp-flask-service"
+import { useMcpService } from "@/lib/services/mcp-flask-service"
 import { createTool, type Tool } from "./get-weather"
 
 export interface MCPToolDefinition {
@@ -12,6 +12,7 @@ export interface MCPToolDefinition {
 export function createMCPTool(mcpTool: MCPToolDefinition): Tool {
   // Convert MCP input schema to Zod schema
   const zodSchema = convertMCPSchemaToZod(mcpTool.inputSchema)
+  const mcpFlaskService = useMcpService()
 
   return createTool({
     description: mcpTool.description,
@@ -73,6 +74,7 @@ function convertMCPSchemaToZod(schema: any): z.ZodSchema {
 }
 
 export async function getMCPTools(): Promise<Record<string, any>> {
+  const mcpFlaskService = useMcpService()
   try {
     // Get all authenticated MCP servers
     const servers = await mcpFlaskService.getAuthenticatedServers()

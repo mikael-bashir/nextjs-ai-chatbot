@@ -5,6 +5,7 @@ import { generateTitleFromUserMessage } from "../../actions"
 
 export const maxDuration = 100000000000000
 
+
 interface UIMessage {
   id: string
   role: "user" | "assistant" | "system"
