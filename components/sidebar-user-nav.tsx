@@ -1,6 +1,7 @@
 'use client';
-import { ChevronUp } from 'lucide-react';
+import { ChevronUp, CreditCard } from 'lucide-react';
 import Image from 'next/image';
+import Link from 'next/link';
 import type { User } from 'next-auth';
 import { signOut } from 'next-auth/react';
 import { useTheme } from 'next-themes';
@@ -47,6 +48,13 @@ export function SidebarUserNav({ user }: { user: User }) {
               onSelect={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
             >
               {`Toggle ${theme === 'light' ? 'dark' : 'light'} mode`}
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem asChild>
+              <Link href="/account" className="flex items-center gap-2 cursor-pointer">
+                <CreditCard className="h-4 w-4" />
+                Account
+              </Link>
             </DropdownMenuItem>
             <DropdownMenuSeparator />
             <DropdownMenuItem asChild>
