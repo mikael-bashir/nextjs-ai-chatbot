@@ -1,5 +1,5 @@
 import type { InferSelectModel } from "drizzle-orm"
-import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean } from "drizzle-orm/pg-core"
+import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean, integer } from "drizzle-orm/pg-core"
 
 export const user = pgTable("User", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
@@ -159,3 +159,27 @@ export const mcpServers = pgTable("MCPServer", {
 })
 
 export type MCPServer = InferSelectModel<typeof mcpServers>
+
+export const userCredits = pgTable("UserCredits", {
+  userId: uuid("userId")
+    .primaryKey()
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  balance: integer("balance").notNull().default(0),
+  updatedAt: timestamp("updatedAt").notNull(),
+})
+
+export type UserCredits = InferSelectModel<typeof userCredits>
+
+export const creditTransactions = pgTable("CreditTransaction", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  userId: uuid("userId")
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  amount: integer("amount").notNull(),
+  type: varchar("type", { length: 32, enum: ["purchase", "usage", "refund", "grant"] }).notNull(),
+  description: text("description").notNull(),
+  createdAt: timestamp("createdAt").notNull(),
+})
+
+export type CreditTransaction = InferSelectModel<typeof creditTransactions>
