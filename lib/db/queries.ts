@@ -30,10 +30,13 @@ import {
   vote,
   type DBMessage,
   type Chat,
+  userCredits,
+  creditTransactions,
+  type UserCredits,
+  type CreditTransaction,
 } from './schema';
 
 import type { ArtifactKind } from '@/components/artifact';
-import { generateHashedPassword } from './utils';
 
 if (!process.env.POSTGRES_URL) {
   throw new Error('POSTGRES_URL environment variable is not set.');
@@ -46,6 +49,8 @@ const schema = {
   suggestion,
   message,
   vote,
+  userCredits,
+  creditTransactions,
 }
 
 const db = drizzle(sql, { schema });
@@ -465,6 +470,175 @@ export async function updateChatVisiblityById({
     return await db.update(chat).set({ visibility }).where(eq(chat.id, chatId));
   } catch (error) {
     console.error('Failed to update chat visibility in database');
+    throw error;
+  }
+}
+
+export async function getCreditBalance({
+  userId,
+}: {
+  userId: string;
+}): Promise<UserCredits | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(userCredits)
+      .where(eq(userCredits.userId, userId));
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get credit balance from database');
+    throw error;
+  }
+}
+
+export async function getOrCreateCreditBalance({
+  userId,
+}: {
+  userId: string;
+}): Promise<number> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(userCredits)
+        .where(eq(userCredits.userId, userId));
+
+      if (existing) return existing.balance;
+
+      await tx.insert(userCredits).values({
+        userId,
+        balance: 100,
+        updatedAt: new Date(),
+      });
+
+      await tx.insert(creditTransactions).values({
+        userId,
+        amount: 100,
+        type: 'grant',
+        description: 'Welcome bonus',
+        createdAt: new Date(),
+      });
+
+      return 100;
+    });
+  } catch (error) {
+    console.error('Failed to get or create credit balance in database');
+    throw error;
+  }
+}
+
+export async function getCreditTransactions({
+  userId,
+  limit,
+  offset,
+}: {
+  userId: string;
+  limit: number;
+  offset: number;
+}): Promise<Array<CreditTransaction>> {
+  try {
+    return await db
+      .select()
+      .from(creditTransactions)
+      .where(eq(creditTransactions.userId, userId))
+      .orderBy(desc(creditTransactions.createdAt))
+      .limit(limit)
+      .offset(offset);
+  } catch (error) {
+    console.error('Failed to get credit transactions from database');
+    throw error;
+  }
+}
+
+export async function addCredits({
+  userId,
+  amount,
+  description,
+  type = 'grant',
+}: {
+  userId: string;
+  amount: number;
+  description: string;
+  type?: 'purchase' | 'grant';
+}): Promise<number> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ balance: userCredits.balance })
+        .from(userCredits)
+        .where(eq(userCredits.userId, userId));
+
+      let newBalance: number;
+
+      if (existing) {
+        newBalance = existing.balance + amount;
+        await tx
+          .update(userCredits)
+          .set({ balance: newBalance, updatedAt: new Date() })
+          .where(eq(userCredits.userId, userId));
+      } else {
+        newBalance = amount;
+        await tx.insert(userCredits).values({
+          userId,
+          balance: newBalance,
+          updatedAt: new Date(),
+        });
+      }
+
+      await tx.insert(creditTransactions).values({
+        userId,
+        amount,
+        type,
+        description,
+        createdAt: new Date(),
+      });
+
+      return newBalance;
+    });
+  } catch (error) {
+    console.error('Failed to add credits in database');
+    throw error;
+  }
+}
+
+export async function deductCredits({
+  userId,
+  amount,
+  description,
+}: {
+  userId: string;
+  amount: number;
+  description: string;
+}): Promise<number> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select({ balance: userCredits.balance })
+        .from(userCredits)
+        .where(eq(userCredits.userId, userId));
+
+      if (!current) throw new Error('Credit account not found');
+      if (current.balance < amount) throw new Error('Insufficient credits');
+
+      const newBalance = current.balance - amount;
+
+      await tx
+        .update(userCredits)
+        .set({ balance: newBalance, updatedAt: new Date() })
+        .where(eq(userCredits.userId, userId));
+
+      await tx.insert(creditTransactions).values({
+        userId,
+        amount: -amount,
+        type: 'usage',
+        description,
+        createdAt: new Date(),
+      });
+
+      return newBalance;
+    });
+  } catch (error) {
+    console.error('Failed to deduct credits in database');
     throw error;
   }
 }
