@@ -5,8 +5,10 @@ import {
   getOrCreateCreditBalance,
   getCreditTransactions,
   getEarliestCreditTransaction,
+  getActiveSubscription,
 } from '@/lib/db/queries';
 import { checkRateLimit } from '@/lib/ratelimit';
+import { SUBSCRIPTION_PLANS } from '@/lib/stripe';
 import {
   Card,
   CardContent,
@@ -16,6 +18,8 @@ import {
 } from '@/components/ui/card';
 import { AddCreditsModal } from './add-credits-modal';
 import { UsageHistory } from './usage-history';
+import { PaymentSuccessToast, PaymentCancelledToast } from './payment-toast';
+import { ManageSubscriptionButton } from './manage-subscription-button';
 
 const RATE_LIMIT = 20;
 
@@ -37,7 +41,11 @@ function RateLimitBar({ used, total }: { used: number; total: number }) {
   );
 }
 
-export default async function AccountPage() {
+export default async function AccountPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ payment?: string }>;
+}) {
   const session = await auth();
   if (!session?.user?.id || !session.user.hasLeakAccount) {
     redirect('/');
@@ -45,12 +53,14 @@ export default async function AccountPage() {
 
   const userId = session.user.id;
   const user = session.user;
+  const { payment } = await searchParams;
 
-  const [balance, transactions, rateLimit, firstTx] = await Promise.all([
+  const [balance, transactions, rateLimit, firstTx, subscription] = await Promise.all([
     getOrCreateCreditBalance({ userId }),
     getCreditTransactions({ userId, limit: 20, offset: 0 }),
     checkRateLimit({ userId }),
     getEarliestCreditTransaction({ userId }),
+    getActiveSubscription({ userId }),
   ]);
 
   const used = RATE_LIMIT - rateLimit.remaining;
@@ -61,12 +71,21 @@ export default async function AccountPage() {
       })
     : null;
 
+  const currentPlan = subscription
+    ? SUBSCRIPTION_PLANS.find((p) => p.id === subscription.planId)
+    : null;
+
+  const planLabel = currentPlan?.name ?? 'Free';
   const displayName = user.name ?? user.email?.split('@')[0] ?? 'User';
   const avatarSrc =
     user.image ?? `https://avatar.vercel.sh/${encodeURIComponent(user.email ?? '')}`;
 
   return (
     <main className="min-h-screen bg-background">
+      {/* Payment state toasts */}
+      {payment === 'success' && <PaymentSuccessToast />}
+      {payment === 'cancelled' && <PaymentCancelledToast />}
+
       {/* Profile hero */}
       <div className="border-b bg-gradient-to-b from-muted/40 to-background">
         <div className="container mx-auto max-w-4xl px-6 py-10">
@@ -88,8 +107,14 @@ export default async function AccountPage() {
             <div className="flex-1 min-w-0">
               <div className="flex flex-wrap items-center gap-2 mb-1">
                 <h1 className="text-2xl font-bold truncate">{displayName}</h1>
-                <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary ring-1 ring-inset ring-primary/20">
-                  Free Plan
+                <span
+                  className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset ${
+                    subscription
+                      ? 'bg-blue-50 text-blue-700 ring-blue-200 dark:bg-blue-900/20 dark:text-blue-400 dark:ring-blue-800'
+                      : 'bg-primary/10 text-primary ring-primary/20'
+                  }`}
+                >
+                  {planLabel} Plan
                 </span>
               </div>
               <p className="text-sm text-muted-foreground truncate">{user.email}</p>
@@ -131,7 +156,33 @@ export default async function AccountPage() {
           </Card>
         </div>
 
-        {/* Credits + rate limit side-by-side on large screens */}
+        {/* Subscription card — only shown when subscribed */}
+        {subscription && currentPlan && (
+          <Card className="border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-900/10">
+            <CardHeader className="flex flex-row items-start justify-between space-y-0 pb-3">
+              <div>
+                <CardTitle className="text-base">{currentPlan.name} Plan</CardTitle>
+                <CardDescription className="text-xs">
+                  {currentPlan.credits} credits per month · renews{' '}
+                  {new Date(subscription.currentPeriodEnd).toLocaleDateString('en-US', {
+                    month: 'long',
+                    day: 'numeric',
+                    year: 'numeric',
+                  })}
+                </CardDescription>
+              </div>
+              <ManageSubscriptionButton />
+            </CardHeader>
+            <CardContent>
+              <p className="text-sm text-muted-foreground">
+                Your subscription automatically renews and adds{' '}
+                <strong>{currentPlan.credits} credits</strong> each billing cycle.
+              </p>
+            </CardContent>
+          </Card>
+        )}
+
+        {/* Credits + rate limit side-by-side */}
         <div className="grid gap-4 md:grid-cols-2">
           {/* Credits card */}
           <Card>
@@ -179,9 +230,7 @@ export default async function AccountPage() {
                   <span className="font-semibold text-foreground">{used}</span> of{' '}
                   {RATE_LIMIT} messages used
                 </span>
-                <span className="text-muted-foreground">
-                  {rateLimit.remaining} remaining
-                </span>
+                <span className="text-muted-foreground">{rateLimit.remaining} remaining</span>
               </div>
             </CardContent>
           </Card>
@@ -194,16 +243,25 @@ export default async function AccountPage() {
           </CardHeader>
           <CardContent>
             <dl className="divide-y divide-border">
-              {[
-                { label: 'Email', value: user.email },
-                {
-                  label: 'User ID',
-                  value: userId.slice(0, 8) + '…',
-                  mono: true,
-                },
-                { label: 'Plan', value: 'Free' },
-                ...(memberSince ? [{ label: 'Member since', value: memberSince }] : []),
-              ].map(({ label, value, mono }) => (
+              {(
+                [
+                  { label: 'Email', value: user.email },
+                  { label: 'User ID', value: `${userId.slice(0, 8)}…`, mono: true },
+                  { label: 'Plan', value: planLabel },
+                  ...(memberSince ? [{ label: 'Member since', value: memberSince }] : []),
+                  ...(subscription
+                    ? [
+                        {
+                          label: 'Next renewal',
+                          value: new Date(subscription.currentPeriodEnd).toLocaleDateString(
+                            'en-US',
+                            { month: 'long', day: 'numeric', year: 'numeric' },
+                          ),
+                        },
+                      ]
+                    : []),
+                ] as Array<{ label: string; value: string | undefined; mono?: boolean }>
+              ).map(({ label, value, mono }) => (
                 <div
                   key={label}
                   className="flex items-center justify-between py-3 text-sm"

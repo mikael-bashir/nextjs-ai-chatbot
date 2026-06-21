@@ -34,6 +34,9 @@ import {
   creditTransactions,
   type UserCredits,
   type CreditTransaction,
+  stripeCustomers,
+  stripeSubscriptions,
+  type StripeSubscription,
 } from './schema';
 
 import type { ArtifactKind } from '@/components/artifact';
@@ -51,6 +54,8 @@ const schema = {
   vote,
   userCredits,
   creditTransactions,
+  stripeCustomers,
+  stripeSubscriptions,
 }
 
 const db = drizzle(sql, { schema });
@@ -658,6 +663,133 @@ export async function deductCredits({
     });
   } catch (error) {
     console.error('Failed to deduct credits in database');
+    throw error;
+  }
+}
+
+export async function getStripeCustomerId({
+  userId,
+}: {
+  userId: string;
+}): Promise<string | null> {
+  try {
+    const [row] = await db
+      .select({ stripeCustomerId: stripeCustomers.stripeCustomerId })
+      .from(stripeCustomers)
+      .where(eq(stripeCustomers.userId, userId));
+    return row?.stripeCustomerId ?? null;
+  } catch (error) {
+    console.error('Failed to get Stripe customer ID from database');
+    throw error;
+  }
+}
+
+export async function saveStripeCustomer({
+  userId,
+  stripeCustomerId,
+}: {
+  userId: string;
+  stripeCustomerId: string;
+}): Promise<void> {
+  try {
+    await db
+      .insert(stripeCustomers)
+      .values({ userId, stripeCustomerId, createdAt: new Date() })
+      .onConflictDoNothing({ target: stripeCustomers.userId });
+  } catch (error) {
+    console.error('Failed to save Stripe customer in database');
+    throw error;
+  }
+}
+
+export async function getActiveSubscription({
+  userId,
+}: {
+  userId: string;
+}): Promise<StripeSubscription | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(stripeSubscriptions)
+      .where(
+        and(
+          eq(stripeSubscriptions.userId, userId),
+          eq(stripeSubscriptions.status, 'active'),
+        ),
+      )
+      .orderBy(desc(stripeSubscriptions.createdAt))
+      .limit(1);
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get active subscription from database');
+    throw error;
+  }
+}
+
+export async function saveOrUpdateSubscription({
+  userId,
+  stripeSubscriptionId,
+  planId,
+  status,
+  currentPeriodEnd,
+}: {
+  userId: string;
+  stripeSubscriptionId: string;
+  planId: string;
+  status: 'active' | 'cancelled' | 'past_due' | 'incomplete';
+  currentPeriodEnd: Date;
+}): Promise<void> {
+  try {
+    const [existing] = await db
+      .select({ id: stripeSubscriptions.id })
+      .from(stripeSubscriptions)
+      .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+
+    const now = new Date();
+    if (existing) {
+      await db
+        .update(stripeSubscriptions)
+        .set({ status, currentPeriodEnd, updatedAt: now })
+        .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    } else {
+      await db.insert(stripeSubscriptions).values({
+        userId,
+        stripeSubscriptionId,
+        planId,
+        status,
+        currentPeriodEnd,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  } catch (error) {
+    console.error('Failed to save or update subscription in database');
+    throw error;
+  }
+}
+
+export async function markSubscriptionCancelled({
+  stripeSubscriptionId,
+}: {
+  stripeSubscriptionId: string;
+}): Promise<void> {
+  try {
+    await db
+      .update(stripeSubscriptions)
+      .set({ status: 'cancelled', updatedAt: new Date() })
+      .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+  } catch (error) {
+    console.error('Failed to cancel subscription in database');
+    throw error;
+  }
+}
+
+export async function getUserById({ id }: { id: string }): Promise<User | null> {
+  try {
+    const [row] = await db.select().from(user).where(eq(user.id, id));
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get user by ID from database');
     throw error;
   }
 }

@@ -36,6 +36,12 @@ export const authConfig = {
         return true;
       }
 
+      // Stripe webhooks must be publicly accessible (signature-verified inside the handler)
+      const isWebhookRoute = nextUrl.pathname.startsWith('/api/webhooks');
+      if (isWebhookRoute) {
+        return true;
+      }
+
       // block all other api requests
       const isApiRoute = nextUrl.pathname.startsWith('/api');
       if (isApiRoute) {

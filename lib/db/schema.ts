@@ -183,3 +183,32 @@ export const creditTransactions = pgTable("CreditTransaction", {
 })
 
 export type CreditTransaction = InferSelectModel<typeof creditTransactions>
+
+export const stripeCustomers = pgTable("StripeCustomer", {
+  userId: uuid("userId")
+    .primaryKey()
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  stripeCustomerId: varchar("stripeCustomerId", { length: 255 }).notNull(),
+  createdAt: timestamp("createdAt").notNull(),
+})
+
+export type StripeCustomer = InferSelectModel<typeof stripeCustomers>
+
+export const stripeSubscriptions = pgTable("StripeSubscription", {
+  id: uuid("id").primaryKey().notNull().defaultRandom(),
+  userId: uuid("userId")
+    .notNull()
+    .references(() => user.id, { onDelete: "cascade" }),
+  stripeSubscriptionId: varchar("stripeSubscriptionId", { length: 255 }).notNull(),
+  planId: varchar("planId", { length: 50 }).notNull(),
+  status: varchar("status", {
+    length: 50,
+    enum: ["active", "cancelled", "past_due", "incomplete"],
+  }).notNull(),
+  currentPeriodEnd: timestamp("currentPeriodEnd").notNull(),
+  createdAt: timestamp("createdAt").notNull(),
+  updatedAt: timestamp("updatedAt").notNull(),
+})
+
+export type StripeSubscription = InferSelectModel<typeof stripeSubscriptions>
