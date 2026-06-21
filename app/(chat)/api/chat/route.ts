@@ -1,5 +1,6 @@
 import { auth } from "@/app/(auth)/auth"
-import { deleteChatById, getChatById, saveChat, saveMessages } from "@/lib/db/queries"
+import { deleteChatById, deductCredits, getChatById, getOrCreateCreditBalance, saveChat, saveMessages } from "@/lib/db/queries"
+import { checkRateLimit } from "@/lib/ratelimit"
 import { generateUUID, getMostRecentUserMessage } from "@/lib/utils"
 import { generateTitleFromUserMessage } from "../../actions"
 
@@ -113,6 +114,21 @@ export async function POST(request: Request) {
       return new Response("Unauthorized", { status: 401 })
     }
 
+    const userId = session.user.id
+
+    const rateLimit = await checkRateLimit({ userId })
+    if (!rateLimit.allowed) {
+      return Response.json(
+        { error: "Rate limit exceeded", resetAt: rateLimit.resetAt },
+        { status: 429 },
+      )
+    }
+
+    const balance = await getOrCreateCreditBalance({ userId })
+    if (balance === 0) {
+      return Response.json({ error: "Insufficient credits" }, { status: 402 })
+    }
+
     const userMessage = getMostRecentUserMessage(messages)
 
     if (!userMessage) {
@@ -126,10 +142,10 @@ export async function POST(request: Request) {
       const title = await generateTitleFromUserMessage({
         message: userMessage,
       })
-      await saveChat({ id, userId: session.user.id, title })
-      console.log("[POST /api/chat] Created new chat", { id, userId: session.user.id, title })
+      await saveChat({ id, userId, title })
+      console.log("[POST /api/chat] Created new chat", { id, userId, title })
     } else {
-      if (chat.userId !== session.user.id) {
+      if (chat.userId !== userId) {
         console.warn("[POST /api/chat] Forbidden: user does not own chat", {
           chatUserId: chat.userId,
           sessionUserId: session.user.id,
@@ -151,12 +167,12 @@ export async function POST(request: Request) {
       ],
     })
 
+
     try {
       const geminiResponse = await callGeminiBackend(messages)
       const assistantMessageId = generateUUID()
       const content = geminiResponse.response || ""
 
-      // Save the assistant message to database
       saveMessages({
         messages: [
           {
@@ -170,6 +186,10 @@ export async function POST(request: Request) {
         ],
       }).catch((error) => {
         console.error("[POST /api/chat] Failed to save Gemini message:", error)
+      })
+
+      deductCredits({ userId, amount: 1, description: "Chat message" }).catch((error) => {
+        console.error("[POST /api/chat] Failed to deduct credits:", error)
       })
 
       return createCustomStreamResponse(content, assistantMessageId)
