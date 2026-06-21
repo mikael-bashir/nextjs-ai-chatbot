@@ -108,6 +108,15 @@ export default defineConfig({
         storageState: 'playwright/.auth/session.json',
       },
     },
+    {
+      name: 'stripe',
+      testMatch: /e2e\/stripe.test.ts/,
+      dependencies: ['setup:auth'],
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'playwright/.auth/session.json',
+      },
+    },
 
     // {
     //   name: 'firefox',

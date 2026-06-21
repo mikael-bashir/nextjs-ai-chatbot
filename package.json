@@ -18,7 +18,10 @@
     "db:up": "drizzle-kit up",
     "test": "export PLAYWRIGHT=True && pnpm exec playwright test",
     "test:route": "export PLAYWRIGHT=True && pnpm exec playwright test --project=routes",
-    "test:e2e": "export PLAYWRIGHT=True && pnpm exec playwright test --project=account"
+    "test:e2e": "export PLAYWRIGHT=True && pnpm exec playwright test --project=account",
+    "test:stripe:route": "export PLAYWRIGHT=True && pnpm exec playwright test --project=routes tests/routes/stripe.test.ts",
+    "test:stripe:e2e": "export PLAYWRIGHT=True && pnpm exec playwright test --project=stripe",
+    "playwright:install": "pnpm exec playwright install --with-deps"
   },
   "dependencies": {
     "@ai-sdk/google": "^1.2.13",
