@@ -1,7 +1,7 @@
 'use client';
 
 import type { User } from 'next-auth';
-import { useRouter } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 
 import { PlusIcon } from '@/components/icons';
 import { SidebarHistory } from '@/components/sidebar-history';
@@ -20,7 +20,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
 
 export function AppSidebar({ user }: { user: User | undefined }) {
   const router = useRouter();
+  const pathname = usePathname();
   const { setOpenMobile } = useSidebar();
+
+  const showNewChat = pathname === '/' || pathname.startsWith('/chat/');
 
   return (
     <Sidebar className="group-data-[side=left]:border-r-0">
@@ -29,39 +32,44 @@ export function AppSidebar({ user }: { user: User | undefined }) {
           <div className="flex flex-row justify-between items-center">
             <Link
               href="/"
-              onClick={() => {
-                setOpenMobile(false);
-              }}
+              onClick={() => setOpenMobile(false)}
               className="flex flex-row gap-3 items-center"
             >
               <span className="text-lg font-semibold px-2 hover:bg-muted rounded-md cursor-pointer">
                 Leak
               </span>
             </Link>
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="ghost"
-                  type="button"
-                  className="p-2 h-fit"
-                  onClick={() => {
-                    setOpenMobile(false);
-                    router.push('/');
-                    router.refresh();
-                  }}
-                >
-                  <PlusIcon />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent align="end">New Chat</TooltipContent>
-            </Tooltip>
+
+            {showNewChat && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    type="button"
+                    className="p-2 h-fit"
+                    onClick={() => {
+                      setOpenMobile(false);
+                      router.push('/');
+                      router.refresh();
+                    }}
+                  >
+                    <PlusIcon />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent align="end">New Chat</TooltipContent>
+              </Tooltip>
+            )}
           </div>
+
+          {user && <SidebarUserNav user={user} placement="header" />}
         </SidebarMenu>
       </SidebarHeader>
+
       <SidebarContent>
         <SidebarHistory user={user} />
       </SidebarContent>
-      <SidebarFooter>{user && <SidebarUserNav user={user} />}</SidebarFooter>
+
+      <SidebarFooter />
     </Sidebar>
   );
 }

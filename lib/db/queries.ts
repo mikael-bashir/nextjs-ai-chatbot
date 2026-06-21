@@ -527,6 +527,25 @@ export async function getOrCreateCreditBalance({
   }
 }
 
+export async function getEarliestCreditTransaction({
+  userId,
+}: {
+  userId: string;
+}): Promise<CreditTransaction | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(creditTransactions)
+      .where(eq(creditTransactions.userId, userId))
+      .orderBy(asc(creditTransactions.createdAt))
+      .limit(1);
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get earliest credit transaction from database');
+    throw error;
+  }
+}
+
 export async function getCreditTransactions({
   userId,
   limit,
