@@ -130,6 +130,7 @@ jobs:
           STRIPE_SECRET:         ${{ secrets.STRIPE_SECRET_TEST }}
           STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET_TEST }}
           RESEND_API_KEY:        ${{ secrets.RESEND_API_KEY }}
+
         with:
           host:     ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
