@@ -85,22 +85,10 @@ export default async function RootLayout({
             <Suspense>
               <GlobalProvisioningListener />
             </Suspense>
-            
+
             {children}
           </ThemeProvider>
         </AppSessionProvider>
-        {/* <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <Toaster position="top-center" />
-
-          <GlobalProvisioningListener />
-
-          {children}
-        </ThemeProvider> */}
       </body>
     </html>
   );

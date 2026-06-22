@@ -70,7 +70,7 @@ test.describe
           data: { messages: [{ role: 'user', content: 'hi' }], model: 'grok-free-pool', id: 'probe' },
           timeout: 5000,
         })
-        .then((r) => r.status() < 500)
+        .then((r: { status: () => number }) => r.status() < 500)
         .catch(() => false);
       test.skip(!agentReachable, 'Requires Python service with working xAI free key');
 
