@@ -16,6 +16,12 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
+# Dummy values so module-level env checks pass during build.
+# Actual values are injected at runtime via the .env file.
+ARG POSTGRES_URL=postgresql://build:build@localhost/build
+ARG AUTH_SECRET=build-placeholder
+ENV POSTGRES_URL=$POSTGRES_URL
+ENV AUTH_SECRET=$AUTH_SECRET
 RUN pnpm exec next build
 
 FROM base AS runner
