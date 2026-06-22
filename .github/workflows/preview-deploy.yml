@@ -147,11 +147,20 @@ jobs:
           script: |
             set -euo pipefail
 
-            # Pull image from GHCR
-            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-
             PREVIEW_DIR="/opt/previews/${SUBDOMAIN}"
             mkdir -p "$PREVIEW_DIR"
+
+            # Prevent concurrent deploys for the same PR (SSH disconnect doesn't kill remote script)
+            LOCK_FILE="/tmp/preview-${SUBDOMAIN}.lock"
+            exec 9>"$LOCK_FILE"
+            if ! flock -n 9; then
+              echo "Another deploy is already running for ${SUBDOMAIN}, skipping."
+              exit 0
+            fi
+            trap 'flock -u 9; rm -f "$LOCK_FILE"' EXIT
+
+            # Pull image from GHCR
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
             # Install Stripe CLI if not already present (idempotent)
             if ! command -v stripe >/dev/null 2>&1; then
