@@ -10,9 +10,17 @@ export function useApiClient() {
   const apiClient = async (input: RequestInfo | URL, init?: RequestInit) => {
     const res = await fetch(input, init);
 
+    // Only inspect the body for error codes on non-streaming responses.
+    // SSE (text/event-stream) responses must not be cloned+parsed here —
+    // reading the clone blocks until the entire stream finishes, freezing the UI.
+    const contentType = res.headers.get('content-type') ?? '';
+    if (contentType.includes('text/event-stream')) {
+      return res;
+    }
+
     // Clone the response so we can read the JSON without consuming it for the actual caller
     const resClone = res.clone();
-    
+
     try {
       const data = await resClone.json();
       
