@@ -119,20 +119,21 @@ jobs:
           CADDY_B64:    ${{ env.CADDY_B64 }}
           GHCR_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
-          # App environment — use Stripe test keys for previews
-          POSTGRES_URL:          ${{ secrets.POSTGRES_URL }}
-          AUTH_SECRET:           ${{ secrets.AUTH_SECRET }}
-          AUTH_URL:              ${{ steps.preview.outputs.url }}
-          NEXT_PUBLIC_APP_URL:   ${{ steps.preview.outputs.url }}
-          XAI_MASTER:            ${{ secrets.XAI_MASTER }}
-          XAI_FREE_KEY_1:        ${{ secrets.XAI_FREE_KEY_1 }}
-          XAI_FREE_KEY_2:        ${{ secrets.XAI_FREE_KEY_2 }}
-          XAI_FREE_KEY_3:        ${{ secrets.XAI_FREE_KEY_3 }}
-          MEM0_API_KEY:          ${{ secrets.MEM0_API_KEY }}
-          REDIS_URL:             ${{ secrets.REDIS_URL }}
-          STRIPE_SECRET:         ${{ secrets.STRIPE_SECRET_TEST }}
-          STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET_TEST }}
-          RESEND_API_KEY:        ${{ secrets.RESEND_API_KEY }}
+          # App environment — use Stripe test keys for previews.
+          # STRIPE_WEBHOOK_SECRET is NOT passed here; it is generated on the VPS
+          # from the Stripe CLI so it matches the CLI listener automatically.
+          POSTGRES_URL:        ${{ secrets.POSTGRES_URL }}
+          AUTH_SECRET:         ${{ secrets.AUTH_SECRET }}
+          AUTH_URL:            ${{ steps.preview.outputs.url }}
+          NEXT_PUBLIC_APP_URL: ${{ steps.preview.outputs.url }}
+          XAI_MASTER:          ${{ secrets.XAI_MASTER }}
+          XAI_FREE_KEY_1:      ${{ secrets.XAI_FREE_KEY_1 }}
+          XAI_FREE_KEY_2:      ${{ secrets.XAI_FREE_KEY_2 }}
+          XAI_FREE_KEY_3:      ${{ secrets.XAI_FREE_KEY_3 }}
+          MEM0_API_KEY:        ${{ secrets.MEM0_API_KEY }}
+          REDIS_URL:           ${{ secrets.REDIS_URL }}
+          STRIPE_SECRET:       ${{ secrets.STRIPE_SECRET_TEST }}
+          RESEND_API_KEY:      ${{ secrets.RESEND_API_KEY }}
 
         with:
           host:     ${{ secrets.SERVER_IP }}
@@ -142,23 +143,32 @@ jobs:
             SUBDOMAIN,PORT,COMPOSE_B64,CADDY_B64,GHCR_TOKEN,GITHUB_ACTOR,
             POSTGRES_URL,AUTH_SECRET,AUTH_URL,NEXT_PUBLIC_APP_URL,XAI_MASTER,
             XAI_FREE_KEY_1,XAI_FREE_KEY_2,XAI_FREE_KEY_3,
-            MEM0_API_KEY,REDIS_URL,
-            STRIPE_SECRET,STRIPE_WEBHOOK_SECRET,
-            RESEND_API_KEY
+            MEM0_API_KEY,REDIS_URL,STRIPE_SECRET,RESEND_API_KEY
           script: |
             set -euo pipefail
 
             # Pull image from GHCR
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
-            # Create preview directory
             PREVIEW_DIR="/opt/previews/${SUBDOMAIN}"
             mkdir -p "$PREVIEW_DIR"
+
+            # Kill any existing Stripe listener from a previous deploy of this PR
+            STRIPE_PID_FILE="$PREVIEW_DIR/stripe-listener.pid"
+            if [ -f "$STRIPE_PID_FILE" ]; then
+              kill "$(cat "$STRIPE_PID_FILE")" 2>/dev/null || true
+              rm -f "$STRIPE_PID_FILE"
+            fi
+
+            # Get the Stripe CLI webhook signing secret before starting containers.
+            # stripe listen --print-secret is consistent for a given API key, so the
+            # secret written here will match what the background listener signs with.
+            CLI_WEBHOOK_SECRET=$(stripe listen --api-key "${STRIPE_SECRET}" --print-secret 2>/dev/null | tr -d '[:space:]')
 
             # Write docker-compose and env file
             echo "$COMPOSE_B64" | base64 -d > "$PREVIEW_DIR/docker-compose.yml"
 
-            # .env — one var per line, no quoting issues
+            # .env — one var per line
             {
               echo "POSTGRES_URL=${POSTGRES_URL}"
               echo "AUTH_SECRET=${AUTH_SECRET}"
@@ -173,11 +183,11 @@ jobs:
               echo "MEM0_API_KEY=${MEM0_API_KEY}"
               echo "REDIS_URL=${REDIS_URL}"
               echo "STRIPE_SECRET=${STRIPE_SECRET}"
-              echo "STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}"
+              echo "STRIPE_WEBHOOK_SECRET=${CLI_WEBHOOK_SECRET}"
               echo "RESEND_API_KEY=${RESEND_API_KEY}"
             } > "$PREVIEW_DIR/.env"
 
-            # Deploy
+            # Start containers
             cd "$PREVIEW_DIR"
             docker compose -p "preview-${SUBDOMAIN}" pull --quiet
             docker compose -p "preview-${SUBDOMAIN}" up -d --remove-orphans
@@ -185,6 +195,16 @@ jobs:
             # Caddy virtual-host — Caddy will auto-provision a Let's Encrypt cert
             echo "$CADDY_B64" | base64 -d | sudo tee "/etc/caddy/sites/${SUBDOMAIN}.caddy" > /dev/null
             sudo systemctl reload caddy
+
+            # Start Stripe CLI listener in background.
+            # Forwards Stripe test events to this preview's webhook endpoint.
+            # PID is saved so teardown can kill it cleanly.
+            PREVIEW_URL="https://${SUBDOMAIN}.preview.leak.competemath.com"
+            nohup stripe listen \
+              --api-key "${STRIPE_SECRET}" \
+              --forward-to "${PREVIEW_URL}/api/webhooks/stripe" \
+              >> "$PREVIEW_DIR/stripe-listener.log" 2>&1 &
+            echo $! > "$STRIPE_PID_FILE"
 
             docker image prune -f
 

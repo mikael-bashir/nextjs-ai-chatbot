@@ -35,6 +35,12 @@ jobs:
             PREVIEW_DIR="/opt/previews/${SUBDOMAIN}"
 
             if [ -d "$PREVIEW_DIR" ]; then
+              # Kill Stripe CLI listener first so it doesn't keep trying to connect
+              STRIPE_PID_FILE="$PREVIEW_DIR/stripe-listener.pid"
+              if [ -f "$STRIPE_PID_FILE" ]; then
+                kill "$(cat "$STRIPE_PID_FILE")" 2>/dev/null || true
+              fi
+
               cd "$PREVIEW_DIR"
               docker compose -p "preview-${SUBDOMAIN}" down --volumes --remove-orphans || true
               cd /
