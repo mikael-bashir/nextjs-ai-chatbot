@@ -34,6 +34,11 @@ export function Chat({
     initialMessages,
     body: { id, selectedChatModel },
     onFinish: () => {
+      // Update URL to the permanent chat route once the first response completes.
+      // Done here (not on click) so Next.js doesn't navigate before the chat exists in the DB.
+      if (window.location.pathname !== `/chat/${id}`) {
+        window.history.replaceState(window.history.state, "", `/chat/${id}`)
+      }
       mutate(unstable_serialize(getChatHistoryPaginationKey))
     },
   })

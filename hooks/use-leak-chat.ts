@@ -49,46 +49,27 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
 
   const apiClient = useApiClient();
 
-  const handleSubmit = useCallback(
-    async (
-      e?: React.FormEvent,
-      options?: { experimental_attachments?: Attachment[] },
-    ): Promise<string | null | undefined> => {
-      if (e) e.preventDefault()
-
-      if (!input.trim() && !options?.experimental_attachments?.length) return null
-
-      const userMessage: UIMessage = {
-        id: generateUUID(),
-        role: "user",
-        content: input,
-        createdAt: new Date(),
-        parts: [{ type: "text", text: input }],
-        experimental_attachments: options?.experimental_attachments,
-      }
-
-      setMessages((prev) => [...prev, userMessage])
-      setInput("")
+  // Shared streaming logic — called by both handleSubmit and append.
+  const sendMessages = useCallback(
+    async (currentMessages: UIMessage[]): Promise<string | null | undefined> => {
       setStatus("streaming")
-
       abortControllerRef.current = new AbortController()
+
       try {
         const response = await apiClient("/api/chat/canary", {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
           signal: abortControllerRef.current.signal,
           body: JSON.stringify({
             id,
-            messages: [...messages, userMessage],
+            messages: currentMessages,
             ...body,
           }),
         })
 
         if (response.status === 429) {
-          const body = await response.json().catch(() => ({}))
-          const resetAt = body.resetAt ? new Date(body.resetAt) : null
+          const resBody = await response.json().catch(() => ({}))
+          const resetAt = resBody.resetAt ? new Date(resBody.resetAt) : null
           const mins = resetAt
             ? Math.ceil((resetAt.getTime() - Date.now()) / 60000)
             : null
@@ -98,7 +79,11 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
               : "Rate limit reached — please wait before sending another message.",
           )
           setStatus("ready")
-          setMessages((prev) => prev.filter((m) => m.id !== userMessage.id))
+          // Remove the optimistically-added user message
+          const lastUserMsg = [...currentMessages].reverse().find((m) => m.role === "user")
+          if (lastUserMsg) {
+            setMessages((prev) => prev.filter((m) => m.id !== lastUserMsg.id))
+          }
           return null
         }
 
@@ -117,7 +102,7 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
           content: "",
           createdAt: new Date(),
           parts: [{ type: "text", text: "" }],
-          annotations: [], // Initialize the annotations array
+          annotations: [],
         }
 
         setMessages((prev) => [...prev, assistantMessage])
@@ -130,35 +115,29 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
           if (done) break
 
           buffer += decoder.decode(value, { stream: true })
-          
-          // FIX 1: Split by double newline as per SSE standards
+
           const events = buffer.split("\n\n")
           buffer = events.pop() || ""
 
           for (const event of events) {
             if (event.startsWith("data: ")) {
               try {
-                // Extract just the JSON string
                 const dataString = event.replace(/^data:\s*/, "")
                 if (!dataString) continue
-                
+
                 const data = JSON.parse(dataString)
 
                 console.log(`🚨 [FRONTEND] Received type: ${data.type}`, data)
-                
-                // Handle text streaming
+
                 if (data.type === "text-delta") {
-                  // const newContent = assistantMessage.content + data.content;
-                  const newContent = data.content; // data content doesn't actually send deltas
+                  const newContent = data.content
                   assistantMessage = {
                     ...assistantMessage,
                     content: newContent,
-                    // THE FIX: Create a completely new array in memory so React updates the UI!
                     parts: [{ type: "text", text: newContent }]
                   }
                 }
-                
-                // FIX 2: Handle the HUD metrics and thoughts
+
                 if (data.type === "message-annotation") {
                   assistantMessage = {
                     ...assistantMessage,
@@ -166,13 +145,12 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
                   }
                 }
 
-                // Update the React state so the UI visually re-renders
                 setMessages((prev) => prev.map((msg) => (msg.id === assistantMessage.id ? assistantMessage : msg)))
-                
+
               } catch (e) {
                 // Silently ignore incomplete JSON chunks
               }
-            } 
+            }
           }
         }
 
@@ -192,13 +170,48 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
         return null
       }
     },
-    [input, messages, id, body, onFinish, onError],
+    [id, body, onFinish, onError, apiClient],
+  )
+
+  const handleSubmit = useCallback(
+    async (
+      e?: React.FormEvent,
+      options?: { experimental_attachments?: Attachment[] },
+    ): Promise<string | null | undefined> => {
+      if (e) e.preventDefault()
+
+      if (!input.trim() && !options?.experimental_attachments?.length) return null
+
+      const userMessage: UIMessage = {
+        id: generateUUID(),
+        role: "user",
+        content: input,
+        createdAt: new Date(),
+        parts: [{ type: "text", text: input }],
+        experimental_attachments: options?.experimental_attachments,
+      }
+
+      const updatedMessages = [...messages, userMessage]
+      setMessages(updatedMessages)
+      setInput("")
+
+      return sendMessages(updatedMessages)
+    },
+    [input, messages, sendMessages],
+  )
+
+  const append = useCallback(
+    async (message: UIMessage): Promise<string | null | undefined> => {
+      const updatedMessages = [...messages, message]
+      setMessages(updatedMessages)
+      return sendMessages(updatedMessages)
+    },
+    [messages, sendMessages],
   )
 
   const stop = useCallback(() => {
-    // 🚨 NEW: Trigger the abort when the stop function is called
     if (abortControllerRef.current) {
-        abortControllerRef.current.abort()
+      abortControllerRef.current.abort()
     }
     setStatus("ready")
   }, [])
@@ -213,11 +226,6 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
     },
     [],
   )
-
-  const append = useCallback(async (message: UIMessage): Promise<string | null | undefined> => {
-    setMessages((prev) => [...prev, message])
-    return message.content
-  }, [])
 
   const reload = useCallback(async (): Promise<string | null | undefined> => {
     console.log("Reload not implemented yet")
