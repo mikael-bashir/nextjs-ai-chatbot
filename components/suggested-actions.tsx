@@ -15,22 +15,22 @@ function PureSuggestedActions({ chatId, append }: SuggestedActionsProps) {
     {
       title: "Even + Even = Even",
       label: "complete this Lean 4 proof",
-      action: `theorem even_add_even (a b : ℤ) (ha : Even a) (hb : Even b) : Even (a + b) := by\n  sorry`,
+      action: "theorem even_add_even (a b : ℤ) (ha : Even a) (hb : Even b) : Even (a + b) := by sorry",
     },
     {
       title: "Infinitely many primes",
       label: "complete this Lean 4 proof",
-      action: `theorem infinitely_many_primes : ∀ n : ℕ, ∃ p, p > n ∧ Nat.Prime p := by\n  sorry`,
+      action: "theorem infinitely_many_primes : ∀ n : ℕ, ∃ p, p > n ∧ Nat.Prime p := by sorry",
     },
     {
       title: "√2 is irrational",
       label: "complete this Lean 4 proof",
-      action: `theorem sqrt_two_irrational : Irrational (Real.sqrt 2) := by\n  sorry`,
+      action: "theorem sqrt_two_irrational : Irrational (Real.sqrt 2) := by sorry",
     },
     {
       title: "Pigeonhole principle",
       label: "complete this Lean 4 proof",
-      action: `theorem pigeonhole {α β : Type*} [Fintype α] [Fintype β]\n    (f : α → β) (h : Fintype.card β < Fintype.card α) :\n    ∃ x y : α, x ≠ y ∧ f x = f y := by\n  sorry`,
+      action: "theorem pigeonhole {α β : Type*} [Fintype α] [Fintype β] (f : α → β) (h : Fintype.card β < Fintype.card α) : ∃ x y : α, x ≠ y ∧ f x = f y := by sorry",
     },
   ]
 
