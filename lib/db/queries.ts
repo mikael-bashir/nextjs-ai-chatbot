@@ -510,22 +510,13 @@ export async function getOrCreateCreditBalance({
 
       if (existing) return existing.balance;
 
-      // Welcome bonus: 1.0 credit = £1 of free compute
       await tx.insert(userCredits).values({
         userId,
-        balance: 1.0,
+        balance: 0,
         updatedAt: new Date(),
       });
 
-      await tx.insert(creditTransactions).values({
-        userId,
-        amount: 1.0,
-        type: 'grant',
-        description: 'Welcome bonus (£1 of free compute)',
-        createdAt: new Date(),
-      });
-
-      return 1.0;
+      return 0;
     });
   } catch (error) {
     console.error('Failed to get or create credit balance in database');

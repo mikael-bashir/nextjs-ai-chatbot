@@ -86,6 +86,22 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
           }),
         })
 
+        if (response.status === 429) {
+          const body = await response.json().catch(() => ({}))
+          const resetAt = body.resetAt ? new Date(body.resetAt) : null
+          const mins = resetAt
+            ? Math.ceil((resetAt.getTime() - Date.now()) / 60000)
+            : null
+          toast.error(
+            mins != null
+              ? `Rate limit reached — try again in ${mins} minute${mins === 1 ? "" : "s"}.`
+              : "Rate limit reached — please wait before sending another message.",
+          )
+          setStatus("ready")
+          setMessages((prev) => prev.filter((m) => m.id !== userMessage.id))
+          return null
+        }
+
         if (!response.ok) {
           throw new Error(`HTTP error! status: ${response.status}`)
         }
