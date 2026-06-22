@@ -38,6 +38,18 @@ export const authConfig = {
         return true;
       }
 
+      // Redirect unauthenticated page visitors to competemath.com login.
+      // Use nextUrl.origin (the actual request origin) so this works on both
+      // leak.competemath.com and any preview subdomain without extra env vars.
+      if (!isLoggedIn) {
+        const loginBase = process.env.NODE_ENV === 'production'
+          ? 'https://competemath.com/auth/login'
+          : 'http://localhost:3001/auth/login';
+        const loginUrl = new URL(loginBase);
+        loginUrl.searchParams.set('callbackUrl', nextUrl.origin + nextUrl.pathname + nextUrl.search);
+        return Response.redirect(loginUrl);
+      }
+
       return true;
     },
 
