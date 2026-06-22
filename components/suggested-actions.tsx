@@ -13,24 +13,24 @@ interface SuggestedActionsProps {
 function PureSuggestedActions({ chatId, append }: SuggestedActionsProps) {
   const suggestedActions = [
     {
-      title: "What are the advantages",
-      label: "of using Next.js?",
-      action: "What are the advantages of using Next.js?",
+      title: "Prove in Lean 4",
+      label: "that the sum of two even numbers is even",
+      action: "Prove in Lean 4 that the sum of two even numbers is even. Use sorry to fill any gaps.",
     },
     {
-      title: "Write code to",
-      label: `demonstrate djikstra's algorithm`,
-      action: `Write code to demonstrate djikstra's algorithm`,
+      title: "Prove in Lean 4",
+      label: "that there are infinitely many primes",
+      action: "Prove in Lean 4 that there are infinitely many primes. Use sorry to fill any gaps.",
     },
     {
-      title: "Help me write an essay",
-      label: `about silicon valley`,
-      action: `Help me write an essay about silicon valley`,
+      title: "Prove in Lean 4",
+      label: "that √2 is irrational",
+      action: "Prove in Lean 4 that √2 is irrational. Use sorry to fill any gaps.",
     },
     {
-      title: "What is the weather",
-      label: "in San Francisco?",
-      action: "What is the weather in San Francisco?",
+      title: "Prove in Lean 4",
+      label: "the pigeonhole principle",
+      action: "Prove in Lean 4 the pigeonhole principle. Use sorry to fill any gaps.",
     },
   ]
 
