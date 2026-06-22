@@ -66,7 +66,7 @@ function PureChatHeader({
       {!isReadonly && <MCPServerManagement className="order-1 md:order-4" />}
 
       <Button
-        className="bg-transparent dark:bg-zinc-100 hover:bg-gray-50 dark:hover:bg-zinc-200 text-zinc-50 dark:text-zinc-900 hidden md:flex py-1.5 px-2 h-fit md:h-[34px] order-5 md:ml-auto"
+        className="bg-transparent hover:bg-transparent text-zinc-50 hidden md:flex py-1.5 px-2 h-fit md:h-[34px] order-5 md:ml-auto"
         asChild
       >
         <Link
