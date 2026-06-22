@@ -116,22 +116,19 @@ jobs:
           CADDY_B64:    ${{ env.CADDY_B64 }}
           GHCR_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
           GITHUB_ACTOR: ${{ github.actor }}
-          # App environment — use test-mode Stripe keys for previews
+          # App environment — use Stripe test keys for previews
           POSTGRES_URL:          ${{ secrets.POSTGRES_URL }}
           AUTH_SECRET:           ${{ secrets.AUTH_SECRET }}
           AUTH_URL:              ${{ steps.preview.outputs.url }}
+          NEXT_PUBLIC_APP_URL:   ${{ steps.preview.outputs.url }}
           XAI_MASTER:            ${{ secrets.XAI_MASTER }}
           XAI_FREE_KEY_1:        ${{ secrets.XAI_FREE_KEY_1 }}
           XAI_FREE_KEY_2:        ${{ secrets.XAI_FREE_KEY_2 }}
           XAI_FREE_KEY_3:        ${{ secrets.XAI_FREE_KEY_3 }}
           MEM0_API_KEY:          ${{ secrets.MEM0_API_KEY }}
           REDIS_URL:             ${{ secrets.REDIS_URL }}
-          STRIPE_SECRET_KEY:     ${{ secrets.STRIPE_SECRET_KEY_TEST }}
+          STRIPE_SECRET:         ${{ secrets.STRIPE_SECRET_TEST }}
           STRIPE_WEBHOOK_SECRET: ${{ secrets.STRIPE_WEBHOOK_SECRET_TEST }}
-          STRIPE_PRICE_TOPUP_5:  ${{ secrets.STRIPE_PRICE_TOPUP_5_TEST }}
-          STRIPE_PRICE_TOPUP_20: ${{ secrets.STRIPE_PRICE_TOPUP_20_TEST }}
-          STRIPE_PRICE_TOPUP_50: ${{ secrets.STRIPE_PRICE_TOPUP_50_TEST }}
-          STRIPE_PRICE_SUB_PRO:  ${{ secrets.STRIPE_PRICE_SUB_PRO_TEST }}
           RESEND_API_KEY:        ${{ secrets.RESEND_API_KEY }}
         with:
           host:     ${{ secrets.SERVER_IP }}
@@ -139,11 +136,10 @@ jobs:
           key:      ${{ secrets.SSH_PRIVATE_KEY }}
           envs: >-
             SUBDOMAIN,PORT,COMPOSE_B64,CADDY_B64,GHCR_TOKEN,GITHUB_ACTOR,
-            POSTGRES_URL,AUTH_SECRET,AUTH_URL,XAI_MASTER,
+            POSTGRES_URL,AUTH_SECRET,AUTH_URL,NEXT_PUBLIC_APP_URL,XAI_MASTER,
             XAI_FREE_KEY_1,XAI_FREE_KEY_2,XAI_FREE_KEY_3,
             MEM0_API_KEY,REDIS_URL,
-            STRIPE_SECRET_KEY,STRIPE_WEBHOOK_SECRET,
-            STRIPE_PRICE_TOPUP_5,STRIPE_PRICE_TOPUP_20,STRIPE_PRICE_TOPUP_50,STRIPE_PRICE_SUB_PRO,
+            STRIPE_SECRET,STRIPE_WEBHOOK_SECRET,
             RESEND_API_KEY
           script: |
             set -euo pipefail
@@ -163,6 +159,7 @@ jobs:
               echo "POSTGRES_URL=${POSTGRES_URL}"
               echo "AUTH_SECRET=${AUTH_SECRET}"
               echo "AUTH_URL=${AUTH_URL}"
+              echo "NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}"
               echo "PYTHON_BACKEND_URL=http://python-backend:5328"
               echo "NODE_ENV=production"
               echo "XAI_MASTER=${XAI_MASTER}"
@@ -171,12 +168,8 @@ jobs:
               echo "XAI_FREE_KEY_3=${XAI_FREE_KEY_3}"
               echo "MEM0_API_KEY=${MEM0_API_KEY}"
               echo "REDIS_URL=${REDIS_URL}"
-              echo "STRIPE_SECRET_KEY=${STRIPE_SECRET_KEY}"
+              echo "STRIPE_SECRET=${STRIPE_SECRET}"
               echo "STRIPE_WEBHOOK_SECRET=${STRIPE_WEBHOOK_SECRET}"
-              echo "STRIPE_PRICE_TOPUP_5=${STRIPE_PRICE_TOPUP_5}"
-              echo "STRIPE_PRICE_TOPUP_20=${STRIPE_PRICE_TOPUP_20}"
-              echo "STRIPE_PRICE_TOPUP_50=${STRIPE_PRICE_TOPUP_50}"
-              echo "STRIPE_PRICE_SUB_PRO=${STRIPE_PRICE_SUB_PRO}"
               echo "RESEND_API_KEY=${RESEND_API_KEY}"
             } > "$PREVIEW_DIR/.env"
 

@@ -28,18 +28,15 @@ jobs:
             POSTGRES_URL=${{ secrets.POSTGRES_URL }}
             AUTH_SECRET=${{ secrets.AUTH_SECRET }}
             AUTH_URL=${{ secrets.AUTH_URL }}
+            NEXT_PUBLIC_APP_URL=${{ secrets.NEXT_PUBLIC_APP_URL }}
             XAI_MASTER=${{ secrets.XAI_MASTER }}
             XAI_FREE_KEY_1=${{ secrets.XAI_FREE_KEY_1 }}
             XAI_FREE_KEY_2=${{ secrets.XAI_FREE_KEY_2 }}
             XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}
             MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}
             REDIS_URL=${{ secrets.REDIS_URL }}
-            STRIPE_SECRET_KEY=${{ secrets.STRIPE_SECRET_KEY }}
+            STRIPE_SECRET=${{ secrets.STRIPE_SECRET }}
             STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
-            STRIPE_PRICE_TOPUP_5=${{ secrets.STRIPE_PRICE_TOPUP_5 }}
-            STRIPE_PRICE_TOPUP_20=${{ secrets.STRIPE_PRICE_TOPUP_20 }}
-            STRIPE_PRICE_TOPUP_50=${{ secrets.STRIPE_PRICE_TOPUP_50 }}
-            STRIPE_PRICE_SUB_PRO=${{ secrets.STRIPE_PRICE_SUB_PRO }}
             RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
             EOF
 

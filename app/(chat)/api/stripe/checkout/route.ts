@@ -53,7 +53,7 @@ export async function POST(req: Request) {
       line_items: [
         {
           price_data: {
-            currency: 'usd',
+            currency: 'gbp',
             product_data: {
               name: `${pack.credits} Leak Credits`,
               description: `Add ${pack.credits} credits to your Leak account`,
@@ -85,7 +85,7 @@ export async function POST(req: Request) {
       line_items: [
         {
           price_data: {
-            currency: 'usd',
+            currency: 'gbp',
             product_data: {
               name: `Leak ${plan.name} Plan`,
               description: `${plan.credits} credits per month`,
