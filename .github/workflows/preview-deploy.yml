@@ -99,7 +99,10 @@ jobs:
           # Caddy virtual-host snippet — auto-TLS via Let's Encrypt HTTP-01
           cat > /tmp/preview-caddy.caddy << CADDY
           ${SUBDOMAIN}.preview.leak.competemath.com {
-              reverse_proxy localhost:${PORT}
+              reverse_proxy localhost:${PORT} {
+                  header_up X-Forwarded-Host {host}
+                  header_up X-Forwarded-Proto {scheme}
+              }
           }
           CADDY
 

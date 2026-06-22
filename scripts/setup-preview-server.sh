@@ -24,7 +24,10 @@ sudo tee /etc/caddy/Caddyfile > /dev/null << 'CADDY'
 
 # Production — proxies to the Docker container on port 3000
 leak.competemath.com {
-    reverse_proxy localhost:3000
+    reverse_proxy localhost:3000 {
+        header_up X-Forwarded-Host {host}
+        header_up X-Forwarded-Proto {scheme}
+    }
 }
 
 # All preview subdomains — each PR adds a file under sites/

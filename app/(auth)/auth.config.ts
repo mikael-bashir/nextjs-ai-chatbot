@@ -1,7 +1,38 @@
 import type { NextAuthConfig } from 'next-auth';
+import type { NextRequest } from 'next/server';
 
 const useSecureCookies = process.env.NODE_ENV === 'production';
 const cookiePrefix = useSecureCookies ? '__Secure-' : '';
+
+// Resolve the true public-facing origin even when running behind a reverse proxy
+// inside a Docker container (where nextUrl.origin may be an internal service name).
+//
+// Priority:
+//  1. X-Forwarded-Host + X-Forwarded-Proto — set by Caddy/nginx per-request;
+//     dynamically correct for every subdomain including previews, no env needed.
+//  2. AUTH_URL env var — set explicitly at deploy time; reliable fallback.
+//  3. nextUrl.origin — may be an internal address (e.g. http://nextjs-frontend:3000)
+//     so only used as a last resort.
+function resolvePublicOrigin(request: NextRequest): string {
+  const fwdHost = request.headers.get('x-forwarded-host');
+  if (fwdHost) {
+    // x-forwarded-proto can be comma-separated when chained through multiple proxies
+    const proto = (request.headers.get('x-forwarded-proto') ?? 'https')
+      .split(',')[0]
+      .trim();
+    return `${proto}://${fwdHost}`;
+  }
+
+  if (process.env.AUTH_URL) {
+    try {
+      return new URL(process.env.AUTH_URL).origin;
+    } catch {
+      // malformed AUTH_URL — fall through
+    }
+  }
+
+  return request.nextUrl.origin;
+}
 
 export const authConfig = {
   pages: {
@@ -23,9 +54,10 @@ export const authConfig = {
   },
   providers: [],
   callbacks: {
-    authorized({ auth, request: { nextUrl } }) {
+    authorized({ auth, request }) {
       const isLoggedIn = !!auth?.user;
       const hasAccount = auth?.user?.hasLeakAccount;
+      const { nextUrl } = request;
 
       if (nextUrl.pathname.startsWith('/api/auth')) return true;
 
@@ -38,15 +70,14 @@ export const authConfig = {
         return true;
       }
 
-      // Redirect unauthenticated page visitors to competemath.com login.
-      // Use nextUrl.origin (the actual request origin) so this works on both
-      // leak.competemath.com and any preview subdomain without extra env vars.
       if (!isLoggedIn) {
         const loginBase = process.env.NODE_ENV === 'production'
           ? 'https://competemath.com/auth/login'
           : 'http://localhost:3001/auth/login';
+
+        const publicOrigin = resolvePublicOrigin(request);
         const loginUrl = new URL(loginBase);
-        loginUrl.searchParams.set('callbackUrl', nextUrl.origin + nextUrl.pathname + nextUrl.search);
+        loginUrl.searchParams.set('callbackUrl', publicOrigin + nextUrl.pathname + nextUrl.search);
         return Response.redirect(loginUrl);
       }
 
