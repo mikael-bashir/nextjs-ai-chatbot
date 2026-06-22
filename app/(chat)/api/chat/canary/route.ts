@@ -8,6 +8,8 @@ import { isPaidModel } from "@/lib/ai/models"
 
 export const maxDuration = 1000000000
 
+const PYTHON_BACKEND = process.env.PYTHON_BACKEND_URL ?? 'http://localhost:5328'
+
 interface UIMessage {
   id: string
   role: "user" | "assistant" | "system"
@@ -40,7 +42,7 @@ async function callAgentBackend(
   userId: string,
   signal: AbortSignal,
 ) {
-  const response = await fetch("http://localhost:5328/api/chat/agent", {
+  const response = await fetch(`${PYTHON_BACKEND}/api/chat/agent`, {
     method: "POST",
     signal, // propagate client disconnect → kills Python task immediately
     headers: { "Content-Type": "application/json" },

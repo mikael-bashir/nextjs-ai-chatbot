@@ -1,4 +1,4 @@
-name: CI/CD Push to Deploy
+name: Deploy to Production
 
 on:
   push:
@@ -9,40 +9,39 @@ concurrency:
   group: production-deployment
   cancel-in-progress: true
 
-
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Deploying App to LunaNode VPS
+      - name: Deploy to VPS
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
+            set -euo pipefail
             cd ~/nextjs-ai-chatbot
-            
             git pull origin main
 
-            cat << 'EOF' > .env
+            cat > .env << 'EOF'
             POSTGRES_URL=${{ secrets.POSTGRES_URL }}
             AUTH_SECRET=${{ secrets.AUTH_SECRET }}
             AUTH_URL=${{ secrets.AUTH_URL }}
-            BLOB_READ_WRITE_TOKEN=${{ secrets.BLOB_READ_WRITE_TOKEN }}
-            GOOGLE_GENERATIVE_AI_API_KEY=${{ secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
-            GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}
-            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
-            XAI_API_KEY=${{ secrets.XAI_API_KEY }}
+            XAI_MASTER=${{ secrets.XAI_MASTER }}
             XAI_FREE_KEY_1=${{ secrets.XAI_FREE_KEY_1 }}
             XAI_FREE_KEY_2=${{ secrets.XAI_FREE_KEY_2 }}
             XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}
             MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}
-            FLASK_APP=${{ secrets.FLASK_APP }}
             REDIS_URL=${{ secrets.REDIS_URL }}
-            HUGGINGFACE_TOKEN=${{ secrets.HUGGINGFACE_TOKEN }}
+            STRIPE_SECRET_KEY=${{ secrets.STRIPE_SECRET_KEY }}
+            STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
+            STRIPE_PRICE_TOPUP_5=${{ secrets.STRIPE_PRICE_TOPUP_5 }}
+            STRIPE_PRICE_TOPUP_20=${{ secrets.STRIPE_PRICE_TOPUP_20 }}
+            STRIPE_PRICE_TOPUP_50=${{ secrets.STRIPE_PRICE_TOPUP_50 }}
+            STRIPE_PRICE_SUB_PRO=${{ secrets.STRIPE_PRICE_SUB_PRO }}
+            RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
             EOF
-            
-            sudo docker compose up -d --build
-            
-            sudo docker image prune -f
+
+            docker compose up -d --build
+            docker image prune -f
