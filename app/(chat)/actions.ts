@@ -13,7 +13,7 @@ export async function saveChatModelAsCookie(model: string) {
 
 export async function generateTitleFromUserMessage({ message }: { message: UIMessage }) {
   const content = message.content || "New Chat"
-  const title = content.length > 80 ? content.substring(0, 77) + "..." : content
+  const title = content.length > 80 ? `${content.substring(0, 77)}...` : content
 
   return title
 }

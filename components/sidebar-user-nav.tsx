@@ -5,6 +5,7 @@ import Link from 'next/link';
 import type { User } from 'next-auth';
 import { signOut } from 'next-auth/react';
 import { useTheme } from 'next-themes';
+import { useCredits } from '@/hooks/use-credits';
 
 import {
   DropdownMenu,
@@ -27,6 +28,7 @@ interface Props {
 
 export function SidebarUserNav({ user, placement = 'footer' }: Props) {
   const { setTheme, theme } = useTheme();
+  const credits = useCredits();
   const isHeader = placement === 'header';
   const ChevronIcon = isHeader ? ChevronDown : ChevronUp;
 
@@ -50,6 +52,11 @@ export function SidebarUserNav({ user, placement = 'footer' }: Props) {
                 className="rounded-full shrink-0"
               />
               <span className="truncate text-sm">{user.name ?? user.email}</span>
+              {credits !== null && (
+                <span className="ml-1 text-xs font-medium tabular-nums text-muted-foreground shrink-0">
+                  £{credits.toFixed(2)}
+                </span>
+              )}
               <ChevronIcon className="ml-auto h-4 w-4 shrink-0 opacity-50" />
             </SidebarMenuButton>
           </DropdownMenuTrigger>
@@ -67,6 +74,11 @@ export function SidebarUserNav({ user, placement = 'footer' }: Props) {
                 <span className="text-xs leading-none text-muted-foreground truncate">
                   {user.email}
                 </span>
+                {credits !== null && (
+                  <span className="text-xs font-semibold text-foreground mt-1">
+                    {credits.toFixed(2)} credits
+                  </span>
+                )}
               </div>
             </DropdownMenuLabel>
 

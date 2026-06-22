@@ -20,13 +20,14 @@ import re
 
 
 from app.api.lib.leak_utils import (
-    choose_child, 
-    optimize_context_window, 
-    mem0_client, 
-    llm_router, 
+    choose_child,
+    optimize_context_window,
+    mem0_client,
+    llm_router,
     pool_semaphore,
     get_key_hash
 )
+from app.api.lib.context_manager import build_context
 # from app.api.lib.instincts import train_v_network, score_and_update_tree_func
 
 logger = logging.getLogger(__name__)
@@ -99,13 +100,7 @@ async def chat_model(state: State) -> tuple[dict, State]:
     invocation_messages = messages.copy()
     invocation_messages.insert(1, thinking_directive)
 
-    # print("-" * 50)
-    # print(f"\n🚀 [RAW MESSAGES] | Chat ID: {chat_id}")
-    # print(json.dumps(raw_messages, indent=2)) 
-    print("$*" * 50)
-    print(f"\n🚀 [LLM INVOCATION CONTEXT] | Chat ID: {chat_id}")
-    print(json.dumps(invocation_messages, indent=2)) 
-    print("$*" * 50)
+    logger.debug(f"[chat_model] LLM invocation context for chat {chat_id}: {len(invocation_messages)} messages")
 
     response = None
     try :
@@ -113,19 +108,26 @@ async def chat_model(state: State) -> tuple[dict, State]:
             kwargs = {
                 "model": model,
                 "messages": invocation_messages,
-                "temperature": 0.2, # Slightly higher temperature encourages diverse tree branching
-                "stream": True
+                "temperature": 0.2,
+                "stream": True,
+                "stream_options": {"include_usage": True},  # get token counts in final chunk
             }
-            # if supports_function_calling(model) and len(tools) > 0:
             kwargs["tools"] = tools
-                
+
             response = await llm_router.acompletion(**kwargs)
-        
+
         full_content = ""
         tool_calls_dict = {}
         tool_calls_list = []
+        tokens_input = 0
+        tokens_output = 0
 
         async for chunk in response:
+            # Capture token usage from the final chunk (sent after stream_options include_usage)
+            if hasattr(chunk, "usage") and chunk.usage:
+                tokens_input = getattr(chunk.usage, "prompt_tokens", 0) or 0
+                tokens_output = getattr(chunk.usage, "completion_tokens", 0) or 0
+
             delta = chunk.choices[0].delta
 
             if hasattr(delta, "content") and delta.content:
@@ -138,12 +140,16 @@ async def chat_model(state: State) -> tuple[dict, State]:
                     idx = tc.index
                     if idx not in tool_calls_dict:
                         tool_calls_dict[idx] = {
-                            "id": tc.id, 
-                            "type": "function", 
+                            "id": tc.id,
+                            "type": "function",
                             "function": {"name": tc.function.name, "arguments": ""}
                         }
                     if tc.function and tc.function.arguments:
                         tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+
+        # Emit token usage so the Next.js route can calculate exact credit cost
+        if stream_queue and (tokens_input or tokens_output):
+            await stream_queue.put(("usage", json.dumps({"tokensInput": tokens_input, "tokensOutput": tokens_output, "model": model}), None, None))
 
 
         # if "<invoke" in full_content:
@@ -370,61 +376,73 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
 
         data = await request.get_json()
         messages = data.get("messages", [])
-        raw_model = data.get("model")
+        raw_model = data.get("model") or "grok-free-pool"
 
         chat_id = data.get("id")
-        
-        # Ensure correct LiteLLM model prefixes
+        user_id = data.get("user_id") or chat_id  # prefer real user_id for cross-session memory
+
+        # Model name IS the LiteLLM router group — pass through as-is
+        # Only remap gemini prefix for backward compat
         if "gemini" in raw_model.lower() and not raw_model.startswith("gemini/"):
             model = f"gemini/{raw_model}"
-        elif "grok" in raw_model.lower():
-            model = "grok-free-pool"
         else:
             model = raw_model
-        print("using model:", model)
-        print('raw model was:', raw_model)
+        logger.info(f"[agent] model={model} user_id={user_id} chat_id={chat_id}")
 
         if not messages:
             return jsonify({"error": "Messages are required"}), 400
-        
+
         latest_user_msg = messages[-1].get("content", "")
-        
-        # Search Mem0 for relevant past context linked strictly to this chat_id
-        memories = mem0_client.search(query=latest_user_msg, filters={"user_id": chat_id})
-        
-        # Format the memories into a readable string for the LLM
-        memory_context = ""
-        if memories:
-            memory_context = "\n\nRelevant Context from Previous Interactions:\n"
-            for m in memories:
-                if isinstance(m, dict):
-                    fact = m.get("memory") or m.get("text", str(m))
-                    memory_context += f"- {fact}\n"
-                else:
-                    # Fallback just in case Mem0 returns objects or strings directly
-                    memory_context += f"- {str(m)}\n"
-        
-        system_directive = """You are a mathmatician equipped with state-of-the-art Lean4 tools. Your goal is to prove/disprove user statements.
 
-        When you believe the proof is complete, you MUST synthesize your successful tool calls into a single, clean Lean 4 code block for the user. """
-                
-        # Example of expected final output:
-        # ```
-        # theorem and_comm (p q : Prop) : p ∧ q ↔ q ∧ p := by
-        # intro p q
-        # constructor
-        # · intro h
-        #     exact ⟨h.right, h.left⟩
-        # · intro h
-        #     exact ⟨h.right, h.left⟩
-        # ```
+        has_tools = bool(authenticated_clients)
 
-        if messages[0].get("role") == "system":
-            # If your UI already sends a system message, append our strict rules to it
-            messages[0]["content"] += f"\n\n{system_directive}"
+        # === SYSTEM PROMPT ===
+        if has_tools:
+            # Math prover mode (Lean4 MCP tools present)
+            system_directive = (
+                "You are a mathematician equipped with state-of-the-art Lean 4 tools. "
+                "Your goal is to prove or disprove user statements. "
+                "When you believe the proof is complete, synthesize your successful tool calls "
+                "into a single clean Lean 4 code block for the user."
+            )
         else:
-            # Otherwise, insert it as the foundational system prompt at the very beginning
+            # General assistant mode
+            system_directive = (
+                "You are a helpful, accurate, and concise AI assistant. "
+                "Answer the user's questions clearly and directly. "
+                "When writing code, prefer clean idiomatic solutions with minimal comments."
+            )
+
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = system_directive + "\n\n" + messages[0]["content"]
+        else:
             messages.insert(0, {"role": "system", "content": system_directive})
+
+        # === MEM0: inject relevant cross-session memories ===
+        # Memories are keyed by user_id so they persist across all conversations
+        memory_context = ""
+        try:
+            results = mem0_client.search(query=latest_user_msg, user_id=user_id, limit=5)
+            if results:
+                facts = []
+                for m in results:
+                    if isinstance(m, dict):
+                        fact = m.get("memory") or m.get("text", "")
+                        if fact:
+                            facts.append(f"- {fact}")
+                if facts:
+                    memory_context = "\n\nContext from your previous conversations with this user:\n" + "\n".join(facts)
+                    messages[0]["content"] += memory_context
+        except Exception as mem_err:
+            logger.warning(f"[MEM0] Search failed (non-fatal): {mem_err}")
+
+        # === CONTEXT MANAGEMENT: compress long conversations before sending to LLM ===
+        # Runs lazily (cache hit = free), uses free model for summarisation calls.
+        # Leaves short conversations untouched.
+        try:
+            messages = await build_context(messages, chat_id, model="grok-free-pool")
+        except Exception as ctx_err:
+            logger.warning(f"[ContextMgr] Failed (non-fatal), using full context: {ctx_err}")
 
         mcp_clients = [info["client"] for info in authenticated_clients.values()]
         openai_tools = []
@@ -558,7 +576,7 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                     final_state = None
                     async for action, result, state in app_builder.aiterate(halt_before=["end"]):
                         act_name = action.name if hasattr(action, 'name') else str(action)
-                        print(f"🚨 [PYTHON] processing action:", action)
+                        logger.debug(f"[burr] processing action: {action}")
                         final_state = state
                         await stream_queue.put(("step", act_name, result, state))
                     await stream_queue.put(("done", None, None, final_state))
@@ -576,8 +594,12 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                         msg_type, action_name, result, state = await asyncio.wait_for(stream_queue.get(), timeout=10.0)
 
                         if msg_type == "text_delta":
-                            # action_name holds the full accumulated string here
                             yield f"data: {json.dumps({'type': 'text-delta', 'content': action_name})}\n\n"
+                            continue
+
+                        if msg_type == "usage":
+                            # action_name is a JSON string with tokensInput/tokensOutput/model
+                            yield f"data: {json.dumps({'type': 'usage', 'data': action_name})}\n\n"
                             continue
 
                         if msg_type == "status":
@@ -599,11 +621,12 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                                         {"role": "user", "content": latest_user_msg},
                                         {"role": "assistant", "content": final_assistant_msg}
                                     ]
-                                    mem0_client.add(messages=mem0_messages, user_id=chat_id)
-                                    logger.info(f"[MEM0] Saved interaction to chat {chat_id}")
+                                    # Use user_id (not chat_id) so memories persist across all conversations
+                                    mem0_client.add(messages=mem0_messages, user_id=user_id)
+                                    logger.info(f"[MEM0] Saved interaction for user {user_id}")
                                     
                                 threading.Thread(target=save_to_mem0).start()
-                                print(f"🚨 [PYTHON] saving final agent stste!")
+                                logger.info(f"[mem0] saving conversation for user {user_id}")
                             break
 
                         elapsed = round(time.time() - start_time, 1)

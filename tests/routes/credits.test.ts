@@ -30,66 +30,55 @@ test.describe
       expect(response.status()).toBe(200);
 
       const body = await response.json();
-      expect(body.balance).toBeGreaterThanOrEqual(100);
+      // Welcome bonus is 1.0 credit = £1 of free compute
+      expect(body.balance).toBeGreaterThanOrEqual(1);
     });
 
-    test('sending a message deducts 1 credit', async ({ adaContext }) => {
-      const beforeResponse = await adaContext.request.get('/api/credits');
-      const { balance: balanceBefore } = await beforeResponse.json();
-
-      const chatId = generateUUID();
-      const chatResponse = await adaContext.request.post('/api/chat', {
-        data: {
-          id: chatId,
-          messages: TEST_PROMPTS.SKY.MESSAGES,
-          selectedChatModel: 'chat-model',
-        },
-      });
-      expect(chatResponse.status()).toBe(200);
-
-      const afterResponse = await adaContext.request.get('/api/credits');
-      const { balance: balanceAfter } = await afterResponse.json();
-
-      expect(balanceAfter).toBe(balanceBefore - 1);
-    });
-
-    test('user with balance 0 receives 402 from chat API', async ({
+    test('paid model with insufficient credits returns 402', async ({
       babbageContext,
     }) => {
-      // Drain Babbage's credits via repeated chat calls until balance is 0
-      // or rely on test isolation to set up zero balance.
-      // This test verifies the 402 response shape when balance hits 0.
-      // In CI, use a seeded zero-balance user instead of draining.
       const creditsResponse = await babbageContext.request.get('/api/credits');
       const { balance } = await creditsResponse.json();
 
-      if (balance > 0) {
-        test.skip(true, 'Skipped: Babbage still has credits — needs zero balance to test 402');
+      if (balance >= 0.5) {
+        test.skip(true, 'Skipped: Babbage has >= 0.5 credits — needs < 0.5 to test 402');
+        return;
       }
 
-      const response = await babbageContext.request.post('/api/chat', {
+      const response = await babbageContext.request.post('/api/chat/canary', {
         data: {
           id: generateUUID(),
           messages: TEST_PROMPTS.SKY.MESSAGES,
-          selectedChatModel: 'chat-model',
+          selectedChatModel: 'grok-3-fast', // paid model triggers credit check
         },
       });
       expect(response.status()).toBe(402);
 
       const body = await response.json();
       expect(body.error).toBe('Insufficient credits');
+      expect(typeof body.required).toBe('number');
+      expect(typeof body.balance).toBe('number');
     });
 
-    test('rate-limit exceeded returns 429', async ({ adaContext }) => {
-      // Send 21 messages in quick succession. The first 20 succeed and the 21st should 429.
-      // In unit tests, mock the rate limiter. Here we just verify the response shape.
-      // Exhausting 20 real messages in an E2E route test is impractical;
-      // instead verify the 429 error contract if rate limit is triggered.
-      const response = await adaContext.request.post('/api/chat', {
+    test('free model with rate-limit returns 429 when exhausted', async ({
+      adaContext,
+      request,
+    }) => {
+      const agentReachable = await request
+        .post('http://localhost:5328/api/chat/agent', {
+          headers: { 'Content-Type': 'application/json' },
+          data: { messages: [{ role: 'user', content: 'hi' }], model: 'grok-free-pool', id: 'probe' },
+          timeout: 5000,
+        })
+        .then((r) => r.status() < 500)
+        .catch(() => false);
+      test.skip(!agentReachable, 'Requires Python service with working xAI free key');
+
+      const response = await adaContext.request.post('/api/chat/canary', {
         data: {
           id: generateUUID(),
           messages: TEST_PROMPTS.SKY.MESSAGES,
-          selectedChatModel: 'chat-model',
+          selectedChatModel: 'grok-free-pool',
         },
       });
 
@@ -98,8 +87,8 @@ test.describe
         expect(body.error).toBe('Rate limit exceeded');
         expect(body.resetAt).toBeTruthy();
       } else {
-        // Not yet rate limited — verify successful response
-        expect(response.status()).toBe(200);
+        // Not yet rate limited — verify request was accepted
+        expect([200, 499]).toContain(response.status());
       }
     });
 

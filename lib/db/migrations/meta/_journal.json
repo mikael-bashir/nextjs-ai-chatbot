@@ -50,6 +50,13 @@
       "when": 1782066525214,
       "tag": "0006_smiling_lady_mastermind",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1782128291799,
+      "tag": "0007_plain_sebastian_shaw",
+      "breakpoints": true
     }
   ]
 }

@@ -3,6 +3,8 @@ import { deleteChatById, deductCredits, getChatById, getOrCreateCreditBalance, s
 import { checkRateLimit } from "@/lib/ratelimit"
 import { generateUUID, getMostRecentUserMessage } from "@/lib/utils"
 import { generateTitleFromUserMessage } from "../../actions"
+import { calculateCreditCost, seedPricingIfEmpty } from "@/lib/pricing"
+import { isPaidModel } from "@/lib/ai/models"
 
 export const maxDuration = 100000000000000
 
@@ -34,54 +36,100 @@ function toCoreMessages(messages: Array<UIMessage>) {
     })
 }
 
-async function callGeminiBackend(messages: Array<UIMessage>) {
-  try {
-    const response = await fetch("http://localhost:5328/api/chat/gemini", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        messages: toCoreMessages(messages),
-      }),
-    })
+// Proxies the Python SSE stream to the client.
+// Intercepts text_response and usage events to persist the assistant message
+// and deduct token-based credits once the stream closes.
+function proxyAgentStream({
+  agentRes,
+  chatId,
+  userId,
+  assistantMessageId,
+  modelId,
+  paid,
+}: {
+  agentRes: Response
+  chatId: string
+  userId: string
+  assistantMessageId: string
+  modelId: string
+  paid: boolean
+}): Response {
+  let finalContent = ""
+  let usageData: { tokensInput: number; tokensOutput: number; model: string } | null = null
 
-    if (!response.ok) {
-      throw new Error(`Gemini backend error: ${response.status}`)
-    }
+  const stream = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      const text = new TextDecoder().decode(chunk)
+      for (const line of text.split("\n")) {
+        if (line.startsWith("data: ")) {
+          try {
+            const event = JSON.parse(line.slice(6))
+            if (event.type === "text_response" && event.text) {
+              finalContent += event.text
+            }
+            if (event.type === "usage" && event.data) {
+              usageData = JSON.parse(event.data)
+            }
+          } catch {
+            // SSE comment / keep-alive lines — ignore
+          }
+        }
+      }
+      controller.enqueue(chunk)
+    },
+    flush() {
+      if (finalContent) {
+        saveMessages({
+          messages: [{
+            id: assistantMessageId,
+            chatId,
+            role: "assistant",
+            parts: [{ type: "text", text: finalContent }],
+            attachments: [],
+            createdAt: new Date(),
+          }],
+        }).catch((err) => console.error("[POST /api/chat] Failed to save assistant message:", err))
+      }
 
-    const data = await response.json()
-    return data
-  } catch (error) {
-    console.error("Error calling Gemini backend:", error)
-    throw error
-  }
-}
+      if (paid) {
+        // Token-based credit deduction with full audit trail
+        const resolvedModel = usageData?.model ?? modelId
+        const tokensIn = usageData?.tokensInput ?? 0
+        const tokensOut = usageData?.tokensOutput ?? 0
 
-function createCustomStreamResponse(content: string, messageId: string) {
-  const encoder = new TextEncoder()
-
-  const stream = new ReadableStream({
-    start(controller) {
-      // Send message annotation
-      const annotation = `data: ${JSON.stringify({ type: "message-annotation", messageIdFromServer: messageId })}\n\n`
-      controller.enqueue(encoder.encode(annotation))
-
-      // Send text content
-      const textDelta = `data: ${JSON.stringify({ type: "text-delta", content })}\n\n`
-      controller.enqueue(encoder.encode(textDelta))
-
-      // Send finish signal
-      const finish = `data: ${JSON.stringify({ type: "finish", content: "" })}\n\n`
-      controller.enqueue(encoder.encode(finish))
-
-      controller.close()
+        if (tokensIn > 0 || tokensOut > 0) {
+          calculateCreditCost({ modelId: resolvedModel, tokensInput: tokensIn, tokensOutput: tokensOut })
+            .then(({ credits, rawCostGbp, markupFactor }) => {
+              if (credits <= 0) return
+              return deductCredits({
+                userId,
+                amount: credits,
+                description: `${resolvedModel} — ${tokensIn} in / ${tokensOut} out tokens`,
+                tokensInput: tokensIn,
+                tokensOutput: tokensOut,
+                modelId: resolvedModel,
+                rawCostGbp,
+                markupFactor,
+              })
+            })
+            .catch((err) => console.error("[POST /api/chat] Failed to deduct token-based credits:", err))
+        } else {
+          deductCredits({
+            userId,
+            amount: 0.001,
+            description: `${modelId} — token usage unavailable`,
+            modelId,
+          }).catch((err) => console.error("[POST /api/chat] Failed to deduct fallback credits:", err))
+        }
+      }
     },
   })
 
-  return new Response(stream, {
+  agentRes.body!.pipeTo(stream.writable)
+
+  return new Response(stream.readable, {
     headers: {
-      "Content-Type": "text/plain; charset=utf-8",
+      "Content-Type": "text/event-stream; charset=utf-8",
       "Cache-Control": "no-cache",
       Connection: "keep-alive",
     },
@@ -100,12 +148,6 @@ export async function POST(request: Request) {
       selectedChatModel: string
     } = await request.json()
 
-    console.log("THIS IS THE MESSAGE SENT:", messages)
-    console.log("[POST /api/chat] Incoming request", {
-      id,
-      selectedChatModel,
-      messagesCount: messages.length,
-    })
 
     const session = await auth()
 
@@ -116,17 +158,26 @@ export async function POST(request: Request) {
 
     const userId = session.user.id
 
-    const rateLimit = await checkRateLimit({ userId })
-    if (!rateLimit.allowed) {
-      return Response.json(
-        { error: "Rate limit exceeded", resetAt: rateLimit.resetAt },
-        { status: 429 },
-      )
-    }
+    const paid = isPaidModel(selectedChatModel)
 
-    const balance = await getOrCreateCreditBalance({ userId })
-    if (balance === 0) {
-      return Response.json({ error: "Insufficient credits" }, { status: 402 })
+    if (paid) {
+      // Paid model: enforce minimum balance, skip rate limit
+      const balance = await getOrCreateCreditBalance({ userId })
+      if (balance < 0.5) {
+        return Response.json(
+          { error: "Insufficient credits", required: 0.5, balance },
+          { status: 402 },
+        )
+      }
+    } else {
+      // Free model: enforce rate limit, no credit check
+      const rateLimit = await checkRateLimit({ userId })
+      if (!rateLimit.allowed) {
+        return Response.json(
+          { error: "Rate limit exceeded", resetAt: rateLimit.resetAt },
+          { status: 429 },
+        )
+      }
     }
 
     const userMessage = getMostRecentUserMessage(messages)
@@ -143,7 +194,6 @@ export async function POST(request: Request) {
         message: userMessage,
       })
       await saveChat({ id, userId, title })
-      console.log("[POST /api/chat] Created new chat", { id, userId, title })
     } else {
       if (chat.userId !== userId) {
         console.warn("[POST /api/chat] Forbidden: user does not own chat", {
@@ -169,33 +219,33 @@ export async function POST(request: Request) {
 
 
     try {
-      const geminiResponse = await callGeminiBackend(messages)
-      const assistantMessageId = generateUUID()
-      const content = geminiResponse.response || ""
-
-      saveMessages({
-        messages: [
-          {
-            id: assistantMessageId,
-            chatId: id,
-            role: "assistant",
-            parts: [{ type: "text", text: content }],
-            attachments: [],
-            createdAt: new Date(),
-          },
-        ],
-      }).catch((error) => {
-        console.error("[POST /api/chat] Failed to save Gemini message:", error)
+      const agentRes = await fetch("http://localhost:5328/api/chat/agent", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          messages: toCoreMessages(messages),
+          id,
+          model: selectedChatModel,
+        }),
       })
 
-      deductCredits({ userId, amount: 1, description: "Chat message" }).catch((error) => {
-        console.error("[POST /api/chat] Failed to deduct credits:", error)
-      })
+      if (!agentRes.ok) {
+        throw new Error(`Agent backend error: ${agentRes.status}`)
+      }
 
-      return createCustomStreamResponse(content, assistantMessageId)
+      if (paid) seedPricingIfEmpty().catch(() => {})
+
+      return proxyAgentStream({
+        agentRes,
+        chatId: id,
+        userId,
+        assistantMessageId: generateUUID(),
+        modelId: selectedChatModel,
+        paid,
+      })
     } catch (error) {
-      console.error("[POST /api/chat] Gemini error:", error)
-      return new Response("Error with Gemini orchestration", { status: 500 })
+      console.error("[POST /api/chat] Agent error:", error)
+      return new Response("Error with agent orchestration", { status: 500 })
     }
   } catch (error) {
     console.error("[POST /api/chat] Caught error in POST handler", error)

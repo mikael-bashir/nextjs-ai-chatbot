@@ -1,11 +1,7 @@
-import { compare } from 'bcrypt-ts';
-import NextAuth, { type User, type Session, type DefaultSession } from 'next-auth';
-import Credentials from 'next-auth/providers/credentials';
 
-import { getUser } from '@/lib/db/queries';
+import NextAuth, { type DefaultSession } from 'next-auth';
 
 import { authConfig } from './auth.config';
-import { DUMMY_PASSWORD } from '@/lib/constants';
 import { leakAccountProvisioned } from '@/lib/db/queries';
 
 // interface ExtendedSession extends Session {

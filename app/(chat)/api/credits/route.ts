@@ -1,5 +1,5 @@
 import { auth } from '@/app/(auth)/auth';
-import { getCreditBalance } from '@/lib/db/queries';
+import { getOrCreateCreditBalance } from '@/lib/db/queries';
 
 export async function GET() {
   const session = await auth();
@@ -9,8 +9,8 @@ export async function GET() {
   }
 
   try {
-    const credits = await getCreditBalance({ userId: session.user.id });
-    return Response.json({ balance: credits?.balance ?? 0 });
+    const balance = await getOrCreateCreditBalance({ userId: session.user.id });
+    return Response.json({ balance });
   } catch (error) {
     console.error('[GET /api/credits] Failed to get credit balance', error);
     return Response.json({ error: 'Internal server error' }, { status: 500 });

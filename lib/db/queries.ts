@@ -510,21 +510,22 @@ export async function getOrCreateCreditBalance({
 
       if (existing) return existing.balance;
 
+      // Welcome bonus: 1.0 credit = £1 of free compute
       await tx.insert(userCredits).values({
         userId,
-        balance: 100,
+        balance: 1.0,
         updatedAt: new Date(),
       });
 
       await tx.insert(creditTransactions).values({
         userId,
-        amount: 100,
+        amount: 1.0,
         type: 'grant',
-        description: 'Welcome bonus',
+        description: 'Welcome bonus (£1 of free compute)',
         createdAt: new Date(),
       });
 
-      return 100;
+      return 1.0;
     });
   } catch (error) {
     console.error('Failed to get or create credit balance in database');
@@ -629,10 +630,20 @@ export async function deductCredits({
   userId,
   amount,
   description,
+  tokensInput,
+  tokensOutput,
+  modelId,
+  rawCostGbp,
+  markupFactor,
 }: {
   userId: string;
   amount: number;
   description: string;
+  tokensInput?: number;
+  tokensOutput?: number;
+  modelId?: string;
+  rawCostGbp?: number;
+  markupFactor?: number;
 }): Promise<number> {
   try {
     return await db.transaction(async (tx) => {
@@ -657,6 +668,11 @@ export async function deductCredits({
         type: 'usage',
         description,
         createdAt: new Date(),
+        tokensInput,
+        tokensOutput,
+        modelId,
+        rawCostGbp,
+        markupFactor,
       });
 
       return newBalance;

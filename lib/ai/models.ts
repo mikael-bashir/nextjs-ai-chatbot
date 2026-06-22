@@ -1,31 +1,33 @@
-export const DEFAULT_CHAT_MODEL: string = 'gemini/gemini-2.5-pro';
+export const DEFAULT_CHAT_MODEL: string = 'grok-free-pool';
 
 interface ChatModel {
   id: string;
   name: string;
   description: string;
+  paid: boolean; // true = deduct credits; false = free tier key, no deduction
 }
 
 export const chatModels: Array<ChatModel> = [
-{ 
-  //   id: "gemini/gemini-2.5-pro", 
-  //   name: "Gemini 2.5 Pro", 
-  //   description: "Google's best model for complex reasoning" 
-  // },
-  // { 
-  //   id: "openai/o3-mini", 
-  //   name: "o3-mini", 
-  //   description: "OpenAI's fast reasoning model" 
-  // },
-  // { 
-  //   id: "anthropic/claude-3-7-sonnet-20250219", 
-  //   name: "Claude 3.7 Sonnet", 
-  //   description: "Anthropic's smartest model" 
-  // },
-    id: "grok-free-pool", 
-    name: "Grok 4.1", 
-    description: "xAI's frontier model" 
-  }
+  {
+    id: 'grok-free-pool',
+    name: 'Grok 4.1 Fast (Free)',
+    description: 'Free tier — daily limits apply',
+    paid: false,
+  },
+  {
+    id: 'grok-3-fast',
+    name: 'Grok 3 Fast',
+    description: 'Paid — fast responses, credits deducted',
+    paid: true,
+  },
+  {
+    id: 'grok-4-fast',
+    name: 'Grok 4 Fast',
+    description: 'Paid — xAI\'s fastest frontier model, credits deducted',
+    paid: true,
+  },
 ];
 
-//  "model_name": "grok-free-pool",
+export function isPaidModel(modelId: string): boolean {
+  return chatModels.find((m) => m.id === modelId)?.paid ?? false;
+}

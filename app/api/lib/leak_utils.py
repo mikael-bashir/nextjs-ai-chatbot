@@ -21,8 +21,22 @@ free_key_pool = [
     },
 ]
 
+# Paid models — require XAI_MASTER (billing-enabled key from x.ai/api)
+paid_models = []
+if os.environ.get("XAI_MASTER"):
+    paid_models = [
+        {
+            "model_name": "grok-3-fast",
+            "litellm_params": {"model": "xai/grok-3-fast", "api_key": os.environ.get("XAI_MASTER")}
+        },
+        {
+            "model_name": "grok-4-fast",
+            "litellm_params": {"model": "xai/grok-4-fast", "api_key": os.environ.get("XAI_MASTER")}
+        },
+    ]
+
 llm_router = Router(
-    model_list=free_key_pool,
+    model_list=free_key_pool + paid_models,
     routing_strategy="simple-shuffle",
     num_retries=3,
     timeout=600

@@ -20,8 +20,17 @@ export async function POST(req: Request) {
     planId?: string;
   };
 
-  // Ensure a Stripe customer exists for this user
+  // Ensure a Stripe customer exists for this user in the current mode (test vs live)
   let customerId = await getStripeCustomerId({ userId: session.user.id });
+  if (customerId) {
+    // Validate the stored customer belongs to the current Stripe mode
+    try {
+      await stripe.customers.retrieve(customerId);
+    } catch {
+      // Wrong mode (e.g. live cus_ used with test key) — create a new one
+      customerId = null;
+    }
+  }
   if (!customerId) {
     const customer = await stripe.customers.create({
       email: session.user.email!,

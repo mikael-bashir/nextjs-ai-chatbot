@@ -1,5 +1,5 @@
 import type { InferSelectModel } from "drizzle-orm"
-import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean, integer } from "drizzle-orm/pg-core"
+import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean, integer, real } from "drizzle-orm/pg-core"
 
 export const user = pgTable("User", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
@@ -98,7 +98,7 @@ export const document = pgTable(
     createdAt: timestamp("createdAt").notNull(),
     title: text("title").notNull(),
     content: text("content"),
-    kind: varchar("text", { enum: ["text", "code", "image", "sheet"] })
+    kind: varchar("kind", { enum: ["text", "code", "image", "sheet"] })
       .notNull()
       .default("text"),
     userId: uuid("userId")
@@ -160,12 +160,13 @@ export const mcpServers = pgTable("MCPServer", {
 
 export type MCPServer = InferSelectModel<typeof mcpServers>
 
+// balance stored as real (fractional credits). 1.0 credit = £1.
 export const userCredits = pgTable("UserCredits", {
   userId: uuid("userId")
     .primaryKey()
     .notNull()
     .references(() => user.id, { onDelete: "cascade" }),
-  balance: integer("balance").notNull().default(0),
+  balance: real("balance").notNull().default(0),
   updatedAt: timestamp("updatedAt").notNull(),
 })
 
@@ -176,10 +177,17 @@ export const creditTransactions = pgTable("CreditTransaction", {
   userId: uuid("userId")
     .notNull()
     .references(() => user.id, { onDelete: "cascade" }),
-  amount: integer("amount").notNull(),
+  // amount in credits (positive = add, negative = deduct). 1.0 credit = £1.
+  amount: real("amount").notNull(),
   type: varchar("type", { length: 32, enum: ["purchase", "usage", "refund", "grant"] }).notNull(),
   description: text("description").notNull(),
   createdAt: timestamp("createdAt").notNull(),
+  // audit fields — populated for usage transactions
+  tokensInput: integer("tokensInput"),
+  tokensOutput: integer("tokensOutput"),
+  modelId: varchar("modelId", { length: 128 }),
+  rawCostGbp: real("rawCostGbp"),
+  markupFactor: real("markupFactor"),
 })
 
 export type CreditTransaction = InferSelectModel<typeof creditTransactions>

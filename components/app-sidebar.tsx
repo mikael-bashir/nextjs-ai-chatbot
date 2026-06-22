@@ -2,6 +2,7 @@
 
 import type { User } from 'next-auth';
 import { usePathname, useRouter } from 'next/navigation';
+import { LogIn } from 'lucide-react';
 
 import { PlusIcon } from '@/components/icons';
 import { SidebarHistory } from '@/components/sidebar-history';
@@ -13,6 +14,8 @@ import {
   SidebarFooter,
   SidebarHeader,
   SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
   useSidebar,
 } from '@/components/ui/sidebar';
 import Link from 'next/link';
@@ -61,7 +64,18 @@ export function AppSidebar({ user }: { user: User | undefined }) {
             )}
           </div>
 
-          {user && <SidebarUserNav user={user} placement="header" />}
+          {user ? (
+            <SidebarUserNav user={user} placement="header" />
+          ) : (
+            <SidebarMenuItem>
+              <SidebarMenuButton asChild className="h-10 mt-1">
+                <Link href="https://competemath.com/auth/login" className="flex items-center gap-2">
+                  <LogIn className="h-4 w-4 shrink-0" />
+                  <span className="text-sm">Sign in</span>
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          )}
         </SidebarMenu>
       </SidebarHeader>
 
