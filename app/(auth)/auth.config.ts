@@ -70,6 +70,9 @@ export const authConfig = {
         return true;
       }
 
+      // Public routes — allow unauthenticated access for SEO
+      if (nextUrl.pathname === '/') return true;
+
       if (!isLoggedIn) {
         const loginBase = process.env.NODE_ENV === 'production'
           ? 'https://competemath.com/auth/login'
