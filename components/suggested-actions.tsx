@@ -13,24 +13,24 @@ interface SuggestedActionsProps {
 function PureSuggestedActions({ chatId, append }: SuggestedActionsProps) {
   const suggestedActions = [
     {
-      title: "Prove in Lean 4",
-      label: "that the sum of two even numbers is even",
-      action: "Prove in Lean 4 that the sum of two even numbers is even. Use sorry to fill any gaps.",
+      title: "Even + Even = Even",
+      label: "complete this Lean 4 proof",
+      action: `theorem even_add_even (a b : ℤ) (ha : Even a) (hb : Even b) : Even (a + b) := by\n  sorry`,
     },
     {
-      title: "Prove in Lean 4",
-      label: "that there are infinitely many primes",
-      action: "Prove in Lean 4 that there are infinitely many primes. Use sorry to fill any gaps.",
+      title: "Infinitely many primes",
+      label: "complete this Lean 4 proof",
+      action: `theorem infinitely_many_primes : ∀ n : ℕ, ∃ p, p > n ∧ Nat.Prime p := by\n  sorry`,
     },
     {
-      title: "Prove in Lean 4",
-      label: "that √2 is irrational",
-      action: "Prove in Lean 4 that √2 is irrational. Use sorry to fill any gaps.",
+      title: "√2 is irrational",
+      label: "complete this Lean 4 proof",
+      action: `theorem sqrt_two_irrational : Irrational (Real.sqrt 2) := by\n  sorry`,
     },
     {
-      title: "Prove in Lean 4",
-      label: "the pigeonhole principle",
-      action: "Prove in Lean 4 the pigeonhole principle. Use sorry to fill any gaps.",
+      title: "Pigeonhole principle",
+      label: "complete this Lean 4 proof",
+      action: `theorem pigeonhole {α β : Type*} [Fintype α] [Fintype β]\n    (f : α → β) (h : Fintype.card β < Fintype.card α) :\n    ∃ x y : α, x ≠ y ∧ f x = f y := by\n  sorry`,
     },
   ]
 
