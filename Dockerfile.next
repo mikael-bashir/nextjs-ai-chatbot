@@ -18,10 +18,13 @@ ENV NEXT_TELEMETRY_DISABLED=1
 ENV NODE_ENV=production
 # Dummy values so module-level env checks pass during build.
 # Actual values are injected at runtime via the .env file.
+# hadolint ignore=DL3025
 ARG POSTGRES_URL=postgresql://build:build@localhost/build
 ARG AUTH_SECRET=build-placeholder
+ARG STRIPE_SECRET=sk_test_build_placeholder
 ENV POSTGRES_URL=$POSTGRES_URL
 ENV AUTH_SECRET=$AUTH_SECRET
+ENV STRIPE_SECRET=$STRIPE_SECRET
 RUN pnpm exec next build
 
 FROM base AS runner
