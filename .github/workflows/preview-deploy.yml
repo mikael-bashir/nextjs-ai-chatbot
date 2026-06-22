@@ -153,6 +153,17 @@ jobs:
             PREVIEW_DIR="/opt/previews/${SUBDOMAIN}"
             mkdir -p "$PREVIEW_DIR"
 
+            # Install Stripe CLI if not already present (idempotent)
+            if ! command -v stripe >/dev/null 2>&1; then
+              echo "Installing Stripe CLI..."
+              curl -fsSL https://packages.stripe.dev/api/security/keypair/stripe-cli-gpg/public \
+                | gpg --dearmor \
+                | sudo tee /usr/share/keyrings/stripe.gpg > /dev/null
+              echo "deb [signed-by=/usr/share/keyrings/stripe.gpg] https://packages.stripe.dev/stripe-cli-debian-local stable main" \
+                | sudo tee /etc/apt/sources.list.d/stripe.list > /dev/null
+              sudo apt-get update -qq && sudo apt-get install -y stripe
+            fi
+
             # Kill any existing Stripe listener from a previous deploy of this PR
             STRIPE_PID_FILE="$PREVIEW_DIR/stripe-listener.pid"
             if [ -f "$STRIPE_PID_FILE" ]; then
