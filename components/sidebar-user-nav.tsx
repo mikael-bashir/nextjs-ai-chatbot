@@ -79,7 +79,7 @@ export function SidebarUserNav({ user, placement = 'footer' }: Props) {
               }
             >
               <AvatarOrInitial user={user} size={24} />
-              <span className="truncate text-sm">{user.name ?? user.email}</span>
+              <span className="truncate text-sm">{user.name ?? user.email ?? 'User'}</span>
               {credits !== null && (
                 <span className="ml-1 text-xs font-medium tabular-nums text-muted-foreground shrink-0">
                   £{credits.toFixed(2)}
@@ -96,12 +96,14 @@ export function SidebarUserNav({ user, placement = 'footer' }: Props) {
           >
             <DropdownMenuLabel className="font-normal">
               <div className="flex flex-col gap-0.5">
-                {user.name && (
-                  <span className="text-sm font-medium leading-none">{user.name}</span>
+                {(user.name || user.email) && (
+                  <span className="text-sm font-medium leading-none">{user.name ?? user.email}</span>
                 )}
-                <span className="text-xs leading-none text-muted-foreground truncate">
-                  {user.email}
-                </span>
+                {user.name && user.email && (
+                  <span className="text-xs leading-none text-muted-foreground truncate">
+                    {user.email}
+                  </span>
+                )}
                 {credits !== null && (
                   <span className="text-xs font-semibold text-foreground mt-1">
                     {credits.toFixed(2)} credits

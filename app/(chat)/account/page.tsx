@@ -249,7 +249,7 @@ export default async function AccountPage({
             <dl className="divide-y divide-border">
               {(
                 [
-                  { label: 'Email', value: user.email },
+                  ...(currentEmail ? [{ label: 'Email', value: currentEmail }] : []),
                   { label: 'User ID', value: `${userId.slice(0, 8)}…`, mono: true },
                   { label: 'Plan', value: planLabel },
                   ...(memberSince ? [{ label: 'Member since', value: memberSince }] : []),

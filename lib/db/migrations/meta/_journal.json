@@ -64,6 +64,13 @@
       "when": 1782200000000,
       "tag": "0009_add_username",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1782210000000,
+      "tag": "0010_nullable_email",
+      "breakpoints": true
     }
   ]
 }

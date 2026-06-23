@@ -118,18 +118,12 @@ export async function provisionLeakUser({
   email,
 }: {
   id: string;
-  email: string;
+  email: string | null;
 }) {
   try {
-    // onConflictDoNothing prevents 500 errors if a user accidentally 
-    // double-clicks the "Complete Setup" button in the modal.
     return await db.insert(user)
-      .values({
-        id,
-        email,
-        // Add any other default fields your schema requires here (e.g., createdAt: new Date())
-      })
-      .onConflictDoNothing({ target: user.id }); 
+      .values({ id, email })
+      .onConflictDoNothing({ target: user.id });
   } catch (error) {
     console.error('Failed to provision user in database', error);
     throw error;

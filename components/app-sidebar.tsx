@@ -21,10 +21,17 @@ import {
 import Link from 'next/link';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
 
-export function AppSidebar({ user }: { user: User | undefined }) {
+const LOGIN_BASE =
+  process.env.NODE_ENV === 'production'
+    ? 'https://competemath.com/auth/login'
+    : 'http://localhost:3001/auth/login';
+
+export function AppSidebar({ user, publicOrigin }: { user: User | undefined; publicOrigin: string }) {
   const router = useRouter();
   const pathname = usePathname();
   const { setOpenMobile } = useSidebar();
+
+  const signInHref = `${LOGIN_BASE}?callbackUrl=${encodeURIComponent(publicOrigin + pathname)}`;
 
   const showNewChat = pathname === '/' || pathname.startsWith('/chat/');
 
@@ -68,20 +75,11 @@ export function AppSidebar({ user }: { user: User | undefined }) {
             <SidebarUserNav user={user} placement="header" />
           ) : (
             <SidebarMenuItem>
-              <SidebarMenuButton
-                className="h-10 mt-1 flex items-center gap-2 cursor-pointer"
-                onClick={() => {
-                  const loginBase =
-                    process.env.NODE_ENV === 'production'
-                      ? 'https://competemath.com/auth/login'
-                      : 'http://localhost:3001/auth/login';
-                  const loginUrl = new URL(loginBase);
-                  loginUrl.searchParams.set('callbackUrl', window.location.href);
-                  window.location.href = loginUrl.toString();
-                }}
-              >
-                <LogIn className="h-4 w-4 shrink-0" />
-                <span className="text-sm">Sign in</span>
+              <SidebarMenuButton asChild className="h-10 mt-1">
+                <a href={signInHref} className="flex items-center gap-2">
+                  <LogIn className="h-4 w-4 shrink-0" />
+                  <span className="text-sm">Sign in</span>
+                </a>
               </SidebarMenuButton>
             </SidebarMenuItem>
           )}

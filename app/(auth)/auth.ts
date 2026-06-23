@@ -51,7 +51,7 @@ export const {
           if (account?.username) token.name = account.username;
           if (account?.email) token.email = account.email;
         } catch {
-          token.hasLeakAccount = false;
+          // DB error — don't clobber existing values; keep the session intact
         }
       }
 
