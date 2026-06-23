@@ -4,6 +4,7 @@ import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, 
 export const user = pgTable("User", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
   email: varchar("email", { length: 64 }).notNull(),
+  username: varchar("username", { length: 32 }).unique(),
 })
 
 export type User = InferSelectModel<typeof user>

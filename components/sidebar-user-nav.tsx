@@ -7,6 +7,40 @@ import { signOut } from 'next-auth/react';
 import { useTheme } from 'next-themes';
 import { useCredits } from '@/hooks/use-credits';
 
+function AvatarOrInitial({ user, size = 24 }: { user: User; size?: number }) {
+  const display = user.name ?? user.email ?? '';
+  if (user.image) {
+    return (
+      <Image
+        src={user.image}
+        alt={display || 'User Avatar'}
+        width={size}
+        height={size}
+        className="rounded-full shrink-0"
+      />
+    );
+  }
+  if (display) {
+    return (
+      <Image
+        src={`https://avatar.vercel.sh/${encodeURIComponent(display)}`}
+        alt={display}
+        width={size}
+        height={size}
+        className="rounded-full shrink-0"
+      />
+    );
+  }
+  return (
+    <div
+      style={{ width: size, height: size, fontSize: size * 0.45 }}
+      className="rounded-full bg-zinc-600 dark:bg-zinc-400 flex items-center justify-center text-white dark:text-zinc-900 font-medium shrink-0"
+    >
+      ?
+    </div>
+  );
+}
+
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -44,13 +78,7 @@ export function SidebarUserNav({ user, placement = 'footer' }: Props) {
                   : 'data-[state=open]:bg-sidebar-accent bg-background data-[state=open]:text-sidebar-accent-foreground h-10'
               }
             >
-              <Image
-                src={user.image ?? `https://avatar.vercel.sh/${user.email}`}
-                alt={user.name ?? user.email ?? 'User Avatar'}
-                width={24}
-                height={24}
-                className="rounded-full shrink-0"
-              />
+              <AvatarOrInitial user={user} size={24} />
               <span className="truncate text-sm">{user.name ?? user.email}</span>
               {credits !== null && (
                 <span className="ml-1 text-xs font-medium tabular-nums text-muted-foreground shrink-0">

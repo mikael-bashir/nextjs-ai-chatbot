@@ -68,11 +68,20 @@ export function AppSidebar({ user }: { user: User | undefined }) {
             <SidebarUserNav user={user} placement="header" />
           ) : (
             <SidebarMenuItem>
-              <SidebarMenuButton asChild className="h-10 mt-1">
-                <Link href="https://competemath.com/auth/login" className="flex items-center gap-2">
-                  <LogIn className="h-4 w-4 shrink-0" />
-                  <span className="text-sm">Sign in</span>
-                </Link>
+              <SidebarMenuButton
+                className="h-10 mt-1 flex items-center gap-2 cursor-pointer"
+                onClick={() => {
+                  const loginBase =
+                    process.env.NODE_ENV === 'production'
+                      ? 'https://competemath.com/auth/login'
+                      : 'http://localhost:3001/auth/login';
+                  const loginUrl = new URL(loginBase);
+                  loginUrl.searchParams.set('callbackUrl', window.location.href);
+                  window.location.href = loginUrl.toString();
+                }}
+              >
+                <LogIn className="h-4 w-4 shrink-0" />
+                <span className="text-sm">Sign in</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
           )}

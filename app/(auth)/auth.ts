@@ -48,6 +48,8 @@ export const {
         try {
           const account = await leakAccountProvisioned({ id: token.id as string });
           token.hasLeakAccount = !!account;
+          if (account?.username) token.name = account.username;
+          if (account?.email) token.email = account.email;
         } catch {
           token.hasLeakAccount = false;
         }

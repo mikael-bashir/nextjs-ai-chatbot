@@ -9,6 +9,7 @@ import {
   gte,
   inArray,
   lt,
+  ne,
   type SQL,
 } from 'drizzle-orm';
 
@@ -798,5 +799,44 @@ export async function getUserById({ id }: { id: string }): Promise<User | null> 
   } catch (error) {
     console.error('Failed to get user by ID from database');
     throw error;
+  }
+}
+
+export type ProfileUpdateError = 'username_taken' | 'email_taken' | 'unknown';
+
+export async function updateUserProfile({
+  userId,
+  username,
+  email,
+}: {
+  userId: string;
+  username?: string;
+  email?: string;
+}): Promise<{ error?: ProfileUpdateError }> {
+  try {
+    if (username !== undefined) {
+      const clash = await db.query.user.findFirst({
+        where: and(eq(user.username, username), ne(user.id, userId)),
+      });
+      if (clash) return { error: 'username_taken' };
+    }
+    if (email !== undefined) {
+      const clash = await db.query.user.findFirst({
+        where: and(eq(user.email, email), ne(user.id, userId)),
+      });
+      if (clash) return { error: 'email_taken' };
+    }
+
+    const updates: Partial<typeof user.$inferInsert> = {};
+    if (username !== undefined) updates.username = username;
+    if (email !== undefined) updates.email = email;
+
+    if (Object.keys(updates).length > 0) {
+      await db.update(user).set(updates).where(eq(user.id, userId));
+    }
+    return {};
+  } catch (error) {
+    console.error('Failed to update user profile in database');
+    return { error: 'unknown' };
   }
 }
