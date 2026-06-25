@@ -10,8 +10,9 @@ import {
   RedoIcon,
   UndoIcon,
 } from '@/components/icons';
-import { Suggestion } from '@/lib/db/schema';
+import type { Suggestion } from '@/lib/db/schema';
 import { toast } from 'sonner';
+import { generateUUID } from '@/lib/utils';
 import { getSuggestions } from '../actions';
 
 interface TextArtifactMetadata {
@@ -90,8 +91,7 @@ export const textArtifact = new Artifact<'text', TextArtifactMetadata>({
             onSaveContent={onSaveContent}
           />
 
-          {metadata &&
-          metadata.suggestions &&
+          {metadata?.suggestions &&
           metadata.suggestions.length > 0 ? (
             <div className="md:hidden h-dvh w-12 shrink-0" />
           ) : null}
@@ -156,10 +156,12 @@ export const textArtifact = new Artifact<'text', TextArtifactMetadata>({
       icon: <PenIcon />,
       description: 'Add final polish',
       onClick: ({ appendMessage }) => {
+        const text = 'Please add final polish and check for grammar, add section titles for better structure, and ensure everything reads smoothly.';
         appendMessage({
+          id: generateUUID(),
           role: 'user',
-          content:
-            'Please add final polish and check for grammar, add section titles for better structure, and ensure everything reads smoothly.',
+          content: text,
+          parts: [{ type: 'text', text }],
         });
       },
     },
@@ -167,10 +169,12 @@ export const textArtifact = new Artifact<'text', TextArtifactMetadata>({
       icon: <MessageIcon />,
       description: 'Request suggestions',
       onClick: ({ appendMessage }) => {
+        const text = 'Please add suggestions you have that could improve the writing.';
         appendMessage({
+          id: generateUUID(),
           role: 'user',
-          content:
-            'Please add suggestions you have that could improve the writing.',
+          content: text,
+          parts: [{ type: 'text', text }],
         });
       },
     },

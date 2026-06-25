@@ -13,24 +13,24 @@ interface SuggestedActionsProps {
 function PureSuggestedActions({ chatId, append }: SuggestedActionsProps) {
   const suggestedActions = [
     {
-      title: "What are the advantages",
-      label: "of using Next.js?",
-      action: "What are the advantages of using Next.js?",
+      title: "Even + Even = Even",
+      label: "complete this Lean 4 proof",
+      action: "theorem even_add_even (a b : ℤ) (ha : Even a) (hb : Even b) : Even (a + b) := by sorry",
     },
     {
-      title: "Write code to",
-      label: `demonstrate djikstra's algorithm`,
-      action: `Write code to demonstrate djikstra's algorithm`,
+      title: "Infinitely many primes",
+      label: "complete this Lean 4 proof",
+      action: "theorem infinitely_many_primes : ∀ n : ℕ, ∃ p, p > n ∧ Nat.Prime p := by sorry",
     },
     {
-      title: "Help me write an essay",
-      label: `about silicon valley`,
-      action: `Help me write an essay about silicon valley`,
+      title: "√2 is irrational",
+      label: "complete this Lean 4 proof",
+      action: "theorem sqrt_two_irrational : Irrational (Real.sqrt 2) := by sorry",
     },
     {
-      title: "What is the weather",
-      label: "in San Francisco?",
-      action: "What is the weather in San Francisco?",
+      title: "Pigeonhole principle",
+      label: "complete this Lean 4 proof",
+      action: "theorem pigeonhole {α β : Type*} [Fintype α] [Fintype β] (f : α → β) (h : Fintype.card β < Fintype.card α) : ∃ x y : α, x ≠ y ∧ f x = f y := by sorry",
     },
   ]
 
@@ -48,8 +48,6 @@ function PureSuggestedActions({ chatId, append }: SuggestedActionsProps) {
           <Button
             variant="ghost"
             onClick={async () => {
-              window.history.replaceState({}, "", `/chat/${chatId}`)
-
               await append({
                 role: "user",
                 content: suggestedAction.action,

@@ -34,6 +34,11 @@ export function Chat({
     initialMessages,
     body: { id, selectedChatModel },
     onFinish: () => {
+      // Update URL to the permanent chat route once the first response completes.
+      // Done here (not on click) so Next.js doesn't navigate before the chat exists in the DB.
+      if (window.location.pathname !== `/chat/${id}`) {
+        window.history.replaceState(window.history.state, "", `/chat/${id}`)
+      }
       mutate(unstable_serialize(getChatHistoryPaginationKey))
     },
   })
@@ -106,7 +111,7 @@ export function Chat({
                     className={`w-2 h-2 rounded-full ${
                       status === "streaming" ? "bg-blue-500 animate-pulse" : "bg-green-500"
                     }`}
-                  ></span>
+                  />
                   <span className="font-medium max-w-[200px] md:max-w-sm truncate text-left">
                     {latestStatus?.thought || "Agent Activity"}
                   </span>
@@ -133,7 +138,7 @@ export function Chat({
                     }}
                     className="flex items-center gap-1 text-xs font-semibold text-red-500 hover:text-red-600 bg-red-50 hover:bg-red-100 px-3 py-1.5 rounded-md border border-red-200 transition-colors"
                   >
-                    <span className="w-2 h-2 bg-red-500 rounded-sm"></span>
+                    <span className="w-2 h-2 bg-red-500 rounded-sm" />
                     Stop Agent
                   </button>
                 )}

@@ -9,6 +9,7 @@ import {
 import { SpreadsheetEditor } from '@/components/sheet-editor';
 import { parse, unparse } from 'papaparse';
 import { toast } from 'sonner';
+import { generateUUID } from '@/lib/utils';
 
 type Metadata = any;
 
@@ -95,8 +96,10 @@ export const sheetArtifact = new Artifact<'sheet', Metadata>({
       icon: <SparklesIcon />,
       onClick: ({ appendMessage }) => {
         appendMessage({
+          id: generateUUID(),
           role: 'user',
           content: 'Can you please format and clean the data?',
+          parts: [{ type: 'text', text: 'Can you please format and clean the data?' }],
         });
       },
     },
@@ -105,9 +108,11 @@ export const sheetArtifact = new Artifact<'sheet', Metadata>({
       icon: <LineChartIcon />,
       onClick: ({ appendMessage }) => {
         appendMessage({
+          id: generateUUID(),
           role: 'user',
           content:
             'Can you please analyze and visualize the data by creating a new code artifact in python?',
+          parts: [{ type: 'text', text: 'Can you please analyze and visualize the data by creating a new code artifact in python?' }],
         });
       },
     },

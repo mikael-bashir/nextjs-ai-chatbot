@@ -99,6 +99,24 @@ export default defineConfig({
         ...devices['Desktop Chrome'],
       },
     },
+    {
+      name: 'account',
+      testMatch: /e2e\/account.test.ts/,
+      dependencies: ['setup:auth'],
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'playwright/.auth/session.json',
+      },
+    },
+    {
+      name: 'stripe',
+      testMatch: /e2e\/stripe.test.ts/,
+      dependencies: ['setup:auth'],
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'playwright/.auth/session.json',
+      },
+    },
 
     // {
     //   name: 'firefox',

@@ -1,0 +1,271 @@
+name: Preview Deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+# One deploy at a time per PR — cancels the in-flight deploy on new push
+concurrency:
+  group: preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write      # push to GHCR
+  pull-requests: write # post PR comment
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # ── Stable, unguessable subdomain ─────────────────────────────────────
+      # Deterministic per PR (same across pushes) but not enumerable.
+      # Format: pr-{number}-{first 6 chars of sha256(repo+pr)}
+      - name: Compute preview identity
+        id: preview
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          HASH=$(printf '%s' "${{ github.repository }}-${PR}" | sha256sum | cut -c1-6)
+          SUBDOMAIN="pr-${PR}-${HASH}"
+          PORT=$((10000 + PR))
+          echo "subdomain=${SUBDOMAIN}"  >> "$GITHUB_OUTPUT"
+          echo "port=${PORT}"            >> "$GITHUB_OUTPUT"
+          echo "url=https://${SUBDOMAIN}.preview.leak.competemath.com" >> "$GITHUB_OUTPUT"
+
+      # ── Build & push images to GHCR ───────────────────────────────────────
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Next.js image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.next
+          push: true
+          tags: ghcr.io/${{ github.repository }}/preview-nextjs:${{ github.sha }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/preview-nextjs:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/preview-nextjs:cache,mode=max
+
+      - name: Build and push Python image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.hidden
+          push: true
+          tags: ghcr.io/${{ github.repository }}/preview-python:${{ github.sha }}
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/preview-python:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/preview-python:cache,mode=max
+
+      # ── Generate config files (base64 so SSH transfer is lossless) ────────
+      - name: Generate docker-compose and Caddy config
+        run: |
+          REPO="${{ github.repository }}"
+          SHA="${{ github.sha }}"
+          PORT="${{ steps.preview.outputs.port }}"
+          SUBDOMAIN="${{ steps.preview.outputs.subdomain }}"
+
+          # docker-compose.yml for this preview
+          cat > /tmp/preview-compose.yml << YAML
+          services:
+            nextjs:
+              image: ghcr.io/${REPO}/preview-nextjs:${SHA}
+              ports:
+                - "${PORT}:3000"
+              env_file:
+                - .env
+              restart: unless-stopped
+              depends_on:
+                - python-backend
+
+            python-backend:
+              image: ghcr.io/${REPO}/preview-python:${SHA}
+              env_file:
+                - .env
+              expose:
+                - "5328"
+              restart: unless-stopped
+          YAML
+
+          # Caddy virtual-host snippet — auto-TLS via Let's Encrypt HTTP-01
+          cat > /tmp/preview-caddy.caddy << CADDY
+          ${SUBDOMAIN}.preview.leak.competemath.com {
+              reverse_proxy localhost:${PORT} {
+                  header_up X-Forwarded-Host {host}
+                  header_up X-Forwarded-Proto {scheme}
+              }
+          }
+          CADDY
+
+          echo "COMPOSE_B64=$(base64 -w0 /tmp/preview-compose.yml)" >> "$GITHUB_ENV"
+          echo "CADDY_B64=$(base64 -w0 /tmp/preview-caddy.caddy)"   >> "$GITHUB_ENV"
+
+      # ── Deploy on VPS ─────────────────────────────────────────────────────
+      - name: Deploy to VPS
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SUBDOMAIN:    ${{ steps.preview.outputs.subdomain }}
+          PORT:         ${{ steps.preview.outputs.port }}
+          COMPOSE_B64:  ${{ env.COMPOSE_B64 }}
+          CADDY_B64:    ${{ env.CADDY_B64 }}
+          GHCR_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          # App environment — use Stripe test keys for previews.
+          # STRIPE_WEBHOOK_SECRET is NOT passed here; it is generated on the VPS
+          # from the Stripe CLI so it matches the CLI listener automatically.
+          POSTGRES_URL:        ${{ secrets.POSTGRES_URL }}
+          AUTH_SECRET:         ${{ secrets.AUTH_SECRET }}
+          AUTH_URL:            ${{ steps.preview.outputs.url }}
+          NEXT_PUBLIC_APP_URL: ${{ steps.preview.outputs.url }}
+          XAI_MASTER:          ${{ secrets.XAI_MASTER }}
+          XAI_FREE_KEY_1:      ${{ secrets.XAI_FREE_KEY_1 }}
+          XAI_FREE_KEY_2:      ${{ secrets.XAI_FREE_KEY_2 }}
+          XAI_FREE_KEY_3:      ${{ secrets.XAI_FREE_KEY_3 }}
+          MEM0_API_KEY:        ${{ secrets.MEM0_API_KEY }}
+          REDIS_URL:           ${{ secrets.REDIS_URL }}
+          STRIPE_SECRET:       ${{ secrets.STRIPE_SECRET_TEST }}
+          RESEND_API_KEY:      ${{ secrets.RESEND_API_KEY }}
+
+        with:
+          host:     ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: >-
+            SUBDOMAIN,PORT,COMPOSE_B64,CADDY_B64,GHCR_TOKEN,GITHUB_ACTOR,
+            POSTGRES_URL,AUTH_SECRET,AUTH_URL,NEXT_PUBLIC_APP_URL,XAI_MASTER,
+            XAI_FREE_KEY_1,XAI_FREE_KEY_2,XAI_FREE_KEY_3,
+            MEM0_API_KEY,REDIS_URL,STRIPE_SECRET,RESEND_API_KEY
+          script: |
+            set -euo pipefail
+
+            PREVIEW_DIR="/opt/previews/${SUBDOMAIN}"
+            mkdir -p "$PREVIEW_DIR"
+
+            # Prevent concurrent deploys for the same PR (SSH disconnect doesn't kill remote script)
+            LOCK_FILE="/tmp/preview-${SUBDOMAIN}.lock"
+            exec 9>"$LOCK_FILE"
+            if ! flock -n 9; then
+              echo "Another deploy is already running for ${SUBDOMAIN}, skipping."
+              exit 0
+            fi
+            trap 'flock -u 9; rm -f "$LOCK_FILE"' EXIT
+
+            # Pull image from GHCR
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+            # Install Stripe CLI if not already present (idempotent)
+            if ! command -v stripe >/dev/null 2>&1; then
+              echo "Installing Stripe CLI..."
+              curl -fsSL https://packages.stripe.dev/api/security/keypair/stripe-cli-gpg/public \
+                | gpg --dearmor \
+                | sudo tee /usr/share/keyrings/stripe.gpg > /dev/null
+              echo "deb [signed-by=/usr/share/keyrings/stripe.gpg] https://packages.stripe.dev/stripe-cli-debian-local stable main" \
+                | sudo tee /etc/apt/sources.list.d/stripe.list > /dev/null
+              sudo apt-get update -qq && sudo apt-get install -y stripe
+            fi
+
+            # Kill any existing Stripe listener from a previous deploy of this PR
+            STRIPE_PID_FILE="$PREVIEW_DIR/stripe-listener.pid"
+            if [ -f "$STRIPE_PID_FILE" ]; then
+              kill "$(cat "$STRIPE_PID_FILE")" 2>/dev/null || true
+              rm -f "$STRIPE_PID_FILE"
+            fi
+
+            # Get the Stripe CLI webhook signing secret before starting containers.
+            # stripe listen --print-secret is consistent for a given API key, so the
+            # secret written here will match what the background listener signs with.
+            CLI_WEBHOOK_SECRET=$(stripe listen --api-key "${STRIPE_SECRET}" --print-secret 2>/dev/null | tr -d '[:space:]')
+
+            # Write docker-compose and env file
+            echo "$COMPOSE_B64" | base64 -d > "$PREVIEW_DIR/docker-compose.yml"
+
+            # .env — one var per line
+            {
+              echo "POSTGRES_URL=${POSTGRES_URL}"
+              echo "AUTH_SECRET=${AUTH_SECRET}"
+              echo "AUTH_URL=${AUTH_URL}"
+              echo "NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}"
+              echo "PYTHON_BACKEND_URL=http://python-backend:5328"
+              echo "NODE_ENV=production"
+              echo "XAI_MASTER=${XAI_MASTER}"
+              echo "XAI_FREE_KEY_1=${XAI_FREE_KEY_1}"
+              echo "XAI_FREE_KEY_2=${XAI_FREE_KEY_2}"
+              echo "XAI_FREE_KEY_3=${XAI_FREE_KEY_3}"
+              echo "MEM0_API_KEY=${MEM0_API_KEY}"
+              echo "REDIS_URL=${REDIS_URL}"
+              echo "STRIPE_SECRET=${STRIPE_SECRET}"
+              echo "STRIPE_WEBHOOK_SECRET=${CLI_WEBHOOK_SECRET}"
+              echo "RESEND_API_KEY=${RESEND_API_KEY}"
+            } > "$PREVIEW_DIR/.env"
+
+            # Start containers
+            cd "$PREVIEW_DIR"
+            docker compose -p "preview-${SUBDOMAIN}" pull --quiet
+            docker compose -p "preview-${SUBDOMAIN}" up -d --remove-orphans
+
+            # Caddy virtual-host — Caddy will auto-provision a Let's Encrypt cert
+            echo "$CADDY_B64" | base64 -d | sudo tee "/etc/caddy/sites/${SUBDOMAIN}.caddy" > /dev/null
+            sudo systemctl reload caddy
+
+            # Start Stripe CLI listener in background.
+            # Forwards Stripe test events to this preview's webhook endpoint.
+            # PID is saved so teardown can kill it cleanly.
+            PREVIEW_URL="https://${SUBDOMAIN}.preview.leak.competemath.com"
+            nohup stripe listen \
+              --api-key "${STRIPE_SECRET}" \
+              --forward-to "${PREVIEW_URL}/api/webhooks/stripe" \
+              >> "$PREVIEW_DIR/stripe-listener.log" 2>&1 &
+            echo $! > "$STRIPE_PID_FILE"
+
+            docker image prune -f
+
+      # ── Post (or update) PR comment ───────────────────────────────────────
+      - name: Post preview URL
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const url  = '${{ steps.preview.outputs.url }}';
+            const sha  = '${{ github.sha }}'.slice(0, 7);
+            const body = [
+              '## 🚀 Preview deployed',
+              '',
+              `**URL:** ${url}`,
+              `**Commit:** \`${sha}\``,
+              '',
+              '_Automatically torn down when this PR is closed._',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes('Preview deployed'),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner:        context.repo.owner,
+                repo:         context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
