@@ -58,7 +58,7 @@ export async function POST(req: Request) {
               type: 'purchase',
             });
             const user = await getUserById({ id: userId });
-            if (user) {
+            if (user?.email) {
               await sendPurchaseConfirmationEmail({
                 to: user.email,
                 name: user.email.split('@')[0],
@@ -118,7 +118,7 @@ export async function POST(req: Request) {
         });
 
         const user = await getUserById({ id: userId });
-        if (user) {
+        if (user?.email) {
           await sendPurchaseConfirmationEmail({
             to: user.email,
             name: user.email.split('@')[0],

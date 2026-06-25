@@ -6,6 +6,7 @@ import {
   getCreditTransactions,
   getEarliestCreditTransaction,
   getActiveSubscription,
+  getUserById,
 } from '@/lib/db/queries';
 import { checkRateLimit } from '@/lib/ratelimit';
 import { SUBSCRIPTION_PLANS } from '@/lib/stripe';
@@ -20,6 +21,7 @@ import { AddCreditsModal } from './add-credits-modal';
 import { UsageHistory } from './usage-history';
 import { PaymentSuccessToast, PaymentCancelledToast } from './payment-toast';
 import { ManageSubscriptionButton } from './manage-subscription-button';
+import { EditProfileForm } from './edit-profile-form';
 
 const RATE_LIMIT = 20;
 
@@ -55,12 +57,13 @@ export default async function AccountPage({
   const user = session.user;
   const { payment } = await searchParams;
 
-  const [balance, transactions, rateLimit, firstTx, subscription] = await Promise.all([
+  const [balance, transactions, rateLimit, firstTx, subscription, localUser] = await Promise.all([
     getOrCreateCreditBalance({ userId }),
     getCreditTransactions({ userId, limit: 20, offset: 0 }),
     checkRateLimit({ userId }),
     getEarliestCreditTransaction({ userId }),
     getActiveSubscription({ userId }),
+    getUserById({ id: userId }),
   ]);
 
   const used = RATE_LIMIT - rateLimit.remaining;
@@ -76,9 +79,10 @@ export default async function AccountPage({
     : null;
 
   const planLabel = currentPlan?.name ?? 'Free';
-  const displayName = user.name ?? user.email?.split('@')[0] ?? 'User';
+  const displayName = localUser?.username ?? user.name ?? user.email?.split('@')[0] ?? 'User';
+  const currentEmail = localUser?.email ?? user.email ?? '';
   const avatarSrc =
-    user.image ?? `https://avatar.vercel.sh/${encodeURIComponent(user.email ?? '')}`;
+    user.image ?? `https://avatar.vercel.sh/${encodeURIComponent(currentEmail || userId)}`;
 
   return (
     <main className="min-h-screen bg-background">
@@ -117,7 +121,7 @@ export default async function AccountPage({
                   {planLabel} Plan
                 </span>
               </div>
-              <p className="text-sm text-muted-foreground truncate">{user.email}</p>
+              <p className="text-sm text-muted-foreground truncate">{currentEmail}</p>
               {memberSince && (
                 <p className="text-xs text-muted-foreground mt-0.5">
                   Member since {memberSince}
@@ -245,7 +249,7 @@ export default async function AccountPage({
             <dl className="divide-y divide-border">
               {(
                 [
-                  { label: 'Email', value: user.email },
+                  ...(currentEmail ? [{ label: 'Email', value: currentEmail }] : []),
                   { label: 'User ID', value: `${userId.slice(0, 8)}…`, mono: true },
                   { label: 'Plan', value: planLabel },
                   ...(memberSince ? [{ label: 'Member since', value: memberSince }] : []),
@@ -271,6 +275,22 @@ export default async function AccountPage({
                 </div>
               ))}
             </dl>
+          </CardContent>
+        </Card>
+
+        {/* Edit profile */}
+        <Card>
+          <CardHeader className="pb-3">
+            <CardTitle className="text-base">Profile Settings</CardTitle>
+            <CardDescription className="text-xs">
+              Your username and email for this app
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <EditProfileForm
+              currentUsername={localUser?.username ?? null}
+              currentEmail={currentEmail}
+            />
           </CardContent>
         </Card>
 
