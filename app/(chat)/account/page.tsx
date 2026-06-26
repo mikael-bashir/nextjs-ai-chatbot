@@ -46,11 +46,18 @@ function RateLimitBar({ used, total }: { used: number; total: number }) {
 export default async function AccountPage({
   searchParams,
 }: {
-  searchParams: Promise<{ payment?: string }>;
+  searchParams: Promise<{ payment?: string; modal?: string }>;
 }) {
   const session = await auth();
-  if (!session?.user?.id || !session.user.hasLeakAccount) {
+  if (!session?.user?.id) {
     redirect('/');
+  }
+  if (!session.user.hasLeakAccount) {
+    const params = await searchParams;
+    if (params.modal !== 'true') redirect('/account?modal=true');
+    // Middleware already injected ?modal=true — render a shell so GlobalProvisioningListener
+    // can display the provisioning modal without crashing on the DB queries below.
+    return <main className="min-h-screen bg-background" />;
   }
 
   const userId = session.user.id;
