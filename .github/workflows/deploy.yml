@@ -1,6 +1,7 @@
 name: Deploy to Production
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -15,7 +16,8 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on:
+  workflow_dispatch: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -45,12 +47,16 @@ jobs:
           context: .
           file: Dockerfile.hidden
           push: true
-          tags: ghcr.io/${{ github.repository }}/production-python:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache
-          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache,mode=max
+          tags: ghcr.io/${{ github.repository }}/production-python:
+  workflow_dispatch:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-python:
+  workflow_dispatch:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-python:
+  workflow_dispatch:cache,mode=max
 
   deploy:
-    runs-on: ubuntu-latest
+    runs-on:
+  workflow_dispatch: ubuntu-latest
     needs: build
     steps:
       - name: Write config and start image pull
@@ -97,9 +103,11 @@ jobs:
                   - PYTHON_BACKEND_URL=http://python-backend:5328
                 restart: always
                 depends_on:
+  workflow_dispatch:
                   - python-backend
               python-backend:
-                image: ghcr.io/${REPO}/production-python:latest
+                image: ghcr.io/${REPO}/production-python:
+  workflow_dispatch:latest
                 env_file: .env
                 container_name: python-backend
                 expose:
@@ -119,7 +127,8 @@ jobs:
             # Pull in background — survives SSH disconnect
             nohup bash -c "
               docker pull ghcr.io/${REPO}/production-nextjs:latest &&
-              docker pull ghcr.io/${REPO}/production-python:latest &&
+              docker pull ghcr.io/${REPO}/production-python:
+  workflow_dispatch:latest &&
               touch /tmp/deploy-ready ||
               touch /tmp/deploy-failed
             " > /tmp/pull.log 2>&1 &
