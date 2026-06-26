@@ -109,6 +109,9 @@ jobs:
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
+            # Free disk space: remove unused images (old preview builds)
+            docker image prune -af 2>/dev/null || true
+
             # Kill any stale pull from a previous run
             pkill -f "docker pull" 2>/dev/null || true
             rm -f /tmp/deploy-ready /tmp/deploy-failed
