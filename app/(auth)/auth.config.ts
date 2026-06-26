@@ -84,6 +84,14 @@ export const authConfig = {
         return Response.redirect(loginUrl);
       }
 
+      // Authenticated but not provisioned: inject ?modal=true so GlobalProvisioningListener
+      // shows the provisioning modal on whatever page they landed on — no per-page boilerplate needed.
+      if (!hasAccount && nextUrl.searchParams.get('modal') !== 'true') {
+        const url = nextUrl.clone();
+        url.searchParams.set('modal', 'true');
+        return Response.redirect(url);
+      }
+
       return true;
     },
 
