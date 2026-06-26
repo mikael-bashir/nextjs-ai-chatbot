@@ -1,1 +1,162 @@
+name: Deploy to Production
 
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: production-deployment
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push Next.js image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.next
+          push: true
+          tags: ghcr.io/${{ github.repository }}/production-nextjs:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-nextjs:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-nextjs:cache,mode=max
+
+      - name: Build and push Python image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.hidden
+          push: true
+          tags: ghcr.io/${{ github.repository }}/production-python:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Write config and start image pull
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 10m
+          envs: GHCR_TOKEN,GHCR_USER,REPO
+          script: |
+            set -euo pipefail
+
+            cat > ~/nextjs-ai-chatbot/.env << 'EOF'
+            POSTGRES_URL=${{ secrets.POSTGRES_URL }}
+            AUTH_SECRET=${{ secrets.AUTH_SECRET }}
+            AUTH_URL=${{ secrets.AUTH_URL }}
+            NEXT_PUBLIC_APP_URL=${{ secrets.NEXT_PUBLIC_APP_URL }}
+            XAI_MASTER=${{ secrets.XAI_MASTER }}
+            XAI_FREE_KEY_1=${{ secrets.XAI_FREE_KEY_1 }}
+            XAI_FREE_KEY_2=${{ secrets.XAI_FREE_KEY_2 }}
+            XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}
+            MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}
+            REDIS_URL=${{ secrets.REDIS_URL }}
+            STRIPE_SECRET=${{ secrets.STRIPE_SECRET }}
+            STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
+            RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
+            NODE_ENV=production
+            EOF
+
+            cat > ~/nextjs-ai-chatbot/docker-compose.prod.yml << COMPOSE
+            services:
+              nextjs-frontend:
+                image: ghcr.io/${REPO}/production-nextjs:latest
+                env_file: .env
+                container_name: nextjs-proxy
+                ports:
+                  - "3000:3000"
+                environment:
+                  - PYTHON_BACKEND_URL=http://python-backend:5328
+                restart: always
+                depends_on:
+                  - python-backend
+              python-backend:
+                image: ghcr.io/${REPO}/production-python:latest
+                env_file: .env
+                container_name: python-backend
+                expose:
+                  - "5328"
+                restart: always
+            COMPOSE
+
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            # Prune unused images to free disk space (old preview builds)
+            docker image prune -af 2>/dev/null || true
+
+            # Kill any stale production pull from a previous run
+            # [d]ocker trick: grep won't match its own cmdline (which has literal [d]ocker, not docker)
+            ps aux | grep '[d]ocker pull.*production-' | awk '{print $2}' | xargs -r kill 2>/dev/null || true
+
+            rm -f /tmp/deploy-ready /tmp/deploy-failed
+
+            # Pull in background — survives SSH disconnect
+            nohup bash -c "
+              docker pull ghcr.io/${REPO}/production-nextjs:latest &&
+              docker pull ghcr.io/${REPO}/production-python:latest &&
+              touch /tmp/deploy-ready ||
+              touch /tmp/deploy-failed
+            " > /tmp/pull.log 2>&1 &
+
+            echo "Pull started in background (PID: $!)"
+
+      - name: Wait for pull, then start containers
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          REPO: ${{ github.repository }}
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
+          envs: REPO
+          script: |
+            set -euo pipefail
+
+            echo "Waiting for image pulls to complete..."
+            until [ -f /tmp/deploy-ready ] || [ -f /tmp/deploy-failed ]; do
+              echo "Still pulling... $(date)"
+              sleep 20
+            done
+
+            if [ -f /tmp/deploy-failed ]; then
+              echo "Pull failed:"
+              cat /tmp/pull.log
+              exit 1
+            fi
+
+            rm -f /tmp/deploy-ready
+            cat /tmp/pull.log
+
+            docker compose -f ~/nextjs-ai-chatbot/docker-compose.prod.yml up -d --remove-orphans
+            docker image prune -f
+            echo "Deployed successfully"
