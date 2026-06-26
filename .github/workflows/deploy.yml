@@ -16,8 +16,7 @@ permissions:
 
 jobs:
   build:
-    runs-on:
-  workflow_dispatch: ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
 
@@ -47,16 +46,12 @@ jobs:
           context: .
           file: Dockerfile.hidden
           push: true
-          tags: ghcr.io/${{ github.repository }}/production-python:
-  workflow_dispatch:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-python:
-  workflow_dispatch:cache
-          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-python:
-  workflow_dispatch:cache,mode=max
+          tags: ghcr.io/${{ github.repository }}/production-python:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache,mode=max
 
   deploy:
-    runs-on:
-  workflow_dispatch: ubuntu-latest
+    runs-on: ubuntu-latest
     needs: build
     steps:
       - name: Write config and start image pull
@@ -69,7 +64,7 @@ jobs:
           host: ${{ secrets.SERVER_IP }}
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          command_timeout: 2m
+          command_timeout: 5m
           envs: GHCR_TOKEN,GHCR_USER,REPO
           script: |
             set -euo pipefail
@@ -103,11 +98,9 @@ jobs:
                   - PYTHON_BACKEND_URL=http://python-backend:5328
                 restart: always
                 depends_on:
-  workflow_dispatch:
                   - python-backend
               python-backend:
-                image: ghcr.io/${REPO}/production-python:
-  workflow_dispatch:latest
+                image: ghcr.io/${REPO}/production-python:latest
                 env_file: .env
                 container_name: python-backend
                 expose:
@@ -117,7 +110,7 @@ jobs:
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
 
-            # Prune unused images: remove unused images (old preview builds)
+            # Prune unused images to free disk space (old preview builds)
             docker image prune -af 2>/dev/null || true
 
             # Kill any stale pull from a previous run
@@ -127,8 +120,7 @@ jobs:
             # Pull in background — survives SSH disconnect
             nohup bash -c "
               docker pull ghcr.io/${REPO}/production-nextjs:latest &&
-              docker pull ghcr.io/${REPO}/production-python:
-  workflow_dispatch:latest &&
+              docker pull ghcr.io/${REPO}/production-python:latest &&
               touch /tmp/deploy-ready ||
               touch /tmp/deploy-failed
             " > /tmp/pull.log 2>&1 &
