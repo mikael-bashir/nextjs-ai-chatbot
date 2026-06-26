@@ -68,7 +68,7 @@ jobs:
           script: |
             set -euo pipefail
 
-            cat > /root/nextjs-ai-chatbot/.env << 'EOF'
+            cat > ~/nextjs-ai-chatbot/.env << 'EOF'
             POSTGRES_URL=${{ secrets.POSTGRES_URL }}
             AUTH_SECRET=${{ secrets.AUTH_SECRET }}
             AUTH_URL=${{ secrets.AUTH_URL }}
@@ -90,7 +90,7 @@ jobs:
             docker pull ghcr.io/${REPO}/production-nextjs:latest
             docker pull ghcr.io/${REPO}/production-python:latest
 
-            cat > /root/nextjs-ai-chatbot/docker-compose.prod.yml << COMPOSE
+            cat > ~/nextjs-ai-chatbot/docker-compose.prod.yml << COMPOSE
             services:
               nextjs-frontend:
                 image: ghcr.io/${REPO}/production-nextjs:latest
@@ -112,5 +112,5 @@ jobs:
                 restart: always
             COMPOSE
 
-            docker compose -f /root/nextjs-ai-chatbot/docker-compose.prod.yml up -d --remove-orphans
+            docker compose -f ~/nextjs-ai-chatbot/docker-compose.prod.yml up -d --remove-orphans
             docker image prune -f
