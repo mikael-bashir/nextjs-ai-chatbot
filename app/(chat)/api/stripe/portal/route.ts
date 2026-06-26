@@ -13,10 +13,15 @@ export async function POST() {
     return Response.json({ error: 'No billing account found' }, { status: 404 });
   }
 
-  const portalSession = await stripe.billingPortal.sessions.create({
-    customer: customerId,
-    return_url: `${appUrl()}/account`,
-  });
-
-  return Response.json({ url: portalSession.url });
+  try {
+    const portalSession = await stripe.billingPortal.sessions.create({
+      customer: customerId,
+      return_url: `${appUrl()}/account`,
+    });
+    return Response.json({ url: portalSession.url });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error('[stripe/portal]', message);
+    return Response.json({ error: message }, { status: 500 });
+  }
 }

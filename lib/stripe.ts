@@ -12,5 +12,11 @@ export type { CreditPack, SubscriptionPlan } from './stripe-config';
 
 export function appUrl() {
   if (process.env.NODE_ENV === 'development') return 'http://localhost:3000';
-  return process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000';
+  // NEXT_PUBLIC_APP_URL is preferred; AUTH_URL is always set in both preview and production
+  // and resolves to the correct public origin — use it as a reliable fallback.
+  const url = process.env.NEXT_PUBLIC_APP_URL ?? process.env.AUTH_URL;
+  if (url) {
+    try { return new URL(url).origin; } catch {}
+  }
+  return 'http://localhost:3000';
 }
