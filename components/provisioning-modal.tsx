@@ -116,7 +116,7 @@ export function ProvisioningModal({ onSuccess }: ProvisioningModalProps) {
           onClick={() => {
             // Just scrub the URL! The Edge will handle the rest if they misbehave.
             const params = new URLSearchParams(searchParams.toString());
-            params.delete('modal');
+            params.set('modal', 'dismissed');
             router.replace(`${pathname}?${params.toString()}`);
           }}
           className="w-full mb-4 text-sm text-[10pt] hover:underline text-gray-400 transition-colors duration-200 hover:text-gray-600"
