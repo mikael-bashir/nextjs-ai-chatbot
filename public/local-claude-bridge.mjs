@@ -289,43 +289,73 @@ function extractScript(text) {
   return (fence ? fence[1] : text).trim()
 }
 
+// Describe the offered tools so Claude can pick one and fill its parameters.
+function toolsSummary(tools) {
+  return tools
+    .map((t) => {
+      const f = t.function || t
+      return `- ${f.name}: ${f.description || ""}\n  parameters: ${JSON.stringify(f.parameters || {})}`
+    })
+    .join("\n")
+}
+
+// Parse Claude's JSON tool choice and validate the name against the offered set.
+function parseToolChoice(text, tools) {
+  const m = text.match(/\{[\s\S]*\}/)
+  if (!m) return null
+  try {
+    const obj = JSON.parse(m[0])
+    const name = obj.tool || obj.name
+    const known = tools.some((t) => (t.function?.name || t.name) === name)
+    if (!name || !known) return null
+    return { name, arguments: obj.arguments || obj.args || {} }
+  } catch {
+    return null
+  }
+}
+
+function toolCallResponse(name, args) {
+  return {
+    response: {
+      content: "",
+      tool_calls: [
+        {
+          id: `call_${randomBytes(6).toString("hex")}`,
+          type: "function",
+          function: { name, arguments: JSON.stringify(args) },
+        },
+      ],
+      finish_reason: "tool_calls",
+      usage: {},
+    },
+  }
+}
+
 // Turn one OpenAI-style request into a Claude run, then an OpenAI-style result.
-// NOTE: the tool-call synthesis below is a first-cut adapter — it assumes a
-// single tool whose first argument takes the proposed script. Tune it to your
-// tree's exact tool schema.
+// When tools are offered, Claude picks one and fills its parameters as JSON;
+// if that can't be parsed, we fall back to treating the output as a script for
+// the first tool's first parameter.
 async function handleRelayRequest(payload) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : []
   const tools = Array.isArray(payload?.tools) ? payload.tools : []
 
   let prompt = messagesToPrompt(messages)
   if (tools.length > 0) {
-    prompt +=
-      "\n\nRespond with ONLY the Lean 4 script for the next step, inside a ```lean code block. No prose."
+    prompt += `\n\nYou have these tools:\n${toolsSummary(tools)}\n\nChoose ONE tool for the next step and respond with ONLY a JSON object:\n{"tool": "<tool name>", "arguments": { ...matching that tool's parameters... }}\nNo prose, no code fences — just the JSON object.`
   }
 
   const result = await runClaude(buildArgs(prompt, {}), { cwd: undefined, timeoutMs: 600000 })
   if (!result.ok) return { error: result.stderr || "claude run failed" }
 
   if (tools.length > 0) {
+    const choice = parseToolChoice(result.text, tools)
+    if (choice) return toolCallResponse(choice.name, choice.arguments)
+    // Fallback: treat the output as a script for the first tool's first param.
     const tool = tools[0]
-    return {
-      response: {
-        content: "",
-        tool_calls: [
-          {
-            id: `call_${randomBytes(6).toString("hex")}`,
-            type: "function",
-            function: {
-              name: tool.function?.name || tool.name || "tool",
-              arguments: JSON.stringify({ [firstToolArgKey(tool)]: extractScript(result.text) }),
-            },
-          },
-        ],
-        finish_reason: "tool_calls",
-        usage: {},
-      },
-    }
+    const name = tool.function?.name || tool.name || "tool"
+    return toolCallResponse(name, { [firstToolArgKey(tool)]: extractScript(result.text) })
   }
+
   return { response: { content: result.text, finish_reason: "stop", usage: {} } }
 }
 

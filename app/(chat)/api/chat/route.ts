@@ -228,6 +228,9 @@ export async function POST(request: Request) {
           messages: toCoreMessages(messages),
           id,
           model: selectedChatModel,
+          // Needed so the Local Agent relay can route to this user's machine
+          // (and for cross-session memory keying).
+          user_id: userId,
         }),
       })
 

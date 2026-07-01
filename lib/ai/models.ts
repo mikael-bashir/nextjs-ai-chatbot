@@ -26,6 +26,12 @@ export const chatModels: Array<ChatModel> = [
     description: 'Paid — xAI\'s fastest frontier model, credits deducted',
     paid: true,
   },
+  {
+    id: 'claude-local',
+    name: 'Claude (your machine)',
+    description: 'Runs on your own Claude Code via the local bridge — no credits used',
+    paid: false, // user's own subscription powers it; we deduct nothing
+  },
 ];
 
 export function isPaidModel(modelId: string): boolean {
