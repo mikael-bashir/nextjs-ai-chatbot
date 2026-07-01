@@ -4,9 +4,9 @@ import { getLocalClaudeConfig, saveLocalClaudeConfig } from "@/lib/db/local-clau
 import { normalizeLocalClaudeConfigInput } from "@/lib/local-claude/config"
 import { DEFAULT_LOCAL_CLAUDE_CONFIG } from "@/lib/types/local-claude"
 
-// This route (and its siblings) spawn a local process, so they must run on the
-// Node.js runtime, not the Edge runtime.
-export const runtime = "nodejs"
+// Route handlers default to the Node.js runtime (required here to spawn a local
+// process). An explicit `runtime` export is intentionally omitted — it is
+// incompatible with this project's `cacheComponents` Next config.
 
 export async function GET() {
   try {

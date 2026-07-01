@@ -8,8 +8,6 @@ import {
   type LocalClaudeConfigInput,
 } from "@/lib/types/local-claude"
 
-export const runtime = "nodejs"
-
 // Runs the layered setup check. Accepts an optional config in the body so the
 // user can test unsaved edits from the form; otherwise uses the saved config.
 export async function POST(request: NextRequest) {

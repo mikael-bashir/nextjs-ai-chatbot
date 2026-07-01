@@ -4,8 +4,6 @@ import { getLocalClaudeConfig } from "@/lib/db/local-claude-queries"
 import { normalizeLocalClaudeConfigInput } from "@/lib/local-claude/config"
 import { runLocalClaude } from "@/lib/services/local-claude"
 
-export const runtime = "nodejs"
-
 // Runs a single prompt through the user's local Claude Code CLI and returns the
 // final text. Uses the user's saved config for model/permissions/tools/timeout.
 export async function POST(request: NextRequest) {
