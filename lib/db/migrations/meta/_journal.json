@@ -47,8 +47,36 @@
     {
       "idx": 6,
       "version": "7",
-      "when": 1751328000000,
-      "tag": "0006_local_claude_agent",
+      "when": 1782066525214,
+      "tag": "0006_smiling_lady_mastermind",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1782128291799,
+      "tag": "0007_plain_sebastian_shaw",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1782200000000,
+      "tag": "0009_add_username",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1782210000000,
+      "tag": "0010_nullable_email",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1782220000000,
+      "tag": "0011_local_claude_agent",
       "breakpoints": true
     }
   ]

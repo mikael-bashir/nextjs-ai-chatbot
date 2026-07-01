@@ -20,7 +20,12 @@ export async function GET(request: Request) {
     return new Response('Unauthorized', { status: 401 });
   }
 
-  const documents = await getDocumentsById({ id });
+  let documents: Awaited<ReturnType<typeof getDocumentsById>>;
+  try {
+    documents = await getDocumentsById({ id });
+  } catch {
+    return new Response('Not found', { status: 404 });
+  }
 
   const [document] = documents;
 
@@ -66,13 +71,19 @@ export async function POST(request: Request) {
     }
   }
 
-  const document = await saveDocument({
-    id,
-    content,
-    title,
-    kind,
-    userId: session.user.id,
-  });
+  let document: Awaited<ReturnType<typeof saveDocument>>;
+  try {
+    document = await saveDocument({
+      id,
+      content,
+      title,
+      kind,
+      userId: session.user.id,
+    });
+  } catch (err) {
+    console.error('[POST /api/document] saveDocument failed:', err);
+    return new Response('Internal server error', { status: 500 });
+  }
 
   return Response.json(document, { status: 200 });
 }

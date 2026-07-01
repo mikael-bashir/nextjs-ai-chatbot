@@ -8,7 +8,7 @@ export async function POST(req: Request) {
     const session = await auth();
 
     // 2. Gatekeeper: Are they actually logged in?
-    if (!session?.user?.id || !session?.user?.email) {
+    if (!session?.user?.id) {
       return NextResponse.json(
         { error: 'Unauthorized: Valid session required' },
         { status: 401 }
@@ -23,10 +23,10 @@ export async function POST(req: Request) {
       );
     }
 
-    // 4. Create the Postgres Row
+    // 4. Create the Postgres Row (email may be null if the provider didn't supply one)
     await provisionLeakUser({
       id: session.user.id,
-      email: session.user.email,
+      email: session.user.email ?? null,
     });
 
     // 5. Return success so the frontend knows it's safe to call update()

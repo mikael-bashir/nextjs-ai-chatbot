@@ -1,6 +1,7 @@
 import { Toaster } from 'sonner';
 import type { Metadata } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
+import { Suspense } from 'react';
 import { ThemeProvider } from '@/components/theme-provider';
 import { GlobalProvisioningListener } from '@/components/global-provisioning-listener';
 import { AppSessionProvider } from '@/components/session-provider';
@@ -81,23 +82,13 @@ export default async function RootLayout({
           >
             <Toaster position="top-center" />
 
-            <GlobalProvisioningListener />
-            
+            <Suspense>
+              <GlobalProvisioningListener />
+            </Suspense>
+
             {children}
           </ThemeProvider>
         </AppSessionProvider>
-        {/* <ThemeProvider
-          attribute="class"
-          defaultTheme="system"
-          enableSystem
-          disableTransitionOnChange
-        >
-          <Toaster position="top-center" />
-
-          <GlobalProvisioningListener />
-
-          {children}
-        </ThemeProvider> */}
       </body>
     </html>
   );

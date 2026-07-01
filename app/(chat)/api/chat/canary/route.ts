@@ -1,9 +1,14 @@
 import { auth } from "@/app/(auth)/auth"
-import { deleteChatById, getChatById, saveChat, saveMessages } from "@/lib/db/queries"
+import { getChatById, saveChat, saveMessages, deductCredits, getOrCreateCreditBalance } from "@/lib/db/queries"
 import { generateUUID, getMostRecentUserMessage } from "@/lib/utils"
 import { generateTitleFromUserMessage } from "@/app/(chat)/actions"
+import { checkRateLimit } from "@/lib/ratelimit"
+import { calculateCreditCost, seedPricingIfEmpty } from "@/lib/pricing"
+import { isPaidModel } from "@/lib/ai/models"
 
 export const maxDuration = 1000000000
+
+const PYTHON_BACKEND = process.env.PYTHON_BACKEND_URL ?? 'http://localhost:5328'
 
 interface UIMessage {
   id: string
@@ -30,20 +35,27 @@ function toCoreMessages(messages: Array<UIMessage>) {
     })
 }
 
-// 1. Return the raw fetch Response so we can tap into its stream
-async function callAgentBackend(messages: Array<UIMessage>, model: string, id: string) {
-  const response = await fetch("http://localhost:5328/api/chat/agent", {
+async function callAgentBackend(
+  messages: Array<UIMessage>,
+  model: string,
+  id: string,
+  userId: string,
+  signal: AbortSignal,
+) {
+  const response = await fetch(`${PYTHON_BACKEND}/api/chat/agent`, {
     method: "POST",
+    signal, // propagate client disconnect → kills Python task immediately
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       id,
+      user_id: userId,
       messages: toCoreMessages(messages),
-      model: model 
-    })
+      model,
+    }),
   })
 
   if (!response.ok) throw new Error(`Agent backend error: ${response.status}`)
-  return response 
+  return response
 }
 
 export async function POST(request: Request) {
@@ -53,6 +65,28 @@ export async function POST(request: Request) {
 
     if (!session?.user?.id) return new Response("Unauthorized", { status: 401 })
 
+    const userId = session.user.id
+    const paid = isPaidModel(selectedChatModel)
+
+    // --- Credit / rate-limit guard ---
+    if (paid) {
+      const balance = await getOrCreateCreditBalance({ userId })
+      if (balance < 0.5) {
+        return Response.json(
+          { error: "Insufficient credits", required: 0.5, balance },
+          { status: 402 },
+        )
+      }
+    } else {
+      const rateLimit = await checkRateLimit({ userId })
+      if (!rateLimit.allowed) {
+        return Response.json(
+          { error: "Rate limit exceeded", resetAt: rateLimit.resetAt },
+          { status: 429 },
+        )
+      }
+    }
+
     const userMessage = getMostRecentUserMessage(messages)
     if (!userMessage) return new Response("No user message found", { status: 400 })
 
@@ -60,8 +94,8 @@ export async function POST(request: Request) {
 
     if (!chat) {
       const title = await generateTitleFromUserMessage({ message: userMessage })
-      await saveChat({ id, userId: session.user.id, title })
-    } else if (chat.userId !== session.user.id) {
+      await saveChat({ id, userId, title })
+    } else if (chat.userId !== userId) {
       return new Response("Forbidden", { status: 403 })
     }
 
@@ -76,21 +110,30 @@ export async function POST(request: Request) {
       }],
     })
 
+    if (paid) seedPricingIfEmpty().catch(() => {})
+
     try {
-      // Fetch the live stream from Python
-      const agentResponse = await callAgentBackend(messages, selectedChatModel, id)
+      const agentResponse = await callAgentBackend(
+        messages,
+        selectedChatModel,
+        id,
+        userId,
+        request.signal, // tied to client connection
+      )
       const assistantMessageId = generateUUID()
-      
+
       const encoder = new TextEncoder()
       const decoder = new TextDecoder()
 
-      let streamFinishedGracefully = false;
+      let streamFinishedGracefully = false
 
-      // 2. Build a proxy stream that translates Python SSE into Vercel AI SDK SSE
       const stream = new ReadableStream({
         async start(controller) {
-          // Lock in the message ID on the frontend
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message-annotation", messageIdFromServer: assistantMessageId })}\n\n`))
+          controller.enqueue(
+            encoder.encode(
+              `data: ${JSON.stringify({ type: "message-annotation", messageIdFromServer: assistantMessageId })}\n\n`,
+            ),
+          )
 
           const reader = agentResponse.body?.getReader()
           if (!reader) {
@@ -98,74 +141,96 @@ export async function POST(request: Request) {
             return
           }
 
+          // When the client disconnects, cancel the Python reader immediately.
+          // The Python task is already being killed via the fetch signal above, but
+          // cancelling the reader also unblocks any pending reader.read() awaits.
+          const abortHandler = () => {
+            reader.cancel().catch(() => {})
+          }
+          request.signal.addEventListener("abort", abortHandler, { once: true })
+
           let buffer = ""
           let finalContent = ""
+          let usageTokens: { tokensInput: number; tokensOutput: number; model: string } | null = null
 
           try {
             while (true) {
               const { done, value } = await reader.read()
               if (done) break
 
-              // Decode the chunk and add to our buffer
               buffer += decoder.decode(value, { stream: true })
               const parts = buffer.split("\n\n")
-              
-              // Keep the last part in the buffer, as it might be an incomplete JSON string
               buffer = parts.pop() || ""
 
               for (const event of parts) {
-                console.log(`🚨 [NEXT PROXY] Raw event from Python:`, event.substring(0, 100))
                 if (event.startsWith("data: ")) {
                   try {
                     const data = JSON.parse(event.replace("data: ", ""))
 
-                    // If it's a thought/metric, send it as a message annotation!
                     if (["status", "tool_intent", "tool_result"].includes(data.type)) {
-                      const annotation = {
-                        type: "message-annotation",
-                        thought: data.message,
-                        metrics: data.metrics
-                      }
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify(annotation)}\n\n`))
+                      controller.enqueue(
+                        encoder.encode(
+                          `data: ${JSON.stringify({ type: "message-annotation", thought: data.message, metrics: data.metrics })}\n\n`,
+                        ),
+                      )
                     }
 
                     if (data.type === "text-delta") {
-                      finalContent = data.content // Keep track so we can save to DB at the end
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: data.content })}\n\n`))
+                      finalContent = data.content
+                      controller.enqueue(
+                        encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: data.content })}\n\n`),
+                      )
                     }
-                    
-                    // If it's text, pipe it as a delta
+
                     if (data.type === "text_response") {
                       finalContent = data.text
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: finalContent })}\n\n`))
+                      controller.enqueue(
+                        encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: finalContent })}\n\n`),
+                      )
                     }
 
                     if (data.type === "error") {
                       finalContent += `\n\n❌ **Backend Error:** ${data.message}`
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: finalContent })}\n\n`))
+                      controller.enqueue(
+                        encoder.encode(`data: ${JSON.stringify({ type: "text-delta", content: finalContent })}\n\n`),
+                      )
+                    }
+
+                    // Intercept token usage for credit deduction
+                    if (data.type === "usage" && data.data) {
+                      try {
+                        usageTokens = JSON.parse(data.data)
+                      } catch {}
                     }
 
                     if (data.type === "done") {
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "finish", content: "" })}\n\n`))
-                      streamFinishedGracefully = true;
+                      controller.enqueue(
+                        encoder.encode(`data: ${JSON.stringify({ type: "finish", content: "" })}\n\n`),
+                      )
+                      streamFinishedGracefully = true
                     }
-                  } catch (e) {
-                    // Silently ignore incomplete JSON parses from mangled chunks
+                  } catch (_e) {
+                    // Silently ignore incomplete JSON
                   }
                 } else if (event.startsWith(":")) {
-                  // Forward the invisible keep-alive comment!
                   controller.enqueue(encoder.encode(`${event}\n\n`))
                 }
               }
             }
+          } catch (err: any) {
+            // AbortError = client disconnected; anything else is unexpected
+            if (err?.name !== "AbortError") {
+              console.error("[canary] reader error:", err)
+            }
           } finally {
-            console.log(`🚨 [NEXT PROXY] Stream closed. Final content length: ${finalContent.length}`)
+            request.signal.removeEventListener("abort", abortHandler)
 
             if (!streamFinishedGracefully) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "finish", content: "" })}\n\n`))
+              try { controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "finish", content: "" })}\n\n`)) } catch {}
             }
-            // 3. Once the stream completely finishes, save the final text to the database
-            if (finalContent) {
+
+            // Save assistant message only on graceful completion
+            if (streamFinishedGracefully && finalContent) {
               saveMessages({
                 messages: [{
                   id: assistantMessageId,
@@ -176,24 +241,51 @@ export async function POST(request: Request) {
                   createdAt: new Date(),
                 }],
               }).catch((error) => console.error("Failed to save message:", error))
+
+              // Deduct credits only for paid models and only on graceful completion
+              if (paid && usageTokens) {
+                const { tokensInput, tokensOutput, model: resolvedModel } = usageTokens
+                if (tokensInput > 0 || tokensOutput > 0) {
+                  calculateCreditCost({ modelId: resolvedModel, tokensInput, tokensOutput })
+                    .then(({ credits, rawCostGbp, markupFactor }) => {
+                      if (credits <= 0) return
+                      return deductCredits({
+                        userId,
+                        amount: credits,
+                        description: `${resolvedModel} — ${tokensInput} in / ${tokensOutput} out tokens`,
+                        tokensInput,
+                        tokensOutput,
+                        modelId: resolvedModel,
+                        rawCostGbp,
+                        markupFactor,
+                      })
+                    })
+                    .catch((err) => console.error("[canary] Failed to deduct credits:", err))
+                }
+              }
+            } else if (!streamFinishedGracefully) {
+              console.log(`[canary] Stream aborted for chat ${id} — no credits deducted`)
             }
-            console.log(`🚨 [NEXT PROXY] messages saved, controller closing!`)
-            controller.close()
+
+            try { controller.close() } catch {}
           }
-        }
+        },
       })
 
-      // Return the proxy stream immediately. No more timeouts!
       return new Response(stream, {
         headers: {
           "Content-Type": "text/event-stream",
           "Cache-Control": "no-cache",
           Connection: "keep-alive",
-          "X-Accel-Buffering": "no"
+          "X-Accel-Buffering": "no",
         },
       })
-      
-    } catch (error) {
+
+    } catch (error: any) {
+      if (error?.name === "AbortError") {
+        // Client disconnected before we even got a response from Python — that's fine
+        return new Response(null, { status: 499 })
+      }
       console.error("Agent error:", error)
       return new Response("Error with Agent orchestration", { status: 500 })
     }

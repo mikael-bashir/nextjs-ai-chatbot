@@ -72,7 +72,18 @@ export function ModelSelector({
                 className="gap-4 group/item flex flex-row justify-between items-center w-full"
               >
                 <div className="flex flex-col gap-1 items-start">
-                  <div>{chatModel.name}</div>
+                  <div className="flex items-center gap-2">
+                    {chatModel.name}
+                    {chatModel.paid ? (
+                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400">
+                        Credits
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-medium px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400">
+                        Free
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-muted-foreground">
                     {chatModel.description}
                   </div>

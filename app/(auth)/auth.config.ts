@@ -1,7 +1,38 @@
 import type { NextAuthConfig } from 'next-auth';
+import type { NextRequest } from 'next/server';
 
 const useSecureCookies = process.env.NODE_ENV === 'production';
 const cookiePrefix = useSecureCookies ? '__Secure-' : '';
+
+// Resolve the true public-facing origin even when running behind a reverse proxy
+// inside a Docker container (where nextUrl.origin may be an internal service name).
+//
+// Priority:
+//  1. X-Forwarded-Host + X-Forwarded-Proto — set by Caddy/nginx per-request;
+//     dynamically correct for every subdomain including previews, no env needed.
+//  2. AUTH_URL env var — set explicitly at deploy time; reliable fallback.
+//  3. nextUrl.origin — may be an internal address (e.g. http://nextjs-frontend:3000)
+//     so only used as a last resort.
+function resolvePublicOrigin(request: NextRequest): string {
+  const fwdHost = request.headers.get('x-forwarded-host');
+  if (fwdHost) {
+    // x-forwarded-proto can be comma-separated when chained through multiple proxies
+    const proto = (request.headers.get('x-forwarded-proto') ?? 'https')
+      .split(',')[0]
+      .trim();
+    return `${proto}://${fwdHost}`;
+  }
+
+  if (process.env.AUTH_URL) {
+    try {
+      return new URL(process.env.AUTH_URL).origin;
+    } catch {
+      // malformed AUTH_URL — fall through
+    }
+  }
+
+  return request.nextUrl.origin;
+}
 
 export const authConfig = {
   pages: {
@@ -16,65 +47,55 @@ export const authConfig = {
         sameSite: 'lax',
         path: '/',
         secure: useSecureCookies,
+        // Wildcard domain covers leak.competemath.com and all preview subdomains
         domain: useSecureCookies ? '.competemath.com' : 'localhost',
       },
     },
   },
-  providers: [
-    // added later in auth.ts since it requires bcrypt which is only compatible with Node.js
-    // while this file is also used in non-Node.js environments
-  ],
+  providers: [],
   callbacks: {
-    authorized({ auth, request: { nextUrl } }) {
+    authorized({ auth, request }) {
       const isLoggedIn = !!auth?.user;
-
       const hasAccount = auth?.user?.hasLeakAccount;
-      
-      // let anyone hit this endpoint
-      const isApiAuthRoute = nextUrl.pathname.startsWith('/api/auth');
-      if (isApiAuthRoute) {
+      const { nextUrl } = request;
+
+      if (nextUrl.pathname.startsWith('/api/auth')) return true;
+
+      // Stripe webhooks are signature-verified inside the handler
+      if (nextUrl.pathname.startsWith('/api/webhooks')) return true;
+
+      if (nextUrl.pathname.startsWith('/api')) {
+        if (!isLoggedIn) return Response.json({ errorCode: 'AUTH_401' }, { status: 401 });
+        if (!hasAccount) return Response.json({ errorCode: 'AUTH_403_MODAL' }, { status: 403 });
         return true;
       }
 
-      // block all other api requests
-      const isApiRoute = nextUrl.pathname.startsWith('/api');
-      if (isApiRoute) {
-        if (!isLoggedIn) {
-          return Response.json({ errorCode: "AUTH_401" }, { status: 401 });
-        }
-        if (!hasAccount) {
-          return Response.json({ errorCode: "AUTH_403_MODAL" }, { status: 403 });
-        }
-        return true;
+      // Public routes — allow unauthenticated access for SEO
+      if (nextUrl.pathname === '/') return true;
+
+      if (!isLoggedIn) {
+        const loginBase = process.env.NODE_ENV === 'production'
+          ? 'https://competemath.com/auth/login'
+          : 'http://localhost:3001/auth/login';
+
+        const publicOrigin = resolvePublicOrigin(request);
+        const loginUrl = new URL(loginBase);
+        loginUrl.searchParams.set('callbackUrl', publicOrigin + nextUrl.pathname + nextUrl.search);
+        return Response.redirect(loginUrl);
       }
 
-      // If they are not logged in, redirect to the main site
-      
-      // if (!isLoggedIn) {
-      //   // Automatically switch between local testing and production
-      //   const mainSiteUrl = process.env.NODE_ENV === 'production' 
-      //     ? 'https://competemath.com/auth/login'
-      //     : 'http://localhost:3001/auth/login';
-
-      //   const loginUrl = new URL(mainSiteUrl);
-        
-      //   // // Attach the exact page they were trying to visit on 'leak'
-      //   // loginUrl.searchParams.set("callbackUrl", nextUrl.href);
-
-      //   const leakDomain = useSecureCookies ? process.env.AUTH_URL : 'http://localhost:3000';
-      //   const intendedPath = nextUrl.pathname + nextUrl.search; // e.g., "/chat/123"
-        
-      //   loginUrl.searchParams.set("callbackUrl", `${leakDomain}${intendedPath}`);
-
-      //   return Response.redirect(loginUrl);
-      // }
+      // Authenticated but not provisioned: inject ?modal=true so GlobalProvisioningListener
+      // shows the provisioning modal on whatever page they landed on — no per-page boilerplate needed.
+      if (!hasAccount && nextUrl.searchParams.get('modal') !== 'true') {
+        const url = nextUrl.clone();
+        url.searchParams.set('modal', 'true');
+        return Response.redirect(url);
+      }
 
       return true;
     },
-    
+
     async session({ session, token }) {
-      console.log(`🚨 [NextAuth SESSION] Minting session object. Token hasLeakAccount: ${token.hasLeakAccount}`);
-      
       if (session.user) {
         session.user.id = token.id as string;
         session.user.name = token.name as string;
@@ -82,7 +103,6 @@ export const authConfig = {
         session.user.image = token.image as string;
         session.user.hasLeakAccount = token.hasLeakAccount as boolean;
       }
-
       return session;
     },
   },

@@ -8,9 +8,8 @@ import { Switch } from "@/components/ui/switch"
 import { TrashIcon } from "./icons"
 import { toast } from "sonner"
 import type { MCPServer } from "@/lib/types/mcp"
-import { type MCPTool } from "@/lib/services/mcp-flask-service"
+import type { MCPTool } from "@/lib/services/mcp-flask-service"
 import { useMcpService } from "@/lib/services/mcp-flask-service"
-import { except } from "drizzle-orm/mysql-core"
 import { useApiClient } from "@/lib/hooks/useApiClient"
 import { useSession } from "next-auth/react"
 
@@ -65,7 +64,7 @@ export function MCPServerList({ refreshTrigger }: MCPServerListProps) {
       const enhancedServers = await Promise.all(
         dbServers.map(async (server: MCPServer) => {
           const normalizeUrl = (url: string) => url.replace(/\/$/, "")
-          let flaskServer = flaskServers.find((fs: any) => normalizeUrl(fs.url) === normalizeUrl(server.url))
+          const flaskServer = flaskServers.find((fs: any) => normalizeUrl(fs.url) === normalizeUrl(server.url))
 
           let isConnected = false
           let tools: MCPTool[] = []

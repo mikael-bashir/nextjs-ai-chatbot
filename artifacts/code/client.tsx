@@ -12,8 +12,8 @@ import { toast } from 'sonner';
 import { generateUUID } from '@/lib/utils';
 import {
   Console,
-  ConsoleOutput,
-  ConsoleOutputContent,
+  type ConsoleOutput,
+  type ConsoleOutputContent,
 } from '@/components/console';
 
 const OUTPUT_HANDLERS = {
@@ -251,8 +251,10 @@ export const codeArtifact = new Artifact<'code', Metadata>({
       description: 'Add comments',
       onClick: ({ appendMessage }) => {
         appendMessage({
+          id: generateUUID(),
           role: 'user',
           content: 'Add comments to the code snippet for understanding',
+          parts: [{ type: 'text', text: 'Add comments to the code snippet for understanding' }],
         });
       },
     },
@@ -261,8 +263,10 @@ export const codeArtifact = new Artifact<'code', Metadata>({
       description: 'Add logs',
       onClick: ({ appendMessage }) => {
         appendMessage({
+          id: generateUUID(),
           role: 'user',
           content: 'Add logs to the code snippet for debugging',
+          parts: [{ type: 'text', text: 'Add logs to the code snippet for debugging' }],
         });
       },
     },

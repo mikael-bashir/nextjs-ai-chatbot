@@ -1,4 +1,4 @@
-import { cookies } from 'next/headers';
+import { cookies, headers } from 'next/headers';
 import { Suspense } from 'react';
 import Script from 'next/script';
 
@@ -6,16 +6,32 @@ import { AppSidebar } from '@/components/app-sidebar';
 import { SidebarInset, SidebarProvider } from '@/components/ui/sidebar';
 import { auth } from '../(auth)/auth';
 
-// export const experimental_ppr = true;
+// Mirrors resolvePublicOrigin from auth.config.ts
+async function getPublicOrigin(): Promise<string> {
+  const hdrs = await headers();
+  const fwdHost = hdrs.get('x-forwarded-host');
+  if (fwdHost) {
+    const proto = (hdrs.get('x-forwarded-proto') ?? 'https').split(',')[0].trim();
+    return `${proto}://${fwdHost}`;
+  }
+  if (process.env.AUTH_URL) {
+    try { return new URL(process.env.AUTH_URL).origin; } catch {}
+  }
+  return 'http://localhost:3000';
+}
 
 // 1. Extract the dynamic fetching into its own internal async component
 async function ChatLayoutContent({ children }: { children: React.ReactNode }) {
-  const [session, cookieStore] = await Promise.all([auth(), cookies()]);
+  const [session, cookieStore, publicOrigin] = await Promise.all([
+    auth(),
+    cookies(),
+    getPublicOrigin(),
+  ]);
   const isCollapsed = cookieStore.get('sidebar:state')?.value !== 'true';
 
   return (
     <SidebarProvider defaultOpen={!isCollapsed}>
-      <AppSidebar user={session?.user} />
+      <AppSidebar user={session?.user} publicOrigin={publicOrigin} />
       <SidebarInset>{children}</SidebarInset>
     </SidebarProvider>
   );

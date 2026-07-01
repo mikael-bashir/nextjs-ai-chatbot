@@ -9,6 +9,7 @@ import {
   gte,
   inArray,
   lt,
+  ne,
   type SQL,
 } from 'drizzle-orm';
 
@@ -30,10 +31,16 @@ import {
   vote,
   type DBMessage,
   type Chat,
+  userCredits,
+  creditTransactions,
+  type UserCredits,
+  type CreditTransaction,
+  stripeCustomers,
+  stripeSubscriptions,
+  type StripeSubscription,
 } from './schema';
 
 import type { ArtifactKind } from '@/components/artifact';
-import { generateHashedPassword } from './utils';
 
 if (!process.env.POSTGRES_URL) {
   throw new Error('POSTGRES_URL environment variable is not set.');
@@ -46,6 +53,10 @@ const schema = {
   suggestion,
   message,
   vote,
+  userCredits,
+  creditTransactions,
+  stripeCustomers,
+  stripeSubscriptions,
 }
 
 const db = drizzle(sql, { schema });
@@ -107,18 +118,12 @@ export async function provisionLeakUser({
   email,
 }: {
   id: string;
-  email: string;
+  email: string | null;
 }) {
   try {
-    // onConflictDoNothing prevents 500 errors if a user accidentally 
-    // double-clicks the "Complete Setup" button in the modal.
     return await db.insert(user)
-      .values({
-        id,
-        email,
-        // Add any other default fields your schema requires here (e.g., createdAt: new Date())
-      })
-      .onConflictDoNothing({ target: user.id }); 
+      .values({ id, email })
+      .onConflictDoNothing({ target: user.id });
   } catch (error) {
     console.error('Failed to provision user in database', error);
     throw error;
@@ -466,5 +471,366 @@ export async function updateChatVisiblityById({
   } catch (error) {
     console.error('Failed to update chat visibility in database');
     throw error;
+  }
+}
+
+export async function getCreditBalance({
+  userId,
+}: {
+  userId: string;
+}): Promise<UserCredits | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(userCredits)
+      .where(eq(userCredits.userId, userId));
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get credit balance from database');
+    throw error;
+  }
+}
+
+export async function getOrCreateCreditBalance({
+  userId,
+}: {
+  userId: string;
+}): Promise<number> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select()
+        .from(userCredits)
+        .where(eq(userCredits.userId, userId));
+
+      if (existing) return existing.balance;
+
+      await tx.insert(userCredits).values({
+        userId,
+        balance: 0,
+        updatedAt: new Date(),
+      });
+
+      return 0;
+    });
+  } catch (error) {
+    console.error('Failed to get or create credit balance in database');
+    throw error;
+  }
+}
+
+export async function getEarliestCreditTransaction({
+  userId,
+}: {
+  userId: string;
+}): Promise<CreditTransaction | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(creditTransactions)
+      .where(eq(creditTransactions.userId, userId))
+      .orderBy(asc(creditTransactions.createdAt))
+      .limit(1);
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get earliest credit transaction from database');
+    throw error;
+  }
+}
+
+export async function getCreditTransactions({
+  userId,
+  limit,
+  offset,
+}: {
+  userId: string;
+  limit: number;
+  offset: number;
+}): Promise<Array<CreditTransaction>> {
+  try {
+    return await db
+      .select()
+      .from(creditTransactions)
+      .where(eq(creditTransactions.userId, userId))
+      .orderBy(desc(creditTransactions.createdAt))
+      .limit(limit)
+      .offset(offset);
+  } catch (error) {
+    console.error('Failed to get credit transactions from database');
+    throw error;
+  }
+}
+
+export async function addCredits({
+  userId,
+  amount,
+  description,
+  type = 'grant',
+}: {
+  userId: string;
+  amount: number;
+  description: string;
+  type?: 'purchase' | 'grant';
+}): Promise<number> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [existing] = await tx
+        .select({ balance: userCredits.balance })
+        .from(userCredits)
+        .where(eq(userCredits.userId, userId));
+
+      let newBalance: number;
+
+      if (existing) {
+        newBalance = existing.balance + amount;
+        await tx
+          .update(userCredits)
+          .set({ balance: newBalance, updatedAt: new Date() })
+          .where(eq(userCredits.userId, userId));
+      } else {
+        newBalance = amount;
+        await tx.insert(userCredits).values({
+          userId,
+          balance: newBalance,
+          updatedAt: new Date(),
+        });
+      }
+
+      await tx.insert(creditTransactions).values({
+        userId,
+        amount,
+        type,
+        description,
+        createdAt: new Date(),
+      });
+
+      return newBalance;
+    });
+  } catch (error) {
+    console.error('Failed to add credits in database');
+    throw error;
+  }
+}
+
+export async function deductCredits({
+  userId,
+  amount,
+  description,
+  tokensInput,
+  tokensOutput,
+  modelId,
+  rawCostGbp,
+  markupFactor,
+}: {
+  userId: string;
+  amount: number;
+  description: string;
+  tokensInput?: number;
+  tokensOutput?: number;
+  modelId?: string;
+  rawCostGbp?: number;
+  markupFactor?: number;
+}): Promise<number> {
+  try {
+    return await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select({ balance: userCredits.balance })
+        .from(userCredits)
+        .where(eq(userCredits.userId, userId));
+
+      if (!current) throw new Error('Credit account not found');
+      if (current.balance < amount) throw new Error('Insufficient credits');
+
+      const newBalance = current.balance - amount;
+
+      await tx
+        .update(userCredits)
+        .set({ balance: newBalance, updatedAt: new Date() })
+        .where(eq(userCredits.userId, userId));
+
+      await tx.insert(creditTransactions).values({
+        userId,
+        amount: -amount,
+        type: 'usage',
+        description,
+        createdAt: new Date(),
+        tokensInput,
+        tokensOutput,
+        modelId,
+        rawCostGbp,
+        markupFactor,
+      });
+
+      return newBalance;
+    });
+  } catch (error) {
+    console.error('Failed to deduct credits in database');
+    throw error;
+  }
+}
+
+export async function getStripeCustomerId({
+  userId,
+}: {
+  userId: string;
+}): Promise<string | null> {
+  try {
+    const [row] = await db
+      .select({ stripeCustomerId: stripeCustomers.stripeCustomerId })
+      .from(stripeCustomers)
+      .where(eq(stripeCustomers.userId, userId));
+    return row?.stripeCustomerId ?? null;
+  } catch (error) {
+    console.error('Failed to get Stripe customer ID from database');
+    throw error;
+  }
+}
+
+export async function saveStripeCustomer({
+  userId,
+  stripeCustomerId,
+}: {
+  userId: string;
+  stripeCustomerId: string;
+}): Promise<void> {
+  try {
+    await db
+      .insert(stripeCustomers)
+      .values({ userId, stripeCustomerId, createdAt: new Date() })
+      .onConflictDoNothing({ target: stripeCustomers.userId });
+  } catch (error) {
+    console.error('Failed to save Stripe customer in database');
+    throw error;
+  }
+}
+
+export async function getActiveSubscription({
+  userId,
+}: {
+  userId: string;
+}): Promise<StripeSubscription | null> {
+  try {
+    const [row] = await db
+      .select()
+      .from(stripeSubscriptions)
+      .where(
+        and(
+          eq(stripeSubscriptions.userId, userId),
+          eq(stripeSubscriptions.status, 'active'),
+        ),
+      )
+      .orderBy(desc(stripeSubscriptions.createdAt))
+      .limit(1);
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get active subscription from database');
+    throw error;
+  }
+}
+
+export async function saveOrUpdateSubscription({
+  userId,
+  stripeSubscriptionId,
+  planId,
+  status,
+  currentPeriodEnd,
+}: {
+  userId: string;
+  stripeSubscriptionId: string;
+  planId: string;
+  status: 'active' | 'cancelled' | 'past_due' | 'incomplete';
+  currentPeriodEnd: Date;
+}): Promise<void> {
+  try {
+    const [existing] = await db
+      .select({ id: stripeSubscriptions.id })
+      .from(stripeSubscriptions)
+      .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+
+    const now = new Date();
+    if (existing) {
+      await db
+        .update(stripeSubscriptions)
+        .set({ status, currentPeriodEnd, updatedAt: now })
+        .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+    } else {
+      await db.insert(stripeSubscriptions).values({
+        userId,
+        stripeSubscriptionId,
+        planId,
+        status,
+        currentPeriodEnd,
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  } catch (error) {
+    console.error('Failed to save or update subscription in database');
+    throw error;
+  }
+}
+
+export async function markSubscriptionCancelled({
+  stripeSubscriptionId,
+}: {
+  stripeSubscriptionId: string;
+}): Promise<void> {
+  try {
+    await db
+      .update(stripeSubscriptions)
+      .set({ status: 'cancelled', updatedAt: new Date() })
+      .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+  } catch (error) {
+    console.error('Failed to cancel subscription in database');
+    throw error;
+  }
+}
+
+export async function getUserById({ id }: { id: string }): Promise<User | null> {
+  try {
+    const [row] = await db.select().from(user).where(eq(user.id, id));
+    return row ?? null;
+  } catch (error) {
+    console.error('Failed to get user by ID from database');
+    throw error;
+  }
+}
+
+export type ProfileUpdateError = 'username_taken' | 'email_taken' | 'unknown';
+
+export async function updateUserProfile({
+  userId,
+  username,
+  email,
+}: {
+  userId: string;
+  username?: string;
+  email?: string;
+}): Promise<{ error?: ProfileUpdateError }> {
+  try {
+    if (username !== undefined) {
+      const clash = await db.query.user.findFirst({
+        where: and(eq(user.username, username), ne(user.id, userId)),
+      });
+      if (clash) return { error: 'username_taken' };
+    }
+    if (email !== undefined) {
+      const clash = await db.query.user.findFirst({
+        where: and(eq(user.email, email), ne(user.id, userId)),
+      });
+      if (clash) return { error: 'email_taken' };
+    }
+
+    const updates: Partial<typeof user.$inferInsert> = {};
+    if (username !== undefined) updates.username = username;
+    if (email !== undefined) updates.email = email;
+
+    if (Object.keys(updates).length > 0) {
+      await db.update(user).set(updates).where(eq(user.id, userId));
+    }
+    return {};
+  } catch (error) {
+    console.error('Failed to update user profile in database');
+    return { error: 'unknown' };
   }
 }
