@@ -1,0 +1,79 @@
+name: Preview Teardown
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  teardown:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Recompute the same deterministic subdomain as preview-deploy.yml
+      - name: Compute preview identity
+        id: preview
+        run: |
+          PR=${{ github.event.pull_request.number }}
+          HASH=$(printf '%s' "${{ github.repository }}-${PR}" | sha256sum | cut -c1-6)
+          echo "subdomain=pr-${PR}-${HASH}" >> "$GITHUB_OUTPUT"
+
+      - name: Tear down preview on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          SUBDOMAIN: ${{ steps.preview.outputs.subdomain }}
+        with:
+          host:     ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: SUBDOMAIN
+          script: |
+            set -euo pipefail
+
+            PREVIEW_DIR="/opt/previews/${SUBDOMAIN}"
+
+            if [ -d "$PREVIEW_DIR" ]; then
+              # Kill Stripe CLI listener first so it doesn't keep trying to connect
+              STRIPE_PID_FILE="$PREVIEW_DIR/stripe-listener.pid"
+              if [ -f "$STRIPE_PID_FILE" ]; then
+                kill "$(cat "$STRIPE_PID_FILE")" 2>/dev/null || true
+              fi
+
+              cd "$PREVIEW_DIR"
+              docker compose -p "preview-${SUBDOMAIN}" down --volumes --remove-orphans || true
+              cd /
+              rm -rf "$PREVIEW_DIR"
+            fi
+
+            CADDY_SITE="/etc/caddy/sites/${SUBDOMAIN}.caddy"
+            if [ -f "$CADDY_SITE" ]; then
+              sudo rm -f "$CADDY_SITE"
+              sudo systemctl reload caddy
+            fi
+
+            docker image prune -f
+
+      - name: Update PR comment
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(
+              c => c.user.login === 'github-actions[bot]' && c.body.includes('Preview deployed'),
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner:      context.repo.owner,
+                repo:       context.repo.repo,
+                comment_id: existing.id,
+                body: existing.body + '\n\n_Preview torn down — PR closed._',
+              });
+            }
