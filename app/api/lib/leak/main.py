@@ -56,7 +56,7 @@ async def select_node(state: State) -> tuple[dict, State]:
     )
 
 
-@action(reads=["messages", "tools", "model", "stream_queue", "chat_id"], writes=["messages"])
+@action(reads=["messages", "tools", "model", "stream_queue", "chat_id", "user_id"], writes=["messages"])
 async def chat_model(state: State) -> tuple[dict, State]:
     """Generates the next step in the conversation (Expansion)."""
     raw_messages = state["messages"]
@@ -64,6 +64,7 @@ async def chat_model(state: State) -> tuple[dict, State]:
     model = state["model"]
     stream_queue : asyncio.Queue = state["stream_queue"]
     chat_id = state["chat_id"]
+    user_id = state.get("user_id")
 
     # 🚨 Apply the Sliding Window Optimization
     # messages = optimize_context_window(raw_messages, chat_id)
@@ -113,6 +114,11 @@ async def chat_model(state: State) -> tuple[dict, State]:
                 "stream_options": {"include_usage": True},  # get token counts in final chunk
             }
             kwargs["tools"] = tools
+
+            # For the local-Claude provider, forward the user_id as the OpenAI
+            # `user` field so the relay can route to that user's own machine.
+            if model == "claude-local" and user_id:
+                kwargs["user"] = user_id
 
             response = await llm_router.acompletion(**kwargs)
 
@@ -490,8 +496,9 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                 messages=messages, 
                 tools=openai_tools, 
                 tool_router=tool_router, 
-                model=model, 
-                chat_id=chat_id, 
+                model=model,
+                chat_id=chat_id,
+                user_id=user_id,
                 stream_queue=stream_queue,
                 tree=initial_tree,
                 root_id=root_id,

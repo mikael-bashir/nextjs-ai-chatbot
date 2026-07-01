@@ -64,6 +64,17 @@ export const authConfig = {
       // middleware pattern, so it needs an explicit allow here.
       if (nextUrl.pathname === '/local-claude-bridge.mjs') return true;
 
+      // Local Agent relay data-plane: the bridge authenticates with a relay
+      // token, and the OpenAI endpoint is an internal backend call — neither
+      // carries a session cookie. They verify auth themselves.
+      if (
+        nextUrl.pathname === '/api/local-claude/agent' ||
+        nextUrl.pathname === '/api/local-claude/agent/result' ||
+        nextUrl.pathname === '/api/local-claude/v1/chat/completions'
+      ) {
+        return true;
+      }
+
       if (nextUrl.pathname.startsWith('/api/auth')) return true;
 
       // Stripe webhooks are signature-verified inside the handler

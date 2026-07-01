@@ -96,6 +96,8 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
   )
   const [origin, setOrigin] = useState("")
   const [copied, setCopied] = useState(false)
+  // Server-minted token that lets the bridge dial in as this user (relay mode).
+  const [relayToken, setRelayToken] = useState("")
 
   const [testing, setTesting] = useState(false)
   const [checks, setChecks] = useState<{
@@ -129,6 +131,14 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
     } catch {
       /* ignore malformed localStorage */
     }
+
+    // Mint a relay token so the bridge can also dial in for server-side runs.
+    fetch("/api/local-claude/relay-token")
+      .then((res) => (res.ok ? res.json() : null))
+      .then((data) => data?.token && setRelayToken(data.token))
+      .catch(() => {
+        /* relay is optional; ignore */
+      })
 
     setLoading(true)
     fetch("/api/local-claude/config")
@@ -170,9 +180,12 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
 
   // One-line command: downloads the bridge from this app and starts it with the
   // token already matched to this browser (no copy-back) and this origin allowed.
+  // Includes RELAY_URL/RELAY_TOKEN once the relay token has loaded, so the same
+  // command powers both the in-browser panel and server-side (relay) runs.
+  const relayEnv = relayToken ? ` RELAY_URL='${origin}' RELAY_TOKEN='${relayToken}'` : ""
   const setupCommand =
     origin && connection.token
-      ? `curl -fsSL '${origin}/local-claude-bridge.mjs' -o claude-bridge.mjs && BRIDGE_TOKEN='${connection.token}' ALLOWED_ORIGINS='${origin}' node claude-bridge.mjs`
+      ? `curl -fsSL '${origin}/local-claude-bridge.mjs' -o claude-bridge.mjs && BRIDGE_TOKEN='${connection.token}' ALLOWED_ORIGINS='${origin}'${relayEnv} node claude-bridge.mjs`
       : ""
 
   const copyCommand = async () => {

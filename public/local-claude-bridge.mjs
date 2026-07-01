@@ -257,3 +257,127 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log("  3. The token is a secret — anyone with it can drive your Claude.")
   console.log(line)
 })
+
+// ---------------------------------------------------------------------------
+// Relay client (optional). When RELAY_URL + RELAY_TOKEN are set, this bridge
+// also dials OUT to the app server and makes this machine available as an
+// on-demand LLM provider for the server-side search. Pure outbound HTTP/SSE —
+// nothing new is exposed on your network.
+// ---------------------------------------------------------------------------
+const RELAY_URL = (process.env.RELAY_URL || "").replace(/\/$/, "")
+const RELAY_TOKEN = process.env.RELAY_TOKEN || ""
+
+function firstToolArgKey(tool) {
+  const required = tool?.function?.parameters?.required
+  if (Array.isArray(required) && required.length) return required[0]
+  const props = tool?.function?.parameters?.properties
+  if (props && typeof props === "object") return Object.keys(props)[0] || "script"
+  return "script"
+}
+
+function messagesToPrompt(messages) {
+  return messages
+    .map((m) => {
+      const content = typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")
+      return `${String(m.role || "user").toUpperCase()}:\n${content}`
+    })
+    .join("\n\n")
+}
+
+function extractScript(text) {
+  const fence = text.match(/```(?:lean\w*)?\s*([\s\S]*?)```/i)
+  return (fence ? fence[1] : text).trim()
+}
+
+// Turn one OpenAI-style request into a Claude run, then an OpenAI-style result.
+// NOTE: the tool-call synthesis below is a first-cut adapter — it assumes a
+// single tool whose first argument takes the proposed script. Tune it to your
+// tree's exact tool schema.
+async function handleRelayRequest(payload) {
+  const messages = Array.isArray(payload?.messages) ? payload.messages : []
+  const tools = Array.isArray(payload?.tools) ? payload.tools : []
+
+  let prompt = messagesToPrompt(messages)
+  if (tools.length > 0) {
+    prompt +=
+      "\n\nRespond with ONLY the Lean 4 script for the next step, inside a ```lean code block. No prose."
+  }
+
+  const result = await runClaude(buildArgs(prompt, {}), { cwd: undefined, timeoutMs: 600000 })
+  if (!result.ok) return { error: result.stderr || "claude run failed" }
+
+  if (tools.length > 0) {
+    const tool = tools[0]
+    return {
+      response: {
+        content: "",
+        tool_calls: [
+          {
+            id: `call_${randomBytes(6).toString("hex")}`,
+            type: "function",
+            function: {
+              name: tool.function?.name || tool.name || "tool",
+              arguments: JSON.stringify({ [firstToolArgKey(tool)]: extractScript(result.text) }),
+            },
+          },
+        ],
+        finish_reason: "tool_calls",
+        usage: {},
+      },
+    }
+  }
+  return { response: { content: result.text, finish_reason: "stop", usage: {} } }
+}
+
+async function postResult(requestId, out) {
+  await fetch(`${RELAY_URL}/api/local-claude/agent/result`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-relay-token": RELAY_TOKEN },
+    body: JSON.stringify({ requestId, ...out }),
+  }).catch((e) => console.error("[relay] result POST failed:", e.message))
+}
+
+async function connectRelay() {
+  const url = `${RELAY_URL}/api/local-claude/agent?token=${encodeURIComponent(RELAY_TOKEN)}`
+  for (;;) {
+    try {
+      console.log(`[relay] connecting to ${RELAY_URL} ...`)
+      const res = await fetch(url, { headers: { accept: "text/event-stream" } })
+      if (!res.ok || !res.body) throw new Error(`relay responded ${res.status}`)
+      console.log("[relay] connected — this machine is available to the app.")
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ""
+      for (;;) {
+        const { value, done } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        let sep
+        while ((sep = buffer.indexOf("\n\n")) !== -1) {
+          const raw = buffer.slice(0, sep)
+          buffer = buffer.slice(sep + 2)
+          let event = ""
+          let data = ""
+          for (const l of raw.split("\n")) {
+            if (l.startsWith("event:")) event = l.slice(6).trim()
+            else if (l.startsWith("data:")) data = l.slice(5).trim()
+          }
+          if (event === "request" && data) {
+            const { requestId, payload } = JSON.parse(data)
+            handleRelayRequest(payload)
+              .then((out) => postResult(requestId, out))
+              .catch((e) => postResult(requestId, { error: e.message }))
+          }
+        }
+      }
+    } catch (e) {
+      console.error("[relay] disconnected:", e.message)
+    }
+    await new Promise((r) => setTimeout(r, 3000))
+  }
+}
+
+if (RELAY_URL && RELAY_TOKEN) {
+  connectRelay()
+}
