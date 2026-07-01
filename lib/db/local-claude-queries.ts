@@ -1,6 +1,6 @@
 import "server-only"
 
-import { eq } from "drizzle-orm"
+import { eq, sql as dsql } from "drizzle-orm"
 import { sql } from "@vercel/postgres"
 import { drizzle } from "drizzle-orm/vercel-postgres"
 import { localClaudeAgentConfig } from "./schema"
@@ -14,10 +14,42 @@ if (!process.env.POSTGRES_URL) {
 const schema = { localClaudeAgentConfig }
 const db = drizzle(sql, { schema })
 
+// This deployment builds with a dummy POSTGRES_URL and starts with `node
+// server.js` — it never runs `db:migrate`. Like the existing MCPServer table,
+// new tables are otherwise created only by a manual `db:push`. To keep this
+// feature self-contained, ensure the table exists on first use. Idempotent.
+let tableEnsured = false
+async function ensureTable(): Promise<void> {
+  if (tableEnsured) return
+  await db.execute(
+    dsql.raw(`
+      CREATE TABLE IF NOT EXISTS "LocalClaudeAgentConfig" (
+        "id" uuid PRIMARY KEY DEFAULT gen_random_uuid() NOT NULL,
+        "userId" uuid NOT NULL REFERENCES "User"("id"),
+        "binaryPath" varchar(1024) DEFAULT 'claude' NOT NULL,
+        "workingDirectory" text,
+        "model" varchar(128),
+        "permissionMode" varchar DEFAULT 'default' NOT NULL,
+        "allowedTools" text,
+        "maxTurns" integer,
+        "timeoutMs" integer DEFAULT 120000 NOT NULL,
+        "systemPromptAppend" text,
+        "extraArgs" json,
+        "enabled" boolean DEFAULT true NOT NULL,
+        "createdAt" timestamp NOT NULL,
+        "updatedAt" timestamp NOT NULL,
+        CONSTRAINT "LocalClaudeAgentConfig_userId_unique" UNIQUE("userId")
+      );
+    `),
+  )
+  tableEnsured = true
+}
+
 export async function getLocalClaudeConfig(
   userId: string,
 ): Promise<LocalClaudeAgentConfig | null> {
   try {
+    await ensureTable()
     const [config] = await db
       .select()
       .from(localClaudeAgentConfig)
@@ -52,6 +84,7 @@ export async function saveLocalClaudeConfig(
   }
 
   try {
+    await ensureTable()
     const [saved] = await db
       .insert(localClaudeAgentConfig)
       .values({ ...values, userId, createdAt: now })
