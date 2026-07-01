@@ -14,6 +14,7 @@ import { memo } from "react"
 import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip"
 import { type VisibilityType, VisibilitySelector } from "./visibility-selector"
 import { MCPServerManagement } from "./mcp-server-management"
+import { LocalClaudeAgentManagement } from "./local-claude-agent-management"
 
 function PureChatHeader({
   chatId,
@@ -65,6 +66,8 @@ function PureChatHeader({
       )}
 
       {!isReadonly && <MCPServerManagement className="order-1 md:order-4" />}
+
+      {!isReadonly && <LocalClaudeAgentManagement className="order-1 md:order-4" />}
 
       <Button
         className="bg-transparent dark:bg-zinc-100 hover:bg-gray-50 dark:hover:bg-zinc-200 text-zinc-50 dark:text-zinc-900 hidden md:flex py-1.5 px-2 h-fit md:h-[34px] order-5 md:ml-auto"
