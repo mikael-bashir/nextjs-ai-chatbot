@@ -5,56 +5,56 @@ on **your** machine, using **your** logged-in Claude Code (and therefore your
 own subscription). Your browser talks to this bridge directly at
 `http://localhost:4123` — prompts and results never touch the app's server.
 
+> The canonical script lives at [`public/local-claude-bridge.mjs`](../public/local-claude-bridge.mjs)
+> so the app can serve it for a one-command install. This folder is just docs.
+
+## Easiest: one command from the app
+
+Open **Local Agent → Configuration** in the app and copy the ready-made command.
+It downloads this script and starts it with a token already matched to your
+browser, so there's nothing to copy back. It looks like:
+
+```sh
+curl -fsSL 'https://<app-origin>/local-claude-bridge.mjs' -o claude-bridge.mjs \
+  && BRIDGE_TOKEN='<generated>' ALLOWED_ORIGINS='https://<app-origin>' node claude-bridge.mjs
+```
+
 ## Prerequisites
 
-1. **Install Claude Code** and verify it:
+1. **Install Claude Code** and log in with your subscription:
    ```sh
    npm install -g @anthropic-ai/claude-code
    claude --version
-   ```
-2. **Log in** with your subscription:
-   ```sh
    claude login
    ```
-3. **Node.js 18+** (for the bridge itself). No `npm install` needed — the bridge
-   uses only Node built-ins.
+2. **Node.js 18+** for the bridge. No `npm install` — it uses only Node built-ins.
 
-## Run the bridge
-
-```sh
-node bridge.mjs
-```
-
-On startup it prints a **URL** and a **Token**. Paste both into the app under
-**Local Agent → Configuration → Connection**. Keep the terminal open while you
-use the feature.
-
-### Options (environment variables)
+## Options (environment variables)
 
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `PORT` | `4123` | Port to listen on (loopback only). |
-| `BRIDGE_TOKEN` | random | Fixed token instead of a new one each start. |
+| `BRIDGE_TOKEN` | random | Fixed token instead of a new one each start. The app sets this for you. |
 | `CLAUDE_BIN` | `claude` | Path to the Claude Code binary. |
 | `ALLOWED_ORIGINS` | competemath origins | Comma-separated app origins allowed to call the bridge. |
 
-Example with a stable token and an explicit binary:
-```sh
-BRIDGE_TOKEN=my-long-secret CLAUDE_BIN="$(which claude)" node bridge.mjs
+Windows PowerShell download alternative:
+```powershell
+irm 'https://<app-origin>/local-claude-bridge.mjs' -OutFile claude-bridge.mjs
+$env:BRIDGE_TOKEN='<generated>'; $env:ALLOWED_ORIGINS='https://<app-origin>'; node claude-bridge.mjs
 ```
 
 ## Security
 
 - Binds to `127.0.0.1` only — not reachable from your network.
 - Every request requires the secret token (keep it private — anyone with it can
-  drive your Claude).
-- Only the specific app origins above are allowed (CORS), plus `localhost`.
-- Accepts only a fixed, validated set of run options. It will **not** run an
+  drive your Claude). This is why the token exists: without it, any website you
+  visit could call `http://localhost:4123` and run agents on your machine.
+- Only the specific app origins are allowed (CORS), plus `localhost`.
+- Accepts only a fixed, validated set of run options — it will **not** run an
   arbitrary binary or arbitrary CLI flags sent by the page.
 
 ## Browser compatibility
-
-The app is served over HTTPS and calls `http://localhost:4123`.
 
 - **Chrome / Edge / Firefox:** works. Chrome may show a one-time Private Network
   Access prompt — allow it.

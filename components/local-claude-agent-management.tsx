@@ -56,7 +56,17 @@ interface CheckState {
 // A failed fetch to http://localhost from an HTTPS page is opaque (TypeError),
 // so give the user the three likely causes rather than a bare "failed".
 function bridgeUnreachableMessage(bridgeUrl: string): string {
-  return `Couldn't reach the bridge at ${bridgeUrl}. Check that: (1) the bridge is running (node bridge.mjs), (2) the URL/port match, and (3) you're on Chrome, Edge, or Firefox — Safari blocks calls from HTTPS pages to http://localhost.`
+  return `Couldn't reach the bridge at ${bridgeUrl}. Check that: (1) the bridge is running (the command in the Configuration tab), (2) the URL/port match, and (3) you're on Chrome, Edge, or Firefox — Safari blocks calls from HTTPS pages to http://localhost.`
+}
+
+// Generate a URL-safe token in the browser. Setup needs no copy-back because
+// the app injects this same value into the run command shown to the user.
+function generateToken(): string {
+  const bytes = new Uint8Array(24)
+  crypto.getRandomValues(bytes)
+  let binary = ""
+  for (const b of bytes) binary += String.fromCharCode(b)
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
 }
 
 // Read run preferences (non-secret) and turn them into the bridge's run options.
@@ -84,6 +94,8 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
   const [connection, setConnection] = useState<LocalClaudeConnection>(
     DEFAULT_LOCAL_CLAUDE_CONNECTION,
   )
+  const [origin, setOrigin] = useState("")
+  const [copied, setCopied] = useState(false)
 
   const [testing, setTesting] = useState(false)
   const [checks, setChecks] = useState<{
@@ -96,13 +108,24 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState<LocalClaudeRunResult | null>(null)
 
+  // The app origin is baked into the setup command (download URL + allowed origin).
+  useEffect(() => {
+    if (typeof window !== "undefined") setOrigin(window.location.origin)
+  }, [])
+
   // Load server prefs + localStorage connection when the dialog opens.
   useEffect(() => {
     if (!open) return
 
     try {
       const raw = localStorage.getItem(CONNECTION_STORAGE_KEY)
-      if (raw) setConnection({ ...DEFAULT_LOCAL_CLAUDE_CONNECTION, ...JSON.parse(raw) })
+      const loaded: LocalClaudeConnection = raw
+        ? { ...DEFAULT_LOCAL_CLAUDE_CONNECTION, ...JSON.parse(raw) }
+        : { ...DEFAULT_LOCAL_CLAUDE_CONNECTION }
+      // Auto-generate a token on first use so the command is ready to copy.
+      if (!loaded.token) loaded.token = generateToken()
+      setConnection(loaded)
+      localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(loaded))
     } catch {
       /* ignore malformed localStorage */
     }
@@ -142,6 +165,24 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
       localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(next))
     } catch {
       /* ignore quota/availability errors */
+    }
+  }
+
+  // One-line command: downloads the bridge from this app and starts it with the
+  // token already matched to this browser (no copy-back) and this origin allowed.
+  const setupCommand =
+    origin && connection.token
+      ? `curl -fsSL '${origin}/local-claude-bridge.mjs' -o claude-bridge.mjs && BRIDGE_TOKEN='${connection.token}' ALLOWED_ORIGINS='${origin}' node claude-bridge.mjs`
+      : ""
+
+  const copyCommand = async () => {
+    if (!setupCommand) return
+    try {
+      await navigator.clipboard.writeText(setupCommand)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      toast.error("Copy failed — select the command and copy it manually.")
     }
   }
 
@@ -309,17 +350,10 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
                   </pre>
                 </li>
                 <li>
-                  <strong>Run the bridge</strong> (keep it open while you use this):
-                  <pre className="mt-1 overflow-x-auto rounded bg-muted p-2 text-xs">
-                    node bridge.mjs
-                  </pre>
-                  Get <code>bridge.mjs</code> from the app repo under{" "}
-                  <code>local-claude-bridge/</code>. It prints a <strong>URL</strong> and{" "}
-                  <strong>Token</strong>.
-                </li>
-                <li>
-                  <strong>Connect.</strong> Paste that URL and Token into{" "}
-                  <em>Configuration → Connection</em>. The token stays in this browser only.
+                  <strong>Start the bridge.</strong> Open the <em>Configuration</em> tab, copy the
+                  one-line command, and run it in a terminal. It downloads the bridge and starts it
+                  with a token already linked to this browser — nothing to paste back. Keep the
+                  terminal open while you use this.
                 </li>
                 <li>
                   <strong>Test.</strong> Open <em>Test &amp; Run → Test connection</em>.
@@ -345,6 +379,33 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
                     Stored in this browser only — never sent to our servers.
                   </p>
                 </div>
+
+                {/* One-command setup */}
+                <div className="space-y-1.5">
+                  <Label>1. Run this on your machine</Label>
+                  <div className="relative">
+                    <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded bg-muted p-2 pr-16 text-xs">
+                      {setupCommand || "Loading…"}
+                    </pre>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      className="absolute right-1.5 top-1.5 h-6 px-2 text-xs"
+                      onClick={copyCommand}
+                      disabled={!setupCommand}
+                    >
+                      {copied ? "Copied" : "Copy"}
+                    </Button>
+                  </div>
+                  <p className="text-xs text-muted-foreground">
+                    Requires Claude Code installed and logged in (<code>claude login</code>). This
+                    downloads the bridge and starts it with a token already matched to this browser
+                    — nothing to copy back. Keep that terminal open.
+                  </p>
+                </div>
+
+                {/* Advanced / manual overrides */}
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
                     <Label htmlFor="lca-url">Bridge URL</Label>
@@ -356,16 +417,28 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
                     />
                   </div>
                   <div className="space-y-1.5">
-                    <Label htmlFor="lca-token">Bridge token</Label>
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="lca-token">Bridge token</Label>
+                      <button
+                        type="button"
+                        className="text-xs text-muted-foreground underline"
+                        onClick={() => persistConnection({ ...connection, token: generateToken() })}
+                      >
+                        Regenerate
+                      </button>
+                    </div>
                     <Input
                       id="lca-token"
                       type="password"
                       value={connection.token}
-                      placeholder="printed when you run the bridge"
+                      placeholder="auto-generated"
                       onChange={(e) => persistConnection({ ...connection, token: e.target.value })}
                     />
                   </div>
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Regenerating the token means re-running the command above with the new value.
+                </p>
               </div>
 
               <Separator />
