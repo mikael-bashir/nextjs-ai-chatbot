@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import { useCallback, useEffect, useState } from "react"
 import { toast } from "sonner"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -27,47 +27,86 @@ import {
 import { cn } from "@/lib/utils"
 import {
   DEFAULT_LOCAL_CLAUDE_CONFIG,
+  DEFAULT_LOCAL_CLAUDE_CONNECTION,
+  type BridgeHealth,
   type LocalClaudeConfigInput,
+  type LocalClaudeConnection,
   type LocalClaudePermissionMode,
   type LocalClaudeRunResult,
-  type LocalClaudeTestResult,
 } from "@/lib/types/local-claude"
 
 interface LocalClaudeAgentManagementProps {
   className?: string
 }
 
-const PERMISSION_MODE_OPTIONS: {
-  value: LocalClaudePermissionMode
-  label: string
-}[] = [
+const CONNECTION_STORAGE_KEY = "lca.connection"
+
+const PERMISSION_MODE_OPTIONS: { value: LocalClaudePermissionMode; label: string }[] = [
   { value: "default", label: "default — prompt on sensitive actions" },
   { value: "acceptEdits", label: "acceptEdits — auto-accept file edits" },
   { value: "plan", label: "plan — read-only planning, no changes" },
   { value: "bypassPermissions", label: "bypassPermissions — allow everything" },
 ]
 
-// The extraArgs field is edited as a single string; split on whitespace.
-function parseExtraArgs(value: string): string[] {
-  return value.trim().length > 0 ? value.trim().split(/\s+/) : []
+interface CheckState {
+  ok: boolean
+  detail: string
+}
+
+// A failed fetch to http://localhost from an HTTPS page is opaque (TypeError),
+// so give the user the three likely causes rather than a bare "failed".
+function bridgeUnreachableMessage(bridgeUrl: string): string {
+  return `Couldn't reach the bridge at ${bridgeUrl}. Check that: (1) the bridge is running (node bridge.mjs), (2) the URL/port match, and (3) you're on Chrome, Edge, or Firefox — Safari blocks calls from HTTPS pages to http://localhost.`
+}
+
+// Read run preferences (non-secret) and turn them into the bridge's run options.
+function toRunOptions(config: LocalClaudeConfigInput) {
+  return {
+    model: config.model,
+    permissionMode: config.permissionMode,
+    allowedTools: config.allowedTools,
+    maxTurns: config.maxTurns,
+    timeoutMs: config.timeoutMs,
+    systemPromptAppend: config.systemPromptAppend,
+    workingDirectory: config.workingDirectory,
+  }
 }
 
 export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManagementProps) {
   const [open, setOpen] = useState(false)
+
+  // Non-secret preferences (server-persisted).
   const [config, setConfig] = useState<LocalClaudeConfigInput>(DEFAULT_LOCAL_CLAUDE_CONFIG)
-  const [extraArgsText, setExtraArgsText] = useState("")
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
+
+  // Connection to the local bridge (browser-only, never sent to the server).
+  const [connection, setConnection] = useState<LocalClaudeConnection>(
+    DEFAULT_LOCAL_CLAUDE_CONNECTION,
+  )
+
   const [testing, setTesting] = useState(false)
-  const [testResult, setTestResult] = useState<LocalClaudeTestResult | null>(null)
+  const [checks, setChecks] = useState<{
+    reachable: CheckState
+    version: CheckState
+    authenticated: CheckState
+  } | null>(null)
 
   const [prompt, setPrompt] = useState("")
   const [running, setRunning] = useState(false)
   const [runResult, setRunResult] = useState<LocalClaudeRunResult | null>(null)
 
-  // Load the saved config whenever the dialog opens.
+  // Load server prefs + localStorage connection when the dialog opens.
   useEffect(() => {
     if (!open) return
+
+    try {
+      const raw = localStorage.getItem(CONNECTION_STORAGE_KEY)
+      if (raw) setConnection({ ...DEFAULT_LOCAL_CLAUDE_CONNECTION, ...JSON.parse(raw) })
+    } catch {
+      /* ignore malformed localStorage */
+    }
+
     setLoading(true)
     fetch("/api/local-claude/config")
       .then((res) => {
@@ -75,7 +114,7 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
         return res.json()
       })
       .then((data) => {
-        const next: LocalClaudeConfigInput = {
+        setConfig({
           binaryPath: data.binaryPath ?? DEFAULT_LOCAL_CLAUDE_CONFIG.binaryPath,
           workingDirectory: data.workingDirectory ?? null,
           model: data.model ?? null,
@@ -86,30 +125,57 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
           systemPromptAppend: data.systemPromptAppend ?? null,
           extraArgs: Array.isArray(data.extraArgs) ? data.extraArgs : [],
           enabled: data.enabled ?? true,
-        }
-        setConfig(next)
-        setExtraArgsText(next.extraArgs.join(" "))
+        })
       })
-      .catch(() => toast.error("Could not load your Local Claude config."))
+      .catch(() => toast.error("Could not load your Local Agent preferences."))
       .finally(() => setLoading(false))
   }, [open])
 
-  // Assemble the config payload from current form state.
-  const buildPayload = (): LocalClaudeConfigInput => ({
-    ...config,
-    extraArgs: parseExtraArgs(extraArgsText),
-  })
+  const update = <K extends keyof LocalClaudeConfigInput>(
+    key: K,
+    value: LocalClaudeConfigInput[K],
+  ) => setConfig((prev) => ({ ...prev, [key]: value }))
 
-  const handleSave = async () => {
+  const persistConnection = (next: LocalClaudeConnection) => {
+    setConnection(next)
+    try {
+      localStorage.setItem(CONNECTION_STORAGE_KEY, JSON.stringify(next))
+    } catch {
+      /* ignore quota/availability errors */
+    }
+  }
+
+  // Fetch against the bridge with the token header. Normalizes the opaque
+  // cross-origin failure into a helpful message.
+  const callBridge = useCallback(
+    async (path: string, init?: RequestInit) => {
+      const base = connection.bridgeUrl.replace(/\/$/, "")
+      try {
+        return await fetch(`${base}${path}`, {
+          ...init,
+          headers: {
+            "content-type": "application/json",
+            "x-bridge-token": connection.token,
+            ...(init?.headers || {}),
+          },
+        })
+      } catch {
+        throw new Error(bridgeUnreachableMessage(connection.bridgeUrl))
+      }
+    },
+    [connection],
+  )
+
+  const handleSavePrefs = async () => {
     setSaving(true)
     try {
       const res = await fetch("/api/local-claude/config", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildPayload()),
+        body: JSON.stringify(config),
       })
       if (!res.ok) throw new Error(await res.text())
-      toast.success("Configuration saved.")
+      toast.success("Preferences saved.")
     } catch (error) {
       toast.error(`Save failed: ${error instanceof Error ? error.message : "unknown error"}`)
     } finally {
@@ -118,22 +184,65 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
   }
 
   const handleTest = async () => {
+    if (!connection.token) {
+      toast.error("Enter the bridge token first (printed when you run the bridge).")
+      return
+    }
     setTesting(true)
-    setTestResult(null)
+    setChecks(null)
+    const next = {
+      reachable: { ok: false, detail: "" },
+      version: { ok: false, detail: "" },
+      authenticated: { ok: false, detail: "" },
+    }
     try {
-      // Test the current (possibly unsaved) form values.
-      const res = await fetch("/api/local-claude/test", {
+      // 1 + 2: reachability and version via /health.
+      const healthRes = await callBridge("/health", { method: "GET" })
+      if (healthRes.status === 401) {
+        next.reachable = { ok: true, detail: "Bridge reachable." }
+        next.version = { ok: false, detail: "Token rejected by the bridge." }
+        setChecks(next)
+        toast.error("The bridge rejected the token.")
+        return
+      }
+      const health: BridgeHealth = await healthRes.json()
+      next.reachable = { ok: true, detail: "Bridge reachable." }
+      next.version = health.ok
+        ? { ok: true, detail: health.version || "version reported" }
+        : { ok: false, detail: health.error || "claude --version failed" }
+
+      if (!health.ok) {
+        setChecks(next)
+        return
+      }
+
+      // 3: a tiny prompt confirms the CLI is logged in.
+      const runRes = await callBridge("/run", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(buildPayload()),
+        body: JSON.stringify({
+          prompt: "Reply with exactly: OK",
+          options: { model: config.model, timeoutMs: 60000 },
+        }),
       })
-      if (!res.ok) throw new Error(await res.text())
-      const data: LocalClaudeTestResult = await res.json()
-      setTestResult(data)
-      if (data.ok) toast.success("Local Claude is set up correctly.")
-      else toast.error("Setup check found a problem — see details below.")
+      const run: LocalClaudeRunResult = await runRes.json()
+      if (run.ok && run.text) {
+        next.authenticated = { ok: true, detail: "Claude responded to a test prompt." }
+      } else if (run.timedOut) {
+        next.authenticated = { ok: false, detail: "Test prompt timed out." }
+      } else if (/log ?in|unauthor|authenticat|not logged|api key/i.test(run.stderr)) {
+        next.authenticated = {
+          ok: false,
+          detail: "Claude Code isn't logged in. Run `claude login` in a terminal.",
+        }
+      } else {
+        next.authenticated = { ok: false, detail: run.stderr || "Test prompt failed." }
+      }
+      setChecks(next)
+      if (next.authenticated.ok) toast.success("Local agent is connected and ready.")
     } catch (error) {
-      toast.error(`Test failed: ${error instanceof Error ? error.message : "unknown error"}`)
+      next.reachable = { ok: false, detail: error instanceof Error ? error.message : "unreachable" }
+      setChecks(next)
+      toast.error("Could not reach the bridge — see details below.")
     } finally {
       setTesting(false)
     }
@@ -141,29 +250,27 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
 
   const handleRun = async () => {
     if (prompt.trim().length === 0) return
+    if (!config.enabled) {
+      toast.error("Local Agent is disabled in Preferences.")
+      return
+    }
     setRunning(true)
     setRunResult(null)
     try {
-      const res = await fetch("/api/local-claude/run", {
+      const res = await callBridge("/run", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+        body: JSON.stringify({ prompt, options: toRunOptions(config) }),
       })
-      if (!res.ok) throw new Error(await res.text())
+      if (res.status === 401) throw new Error("The bridge rejected the token.")
       const data: LocalClaudeRunResult = await res.json()
       setRunResult(data)
       if (!data.ok) toast.error("The agent run did not complete cleanly.")
     } catch (error) {
-      toast.error(`Run failed: ${error instanceof Error ? error.message : "unknown error"}`)
+      toast.error(error instanceof Error ? error.message : "Run failed.")
     } finally {
       setRunning(false)
     }
   }
-
-  const update = <K extends keyof LocalClaudeConfigInput>(
-    key: K,
-    value: LocalClaudeConfigInput[K],
-  ) => setConfig((prev) => ({ ...prev, [key]: value }))
 
   return (
     <Dialog open={open} onOpenChange={setOpen}>
@@ -184,199 +291,204 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
             <TabsTrigger value="test">Test &amp; Run</TabsTrigger>
           </TabsList>
 
-          {/* ---------- SETUP (things you do outside this app) ---------- */}
+          {/* ---------- SETUP ---------- */}
           <TabsContent value="setup" className="flex-1 overflow-y-auto pr-1 text-sm">
             <div className="space-y-4">
               <p className="text-muted-foreground">
-                This feature runs agents on <strong>your own machine</strong> using your local
-                Claude Code install and its login. Your subscription powers the runs — this app
-                never sees your credentials.
+                This runs agents on <strong>your machine</strong> using your logged-in Claude
+                Code. Your browser talks to a small <strong>bridge</strong> you run locally —
+                prompts and results never touch our servers, and your own subscription powers the
+                runs.
               </p>
-
-              <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-amber-900">
-                <strong>Requirement:</strong> the app server must run on the{" "}
-                <em>same machine</em> as Claude Code. It cannot reach a CLI on a remote device.
-                Run CompeteMath locally (<code>pnpm dev</code>) to use this.
-              </div>
 
               <ol className="list-decimal space-y-3 pl-5">
                 <li>
-                  <strong>Install Claude Code.</strong>
+                  <strong>Install &amp; log in to Claude Code</strong> (once, in a terminal):
                   <pre className="mt-1 overflow-x-auto rounded bg-muted p-2 text-xs">
-                    npm install -g @anthropic-ai/claude-code
+                    npm install -g @anthropic-ai/claude-code{"\n"}claude login
                   </pre>
-                  Verify with <code>claude --version</code>.
                 </li>
                 <li>
-                  <strong>Log in with your subscription.</strong> In a terminal run{" "}
-                  <code>claude login</code> and choose your Pro/Max account. (Alternatively, an{" "}
-                  <code>ANTHROPIC_API_KEY</code> in the server environment is used if present.)
+                  <strong>Run the bridge</strong> (keep it open while you use this):
+                  <pre className="mt-1 overflow-x-auto rounded bg-muted p-2 text-xs">
+                    node bridge.mjs
+                  </pre>
+                  Get <code>bridge.mjs</code> from the app repo under{" "}
+                  <code>local-claude-bridge/</code>. It prints a <strong>URL</strong> and{" "}
+                  <strong>Token</strong>.
                 </li>
                 <li>
-                  <strong>Confirm the binary path.</strong> Run <code>which claude</code>. If it
-                  isn&apos;t on the server&apos;s PATH, paste the full path into{" "}
-                  <em>Configuration → Binary path</em>.
+                  <strong>Connect.</strong> Paste that URL and Token into{" "}
+                  <em>Configuration → Connection</em>. The token stays in this browser only.
                 </li>
                 <li>
-                  <strong>Run the setup test.</strong> Open the <em>Test &amp; Run</em> tab and
-                  click <em>Test setup</em> — it checks the binary, version, and login for you.
+                  <strong>Test.</strong> Open <em>Test &amp; Run → Test connection</em>.
                 </li>
               </ol>
 
-              <p className="text-muted-foreground">
-                Everything below the binary/login step is configurable in the{" "}
-                <em>Configuration</em> tab. The two things this app can&apos;t do for you are
-                installing the CLI and logging it in — those happen once, in your terminal.
-              </p>
+              <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-amber-900">
+                <strong>Browser note:</strong> use <strong>Chrome, Edge, or Firefox</strong>.
+                Safari blocks HTTPS pages from calling <code>http://localhost</code>, so this
+                feature won&apos;t work there.
+              </div>
             </div>
           </TabsContent>
 
-          {/* ---------- CONFIGURATION (everything controllable in-UI) ---------- */}
+          {/* ---------- CONFIGURATION ---------- */}
           <TabsContent value="config" className="flex-1 overflow-y-auto pr-1">
-            <div className="space-y-4 py-1">
-              <div className="flex items-center justify-between rounded-md border p-3">
+            <div className="space-y-5 py-1">
+              {/* Connection — browser-only */}
+              <div className="space-y-3">
                 <div>
-                  <Label htmlFor="lca-enabled">Enable Local Claude Agent</Label>
+                  <h3 className="text-sm font-semibold">Connection</h3>
                   <p className="text-xs text-muted-foreground">
-                    When off, run requests are rejected.
+                    Stored in this browser only — never sent to our servers.
                   </p>
                 </div>
-                <Switch
-                  id="lca-enabled"
-                  checked={config.enabled}
-                  onCheckedChange={(v) => update("enabled", v)}
-                />
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="lca-url">Bridge URL</Label>
+                    <Input
+                      id="lca-url"
+                      value={connection.bridgeUrl}
+                      placeholder="http://localhost:4123"
+                      onChange={(e) => persistConnection({ ...connection, bridgeUrl: e.target.value })}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="lca-token">Bridge token</Label>
+                    <Input
+                      id="lca-token"
+                      type="password"
+                      value={connection.token}
+                      placeholder="printed when you run the bridge"
+                      onChange={(e) => persistConnection({ ...connection, token: e.target.value })}
+                    />
+                  </div>
+                </div>
               </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="lca-binary">Binary path</Label>
-                <Input
-                  id="lca-binary"
-                  value={config.binaryPath}
-                  placeholder="claude"
-                  onChange={(e) => update("binaryPath", e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Command or absolute path to the Claude Code CLI (from{" "}
-                  <code>which claude</code>).
-                </p>
-              </div>
+              <Separator />
 
-              <div className="space-y-1.5">
-                <Label htmlFor="lca-cwd">Working directory</Label>
-                <Input
-                  id="lca-cwd"
-                  value={config.workingDirectory ?? ""}
-                  placeholder="/Users/you/projects/my-repo (defaults to server cwd)"
-                  onChange={(e) => update("workingDirectory", e.target.value || null)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  The project directory the agent operates in.
-                </p>
-              </div>
+              {/* Preferences — server-synced */}
+              <div className="space-y-4">
+                <div>
+                  <h3 className="text-sm font-semibold">Run preferences</h3>
+                  <p className="text-xs text-muted-foreground">
+                    Non-secret settings, synced to your account and sent to the bridge per run.
+                  </p>
+                </div>
 
-              <div className="grid grid-cols-2 gap-3">
-                <div className="space-y-1.5">
-                  <Label htmlFor="lca-model">Model</Label>
-                  <Input
-                    id="lca-model"
-                    value={config.model ?? ""}
-                    placeholder="claude-opus-4-8 (optional)"
-                    onChange={(e) => update("model", e.target.value || null)}
+                <div className="flex items-center justify-between rounded-md border p-3">
+                  <div>
+                    <Label htmlFor="lca-enabled">Enable Local Agent</Label>
+                    <p className="text-xs text-muted-foreground">When off, runs are blocked.</p>
+                  </div>
+                  <Switch
+                    id="lca-enabled"
+                    checked={config.enabled}
+                    onCheckedChange={(v) => update("enabled", v)}
                   />
                 </div>
-                <div className="space-y-1.5">
-                  <Label>Permission mode</Label>
-                  <Select
-                    value={config.permissionMode}
-                    onValueChange={(v) =>
-                      update("permissionMode", v as LocalClaudePermissionMode)
-                    }
-                  >
-                    <SelectTrigger>
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {PERMISSION_MODE_OPTIONS.map((o) => (
-                        <SelectItem key={o.value} value={o.value}>
-                          {o.label}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
-              </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="lca-tools">Allowed tools</Label>
-                <Input
-                  id="lca-tools"
-                  value={config.allowedTools ?? ""}
-                  placeholder='e.g. "Read Edit Bash(git:*)" — blank = no restriction'
-                  onChange={(e) => update("allowedTools", e.target.value || null)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Passed to <code>--allowedTools</code>. Restricts what the agent may do.
-                </p>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
                 <div className="space-y-1.5">
-                  <Label htmlFor="lca-maxturns">Max turns</Label>
+                  <Label htmlFor="lca-cwd">Working directory</Label>
                   <Input
-                    id="lca-maxturns"
-                    type="number"
-                    min={1}
-                    value={config.maxTurns ?? ""}
-                    placeholder="unlimited"
-                    onChange={(e) =>
-                      update("maxTurns", e.target.value ? Number(e.target.value) : null)
-                    }
+                    id="lca-cwd"
+                    value={config.workingDirectory ?? ""}
+                    placeholder="/Users/you/projects/my-repo (defaults to the bridge's cwd)"
+                    onChange={(e) => update("workingDirectory", e.target.value || null)}
                   />
                 </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="lca-model">Model</Label>
+                    <Input
+                      id="lca-model"
+                      value={config.model ?? ""}
+                      placeholder="claude-opus-4-8 (optional)"
+                      onChange={(e) => update("model", e.target.value || null)}
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label>Permission mode</Label>
+                    <Select
+                      value={config.permissionMode}
+                      onValueChange={(v) => update("permissionMode", v as LocalClaudePermissionMode)}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {PERMISSION_MODE_OPTIONS.map((o) => (
+                          <SelectItem key={o.value} value={o.value}>
+                            {o.label}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+
                 <div className="space-y-1.5">
-                  <Label htmlFor="lca-timeout">Timeout (ms)</Label>
+                  <Label htmlFor="lca-tools">Allowed tools</Label>
                   <Input
-                    id="lca-timeout"
-                    type="number"
-                    min={5000}
-                    step={1000}
-                    value={config.timeoutMs}
-                    onChange={(e) =>
-                      update("timeoutMs", Number(e.target.value) || DEFAULT_LOCAL_CLAUDE_CONFIG.timeoutMs)
-                    }
+                    id="lca-tools"
+                    value={config.allowedTools ?? ""}
+                    placeholder='e.g. "Read Edit Bash(git:*)" — blank = no restriction'
+                    onChange={(e) => update("allowedTools", e.target.value || null)}
                   />
                 </div>
-              </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="lca-sysprompt">Append to system prompt</Label>
-                <Textarea
-                  id="lca-sysprompt"
-                  rows={2}
-                  value={config.systemPromptAppend ?? ""}
-                  placeholder="Extra instructions added to every run (optional)"
-                  onChange={(e) => update("systemPromptAppend", e.target.value || null)}
-                />
-              </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <Label htmlFor="lca-maxturns">Max turns</Label>
+                    <Input
+                      id="lca-maxturns"
+                      type="number"
+                      min={1}
+                      value={config.maxTurns ?? ""}
+                      placeholder="unlimited"
+                      onChange={(e) =>
+                        update("maxTurns", e.target.value ? Number(e.target.value) : null)
+                      }
+                    />
+                  </div>
+                  <div className="space-y-1.5">
+                    <Label htmlFor="lca-timeout">Timeout (ms)</Label>
+                    <Input
+                      id="lca-timeout"
+                      type="number"
+                      min={5000}
+                      step={1000}
+                      value={config.timeoutMs}
+                      onChange={(e) =>
+                        update(
+                          "timeoutMs",
+                          Number(e.target.value) || DEFAULT_LOCAL_CLAUDE_CONFIG.timeoutMs,
+                        )
+                      }
+                    />
+                  </div>
+                </div>
 
-              <div className="space-y-1.5">
-                <Label htmlFor="lca-extra">Extra CLI args (advanced)</Label>
-                <Input
-                  id="lca-extra"
-                  value={extraArgsText}
-                  placeholder="--add-dir /tmp --verbose"
-                  onChange={(e) => setExtraArgsText(e.target.value)}
-                />
-                <p className="text-xs text-muted-foreground">
-                  Raw flags appended verbatim. Space-separated.
-                </p>
-              </div>
+                <div className="space-y-1.5">
+                  <Label htmlFor="lca-sysprompt">Append to system prompt</Label>
+                  <Textarea
+                    id="lca-sysprompt"
+                    rows={2}
+                    value={config.systemPromptAppend ?? ""}
+                    placeholder="Extra instructions added to every run (optional)"
+                    onChange={(e) => update("systemPromptAppend", e.target.value || null)}
+                  />
+                </div>
 
-              <div className="flex justify-end gap-2 pt-1">
-                <Button onClick={handleSave} disabled={saving || loading}>
-                  {saving ? "Saving…" : "Save configuration"}
-                </Button>
+                <div className="flex justify-end">
+                  <Button onClick={handleSavePrefs} disabled={saving || loading}>
+                    {saving ? "Saving…" : "Save preferences"}
+                  </Button>
+                </div>
               </div>
             </div>
           </TabsContent>
@@ -387,33 +499,21 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
               <div>
                 <div className="flex items-center justify-between">
                   <div>
-                    <p className="font-medium">Setup test</p>
+                    <p className="font-medium">Connection test</p>
                     <p className="text-xs text-muted-foreground">
-                      Verifies the binary, version, and login using your current settings.
+                      Checks the bridge, the CLI version, and that Claude is logged in.
                     </p>
                   </div>
                   <Button onClick={handleTest} disabled={testing} variant="outline">
-                    {testing ? "Testing…" : "Test setup"}
+                    {testing ? "Testing…" : "Test connection"}
                   </Button>
                 </div>
 
-                {testResult && (
+                {checks && (
                   <div className="mt-3 space-y-2 rounded-md border p-3">
-                    <CheckRow
-                      label="Binary found"
-                      ok={testResult.checks.binaryFound.ok}
-                      detail={testResult.checks.binaryFound.detail}
-                    />
-                    <CheckRow
-                      label="Version"
-                      ok={testResult.checks.version.ok}
-                      detail={testResult.checks.version.detail}
-                    />
-                    <CheckRow
-                      label="Logged in"
-                      ok={testResult.checks.authenticated.ok}
-                      detail={testResult.checks.authenticated.detail}
-                    />
+                    <CheckRow label="Bridge reachable" {...checks.reachable} />
+                    <CheckRow label="CLI version" {...checks.version} />
+                    <CheckRow label="Logged in" {...checks.authenticated} />
                   </div>
                 )}
               </div>

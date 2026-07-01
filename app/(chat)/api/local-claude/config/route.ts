@@ -4,9 +4,9 @@ import { getLocalClaudeConfig, saveLocalClaudeConfig } from "@/lib/db/local-clau
 import { normalizeLocalClaudeConfigInput } from "@/lib/local-claude/config"
 import { DEFAULT_LOCAL_CLAUDE_CONFIG } from "@/lib/types/local-claude"
 
-// Route handlers default to the Node.js runtime (required here to spawn a local
-// process). An explicit `runtime` export is intentionally omitted — it is
-// incompatible with this project's `cacheComponents` Next config.
+// Stores the user's non-secret Local Agent run preferences. Execution happens
+// entirely in the browser against the user's local bridge — this route never
+// touches the CLI. (No `runtime` export: incompatible with `cacheComponents`.)
 
 export async function GET() {
   try {

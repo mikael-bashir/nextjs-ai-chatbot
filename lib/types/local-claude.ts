@@ -4,7 +4,9 @@ export type LocalClaudePermissionMode =
   | "plan"
   | "bypassPermissions"
 
-// The subset of config a user can edit from the UI.
+// Non-secret run preferences. Persisted server-side (synced across the user's
+// devices) via /api/local-claude/config. These are sent to the local bridge as
+// run options; they contain no secrets and never drive an arbitrary binary.
 export interface LocalClaudeConfigInput {
   binaryPath: string
   workingDirectory: string | null
@@ -25,7 +27,6 @@ export interface LocalClaudeConfig extends LocalClaudeConfigInput {
   updatedAt: string
 }
 
-// Sensible defaults used when a user has never saved a config.
 export const DEFAULT_LOCAL_CLAUDE_CONFIG: LocalClaudeConfigInput = {
   binaryPath: "claude",
   workingDirectory: null,
@@ -39,19 +40,26 @@ export const DEFAULT_LOCAL_CLAUDE_CONFIG: LocalClaudeConfigInput = {
   enabled: true,
 }
 
-// Result of the "Test setup" button. Each check is independent so the UI can
-// show the user exactly which step failed.
-export interface LocalClaudeTestResult {
-  ok: boolean
-  checks: {
-    binaryFound: { ok: boolean; detail: string }
-    version: { ok: boolean; detail: string }
-    authenticated: { ok: boolean; detail: string }
-  }
-  // Raw probe output (stdout/stderr), useful for troubleshooting.
-  probe?: { stdout: string; stderr: string; exitCode: number | null }
+// Connection to the user's local bridge. Machine-specific and secret, so this
+// is kept in the browser's localStorage ONLY — never sent to the app server.
+export interface LocalClaudeConnection {
+  bridgeUrl: string
+  token: string
 }
 
+export const DEFAULT_LOCAL_CLAUDE_CONNECTION: LocalClaudeConnection = {
+  bridgeUrl: "http://localhost:4123",
+  token: "",
+}
+
+// Shape returned by the bridge's GET /health.
+export interface BridgeHealth {
+  ok: boolean
+  version: string
+  error?: string
+}
+
+// Shape returned by the bridge's POST /run.
 export interface LocalClaudeRunResult {
   ok: boolean
   text: string
