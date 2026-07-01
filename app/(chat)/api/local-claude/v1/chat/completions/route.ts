@@ -33,7 +33,9 @@ export async function POST(request: NextRequest) {
     return openaiError("invalid_request", "malformed body", 400)
   }
 
-  const userId: string | undefined = body.user
+  // Routing key: prefer the x-relay-user header (LiteLLM forwards extra_headers
+  // reliably); fall back to the OpenAI `user` body field.
+  const userId: string | undefined = request.headers.get("x-relay-user") ?? body.user
   const model: string = body.model || "claude-local"
   const messages: OpenAIMessage[] = Array.isArray(body.messages) ? body.messages : []
   const tools = Array.isArray(body.tools) ? body.tools : []

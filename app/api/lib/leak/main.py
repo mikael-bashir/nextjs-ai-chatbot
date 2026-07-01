@@ -115,10 +115,12 @@ async def chat_model(state: State) -> tuple[dict, State]:
             }
             kwargs["tools"] = tools
 
-            # For the local-Claude provider, forward the user_id as the OpenAI
-            # `user` field so the relay can route to that user's own machine.
+            # For the local-Claude provider, forward the user_id so the relay
+            # can route to that user's own machine. Sent as a header (LiteLLM
+            # forwards extra_headers reliably) and as the OpenAI `user` field.
             if model == "claude-local" and user_id:
                 kwargs["user"] = user_id
+                kwargs["extra_headers"] = {"x-relay-user": user_id}
 
             response = await llm_router.acompletion(**kwargs)
 
