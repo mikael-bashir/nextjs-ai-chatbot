@@ -59,6 +59,11 @@ export const authConfig = {
       const hasAccount = auth?.user?.hasLeakAccount;
       const { nextUrl } = request;
 
+      // Public static asset: the Local Agent bridge script must be downloadable
+      // without auth (users `curl` it during setup). It matches the `/:id`
+      // middleware pattern, so it needs an explicit allow here.
+      if (nextUrl.pathname === '/local-claude-bridge.mjs') return true;
+
       if (nextUrl.pathname.startsWith('/api/auth')) return true;
 
       // Stripe webhooks are signature-verified inside the handler
