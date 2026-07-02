@@ -353,7 +353,14 @@ async def execute_tools(state: State) -> tuple[dict, State]:
         
     # 🛑 THE SHORT-CIRCUIT: Push directly to UI and forge the final history
     if is_solved and final_script_output:
-        success_message = f"🎉 **Proof Complete!**\n\n{final_script_output}"
+        # Stamp every verified proof with the Lean toolchain it was checked
+        # against — same daemon for all models, so this applies to all of them.
+        toolchain = os.environ.get("LEAN_TOOLCHAIN", "leanprover/lean4:v4.29.1")
+        success_message = (
+            f"🎉 **Proof Complete!**\n\n{final_script_output}\n\n"
+            f"> 🔒 Verified against **{toolchain}** (Mathlib pinned to this toolchain). "
+            "Guaranteed to compile only on this exact version."
+        )
         
         # 1. Stream the script to the frontend instantly (mimicking the LLM)
         await stream_queue.put(("text_delta", success_message, None, None))
