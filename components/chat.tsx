@@ -65,15 +65,8 @@ export function Chat({
   // latestStatus (incl. heartbeats) drives the elapsed-time/metrics header.
   const latestStatus = annotations.length > 0 ? annotations[annotations.length - 1] : null
 
-  // The activity log: drop heartbeats and collapse consecutive identical
-  // status lines so a long wait doesn't flood the panel.
-  const activityLog = annotations.reduce<Array<any>>((out, a) => {
-    if (a.subtype === "heartbeat") return out
-    const prev = out[out.length - 1]
-    if (prev && prev.thought && prev.thought === a.thought && !a.input && !a.output) return out
-    out.push(a)
-    return out
-  }, [])
+  // The activity log: show every step, just drop the timer-tick heartbeats.
+  const activityLog = annotations.filter((a) => a.subtype !== "heartbeat")
   const headerThought = [...activityLog].reverse().find((a) => a.thought)?.thought
 
   const [localTime, setLocalTime] = useState(0)
