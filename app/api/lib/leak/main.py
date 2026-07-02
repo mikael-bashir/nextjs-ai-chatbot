@@ -649,7 +649,7 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                                 for tc in msg["tool_calls"]:
                                     t_name = tc["function"]["name"]
                                     metrics["tools_invoked"] += 1
-                                    yield f"data: {json.dumps({'type': 'tool_intent', 'tool': t_name, 'message': f'Decided to use {t_name}...', 'metrics': metrics})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'tool_intent', 'tool': t_name, 'input': tc['function'].get('arguments', ''), 'message': f'Decided to use {t_name}...', 'metrics': metrics})}\n\n"
                             else:
                                 content = msg.get("content", "")
                                 logger.info(f"🚨 [PYTHON] Sending final text_response. Length: {len(content)}")
@@ -659,8 +659,9 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                             for tr in result.get("tool_results", []):
                                 status_msg = f"Received output from {tr['name']}. Analyzing..."
 
-                                # Build the payload dictionary
-                                payload = {'type': 'tool_result', 'tool': tr['name'], 'message': status_msg, 'metrics': metrics}
+                                # Build the payload dictionary (include the tool
+                                # output so the UI can show the Lean result).
+                                payload = {'type': 'tool_result', 'tool': tr['name'], 'output': tr.get('content', ''), 'message': status_msg, 'metrics': metrics}
 
                                 # Dump it cleanly without nested f-string collisions
                                 yield f"data: {json.dumps(payload)}\n\n"
