@@ -300,6 +300,13 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
   const stripName = (n) => String(n || "").replace(/^mcp__[a-z0-9-]+__/i, "")
 
+  // System gate: the ONE enforced restriction. We only accept a proof that the
+  // harness itself watched pass verify_full_script — not one Claude merely
+  // claims. Map each verify_full_script call id -> its script, and record the
+  // script when the matching result reports success.
+  const verifyCalls = {}
+  let verifiedScript = null
+
   let child
   try {
     child = spawn(CLAUDE_BIN, args, {
@@ -344,6 +351,14 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
           if (c.type === "tool_use") {
             metrics.tools_invoked++
             const name = stripName(c.name)
+            if (
+              name === "verify_full_script" &&
+              c.input &&
+              typeof c.input === "object" &&
+              typeof c.input.script === "string"
+            ) {
+              verifyCalls[c.id] = c.input.script
+            }
             send({
               type: "message-annotation",
               subtype: "tool_intent",
@@ -362,6 +377,13 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
             const t = Array.isArray(c.content)
               ? c.content.map((x) => x.text || "").join("\n")
               : String(c.content ?? "")
+            if (
+              c.tool_use_id &&
+              verifyCalls[c.tool_use_id] &&
+              /compilation successful|100% verified|no goals/i.test(t)
+            ) {
+              verifiedScript = verifyCalls[c.tool_use_id]
+            }
             send({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t, metrics })
           }
         }
@@ -382,8 +404,29 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   })
   child.on("close", () => {
     clearTimeout(timer)
-    if (finalText) send({ type: "text-delta", content: finalText })
-    else if (stderr.trim()) send({ type: "error", message: stderr.trim().slice(0, 500) })
+    // Enforce the gate: accept only a harness-verified script.
+    if (verifiedScript) {
+      send({
+        type: "message-annotation",
+        subtype: "status",
+        thought: "✅ System check passed — script verified with no errors.",
+        metrics,
+      })
+      send({ type: "text-delta", content: `✅ **Verified proof** (confirmed by verify_full_script):\n\n\`\`\`lean\n${verifiedScript}\n\`\`\`` })
+    } else {
+      send({
+        type: "message-annotation",
+        subtype: "error",
+        thought: "❌ System check failed — no script passed verify_full_script.",
+        metrics,
+      })
+      const detail = finalText
+        ? `⚠️ Not accepted — no verify_full_script call succeeded, so this is unverified:\n\n${finalText}`
+        : stderr.trim()
+          ? `Error: ${stderr.trim().slice(0, 500)}`
+          : "No verified proof was produced."
+      send({ type: "text-delta", content: detail })
+    }
     send({ type: "done", metrics })
     res.end()
   })
