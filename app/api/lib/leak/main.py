@@ -379,8 +379,18 @@ async def execute_tools(state: State) -> tuple[dict, State]:
                 else:
                     result_str = str(result)
                     
-                # 🏆 INTERCEPT THE VICTORY
-                if "Tactic succeeded! Proof complete. No goals remaining." in result_str:
+                # 🏆 INTERCEPT THE VICTORY — success comes in two flavours:
+                #   apply_tactic      → "...Proof complete. No goals remaining."
+                #   verify_full_script → "✅ Compilation Successful! The proof is 100% verified."
+                # Match either (case-insensitive) so the run exits on a win from
+                # any tool. These phrases never appear in failure messages
+                # (e.g. "❌ Compilation Failed"), so no false positives.
+                _rlow = result_str.lower()
+                if (
+                    "no goals remaining" in _rlow
+                    or "compilation successful" in _rlow
+                    or "100% verified" in _rlow
+                ):
                     logger.info("🎉 VICTORY DETECTED! Proof complete.")
                     is_solved = True
                     final_script_output = result_str # Save the exact tool output
