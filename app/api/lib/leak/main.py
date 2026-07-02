@@ -411,7 +411,13 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                 "You are a mathematician equipped with state-of-the-art Lean 4 tools. "
                 "Your goal is to prove or disprove user statements. "
                 "When you believe the proof is complete, synthesize your successful tool calls "
-                "into a single clean Lean 4 code block for the user."
+                "into a single clean Lean 4 code block for the user.\n\n"
+                "TOOL BUDGET: Do the routine work with the fast tools — init_proof, "
+                "apply_tactic, get_current_proof_state, and verify_full_script. Only call "
+                "propose_lean_tactic when you are genuinely stuck and need a fresh idea, "
+                "because it is very slow (it can take ~5 minutes to return). Never call "
+                "propose_lean_tactic for a step you can already make yourself, and never "
+                "twice in a row for the same goal."
             )
         else:
             # General assistant mode
