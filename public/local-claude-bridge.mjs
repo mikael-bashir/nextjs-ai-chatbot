@@ -20,6 +20,9 @@
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
 import { randomBytes, timingSafeEqual } from "node:crypto"
+import { mkdtempSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
 const PORT = Number(process.env.PORT || 4123)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"
@@ -200,6 +203,75 @@ function getVersion() {
   })
 }
 
+// ---------------------------------------------------------------------------
+// /prove — the new architecture. Hand Claude the Lean MCP tools and let its own
+// agent loop iterate (tool → verify → error → retry) until verify_full_script
+// confirms a proof of the stated theorem, then return that proof.
+// ---------------------------------------------------------------------------
+function buildMcpConfig(mcpServers) {
+  const servers = {}
+  for (const s of mcpServers || []) {
+    if (s && s.name && s.url) servers[s.name] = { type: "sse", url: s.url }
+  }
+  return { mcpServers: servers }
+}
+
+function provePrompt(theorem) {
+  return [
+    "You are a Lean 4 theorem prover. You have MCP tools to initialize a proof, apply",
+    "tactics, inspect the goal state, search Mathlib (loogle/moogle), and verify a full",
+    "script against a Lean backend.",
+    "",
+    "Prove EXACTLY this theorem (do not change its statement):",
+    "",
+    theorem,
+    "",
+    "Rules:",
+    "- Use the tools to construct AND check the proof.",
+    "- You are NOT finished until verify_full_script reports success — the script must",
+    "  compile with NO errors and prove this exact statement.",
+    "- If a verification fails, read the error output and try again. Keep iterating.",
+    "- Only when it verifies, output ONLY the final, verified Lean 4 proof in a single",
+    "  ```lean code block. No commentary.",
+  ].join("\n")
+}
+
+async function runProve(theorem, mcpServers, opts = {}) {
+  const start = Date.now()
+
+  let cfgPath
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "claude-prove-"))
+    cfgPath = join(dir, "mcp.json")
+    writeFileSync(cfgPath, JSON.stringify(buildMcpConfig(mcpServers)))
+  } catch (e) {
+    return { ok: false, proof: "", stderr: `failed to write mcp config: ${e.message}`, durationMs: 0 }
+  }
+
+  // NOTE: these Claude Code flags (--mcp-config, --permission-mode bypassPermissions)
+  // may need tweaking for your installed CLI version; the bridge logs stderr so
+  // permission/MCP errors are visible.
+  const args = [
+    "-p", provePrompt(theorem),
+    "--output-format", "json",
+    "--mcp-config", cfgPath,
+    "--permission-mode", "bypassPermissions",
+  ]
+  if (opts.model) args.push("--model", opts.model)
+
+  const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 3600000)
+  const result = await runClaude(args, { cwd: opts.workingDirectory || undefined, timeoutMs })
+
+  return {
+    ok: result.ok,
+    proof: result.text,
+    exitCode: result.exitCode,
+    durationMs: Date.now() - start,
+    timedOut: result.timedOut,
+    stderr: result.stderr,
+  }
+}
+
 const server = createServer(async (req, res) => {
   const allowed = setCors(req, res)
 
@@ -232,6 +304,16 @@ const server = createServer(async (req, res) => {
           ? options.workingDirectory.trim()
           : undefined
       const result = await runClaude(buildArgs(prompt, options), { cwd, timeoutMs })
+      return json(res, 200, result)
+    }
+
+    if (req.method === "POST" && url.pathname === "/prove") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const theorem = body.theorem || body.prompt
+      if (typeof theorem !== "string" || !theorem.trim()) {
+        return json(res, 400, { error: "theorem_required" })
+      }
+      const result = await runProve(theorem, body.mcpServers || [], body.options || {})
       return json(res, 200, result)
     }
 

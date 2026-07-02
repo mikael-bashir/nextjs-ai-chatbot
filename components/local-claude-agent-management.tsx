@@ -108,6 +108,7 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
 
   const [prompt, setPrompt] = useState("")
   const [running, setRunning] = useState(false)
+  const [proving, setProving] = useState(false)
   const [runResult, setRunResult] = useState<LocalClaudeRunResult | null>(null)
 
   // The app origin is baked into the setup command (download URL + allowed origin).
@@ -323,6 +324,54 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
       toast.error(error instanceof Error ? error.message : "Run failed.")
     } finally {
       setRunning(false)
+    }
+  }
+
+  // New architecture: hand Claude the Lean MCP tools and let it loop until it
+  // produces a verified proof of the theorem. Reuses the user's MCP servers.
+  const handleProve = async () => {
+    if (prompt.trim().length === 0) return
+    if (!config.enabled) {
+      toast.error("Local Agent is disabled in Preferences.")
+      return
+    }
+    setProving(true)
+    setRunResult(null)
+    try {
+      const mcpRes = await fetch("/api/mcp/servers")
+      const servers = mcpRes.ok ? await mcpRes.json() : []
+      const mcpServers = (Array.isArray(servers) ? servers : [])
+        .filter((s) => s?.url && s?.name && s?.isActive !== false)
+        .map((s) => ({ name: s.name, url: s.url }))
+
+      if (mcpServers.length === 0) {
+        toast.error("No active MCP servers found — add your Lean servers under MCP Servers first.")
+        return
+      }
+
+      const res = await callBridge("/prove", {
+        method: "POST",
+        body: JSON.stringify({
+          theorem: prompt,
+          mcpServers,
+          options: { model: config.model, timeoutMs: config.timeoutMs },
+        }),
+      })
+      if (res.status === 401) throw new Error("The bridge rejected the token.")
+      const data = await res.json()
+      setRunResult({
+        ok: data.ok,
+        text: data.proof || "",
+        exitCode: data.exitCode ?? null,
+        durationMs: data.durationMs ?? 0,
+        timedOut: data.timedOut ?? false,
+        stderr: data.stderr || "",
+      })
+      if (!data.ok) toast.error("The prover did not return a verified proof.")
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Prove failed.")
+    } finally {
+      setProving(false)
     }
   }
 
@@ -607,17 +656,31 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
               <Separator />
 
               <div className="space-y-2">
-                <Label htmlFor="lca-prompt">Try a prompt</Label>
+                <Label htmlFor="lca-prompt">Prompt / theorem</Label>
                 <Textarea
                   id="lca-prompt"
                   rows={3}
                   value={prompt}
-                  placeholder="e.g. List the files in this project and summarize what it does."
+                  placeholder="Run agent: a chat prompt. Prove theorem: a Lean 4 statement, e.g. theorem t (n : ℕ) : n < 2 ^ n := by sorry"
                   onChange={(e) => setPrompt(e.target.value)}
                 />
-                <div className="flex justify-end">
-                  <Button onClick={handleRun} disabled={running || prompt.trim().length === 0}>
+                <p className="text-xs text-muted-foreground">
+                  <strong>Prove theorem</strong> hands Claude your Lean MCP tools and loops until
+                  it returns a verified proof — no tree, no credits.
+                </p>
+                <div className="flex justify-end gap-2">
+                  <Button
+                    variant="outline"
+                    onClick={handleRun}
+                    disabled={running || proving || prompt.trim().length === 0}
+                  >
                     {running ? "Running…" : "Run agent"}
+                  </Button>
+                  <Button
+                    onClick={handleProve}
+                    disabled={running || proving || prompt.trim().length === 0}
+                  >
+                    {proving ? "Proving…" : "Prove theorem"}
                   </Button>
                 </div>
 
