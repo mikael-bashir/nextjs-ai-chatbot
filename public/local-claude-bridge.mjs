@@ -427,7 +427,8 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
           : "No verified proof was produced."
       send({ type: "text-delta", content: detail })
     }
-    send({ type: "done", metrics })
+    // Include a clean machine-readable outcome for the automated pipeline.
+    send({ type: "done", metrics, verified: !!verifiedScript, proof: verifiedScript || "" })
     res.end()
   })
 
