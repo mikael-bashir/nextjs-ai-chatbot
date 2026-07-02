@@ -62,7 +62,19 @@ export function Chat({
   // 1. Extract the latest metrics from the active agent stream
   const lastAssistantMsg = [...messages].reverse().find((m) => m.role === "assistant")
   const annotations = (lastAssistantMsg?.annotations || []) as Array<any>
+  // latestStatus (incl. heartbeats) drives the elapsed-time/metrics header.
   const latestStatus = annotations.length > 0 ? annotations[annotations.length - 1] : null
+
+  // The activity log: drop heartbeats and collapse consecutive identical
+  // status lines so a long wait doesn't flood the panel.
+  const activityLog = annotations.reduce<Array<any>>((out, a) => {
+    if (a.subtype === "heartbeat") return out
+    const prev = out[out.length - 1]
+    if (prev && prev.thought && prev.thought === a.thought && !a.input && !a.output) return out
+    out.push(a)
+    return out
+  }, [])
+  const headerThought = [...activityLog].reverse().find((a) => a.thought)?.thought
 
   const [localTime, setLocalTime] = useState(0)
   const [isThoughtsExpanded, setIsThoughtsExpanded] = useState(false)
@@ -124,7 +136,7 @@ export function Chat({
                     }`}
                   />
                   <span className="font-medium max-w-[200px] md:max-w-sm truncate text-left">
-                    {latestStatus?.thought || "Agent Activity"}
+                    {headerThought || "Agent Activity"}
                   </span>
                   <span className="opacity-50">|</span>
                   <span>{localTime}s elapsed</span>
@@ -158,7 +170,7 @@ export function Chat({
               {/* 🚨 NEW: The Full Receipt of Thoughts (Scrollable) */}
               {isThoughtsExpanded && (
                 <div className="flex flex-col gap-1 p-3 bg-muted/30 border border-border/50 rounded-md max-h-64 overflow-y-auto text-xs font-mono text-muted-foreground shadow-inner">
-                  {annotations.map((ann, idx) => (
+                  {activityLog.map((ann, idx) => (
                     <div key={idx} className="flex flex-col gap-1 border-b border-border/20 last:border-0 pb-1 last:pb-0">
                       <div className="flex gap-3">
                         <span className="opacity-40 min-w-[24px]">[{idx + 1}]</span>

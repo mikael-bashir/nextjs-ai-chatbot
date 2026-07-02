@@ -671,8 +671,10 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                         metrics["time_elapsed"] = elapsed
                         
                         # THE FIX: 2048 bytes of invisible SSE comment padding to forcefully flush the server buffer!
-                        yield f": {'=' * 2048}\n\n" 
-                        yield f"data: {json.dumps({'type': 'status', 'message': 'Thinking deep (waiting on tool)...', 'metrics': metrics})}\n\n"
+                        yield f": {'=' * 2048}\n\n"
+                        # Heartbeat: keeps the connection alive and updates the elapsed
+                        # timer, but is NOT a log line (the UI must not spam it).
+                        yield f"data: {json.dumps({'type': 'heartbeat', 'metrics': metrics})}\n\n"
             except asyncio.CancelledError:
                 logger.warning(f"Client disconnected or cancelled. Killing agent task for chat {chat_id}.")
                 task.cancel()

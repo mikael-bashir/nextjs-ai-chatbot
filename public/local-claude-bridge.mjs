@@ -346,6 +346,14 @@ function toolCallResponse(name, args) {
   }
 }
 
+// True if the tool arguments actually carry something (not {} or {"script":""}).
+function argsHaveContent(args) {
+  if (!args || typeof args !== "object") return false
+  return Object.values(args).some((v) =>
+    typeof v === "string" ? v.trim().length > 0 : v != null,
+  )
+}
+
 // Best fallback tool when Claude returns a bare script instead of JSON.
 function preferredTool(tools) {
   return (
@@ -372,11 +380,20 @@ async function handleRelayRequest(payload) {
 
   if (tools.length > 0) {
     const choice = parseToolChoice(result.text, tools)
-    if (choice) return toolCallResponse(choice.name, choice.arguments)
-    // Fallback: Claude gave a bare script — wrap it into the most likely action.
-    const tool = preferredTool(tools)
-    const name = tool.function?.name || tool.name || "tool"
-    return toolCallResponse(name, { [firstToolArgKey(tool)]: extractScript(result.text) })
+    if (choice && argsHaveContent(choice.arguments)) {
+      return toolCallResponse(choice.name, choice.arguments)
+    }
+    // Fallback: wrap a bare script into the most likely action — but ONLY if
+    // there's actually a script. An empty tool call just hangs the MCP server.
+    const script = extractScript(result.text)
+    if (script) {
+      const tool = preferredTool(tools)
+      const name = tool.function?.name || tool.name || "tool"
+      return toolCallResponse(name, { [firstToolArgKey(tool)]: script })
+    }
+    // Nothing usable — return the text so the tree surfaces it instead of
+    // calling a tool with an empty script.
+    return { response: { content: result.text || "(the model produced no script)", finish_reason: "stop", usage: {} } }
   }
 
   return { response: { content: result.text, finish_reason: "stop", usage: {} } }
