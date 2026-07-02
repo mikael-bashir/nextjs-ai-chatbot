@@ -355,9 +355,12 @@ function argsHaveContent(args) {
 }
 
 // Best fallback tool when Claude returns a bare script instead of JSON.
+// Prefer the fast tools; never fall back to the slow propose_lean_tactic.
 function preferredTool(tools) {
+  const nameOf = (t) => t.function?.name || t.name || ""
   return (
-    tools.find((t) => /verify.*script|propose|apply.*tactic/i.test(t.function?.name || t.name || "")) ||
+    tools.find((t) => /apply.*tactic|verify.*script|init.*proof/i.test(nameOf(t))) ||
+    tools.find((t) => !/propose/i.test(nameOf(t))) ||
     tools[0]
   )
 }
