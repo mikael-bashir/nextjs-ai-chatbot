@@ -264,6 +264,140 @@ async function runProve(theorem, mcpServers, opts = {}) {
   }
 }
 
+// Streaming variant of /prove: runs Claude with stream-json and translates each
+// event into the app's SSE shape (message-annotation for tool activity,
+// text-delta for the final proof) so the main chat's activity panel renders it.
+function proveStream(res, theorem, mcpServers, opts = {}) {
+  let cfgPath
+  try {
+    const dir = mkdtempSync(join(tmpdir(), "claude-prove-"))
+    cfgPath = join(dir, "mcp.json")
+    writeFileSync(cfgPath, JSON.stringify(buildMcpConfig(mcpServers)))
+  } catch (e) {
+    res.writeHead(500, { "content-type": "text/event-stream" })
+    res.write(`data: ${JSON.stringify({ type: "error", message: `mcp config: ${e.message}` })}\n\n`)
+    res.end()
+    return
+  }
+
+  const args = [
+    "-p", provePrompt(theorem),
+    "--output-format", "stream-json", "--verbose",
+    "--mcp-config", cfgPath, "--strict-mcp-config", "--dangerously-skip-permissions",
+  ]
+  if (opts.model) args.push("--model", opts.model)
+
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform" })
+  const send = (obj) => {
+    try {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    } catch {
+      /* client gone */
+    }
+  }
+
+  const start = Date.now()
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+  const stripName = (n) => String(n || "").replace(/^mcp__[a-z0-9-]+__/i, "")
+
+  let child
+  try {
+    child = spawn(CLAUDE_BIN, args, {
+      cwd: opts.workingDirectory || process.cwd(),
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+    })
+  } catch (e) {
+    send({ type: "error", message: `Failed to launch "${CLAUDE_BIN}": ${e.message}` })
+    res.end()
+    return
+  }
+
+  const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 900000, 30000), 3600000)
+  const timer = setTimeout(() => {
+    send({ type: "error", message: "Prover timed out." })
+    child.kill("SIGKILL")
+  }, timeoutMs)
+
+  let buf = ""
+  let stderr = ""
+  let finalText = ""
+
+  child.stdout.on("data", (chunk) => {
+    buf += chunk.toString("utf8")
+    let nl
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl)
+      buf = buf.slice(nl + 1)
+      if (!line.trim()) continue
+      let o
+      try {
+        o = JSON.parse(line)
+      } catch {
+        continue
+      }
+      metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+
+      if (o.type === "assistant" && o.message?.content) {
+        metrics.llm_invocations++
+        for (const c of o.message.content) {
+          if (c.type === "tool_use") {
+            metrics.tools_invoked++
+            const name = stripName(c.name)
+            send({
+              type: "message-annotation",
+              subtype: "tool_intent",
+              thought: `Using ${name}`,
+              tool: name,
+              input: typeof c.input === "string" ? c.input : JSON.stringify(c.input),
+              metrics,
+            })
+          } else if (c.type === "text" && c.text && c.text.trim()) {
+            send({ type: "message-annotation", subtype: "status", thought: c.text.trim().slice(0, 300), metrics })
+          }
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_result") {
+            const t = Array.isArray(c.content)
+              ? c.content.map((x) => x.text || "").join("\n")
+              : String(c.content ?? "")
+            send({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t, metrics })
+          }
+        }
+      } else if (o.type === "result") {
+        finalText = o.result || ""
+      }
+    }
+  })
+
+  child.stderr.on("data", (c) => {
+    stderr += c.toString("utf8")
+  })
+
+  child.on("error", (e) => {
+    clearTimeout(timer)
+    send({ type: "error", message: e.message })
+    res.end()
+  })
+  child.on("close", () => {
+    clearTimeout(timer)
+    if (finalText) send({ type: "text-delta", content: finalText })
+    else if (stderr.trim()) send({ type: "error", message: stderr.trim().slice(0, 500) })
+    send({ type: "done", metrics })
+    res.end()
+  })
+
+  res.on("close", () => {
+    clearTimeout(timer)
+    try {
+      child.kill("SIGKILL")
+    } catch {
+      /* already gone */
+    }
+  })
+}
+
 const server = createServer(async (req, res) => {
   const allowed = setCors(req, res)
 
@@ -307,6 +441,16 @@ const server = createServer(async (req, res) => {
       }
       const result = await runProve(theorem, body.mcpServers || [], body.options || {})
       return json(res, 200, result)
+    }
+
+    if (req.method === "POST" && url.pathname === "/prove-stream") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const theorem = body.theorem || body.prompt
+      if (typeof theorem !== "string" || !theorem.trim()) {
+        return json(res, 400, { error: "theorem_required" })
+      }
+      proveStream(res, theorem, body.mcpServers || [], body.options || {})
+      return
     }
 
     return json(res, 404, { error: "not_found" })

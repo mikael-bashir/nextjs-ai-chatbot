@@ -56,16 +56,53 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
       abortControllerRef.current = new AbortController()
 
       try {
-        const response = await apiClient("/api/chat/canary", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: abortControllerRef.current.signal,
-          body: JSON.stringify({
-            id,
-            messages: currentMessages,
-            ...body,
-          }),
-        })
+        let response: Response
+        if (body.selectedChatModel === "claude-prove") {
+          // Prove on the user's own machine: talk to the local bridge directly
+          // (browser → localhost). It streams tool activity in the same SSE
+          // shape as the canary route, so the parsing below is unchanged.
+          let conn: { bridgeUrl?: string; token?: string } = {}
+          try {
+            const raw = localStorage.getItem("lca.connection")
+            if (raw) conn = JSON.parse(raw)
+          } catch {
+            /* ignore */
+          }
+          const base = (conn.bridgeUrl || "http://localhost:4123").replace(/\/$/, "")
+          let mcpServers: Array<{ name: string; url: string }> = []
+          try {
+            const mr = await apiClient("/api/mcp/servers")
+            if (mr.ok) {
+              const s = await mr.json()
+              if (Array.isArray(s)) {
+                mcpServers = s
+                  .filter((x: any) => x?.url && x?.name && x?.isActive !== false)
+                  .map((x: any) => ({ name: x.name, url: x.url }))
+              }
+            }
+          } catch {
+            /* ignore */
+          }
+          const theorem =
+            [...currentMessages].reverse().find((m) => m.role === "user")?.content || ""
+          response = await fetch(`${base}/prove-stream`, {
+            method: "POST",
+            signal: abortControllerRef.current.signal,
+            headers: { "Content-Type": "application/json", "x-bridge-token": conn.token || "" },
+            body: JSON.stringify({ theorem, mcpServers }),
+          })
+        } else {
+          response = await apiClient("/api/chat/canary", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: abortControllerRef.current.signal,
+            body: JSON.stringify({
+              id,
+              messages: currentMessages,
+              ...body,
+            }),
+          })
+        }
 
         if (response.status === 429) {
           const resBody = await response.json().catch(() => ({}))
