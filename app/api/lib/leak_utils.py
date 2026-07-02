@@ -35,8 +35,24 @@ if os.environ.get("XAI_MASTER"):
         },
     ]
 
+# Local Claude — routes to the requesting user's own machine via the app's relay
+# endpoint (an OpenAI-compatible shim). The relay authenticates by the OpenAI
+# `user` field (LiteLLM forwards `user=` verbatim), so the api_key here is unused.
+# LOCAL_CLAUDE_RELAY_BASE should point at the Next app; in Docker that's the
+# internal service URL, e.g. http://nextjs:3000/api/local-claude/v1
+local_claude = [
+    {
+        "model_name": "claude-local",
+        "litellm_params": {
+            "model": "openai/claude-local",
+            "api_base": os.environ.get("LOCAL_CLAUDE_RELAY_BASE", "http://localhost:3000/api/local-claude/v1"),
+            "api_key": "relay-unused",
+        },
+    },
+]
+
 llm_router = Router(
-    model_list=free_key_pool + paid_models,
+    model_list=free_key_pool + paid_models + local_claude,
     routing_strategy="simple-shuffle",
     num_retries=3,
     timeout=600

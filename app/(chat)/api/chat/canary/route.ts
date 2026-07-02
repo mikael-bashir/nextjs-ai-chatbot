@@ -170,7 +170,15 @@ export async function POST(request: Request) {
                     if (["status", "tool_intent", "tool_result"].includes(data.type)) {
                       controller.enqueue(
                         encoder.encode(
-                          `data: ${JSON.stringify({ type: "message-annotation", thought: data.message, metrics: data.metrics })}\n\n`,
+                          `data: ${JSON.stringify({
+                            type: "message-annotation",
+                            subtype: data.type,
+                            thought: data.message,
+                            tool: data.tool,
+                            input: data.input,
+                            output: data.output,
+                            metrics: data.metrics,
+                          })}\n\n`,
                         ),
                       )
                     }

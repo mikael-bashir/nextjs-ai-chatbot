@@ -195,6 +195,7 @@ jobs:
               echo "AUTH_URL=${AUTH_URL}"
               echo "NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL}"
               echo "PYTHON_BACKEND_URL=http://python-backend:5328"
+              echo "LOCAL_CLAUDE_RELAY_BASE=http://nextjs:3000/api/local-claude/v1"
               echo "NODE_ENV=production"
               echo "XAI_MASTER=${XAI_MASTER}"
               echo "XAI_FREE_KEY_1=${XAI_FREE_KEY_1}"

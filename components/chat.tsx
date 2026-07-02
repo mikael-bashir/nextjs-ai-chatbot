@@ -14,6 +14,17 @@ import { unstable_serialize } from "swr/infinite"
 import { getChatHistoryPaginationKey } from "./sidebar-history"
 import { useLeakChat, type UIMessage, type Attachment } from "@/hooks/use-leak-chat"
 
+// Tool inputs arrive as a JSON string (e.g. {"script":"..."}). Show the script
+// itself when present, otherwise pretty-print the arguments.
+function formatToolInput(input: string): string {
+  try {
+    const obj = JSON.parse(input)
+    return obj.script ?? obj.tactic ?? obj.code ?? JSON.stringify(obj, null, 2)
+  } catch {
+    return input
+  }
+}
+
 export function Chat({
   id,
   initialMessages,
@@ -148,11 +159,27 @@ export function Chat({
               {isThoughtsExpanded && (
                 <div className="flex flex-col gap-1 p-3 bg-muted/30 border border-border/50 rounded-md max-h-64 overflow-y-auto text-xs font-mono text-muted-foreground shadow-inner">
                   {annotations.map((ann, idx) => (
-                    <div key={idx} className="flex gap-3 border-b border-border/20 last:border-0 pb-1 last:pb-0">
-                      <span className="opacity-40 min-w-[24px]">[{idx + 1}]</span>
-                      <span className={`${ann.type === 'error' ? 'text-red-500' : ''} ${ann.type === 'status' ? 'text-blue-500/80 font-semibold' : ''}`}>
-                        {ann.thought || ann.message || (ann.tool ? `Executed tool: ${ann.tool}` : JSON.stringify(ann))}
-                      </span>
+                    <div key={idx} className="flex flex-col gap-1 border-b border-border/20 last:border-0 pb-1 last:pb-0">
+                      <div className="flex gap-3">
+                        <span className="opacity-40 min-w-[24px]">[{idx + 1}]</span>
+                        <span className={`${ann.subtype === 'error' ? 'text-red-500' : ''} ${ann.subtype === 'status' ? 'text-blue-500/80 font-semibold' : ''} ${ann.subtype === 'tool_intent' ? 'text-emerald-500/90' : ''}`}>
+                          {ann.thought || ann.message || (ann.tool ? `Tool: ${ann.tool}` : JSON.stringify(ann))}
+                        </span>
+                      </div>
+
+                      {/* The actual dialogue: proposed script (input) and Lean output */}
+                      {ann.input && (
+                        <details className="ml-[36px]">
+                          <summary className="cursor-pointer opacity-60 hover:opacity-100">view proposed script</summary>
+                          <pre className="mt-1 whitespace-pre-wrap break-words rounded bg-background/60 p-2 text-[11px] leading-snug">{formatToolInput(ann.input)}</pre>
+                        </details>
+                      )}
+                      {ann.output && (
+                        <details className="ml-[36px]">
+                          <summary className="cursor-pointer opacity-60 hover:opacity-100">view Lean output</summary>
+                          <pre className="mt-1 whitespace-pre-wrap break-words rounded bg-background/60 p-2 text-[11px] leading-snug">{ann.output}</pre>
+                        </details>
+                      )}
                     </div>
                   ))}
                 </div>

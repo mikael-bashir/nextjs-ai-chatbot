@@ -1,5 +1,5 @@
 import type { InferSelectModel } from "drizzle-orm"
-import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean, integer, real } from "drizzle-orm/pg-core"
+import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean, integer, real, unique } from "drizzle-orm/pg-core"
 
 export const user = pgTable("User", {
   id: uuid("id").primaryKey().notNull().defaultRandom(),
@@ -160,6 +160,49 @@ export const mcpServers = pgTable("MCPServer", {
 })
 
 export type MCPServer = InferSelectModel<typeof mcpServers>
+
+// Per-user configuration for the Local Claude Agent feature.
+// One row per user (see the unique constraint on userId). Stores how this
+// user's locally-installed Claude Code CLI should be invoked by the server.
+export const localClaudeAgentConfig = pgTable(
+  "LocalClaudeAgentConfig",
+  {
+    id: uuid("id").primaryKey().notNull().defaultRandom(),
+    userId: uuid("userId")
+      .notNull()
+      .references(() => user.id),
+    // Path to the `claude` executable on the host running this server.
+    binaryPath: varchar("binaryPath", { length: 1024 }).notNull().default("claude"),
+    // Directory the agent runs in (its default cwd / project root). Null = server cwd.
+    workingDirectory: text("workingDirectory"),
+    // Model override passed via `--model`. Null = use the CLI's configured default.
+    model: varchar("model", { length: 128 }),
+    // Maps to `--permission-mode`.
+    permissionMode: varchar("permissionMode", {
+      enum: ["default", "acceptEdits", "plan", "bypassPermissions"],
+    })
+      .notNull()
+      .default("default"),
+    // Comma-separated tool allowlist passed via `--allowedTools`. Null = no restriction.
+    allowedTools: text("allowedTools"),
+    // Maps to `--max-turns`. Null = CLI default.
+    maxTurns: integer("maxTurns"),
+    // Hard wall-clock timeout for a single run, in milliseconds.
+    timeoutMs: integer("timeoutMs").notNull().default(120000),
+    // Appended to the system prompt via `--append-system-prompt`.
+    systemPromptAppend: text("systemPromptAppend"),
+    // Advanced: extra raw CLI flags, stored as a JSON string[] (escape hatch).
+    extraArgs: json("extraArgs"),
+    enabled: boolean("enabled").notNull().default(true),
+    createdAt: timestamp("createdAt").notNull(),
+    updatedAt: timestamp("updatedAt").notNull(),
+  },
+  (table) => ({
+    uniqueUser: unique("LocalClaudeAgentConfig_userId_unique").on(table.userId),
+  }),
+)
+
+export type LocalClaudeAgentConfig = InferSelectModel<typeof localClaudeAgentConfig>
 
 // balance stored as real (fractional credits). 1.0 credit = £1.
 export const userCredits = pgTable("UserCredits", {
