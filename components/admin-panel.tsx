@@ -25,17 +25,34 @@ Requirements:
 - The answer is a specific INTEGER.
 - Solvable BY HAND with at most a basic calculator: it must hinge on an elegant insight, NOT brute force or a computer. A strong student derives the integer on paper.
 - Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. STRONGLY prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range n, Finset.Icc, functions between small Fin types) so it is machine-checkable, or a clean closed-form equality. It MUST be true — compute the answer correctly. Assume "import Mathlib" is present; do NOT include imports.
+- Also give it presentation metadata: a short evocative title, a 1-3 word subtitle, a difficulty of exactly "Easy" | "Medium" | "Hard" | "Extreme", and points = 50 for Easy, 100 for Medium, 150 for Hard, 200 for Extreme.
 
 Respond with ONLY this JSON object, nothing else:
-{"problem":"<self-contained statement>","answer":<integer>,"insight":"<key trick, 1-2 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
+{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"insight":"<key trick, 1-2 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
 const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
 
 interface GenProblem {
+  questionTitle?: string;
+  subtitle?: string;
   problem?: string;
   answer?: number;
+  difficulty?: string;
+  points?: number;
   insight?: string;
   lean?: string;
+}
+
+interface StagedItem extends GenProblem {
+  id: string;
+  proof?: string;
+  toolchain?: string;
+  createdAt?: string;
+}
+
+interface Health {
+  staging: { ok: boolean; length?: number; error?: string };
+  prod: { ok: boolean; length?: number; error?: string };
 }
 
 function extractJson(text: string): GenProblem | null {
@@ -68,8 +85,68 @@ export function AdminPanel({ className }: { className?: string }) {
     errors: 0,
   });
   const [queued, setQueued] = useState<number | null>(null);
+  const [health, setHealth] = useState<Health | null>(null);
+  const [items, setItems] = useState<StagedItem[]>([]);
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
 
   const workRef = useRef(false);
+
+  // Load the queue: Redis health for both instances + the staged items.
+  const loadQueue = useCallback(async () => {
+    try {
+      const r = await fetch('/api/admin/problems');
+      if (!r.ok) return;
+      const j = await r.json();
+      setHealth(j.health ?? null);
+      setItems(Array.isArray(j.items) ? j.items : []);
+      setQueued(j.queued ?? null);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const removeItem = useCallback(
+    async (id: string) => {
+      setBusy(id);
+      try {
+        await fetch(`/api/admin/problems?id=${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        await loadQueue();
+      } finally {
+        setBusy(null);
+      }
+    },
+    [loadQueue],
+  );
+
+  const promoteItem = useCallback(
+    async (id: string) => {
+      setBusy(id);
+      try {
+        const r = await fetch('/api/admin/problems/promote', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ id }),
+        });
+        if (!r.ok) {
+          const detail = await r.text();
+          throw new Error(detail || `promote failed (${r.status})`);
+        }
+        await loadQueue();
+      } catch (e) {
+        setHealth((h) =>
+          h
+            ? { ...h, prod: { ok: false, error: String((e as Error).message) } }
+            : h,
+        );
+      } finally {
+        setBusy(null);
+      }
+    },
+    [loadQueue],
+  );
 
   const getConn = () => {
     try {
@@ -181,11 +258,17 @@ export function AdminPanel({ className }: { className?: string }) {
         const j = await r.json();
         setQueued(j.queued);
         setStats((s) => ({ ...s, verified: s.verified + 1 }));
+        loadQueue();
       }
     } else {
       setStats((s) => ({ ...s, discarded: s.discarded + 1 }));
     }
-  }, [callBridge, proveStream]);
+  }, [callBridge, proveStream, loadQueue]);
+
+  // Refresh the queue view whenever the dropdown is opened.
+  useEffect(() => {
+    if (open) loadQueue();
+  }, [open, loadQueue]);
 
   useEffect(() => {
     workRef.current = work;
@@ -236,7 +319,10 @@ export function AdminPanel({ className }: { className?: string }) {
           )}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end" className="w-96 p-3">
+      <DropdownMenuContent
+        align="end"
+        className="max-h-[80vh] w-[420px] overflow-y-auto p-3"
+      >
         <DropdownMenuLabel className="px-0">Content pipeline</DropdownMenuLabel>
 
         <div className="mt-1 flex items-center justify-between rounded-md border p-3">
@@ -298,9 +384,116 @@ export function AdminPanel({ className }: { className?: string }) {
           )}
         </div>
 
+        <Separator className="my-3" />
+
+        {/* Queue management */}
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium">
+            Review queue{' '}
+            {health?.staging.ok && (
+              <span className="text-muted-foreground">
+                ({health.staging.length ?? items.length})
+              </span>
+            )}
+          </span>
+          <button
+            type="button"
+            onClick={loadQueue}
+            className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+          >
+            Refresh
+          </button>
+        </div>
+
+        <div className="mt-2 flex gap-2 text-[11px]">
+          <HealthChip label="Staging" state={health?.staging} />
+          <HealthChip label="Prod" state={health?.prod} />
+        </div>
+
+        <div className="mt-2 space-y-1.5">
+          {items.length === 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              {health && !health.staging.ok
+                ? 'Staging Redis unreachable — see error above.'
+                : 'Queue is empty.'}
+            </p>
+          )}
+          {items.map((it) => (
+            <div key={it.id} className="rounded-md border p-2 text-xs">
+              <div className="flex items-start justify-between gap-2">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setExpanded((e) => (e === it.id ? null : it.id))
+                  }
+                  className="min-w-0 flex-1 text-left"
+                >
+                  <span className="block truncate font-medium">
+                    {it.questionTitle || it.problem || 'Untitled problem'}
+                  </span>
+                  <span className="text-[10px] text-muted-foreground">
+                    {[
+                      it.difficulty,
+                      it.points ? `${it.points}pts` : null,
+                      it.answer != null ? `ans ${it.answer}` : null,
+                    ]
+                      .filter(Boolean)
+                      .join(' · ')}
+                  </span>
+                </button>
+                <div className="flex shrink-0 gap-1">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-6 px-2 text-[11px]"
+                    disabled={busy === it.id || !health?.prod.ok}
+                    onClick={() => promoteItem(it.id)}
+                    title={
+                      health?.prod.ok
+                        ? 'Push to production weekly-problems queue'
+                        : 'Prod Redis unreachable'
+                    }
+                  >
+                    {busy === it.id ? '…' : 'Push to prod'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 px-2 text-[11px] text-red-500 hover:text-red-600"
+                    disabled={busy === it.id}
+                    onClick={() => removeItem(it.id)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              </div>
+
+              {expanded === it.id && (
+                <div className="mt-2 space-y-1 border-t pt-2 text-[11px] text-muted-foreground">
+                  {it.problem && <p>{it.problem}</p>}
+                  {it.insight && (
+                    <p>
+                      <span className="font-medium text-foreground">
+                        Insight:{' '}
+                      </span>
+                      {it.insight}
+                    </p>
+                  )}
+                  {it.lean && (
+                    <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted/50 p-1.5 text-[10px] text-foreground">
+                      {it.lean}
+                    </pre>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
         <p className="mt-3 text-[11px] text-muted-foreground">
           Requires your bridge running (Local Agent → set it up). Verified
-          problems are pushed to the Redis queue.
+          problems land in the staging queue; “Push to prod” publishes to the
+          main CompeteMath queue and archives the Lean proof to the database.
         </p>
       </DropdownMenuContent>
     </DropdownMenu>
@@ -317,5 +510,42 @@ function Stat({
       <div className={cn('text-sm font-semibold', tone)}>{value}</div>
       <div className="text-[10px] text-muted-foreground">{label}</div>
     </div>
+  );
+}
+
+function HealthChip({
+  label,
+  state,
+}: {
+  label: string;
+  state?: { ok: boolean; length?: number; error?: string };
+}) {
+  const ok = state?.ok;
+  return (
+    <span
+      className={cn(
+        'flex items-center gap-1 rounded border px-1.5 py-0.5',
+        ok === undefined
+          ? 'text-muted-foreground'
+          : ok
+            ? 'border-emerald-500/40 text-emerald-600'
+            : 'border-red-500/40 text-red-500',
+      )}
+      title={state?.error || undefined}
+    >
+      <span
+        className={cn(
+          'h-1.5 w-1.5 rounded-full',
+          ok === undefined
+            ? 'bg-muted-foreground'
+            : ok
+              ? 'bg-emerald-500'
+              : 'bg-red-500',
+        )}
+      />
+      {label}
+      {ok && state?.length != null ? ` · ${state.length}` : ''}
+      {ok === false ? ' · error' : ''}
+    </span>
   );
 }

@@ -2,7 +2,10 @@ import 'server-only';
 
 import Redis from 'ioredis';
 
-// Shared ioredis singleton (mirrors the pattern in lib/pricing.ts).
+// Two separate Redis instances, deliberately kept distinct:
+//   - staging  (REDIS_URL)             : this sub-service's review queue
+//   - prod     (COMPETEMATH_REDIS_URL) : the main CompeteMath app's live queue
+// (mirrors the singleton pattern in lib/pricing.ts).
 let _redis: Redis | null = null;
 export function getRedis(): Redis {
   if (!_redis) {
@@ -14,15 +17,109 @@ export function getRedis(): Redis {
   return _redis;
 }
 
-// The queue that successfully-generated + Lean-verified problems land in.
-export const PROBLEM_QUEUE_KEY = 'competemath:problems:queue';
+let _prodRedis: Redis | null = null;
+export function getCompetemathRedis(): Redis {
+  if (!_prodRedis) {
+    _prodRedis = new Redis(process.env.COMPETEMATH_REDIS_URL!, {
+      lazyConnect: true,
+      maxRetriesPerRequest: 2,
+    });
+  }
+  return _prodRedis;
+}
 
-export async function pushProblem(problem: unknown): Promise<number> {
-  const redis = getRedis();
-  // LPUSH so consumers can RPOP in FIFO order; return the new queue length.
-  return redis.lpush(PROBLEM_QUEUE_KEY, JSON.stringify(problem));
+// Staging queue: generated + Lean-verified problems awaiting review.
+export const PROBLEM_QUEUE_KEY = 'competemath:problems:queue';
+// Production queue consumed by the main app's weekly-problems cron via LPOP.
+export const PROD_QUEUE_KEY = 'weekly-problems';
+
+export interface StagedProblem {
+  id: string;
+  questionTitle?: string;
+  subtitle?: string;
+  problem?: string;
+  answer?: number | string | null;
+  difficulty?: string;
+  points?: number;
+  insight?: string;
+  lean: string;
+  proof: string;
+  toolchain?: string;
+  createdAt: string;
+}
+
+export async function pushProblem(
+  problem: Record<string, unknown>,
+): Promise<number> {
+  // Stamp a stable id so the item can later be targeted for delete/promote.
+  const record = { id: crypto.randomUUID(), ...problem };
+  // LPUSH so consumers RPOP/LPOP in FIFO order; return the new queue length.
+  return getRedis().lpush(PROBLEM_QUEUE_KEY, JSON.stringify(record));
 }
 
 export async function queueLength(): Promise<number> {
   return getRedis().llen(PROBLEM_QUEUE_KEY);
+}
+
+export async function listProblems(): Promise<StagedProblem[]> {
+  const raws: string[] = await getRedis().lrange(PROBLEM_QUEUE_KEY, 0, -1);
+  return raws
+    .map((r: string): StagedProblem | null => {
+      try {
+        return JSON.parse(r) as StagedProblem;
+      } catch {
+        return null;
+      }
+    })
+    .filter((x: StagedProblem | null): x is StagedProblem => !!x);
+}
+
+// Remove the staged item whose id matches; returns the removed record or null.
+export async function deleteProblem(id: string): Promise<StagedProblem | null> {
+  const redis = getRedis();
+  const raws = await redis.lrange(PROBLEM_QUEUE_KEY, 0, -1);
+  for (const raw of raws) {
+    try {
+      const rec = JSON.parse(raw) as StagedProblem;
+      if (rec.id === id) {
+        // LREM by the exact stored string (count 1) — precise, id-targeted.
+        await redis.lrem(PROBLEM_QUEUE_KEY, 1, raw);
+        return rec;
+      }
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return null;
+}
+
+// Push a payload onto the production weekly-problems queue (separate instance).
+export async function pushToProd(
+  payload: Record<string, unknown>,
+): Promise<number> {
+  return getCompetemathRedis().lpush(PROD_QUEUE_KEY, JSON.stringify(payload));
+}
+
+export async function prodQueueLength(): Promise<number> {
+  return getCompetemathRedis().llen(PROD_QUEUE_KEY);
+}
+
+// Health probe for both instances: reports reachability + queue length so the
+// admin UI can surface Redis issues immediately.
+export async function redisHealth(): Promise<{
+  staging: { ok: boolean; length?: number; error?: string };
+  prod: { ok: boolean; length?: number; error?: string };
+}> {
+  const probe = async (fn: () => Promise<number>) => {
+    try {
+      return { ok: true, length: await fn() };
+    } catch (e) {
+      return { ok: false, error: String((e as Error)?.message || e) };
+    }
+  };
+  const [staging, prod] = await Promise.all([
+    probe(queueLength),
+    probe(prodQueueLength),
+  ]);
+  return { staging, prod };
 }

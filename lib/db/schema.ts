@@ -1,134 +1,147 @@
-import type { InferSelectModel } from "drizzle-orm"
-import { pgTable, varchar, timestamp, json, uuid, text, primaryKey, foreignKey, boolean, integer, real, unique } from "drizzle-orm/pg-core"
+import type { InferSelectModel } from 'drizzle-orm';
+import {
+  pgTable,
+  varchar,
+  timestamp,
+  json,
+  uuid,
+  text,
+  primaryKey,
+  foreignKey,
+  boolean,
+  integer,
+  real,
+  unique,
+} from 'drizzle-orm/pg-core';
 
-export const user = pgTable("User", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  email: varchar("email", { length: 64 }),
-  username: varchar("username", { length: 32 }).unique(),
-})
+export const user = pgTable('User', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  email: varchar('email', { length: 64 }),
+  username: varchar('username', { length: 32 }).unique(),
+});
 
-export type User = InferSelectModel<typeof user>
+export type User = InferSelectModel<typeof user>;
 
-export const chat = pgTable("Chat", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  createdAt: timestamp("createdAt").notNull(),
-  title: text("title").notNull(),
-  userId: uuid("userId")
+export const chat = pgTable('Chat', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  createdAt: timestamp('createdAt').notNull(),
+  title: text('title').notNull(),
+  userId: uuid('userId')
     .notNull()
     .references(() => user.id),
-  visibility: varchar("visibility", { enum: ["public", "private"] })
+  visibility: varchar('visibility', { enum: ['public', 'private'] })
     .notNull()
-    .default("private"),
-})
+    .default('private'),
+});
 
-export type Chat = InferSelectModel<typeof chat>
+export type Chat = InferSelectModel<typeof chat>;
 
 // DEPRECATED: The following schema is deprecated and will be removed in the future.
 // Read the migration guide at https://github.com/vercel/ai-chatbot/blob/main/docs/04-migrate-to-parts.md
-export const messageDeprecated = pgTable("Message", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  chatId: uuid("chatId")
+export const messageDeprecated = pgTable('Message', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  chatId: uuid('chatId')
     .notNull()
     .references(() => chat.id),
-  role: varchar("role").notNull(),
-  content: json("content").notNull(),
-  createdAt: timestamp("createdAt").notNull(),
-})
+  role: varchar('role').notNull(),
+  content: json('content').notNull(),
+  createdAt: timestamp('createdAt').notNull(),
+});
 
-export type MessageDeprecated = InferSelectModel<typeof messageDeprecated>
+export type MessageDeprecated = InferSelectModel<typeof messageDeprecated>;
 
-export const message = pgTable("Message_v2", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  chatId: uuid("chatId")
+export const message = pgTable('Message_v2', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  chatId: uuid('chatId')
     .notNull()
     .references(() => chat.id),
-  role: varchar("role").notNull(),
-  parts: json("parts").notNull(),
-  attachments: json("attachments").notNull(),
-  createdAt: timestamp("createdAt").notNull(),
-})
+  role: varchar('role').notNull(),
+  parts: json('parts').notNull(),
+  attachments: json('attachments').notNull(),
+  createdAt: timestamp('createdAt').notNull(),
+});
 
-export type DBMessage = InferSelectModel<typeof message>
+export type DBMessage = InferSelectModel<typeof message>;
 
 // DEPRECATED: The following schema is deprecated and will be removed in the future.
 // Read the migration guide at https://github.com/vercel/ai-chatbot/blob/main/docs/04-migrate-to-parts.md
 export const voteDeprecated = pgTable(
-  "Vote",
+  'Vote',
   {
-    chatId: uuid("chatId")
+    chatId: uuid('chatId')
       .notNull()
       .references(() => chat.id),
-    messageId: uuid("messageId")
+    messageId: uuid('messageId')
       .notNull()
       .references(() => messageDeprecated.id),
-    isUpvoted: boolean("isUpvoted").notNull(),
+    isUpvoted: boolean('isUpvoted').notNull(),
   },
   (table) => {
     return {
       pk: primaryKey({ columns: [table.chatId, table.messageId] }),
-    }
+    };
   },
-)
+);
 
-export type VoteDeprecated = InferSelectModel<typeof voteDeprecated>
+export type VoteDeprecated = InferSelectModel<typeof voteDeprecated>;
 
 export const vote = pgTable(
-  "Vote_v2",
+  'Vote_v2',
   {
-    chatId: uuid("chatId")
+    chatId: uuid('chatId')
       .notNull()
       .references(() => chat.id),
-    messageId: uuid("messageId")
+    messageId: uuid('messageId')
       .notNull()
       .references(() => message.id),
-    isUpvoted: boolean("isUpvoted").notNull(),
+    isUpvoted: boolean('isUpvoted').notNull(),
   },
   (table) => {
     return {
       pk: primaryKey({ columns: [table.chatId, table.messageId] }),
-    }
+    };
   },
-)
+);
 
-export type Vote = InferSelectModel<typeof vote>
+export type Vote = InferSelectModel<typeof vote>;
 
 export const document = pgTable(
-  "Document",
+  'Document',
   {
-    id: uuid("id").primaryKey().notNull().defaultRandom(),
-    createdAt: timestamp("createdAt").notNull(),
-    title: text("title").notNull(),
-    content: text("content"),
-    kind: varchar("kind", { enum: ["text", "code", "image", "sheet"] })
+    id: uuid('id').primaryKey().notNull().defaultRandom(),
+    createdAt: timestamp('createdAt').notNull(),
+    title: text('title').notNull(),
+    content: text('content'),
+    kind: varchar('kind', { enum: ['text', 'code', 'image', 'sheet'] })
       .notNull()
-      .default("text"),
-    userId: uuid("userId")
+      .default('text'),
+    userId: uuid('userId')
       .notNull()
       .references(() => user.id),
   },
   (table) => {
     return {
       pk: primaryKey({ columns: [table.id, table.createdAt] }),
-    }
+    };
   },
-)
+);
 
-export type Document = InferSelectModel<typeof document>
+export type Document = InferSelectModel<typeof document>;
 
 export const suggestion = pgTable(
-  "Suggestion",
+  'Suggestion',
   {
-    id: uuid("id").primaryKey().notNull().defaultRandom(),
-    documentId: uuid("documentId").notNull(),
-    documentCreatedAt: timestamp("documentCreatedAt").notNull(),
-    originalText: text("originalText").notNull(),
-    suggestedText: text("suggestedText").notNull(),
-    description: text("description"),
-    isResolved: boolean("isResolved").notNull().default(false),
-    userId: uuid("userId")
+    id: uuid('id').primaryKey().notNull().defaultRandom(),
+    documentId: uuid('documentId').notNull(),
+    documentCreatedAt: timestamp('documentCreatedAt').notNull(),
+    originalText: text('originalText').notNull(),
+    suggestedText: text('suggestedText').notNull(),
+    description: text('description'),
+    isResolved: boolean('isResolved').notNull().default(false),
+    userId: uuid('userId')
       .notNull()
       .references(() => user.id),
-    createdAt: timestamp("createdAt").notNull(),
+    createdAt: timestamp('createdAt').notNull(),
   },
   (table) => ({
     pk: primaryKey({ columns: [table.id] }),
@@ -137,130 +150,161 @@ export const suggestion = pgTable(
       foreignColumns: [document.id, document.createdAt],
     }),
   }),
-)
+);
 
-export type Suggestion = InferSelectModel<typeof suggestion>
+export type Suggestion = InferSelectModel<typeof suggestion>;
 
-export const mcpServers = pgTable("MCPServer", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  name: varchar("name", { length: 255 }).notNull(),
-  url: text("url").notNull(),
-  description: text("description"),
-  authType: varchar("authType", { enum: ["none", "bearer", "oauth", "apikey"] })
+export const mcpServers = pgTable('MCPServer', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  name: varchar('name', { length: 255 }).notNull(),
+  url: text('url').notNull(),
+  description: text('description'),
+  authType: varchar('authType', { enum: ['none', 'bearer', 'oauth', 'apikey'] })
     .notNull()
-    .default("none"),
-  credentials: json("credentials"), // Encrypted credentials storage
-  flaskServerId: varchar("flaskServerId", { length: 255 }), // Links to Flask backend server ID
-  isActive: boolean("isActive").notNull().default(true),
-  userId: uuid("userId")
+    .default('none'),
+  credentials: json('credentials'), // Encrypted credentials storage
+  flaskServerId: varchar('flaskServerId', { length: 255 }), // Links to Flask backend server ID
+  isActive: boolean('isActive').notNull().default(true),
+  userId: uuid('userId')
     .notNull()
     .references(() => user.id),
-  createdAt: timestamp("createdAt").notNull(),
-  updatedAt: timestamp("updatedAt").notNull(),
-})
+  createdAt: timestamp('createdAt').notNull(),
+  updatedAt: timestamp('updatedAt').notNull(),
+});
 
-export type MCPServer = InferSelectModel<typeof mcpServers>
+export type MCPServer = InferSelectModel<typeof mcpServers>;
 
 // Per-user configuration for the Local Claude Agent feature.
 // One row per user (see the unique constraint on userId). Stores how this
 // user's locally-installed Claude Code CLI should be invoked by the server.
 export const localClaudeAgentConfig = pgTable(
-  "LocalClaudeAgentConfig",
+  'LocalClaudeAgentConfig',
   {
-    id: uuid("id").primaryKey().notNull().defaultRandom(),
-    userId: uuid("userId")
+    id: uuid('id').primaryKey().notNull().defaultRandom(),
+    userId: uuid('userId')
       .notNull()
       .references(() => user.id),
     // Path to the `claude` executable on the host running this server.
-    binaryPath: varchar("binaryPath", { length: 1024 }).notNull().default("claude"),
+    binaryPath: varchar('binaryPath', { length: 1024 })
+      .notNull()
+      .default('claude'),
     // Directory the agent runs in (its default cwd / project root). Null = server cwd.
-    workingDirectory: text("workingDirectory"),
+    workingDirectory: text('workingDirectory'),
     // Model override passed via `--model`. Null = use the CLI's configured default.
-    model: varchar("model", { length: 128 }),
+    model: varchar('model', { length: 128 }),
     // Maps to `--permission-mode`.
-    permissionMode: varchar("permissionMode", {
-      enum: ["default", "acceptEdits", "plan", "bypassPermissions"],
+    permissionMode: varchar('permissionMode', {
+      enum: ['default', 'acceptEdits', 'plan', 'bypassPermissions'],
     })
       .notNull()
-      .default("default"),
+      .default('default'),
     // Comma-separated tool allowlist passed via `--allowedTools`. Null = no restriction.
-    allowedTools: text("allowedTools"),
+    allowedTools: text('allowedTools'),
     // Maps to `--max-turns`. Null = CLI default.
-    maxTurns: integer("maxTurns"),
+    maxTurns: integer('maxTurns'),
     // Hard wall-clock timeout for a single run, in milliseconds.
-    timeoutMs: integer("timeoutMs").notNull().default(120000),
+    timeoutMs: integer('timeoutMs').notNull().default(120000),
     // Appended to the system prompt via `--append-system-prompt`.
-    systemPromptAppend: text("systemPromptAppend"),
+    systemPromptAppend: text('systemPromptAppend'),
     // Advanced: extra raw CLI flags, stored as a JSON string[] (escape hatch).
-    extraArgs: json("extraArgs"),
-    enabled: boolean("enabled").notNull().default(true),
-    createdAt: timestamp("createdAt").notNull(),
-    updatedAt: timestamp("updatedAt").notNull(),
+    extraArgs: json('extraArgs'),
+    enabled: boolean('enabled').notNull().default(true),
+    createdAt: timestamp('createdAt').notNull(),
+    updatedAt: timestamp('updatedAt').notNull(),
   },
   (table) => ({
-    uniqueUser: unique("LocalClaudeAgentConfig_userId_unique").on(table.userId),
+    uniqueUser: unique('LocalClaudeAgentConfig_userId_unique').on(table.userId),
   }),
-)
+);
 
-export type LocalClaudeAgentConfig = InferSelectModel<typeof localClaudeAgentConfig>
+export type LocalClaudeAgentConfig = InferSelectModel<
+  typeof localClaudeAgentConfig
+>;
 
 // balance stored as real (fractional credits). 1.0 credit = £1.
-export const userCredits = pgTable("UserCredits", {
-  userId: uuid("userId")
+export const userCredits = pgTable('UserCredits', {
+  userId: uuid('userId')
     .primaryKey()
     .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  balance: real("balance").notNull().default(0),
-  updatedAt: timestamp("updatedAt").notNull(),
-})
+    .references(() => user.id, { onDelete: 'cascade' }),
+  balance: real('balance').notNull().default(0),
+  updatedAt: timestamp('updatedAt').notNull(),
+});
 
-export type UserCredits = InferSelectModel<typeof userCredits>
+export type UserCredits = InferSelectModel<typeof userCredits>;
 
-export const creditTransactions = pgTable("CreditTransaction", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  userId: uuid("userId")
+export const creditTransactions = pgTable('CreditTransaction', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  userId: uuid('userId')
     .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
+    .references(() => user.id, { onDelete: 'cascade' }),
   // amount in credits (positive = add, negative = deduct). 1.0 credit = £1.
-  amount: real("amount").notNull(),
-  type: varchar("type", { length: 32, enum: ["purchase", "usage", "refund", "grant"] }).notNull(),
-  description: text("description").notNull(),
-  createdAt: timestamp("createdAt").notNull(),
+  amount: real('amount').notNull(),
+  type: varchar('type', {
+    length: 32,
+    enum: ['purchase', 'usage', 'refund', 'grant'],
+  }).notNull(),
+  description: text('description').notNull(),
+  createdAt: timestamp('createdAt').notNull(),
   // audit fields — populated for usage transactions
-  tokensInput: integer("tokensInput"),
-  tokensOutput: integer("tokensOutput"),
-  modelId: varchar("modelId", { length: 128 }),
-  rawCostGbp: real("rawCostGbp"),
-  markupFactor: real("markupFactor"),
-})
+  tokensInput: integer('tokensInput'),
+  tokensOutput: integer('tokensOutput'),
+  modelId: varchar('modelId', { length: 128 }),
+  rawCostGbp: real('rawCostGbp'),
+  markupFactor: real('markupFactor'),
+});
 
-export type CreditTransaction = InferSelectModel<typeof creditTransactions>
+export type CreditTransaction = InferSelectModel<typeof creditTransactions>;
 
-export const stripeCustomers = pgTable("StripeCustomer", {
-  userId: uuid("userId")
+export const stripeCustomers = pgTable('StripeCustomer', {
+  userId: uuid('userId')
     .primaryKey()
     .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  stripeCustomerId: varchar("stripeCustomerId", { length: 255 }).notNull(),
-  createdAt: timestamp("createdAt").notNull(),
-})
+    .references(() => user.id, { onDelete: 'cascade' }),
+  stripeCustomerId: varchar('stripeCustomerId', { length: 255 }).notNull(),
+  createdAt: timestamp('createdAt').notNull(),
+});
 
-export type StripeCustomer = InferSelectModel<typeof stripeCustomers>
+export type StripeCustomer = InferSelectModel<typeof stripeCustomers>;
 
-export const stripeSubscriptions = pgTable("StripeSubscription", {
-  id: uuid("id").primaryKey().notNull().defaultRandom(),
-  userId: uuid("userId")
+export const stripeSubscriptions = pgTable('StripeSubscription', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  userId: uuid('userId')
     .notNull()
-    .references(() => user.id, { onDelete: "cascade" }),
-  stripeSubscriptionId: varchar("stripeSubscriptionId", { length: 255 }).notNull(),
-  planId: varchar("planId", { length: 50 }).notNull(),
-  status: varchar("status", {
-    length: 50,
-    enum: ["active", "cancelled", "past_due", "incomplete"],
+    .references(() => user.id, { onDelete: 'cascade' }),
+  stripeSubscriptionId: varchar('stripeSubscriptionId', {
+    length: 255,
   }).notNull(),
-  currentPeriodEnd: timestamp("currentPeriodEnd").notNull(),
-  createdAt: timestamp("createdAt").notNull(),
-  updatedAt: timestamp("updatedAt").notNull(),
-})
+  planId: varchar('planId', { length: 50 }).notNull(),
+  status: varchar('status', {
+    length: 50,
+    enum: ['active', 'cancelled', 'past_due', 'incomplete'],
+  }).notNull(),
+  currentPeriodEnd: timestamp('currentPeriodEnd').notNull(),
+  createdAt: timestamp('createdAt').notNull(),
+  updatedAt: timestamp('updatedAt').notNull(),
+});
 
-export type StripeSubscription = InferSelectModel<typeof stripeSubscriptions>
+export type StripeSubscription = InferSelectModel<typeof stripeSubscriptions>;
+
+// Metadata for problems generated by the admin pipeline. The Redis queues carry
+// only what each consumer needs; the Lean theorem + verified proof (and other
+// internal fields) live here, written when a problem is promoted to prod.
+export const generatedProblem = pgTable('GeneratedProblem', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  problemId: varchar('problemId', { length: 128 }),
+  questionTitle: text('questionTitle'),
+  subtitle: text('subtitle'),
+  problem: text('problem'),
+  answer: text('answer'),
+  difficulty: varchar('difficulty', { length: 32 }),
+  points: integer('points'),
+  insight: text('insight'),
+  lean: text('lean').notNull(),
+  proof: text('proof').notNull(),
+  toolchain: varchar('toolchain', { length: 128 }),
+  promotedAt: timestamp('promotedAt'),
+  createdAt: timestamp('createdAt').notNull().defaultNow(),
+});
+
+export type GeneratedProblem = InferSelectModel<typeof generatedProblem>;
