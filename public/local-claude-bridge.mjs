@@ -26,9 +26,6 @@ import { join } from "node:path"
 
 const PORT = Number(process.env.PORT || 4123)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"
-// The Lean toolchain the verify daemon is pinned to. A "verified" proof is only
-// reproducible on this exact version — stamped onto every accepted proof.
-const LEAN_TOOLCHAIN = process.env.LEAN_TOOLCHAIN || "leanprover/lean4:v4.29.1"
 // Auto-generate a token if none supplied. Copy it into the app UI once.
 const TOKEN = process.env.BRIDGE_TOKEN || randomBytes(24).toString("base64url")
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024
@@ -412,17 +409,10 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
       send({
         type: "message-annotation",
         subtype: "status",
-        thought: `✅ System check passed — verified with no errors against ${LEAN_TOOLCHAIN}.`,
+        thought: "✅ System check passed — script verified with no errors.",
         metrics,
       })
-      send({
-        type: "text-delta",
-        content:
-          "✅ **Verified proof** (confirmed by verify_full_script):\n\n" +
-          `\`\`\`lean\n${verifiedScript}\n\`\`\`\n\n` +
-          `> 🔒 Verified against **${LEAN_TOOLCHAIN}** (Mathlib pinned to this toolchain). ` +
-          "Guaranteed to compile only on this exact version.",
-      })
+      send({ type: "text-delta", content: `✅ **Verified proof** (confirmed by verify_full_script):\n\n\`\`\`lean\n${verifiedScript}\n\`\`\`` })
     } else {
       send({
         type: "message-annotation",
