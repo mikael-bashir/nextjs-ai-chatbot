@@ -216,24 +216,10 @@ function buildMcpConfig(mcpServers) {
   return { mcpServers: servers }
 }
 
+// Minimal prompt on purpose — the goal is to let Claude use the tools logically
+// on its own, not to script the proof. Verified to work this way.
 function provePrompt(theorem) {
-  return [
-    "You are a Lean 4 theorem prover. You have MCP tools to initialize a proof, apply",
-    "tactics, inspect the goal state, search Mathlib (loogle/moogle), and verify a full",
-    "script against a Lean backend.",
-    "",
-    "Prove EXACTLY this theorem (do not change its statement):",
-    "",
-    theorem,
-    "",
-    "Rules:",
-    "- Use the tools to construct AND check the proof.",
-    "- You are NOT finished until verify_full_script reports success — the script must",
-    "  compile with NO errors and prove this exact statement.",
-    "- If a verification fails, read the error output and try again. Keep iterating.",
-    "- Only when it verifies, output ONLY the final, verified Lean 4 proof in a single",
-    "  ```lean code block. No commentary.",
-  ].join("\n")
+  return `Prove this Lean 4 theorem using your MCP tools, and verify it compiles with no errors. Then give the final verified proof.\n\n${theorem}`
 }
 
 async function runProve(theorem, mcpServers, opts = {}) {
@@ -248,14 +234,15 @@ async function runProve(theorem, mcpServers, opts = {}) {
     return { ok: false, proof: "", stderr: `failed to write mcp config: ${e.message}`, durationMs: 0 }
   }
 
-  // NOTE: these Claude Code flags (--mcp-config, --permission-mode bypassPermissions)
-  // may need tweaking for your installed CLI version; the bridge logs stderr so
-  // permission/MCP errors are visible.
+  // Flags verified against Claude Code 2.1.x: strict-mcp-config uses only these
+  // servers, dangerously-skip-permissions lets the agent call the MCP tools
+  // without prompting (it's the user's own machine + own tools).
   const args = [
     "-p", provePrompt(theorem),
     "--output-format", "json",
     "--mcp-config", cfgPath,
-    "--permission-mode", "bypassPermissions",
+    "--strict-mcp-config",
+    "--dangerously-skip-permissions",
   ]
   if (opts.model) args.push("--model", opts.model)
 
