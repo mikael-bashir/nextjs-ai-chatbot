@@ -301,10 +301,69 @@ async def execute_tools(state: State) -> tuple[dict, State]:
     tool_results = []
     final_script_output = "" # Store the winning script
     
+    # 🛡️ ROBUSTNESS: learn from prior tool results so we don't hammer a failing
+    # tool. failed_signatures = exact (tool, args) that already errored;
+    # tool_error_streak = consecutive trailing errors per tool (a service that is
+    # down / cold-starting, e.g. the Loogle daemon, keeps erroring for minutes).
+    def _looks_like_error(content) -> bool:
+        if not isinstance(content, str):
+            return False
+        c = content.strip().lower()
+        return (
+            c.startswith("error")
+            or c.startswith("skipped:")
+            or "error parsing" in c
+            or "loogle error" in c
+            or "i/o error" in c
+            or "timed out" in c
+            or "not found" in c
+        )
+
+    call_args_by_id = {}
+    failed_signatures = set()
+    tool_error_streak = {}
+    for _m in messages:
+        if _m.get("role") == "assistant" and _m.get("tool_calls"):
+            for _c in _m["tool_calls"]:
+                call_args_by_id[_c["id"]] = (_c["function"]["name"], _c["function"].get("arguments", ""))
+        elif _m.get("role") == "tool":
+            _name = _m.get("name")
+            if _looks_like_error(_m.get("content", "")):
+                tool_error_streak[_name] = tool_error_streak.get(_name, 0) + 1
+                _sig = call_args_by_id.get(_m.get("tool_call_id"))
+                if _sig:
+                    failed_signatures.add(_sig)
+            else:
+                tool_error_streak[_name] = 0
+
     for tc in last_msg.get("tool_calls", []):
         tool_name = tc["function"]["name"]
-        tool_args = json.loads(tc["function"]["arguments"])
+        raw_args = tc["function"].get("arguments", "")
+        tool_args = json.loads(raw_args) if raw_args else {}
         logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
+
+        # Don't re-run a call we already know fails.
+        skip_reason = None
+        if (tool_name, raw_args) in failed_signatures:
+            skip_reason = (
+                f"SKIPPED: You already called {tool_name} with these exact arguments and it failed. "
+                "Do not repeat it — change the query, use a different tool, or proceed without it."
+            )
+        elif tool_error_streak.get(tool_name, 0) >= 2:
+            skip_reason = (
+                f"SKIPPED: {tool_name} has failed {tool_error_streak[tool_name]} times in a row and is likely "
+                "unavailable right now (the service may be down or cold-starting). Do NOT call it again; "
+                "continue with other tools or your own reasoning."
+            )
+        if skip_reason is not None:
+            logger.warning(f"Guard: skipping repeat/failing tool call to {tool_name}")
+            tool_results.append({
+                "role": "tool",
+                "name": tool_name,
+                "tool_call_id": tc["id"],
+                "content": skip_reason,
+            })
+            continue
         
         client = tool_router.get(tool_name)
         if not client:
@@ -419,7 +478,11 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                 "Do NOT call it on the first move. Do NOT call it when you already know the "
                 "strategy — if you can describe the tactic (e.g. 'induction on n'), then just "
                 "apply it directly with apply_tactic instead. Never call it twice in a row on "
-                "the same goal."
+                "the same goal.\n\n"
+                "ON ERRORS: If a tool returns an error, do NOT immediately retry it with the "
+                "same input. Change the query, switch to a different tool, or proceed without "
+                "it. If a tool errors repeatedly, treat it as unavailable and move on — do not "
+                "keep calling it."
             )
         else:
             # General assistant mode
