@@ -352,7 +352,7 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
             metrics.tools_invoked++
             const name = stripName(c.name)
             if (
-              name === "verify_full_script" &&
+              String(c.name || "").endsWith("verify_full_script") &&
               c.input &&
               typeof c.input === "object" &&
               typeof c.input.script === "string"

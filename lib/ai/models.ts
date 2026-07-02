@@ -27,12 +27,6 @@ export const chatModels: Array<ChatModel> = [
     paid: true,
   },
   {
-    id: 'claude-local',
-    name: 'Claude (your machine)',
-    description: 'Runs on your own Claude Code via the local bridge — no credits used',
-    paid: false, // user's own subscription powers it; we deduct nothing
-  },
-  {
     id: 'claude-prove',
     name: 'Claude Prover (your machine)',
     description: 'Proves Lean 4 theorems on your machine — Claude drives the MCP tools, streamed live',
