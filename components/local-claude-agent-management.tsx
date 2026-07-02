@@ -354,7 +354,9 @@ export function LocalClaudeAgentManagement({ className }: LocalClaudeAgentManage
         body: JSON.stringify({
           theorem: prompt,
           mcpServers,
-          options: { model: config.model, timeoutMs: config.timeoutMs },
+          // Proving needs minutes (multiple MCP round-trips; loogle can
+          // cold-start ~3.5 min) — not the short chat-run timeout.
+          options: { model: config.model, timeoutMs: 900000 },
         }),
       })
       if (res.status === 401) throw new Error("The bridge rejected the token.")

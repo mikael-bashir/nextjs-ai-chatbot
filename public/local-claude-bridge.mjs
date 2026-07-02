@@ -134,8 +134,13 @@ function runClaude(args, { cwd, timeoutMs }) {
     let child
     try {
       // Array args + shell:false => the prompt is passed literally and can
-      // never be reinterpreted by a shell.
-      child = spawn(CLAUDE_BIN, args, { cwd: cwd || process.cwd(), shell: false })
+      // never be reinterpreted by a shell. stdin ignored: the prompt is passed
+      // via -p, so closing stdin avoids the CLI's "no stdin data" 3s warning.
+      child = spawn(CLAUDE_BIN, args, {
+        cwd: cwd || process.cwd(),
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      })
     } catch (err) {
       resolve({ ok: false, text: "", exitCode: null, durationMs: 0, timedOut: false, stderr: String(err) })
       return
