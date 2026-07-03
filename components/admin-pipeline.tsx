@@ -16,7 +16,10 @@ const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
 // tokens of context instead of ~17k (default system prompt + tool schemas),
 // which drastically cuts subscription rate-limit pressure when looping.
 const GEN_RUN_OPTIONS = {
-  timeoutMs: 180000,
+  // Inventing an original problem + a correct Lean theorem is genuinely ~2 min
+  // of model reasoning (measured 116–154s); 180s was too tight and killed
+  // normal-variance runs. 7 min gives ample headroom (hard/nested think longer).
+  timeoutMs: 420000,
   systemPrompt:
     'You are a creative competition-math problem setter. Follow the user instructions exactly and respond with ONLY the requested JSON object.',
   disallowedTools:
