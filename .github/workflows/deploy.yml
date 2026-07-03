@@ -80,6 +80,7 @@ jobs:
             XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}
             MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}
             REDIS_URL=${{ secrets.REDIS_URL }}
+            COMPETEMATH_REDIS_URL=${{ secrets.COMPETEMATH_REDIS_URL }}
             STRIPE_SECRET=${{ secrets.STRIPE_SECRET }}
             STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
             RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
