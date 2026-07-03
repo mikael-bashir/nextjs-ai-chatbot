@@ -101,6 +101,7 @@ export function AdminPipeline() {
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [workBridgeUrl, setWorkBridgeUrl] = useState('');
+  const [lastError, setLastError] = useState<string | null>(null);
 
   const workRef = useRef(false);
 
@@ -116,7 +117,9 @@ export function AdminPipeline() {
 
   const callBridge = useCallback((path: string, init?: RequestInit) => {
     const conn = getConn();
-    const base = (conn.bridgeUrl || 'http://localhost:4123').replace(/\/$/, '');
+    let base = (conn.bridgeUrl || 'http://localhost:4123').replace(/\/$/, '');
+    // Tolerate a bare host:port (e.g. "localhost:4123") — fetch needs a scheme.
+    if (!/^https?:\/\//i.test(base)) base = `http://${base}`;
     return fetch(`${base}${path}`, {
       ...init,
       headers: {
@@ -345,21 +348,45 @@ export function AdminPipeline() {
   // ---- the Work loop ----------------------------------------------------
 
   const runOnce = useCallback(async () => {
+    const bridgeUrl =
+      (getConn().bridgeUrl as string) || 'http://localhost:4123';
     const mcpServers = await fetchMcp();
     setStage('generating');
     setActivity([]);
     setCurrent(null);
-    const genRes = await callBridge('/run', {
-      method: 'POST',
-      body: JSON.stringify({
-        prompt: GEN_PROMPT,
-        options: { timeoutMs: 180000 },
-      }),
-    });
-    if (!genRes.ok) throw new Error(`generation failed (${genRes.status})`);
+    setLastError(null);
+
+    let genRes: Response;
+    try {
+      genRes = await callBridge('/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: GEN_PROMPT,
+          options: { timeoutMs: 180000 },
+        }),
+      });
+    } catch {
+      // A failed fetch to the bridge is opaque (TypeError). Point at the URL.
+      throw new Error(
+        `Couldn't reach the bridge at ${bridgeUrl}. Check: a bridge is running on that port, the URL is a full http:// URL (not just "localhost:4123"), and you're on Chrome/Edge/Firefox (Safari blocks HTTPS→localhost).`,
+      );
+    }
+    if (!genRes.ok) {
+      const detail = await genRes.text().catch(() => '');
+      throw new Error(
+        `Bridge /run failed (${genRes.status})${detail ? `: ${detail.slice(0, 200)}` : ''}`,
+      );
+    }
     const genData = await genRes.json();
-    const gen = extractJson(genData.text || genData.proof || '');
-    if (!gen?.lean) throw new Error('could not parse generated problem');
+    const raw = String(genData.text || genData.proof || '');
+    const gen = extractJson(raw);
+    if (!gen?.lean) {
+      throw new Error(
+        `Couldn't parse a problem from the generation output${
+          raw ? `: ${raw.slice(0, 160)}…` : ' (empty response)'
+        }`,
+      );
+    }
     setStats((s) => ({ ...s, generated: s.generated + 1 }));
     setCurrent(gen);
 
@@ -411,8 +438,9 @@ export function AdminPipeline() {
       while (!cancelled && workRef.current) {
         try {
           await runOnce();
-        } catch {
+        } catch (e) {
           setStats((s) => ({ ...s, errors: s.errors + 1 }));
+          setLastError(String((e as Error)?.message || e));
           await new Promise((res) => setTimeout(res, 3000));
         }
       }
@@ -509,6 +537,12 @@ export function AdminPipeline() {
           <p className="mt-2 text-xs text-muted-foreground">
             Current: {current.questionTitle}
           </p>
+        )}
+        {lastError && (
+          <div className="mt-2 rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-500">
+            <span className="font-medium">Last error: </span>
+            <span className="break-all font-mono">{lastError}</span>
+          </div>
         )}
       </div>
 
