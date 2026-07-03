@@ -127,12 +127,21 @@ const MODE_BLOCKS: Record<GenMode, string> = {
 - NESTED INSIGHTS MODE. The solution must require chaining 2-3 DISTINCT, non-obvious insights, each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. A strong solver needs a genuine multi-step derivation to reach the integer answer.
 - The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
   reverse: `
-- REVERSE-CONSTRUCTION MODE. Build the problem BACKWARD, so its answer is KNOWN by construction (this is how many elegant competition problems are actually made — and it means you never have to solve a problem you're inventing):
-  1. SEED: start from a base object whose value/count/identity you already know exactly — a closed-form sum, a bijection or counting identity, an algebraic identity, an invariant, or a deliberately chosen small integer answer.
-  2. NEST: apply a chain of answer-preserving (or answer-trackable) manipulations — substitutions, changes of variable, reparametrizations, added-but-cancelling conditions, reframings across a different domain (number theory ↔ combinatorics ↔ geometry). Track the exact integer answer at EVERY step.
-  3. DISGUISE: state the final result as a clean, self-contained problem whose connection to the seed is hidden, so a solver must peel back the layers — that hidden nesting is what makes it hard.
-- Because you built it forward from the seed, you ALREADY KNOW the exact integer answer — state it directly; do NOT re-derive it.
-- Lean 4 theorem: encode the final answer in a form the prover can confirm — prefer native_decide over a bounded instance, or a clean closed-form/identity. It is true by your construction.`,
+- REVERSE-CONSTRUCTION MODE, tuned for the IDEAL class: EASY TO VERIFY, HARD TO SOLVE. Build the problem BACKWARD from a secret you choose, so the answer is known for free, the Lean check is a cheap one-step CERTIFICATE, yet a solver must do real search or inversion.
+  THE TARGET ASYMMETRY: checking the answer is ONE short computation (a multiplication, a modular exponentiation, evaluating a witness). Finding it needs search that a naive brute-force loop cannot do in reasonable time — but a clever insight or algorithm can. This is the NP / one-way-function shape.
+
+  1. SECRET: choose hidden data you know — e.g. two primes p,q; a discrete-log exponent x; a subset S; a satisfying assignment; a permutation. This secret IS (or determines) your integer answer.
+  2. ONE-WAY FORWARD MAP: apply a map that is cheap forward but hard to invert — multiply p*q = N; exponentiate g^x mod p; sum/combine over S; a hidden bijection over a huge domain. Hand the solver only the OUTPUT and ask for a function of the secret (a specific INTEGER, e.g. "the sum of the prime factors of N", "the exponent x", "the size of the hidden subset").
+  3. Present it as a clean, self-contained competition problem; do not reveal the secret.
+
+  LEAN 4 THEOREM = a CERTIFICATE the ANSWER satisfies, verifiable by ONE computation, NOT a search:
+  - GOOD: p * q = N ∧ Nat.Prime p ∧ Nat.Prime q ; (g ^ x : ZMod p) = h ; ((S : Finset ℕ).sum f = T ∧ <cheap predicate on S>). Use ZMod for modular facts so the check stays fast (never compute giant powers before taking the mod). Prefer decide/native_decide on that single certificate.
+  - FORBIDDEN: a statement whose ONLY way to check is to enumerate a bounded domain — if Lean brute-forces it, so can the solver. Reference the answer/witness DIRECTLY so verification is polynomial, not a search.
+  - Also FORBIDDEN (co-NP, not cheap to verify): "the maximum/minimum is V", "the number of solutions is K", or any nonexistence claim.
+
+  SCALE so brute force fails but insight wins: make the search space large enough that "just loop over everything" is impractical (e.g. N a ~30-40 bit semiprime; x over a large modulus; S over 2^40 subsets), yet small enough that a smart method (Pollard rho, meet-in-the-middle, CRT, exploiting the hidden structure) cracks it. Do NOT make it cryptographically unbreakable.
+
+  You built it from the secret, so state the exact integer answer directly; do NOT re-derive it.`,
 };
 
 const RESPONSE_FORMAT = `
@@ -1215,7 +1224,7 @@ export function AdminPipeline() {
             {mode === 'nested' &&
               'Requires chaining 2-3 distinct insights; general (non-decide) Lean statement. Hardest to prove automatically.'}
             {mode === 'reverse' &&
-              'Built backward from a known seed → answer is correct by construction, so generation is fast AND cheap. Nesting + disguise make it hard for solvers.'}
+              'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             De-duplicating against {generated.length} generated +{' '}
