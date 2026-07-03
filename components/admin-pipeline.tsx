@@ -12,6 +12,19 @@ import { MathMarkdown } from '@/components/math-markdown';
 
 const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
 
+// Generation needs no tools/MCP — run claude lean so each call carries ~4k
+// tokens of context instead of ~17k (default system prompt + tool schemas),
+// which drastically cuts subscription rate-limit pressure when looping.
+const GEN_RUN_OPTIONS = {
+  timeoutMs: 180000,
+  systemPrompt:
+    'You are a creative competition-math problem setter. Follow the user instructions exactly and respond with ONLY the requested JSON object.',
+  disallowedTools:
+    'Bash Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
+  strictMcpConfig: true,
+  excludeDynamicSections: true,
+};
+
 type GenMode = 'standard' | 'hard' | 'nested';
 
 const MODE_LABEL: Record<GenMode, string> = {
@@ -615,7 +628,7 @@ export function AdminPipeline() {
     try {
       genRes = await callBridge(true, '/run', {
         method: 'POST',
-        body: JSON.stringify({ prompt, options: { timeoutMs: 180000 } }),
+        body: JSON.stringify({ prompt, options: GEN_RUN_OPTIONS }),
       });
     } catch {
       throw new Error(

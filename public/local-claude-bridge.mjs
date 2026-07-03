@@ -113,6 +113,17 @@ function buildArgs(prompt, options = {}) {
     args.push("--max-turns", String(Math.floor(options.maxTurns)))
   if (typeof options.systemPromptAppend === "string" && options.systemPromptAppend.trim())
     args.push("--append-system-prompt", options.systemPromptAppend.trim())
+  // Leanness flags — for stateless tasks (e.g. problem generation) that need no
+  // tools/MCP: replacing the system prompt and dropping tool schemas cuts the
+  // per-call context from ~17k tokens to ~4k, which matters a lot under a
+  // subscription's rate limits when running in a loop.
+  if (typeof options.systemPrompt === "string" && options.systemPrompt.trim())
+    args.push("--system-prompt", options.systemPrompt.trim())
+  if (typeof options.disallowedTools === "string" && options.disallowedTools.trim())
+    args.push("--disallowedTools", ...options.disallowedTools.trim().split(/\s+/))
+  if (options.strictMcpConfig) args.push("--strict-mcp-config")
+  if (options.excludeDynamicSections)
+    args.push("--exclude-dynamic-system-prompt-sections")
   return args
 }
 
