@@ -43,6 +43,56 @@ function fmtTokens(n: number): string {
   return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
 }
 
+// Compute the next timestamp for a wall-clock time like "8:30pm" in the viewer's
+// local timezone (best effort — assumes the browser tz matches the reset tz).
+function nextTimeToday(hour12: number, minute: number, ampm?: string): number {
+  let hour = hour12;
+  if (ampm) {
+    const pm = /p/i.test(ampm);
+    if (pm && hour < 12) hour += 12;
+    if (!pm && hour === 12) hour = 0;
+  }
+  const now = new Date();
+  const d = new Date(now);
+  d.setHours(hour, minute, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+// Detect Claude's usage/session-limit message (e.g. "You've hit your session
+// limit · resets 8:30pm (Europe/London)") in stdout/stderr, and parse the reset
+// time so the worker can pause and auto-resume.
+function detectSessionLimit(text: string): {
+  hit: boolean;
+  message?: string;
+  resetText?: string;
+  resetAt?: number;
+} {
+  const t = (text || '').trim();
+  if (!/limit/i.test(t)) return { hit: false };
+  if (
+    !/(session|usage|rate)\s*limit|hit your|limit (reached|exceeded)/i.test(t)
+  )
+    return { hit: false };
+  const m = t.match(/reset[s]?\b[^0-9]*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  const resetAt = m
+    ? nextTimeToday(Number(m[1]), m[2] ? Number(m[2]) : 0, m[3])
+    : undefined;
+  return {
+    hit: true,
+    message: t.slice(0, 200),
+    resetText: m?.[0]?.trim(),
+    resetAt,
+  };
+}
+
+function fmtCountdown(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+}
+
 type GenMode = 'standard' | 'hard' | 'nested';
 
 const MODE_LABEL: Record<GenMode, string> = {
@@ -333,6 +383,23 @@ export function AdminPipeline() {
     },
     [],
   );
+
+  const pauseForLimit = useCallback(
+    (lim: { message: string; resetText?: string; resetAt?: number }) => {
+      if (limitPausedRef.current) return;
+      limitPausedRef.current = true;
+      setLimitPause(lim);
+      pushLog(
+        'warn',
+        `Paused — Claude session/usage limit reached${
+          lim.resetText ? ` (${lim.resetText})` : ''
+        }. Work auto-resumes at reset.`,
+        lim.message,
+      );
+    },
+    [pushLog],
+  );
+
   const [queued, setQueued] = useState<number | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [items, setItems] = useState<StagedItem[]>([]);
@@ -368,9 +435,17 @@ export function AdminPipeline() {
     lastCostUsd: 0,
   });
 
+  // Auto-pause when Claude's session/usage limit is hit; auto-resume at reset.
+  const [limitPause, setLimitPause] = useState<{
+    message: string;
+    resetText?: string;
+    resetAt?: number;
+  } | null>(null);
+
   const workRef = useRef(false);
   const genAbortRef = useRef<AbortController | null>(null);
   const verifyAbortRef = useRef<AbortController | null>(null);
+  const limitPausedRef = useRef(false);
   const queueRef = useRef<GeneratedItem[]>([]);
   const verifyingIdRef = useRef<string | null>(null);
   const runningRef = useRef(false);
@@ -389,12 +464,13 @@ export function AdminPipeline() {
     generatedRef.current = generated;
   }, [generated]);
 
-  // Tick once a second while something is running, so elapsed timers update.
+  // Tick once a second while something is running (or paused), so elapsed timers
+  // and the limit countdown update live.
   useEffect(() => {
-    if (genStartedAt == null && verifyStartedAt == null) return;
+    if (genStartedAt == null && verifyStartedAt == null && !limitPause) return;
     const id = setInterval(() => setNowTick((n) => n + 1), 1000);
     return () => clearInterval(id);
-  }, [genStartedAt, verifyStartedAt]);
+  }, [genStartedAt, verifyStartedAt, limitPause]);
 
   const recordUsage = useCallback((u: any, costUsd: number | null) => {
     const t =
@@ -474,6 +550,7 @@ export function AdminPipeline() {
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
+      let content = ''; // accumulate text to detect a session-limit message
       let outcome: { verified: boolean; proof: string } | null = null;
       while (true) {
         const { done, value } = await reader.read();
@@ -491,6 +568,8 @@ export function AdminPipeline() {
                 { id: Date.now() + a.length, tool: String(d.tool) },
               ]);
             }
+            if (typeof d.content === 'string') content += d.content;
+            if (typeof d.message === 'string') content += ` ${d.message}`;
             if (d.type === 'done')
               outcome = { verified: !!d.verified, proof: d.proof || '' };
           } catch {
@@ -498,6 +577,9 @@ export function AdminPipeline() {
           }
         }
       }
+      // Surface a usage-limit hit so the verifier pauses instead of failing.
+      const lim = detectSessionLimit(content);
+      if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
       if (!outcome) throw new Error('prove stream ended without a result');
       return outcome;
     },
@@ -527,6 +609,8 @@ export function AdminPipeline() {
     setVerifyPaused(null);
     try {
       while (queueRef.current.length > 0) {
+        // Stop proving while paused for a usage limit (auto-resumes on reset).
+        if (limitPausedRef.current) break;
         const item = queueRef.current[0];
         verifyingIdRef.current = item.id;
         setVerifyingId(item.id);
@@ -561,6 +645,13 @@ export function AdminPipeline() {
             queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
             syncQueue();
             continue;
+          }
+          const lim = (e as { limit?: Parameters<typeof pauseForLimit>[0] })
+            .limit;
+          if (lim) {
+            // Usage limit — leave this item queued and pause everything.
+            pauseForLimit(lim);
+            break;
           }
           // Transient — keep the item queued (DB flag stays true) and stop.
           const msg = String((e as Error)?.message || e);
@@ -597,9 +688,26 @@ export function AdminPipeline() {
       setVerifyStartedAt(null);
       runningRef.current = false;
     }
-  }, [proveStream, pushLog]);
+  }, [proveStream, pushLog, pauseForLimit]);
 
   const terminateVerification = () => verifyAbortRef.current?.abort();
+
+  const resumeNow = useCallback(() => {
+    limitPausedRef.current = false;
+    setLimitPause(null);
+    // Generation loop resumes on its own (it polls limitPausedRef); kick the
+    // verifier back into gear for any still-queued items.
+    runVerifier();
+  }, [runVerifier]);
+
+  // Auto-resume at the parsed reset time (+30s buffer). If no reset time could
+  // be parsed, stays paused until the user resumes manually.
+  useEffect(() => {
+    if (!limitPause?.resetAt) return;
+    const ms = Math.max(0, limitPause.resetAt - Date.now()) + 30000;
+    const id = setTimeout(resumeNow, ms);
+    return () => clearTimeout(id);
+  }, [limitPause, resumeNow]);
 
   // Add to the verification queue — persists queued=true so it survives reloads.
   const enqueueVerify = useCallback(
@@ -757,6 +865,16 @@ export function AdminPipeline() {
         // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
         // cause, not just the symptom. Plus the full raw output for parse issues.
         const stderr = String(genData.stderr || '').trim();
+        // Session/usage limit → surface a limit marker so the loop pauses.
+        const lim = detectSessionLimit(`${raw}\n${stderr}`);
+        if (lim.hit) {
+          throw Object.assign(
+            new Error(
+              `Session limit reached${lim.resetText ? ` — ${lim.resetText}` : ''}`,
+            ),
+            { limit: lim, detail: raw || stderr },
+          );
+        }
         const reason = raw
           ? 'could not parse a problem from the output'
           : genData.timedOut
@@ -840,12 +958,24 @@ export function AdminPipeline() {
     let cancelled = false;
     (async () => {
       while (!cancelled && workRef.current) {
+        // Hold while paused for a usage limit (auto-resumes when the limit clears).
+        if (limitPausedRef.current) {
+          await new Promise((res) => setTimeout(res, 4000));
+          continue;
+        }
         try {
           await generateOne();
         } catch (e) {
-          const err = e as Error & { detail?: string };
-          setStats((s) => ({ ...s, errors: s.errors + 1 }));
-          pushLog('error', err.message, err.detail);
+          const err = e as Error & {
+            detail?: string;
+            limit?: { message: string; resetText?: string; resetAt?: number };
+          };
+          if (err.limit) {
+            pauseForLimit(err.limit);
+          } else {
+            setStats((s) => ({ ...s, errors: s.errors + 1 }));
+            pushLog('error', err.message, err.detail);
+          }
           await new Promise((res) => setTimeout(res, 3000));
         }
       }
@@ -854,7 +984,7 @@ export function AdminPipeline() {
     return () => {
       cancelled = true;
     };
-  }, [work, generateOne, pushLog]);
+  }, [work, generateOne, pushLog, pauseForLimit]);
 
   // ---- per-item actions -------------------------------------------------
 
@@ -991,6 +1121,35 @@ export function AdminPipeline() {
           <Link href="/">← Back to chat</Link>
         </Button>
       </div>
+
+      {/* Usage-limit pause banner */}
+      {limitPause && (
+        <div className="mb-4 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-medium text-amber-700">
+                ⏸ Paused — Claude usage limit reached
+              </p>
+              <p className="mt-0.5 text-xs text-amber-700/90">
+                {limitPause.message}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {limitPause.resetAt
+                  ? `Auto-resumes at ${new Date(limitPause.resetAt).toLocaleTimeString()} (in ${fmtCountdown(limitPause.resetAt - Date.now())}).`
+                  : 'No reset time detected — resume manually when your limit refreshes.'}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 shrink-0"
+              onClick={resumeNow}
+            >
+              Resume now
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Work / generation control */}
       <div className="rounded-lg border p-4">
