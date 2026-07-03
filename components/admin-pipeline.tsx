@@ -30,6 +30,19 @@ const GEN_RUN_OPTIONS = {
   excludeDynamicSections: true,
 };
 
+// The model's context window, for a rough "% of context used" readout.
+const CONTEXT_WINDOW = 200000;
+
+function fmtElapsed(startMs: number | null): string {
+  if (startMs == null) return '';
+  const s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+}
+
 type GenMode = 'standard' | 'hard' | 'nested';
 
 const MODE_LABEL: Record<GenMode, string> = {
@@ -342,7 +355,22 @@ export function AdminPipeline() {
     Array<{ id: number; tool: string }>
   >([]);
 
+  // Live monitoring: start timestamps drive elapsed timers; usage accumulates
+  // token/cost metadata reported by the bridge.
+  const [genStartedAt, setGenStartedAt] = useState<number | null>(null);
+  const [verifyStartedAt, setVerifyStartedAt] = useState<number | null>(null);
+  const [, setNowTick] = useState(0);
+  const [usage, setUsage] = useState({
+    calls: 0,
+    tokens: 0,
+    costUsd: 0,
+    lastTokens: 0,
+    lastCostUsd: 0,
+  });
+
   const workRef = useRef(false);
+  const genAbortRef = useRef<AbortController | null>(null);
+  const verifyAbortRef = useRef<AbortController | null>(null);
   const queueRef = useRef<GeneratedItem[]>([]);
   const verifyingIdRef = useRef<string | null>(null);
   const runningRef = useRef(false);
@@ -360,6 +388,30 @@ export function AdminPipeline() {
   useEffect(() => {
     generatedRef.current = generated;
   }, [generated]);
+
+  // Tick once a second while something is running, so elapsed timers update.
+  useEffect(() => {
+    if (genStartedAt == null && verifyStartedAt == null) return;
+    const id = setInterval(() => setNowTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [genStartedAt, verifyStartedAt]);
+
+  const recordUsage = useCallback((u: any, costUsd: number | null) => {
+    const t =
+      (u?.input_tokens ?? 0) +
+      (u?.cache_creation_input_tokens ?? 0) +
+      (u?.cache_read_input_tokens ?? 0) +
+      (u?.output_tokens ?? 0);
+    if (!t && !costUsd) return;
+    const cost = costUsd ?? 0;
+    setUsage((s) => ({
+      calls: s.calls + 1,
+      tokens: s.tokens + t,
+      costUsd: s.costUsd + cost,
+      lastTokens: t,
+      lastCostUsd: cost,
+    }));
+  }, []);
 
   const callBridge = useCallback(
     (useWork: boolean, path: string, init?: RequestInit) => {
@@ -400,14 +452,20 @@ export function AdminPipeline() {
   // rather than mis-marking it "failed". Returns an outcome only on a real
   // `done` event.
   const proveStream = useCallback(
-    async (lean: string, mcpServers: Array<{ name: string; url: string }>) => {
+    async (
+      lean: string,
+      mcpServers: Array<{ name: string; url: string }>,
+      signal?: AbortSignal,
+    ) => {
       let res: Response;
       try {
         res = await callBridge(false, '/prove-stream', {
           method: 'POST',
           body: JSON.stringify({ theorem: lean, mcpServers }),
+          signal,
         });
       } catch {
+        if (signal?.aborted) throw new Error('__aborted__');
         throw new Error("couldn't reach the verification (shared) bridge");
       }
       if (!res.ok || !res.body) {
@@ -473,15 +531,37 @@ export function AdminPipeline() {
         verifyingIdRef.current = item.id;
         setVerifyingId(item.id);
         setVerifyActivity([]);
+        const ctrl = new AbortController();
+        verifyAbortRef.current = ctrl;
+        setVerifyStartedAt(Date.now());
 
         let verified = false;
         let proof = '';
         try {
           const mcpServers = await fetchMcp();
-          const out = await proveStream(item.lean as string, mcpServers);
+          const out = await proveStream(
+            item.lean as string,
+            mcpServers,
+            ctrl.signal,
+          );
           verified = out.verified;
           proof = out.proof;
         } catch (e) {
+          const title =
+            item.questionTitle || item.problem?.slice(0, 60) || item.id;
+          if (ctrl.signal.aborted) {
+            // User terminated THIS verification — mark it and move to the next.
+            await patchGenerated(item.id, {
+              verified: false,
+              error: 'Verification terminated by you',
+              queued: false,
+            });
+            setStats((s) => ({ ...s, failed: s.failed + 1 }));
+            pushLog('warn', `Verification terminated: ${title}`);
+            queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
+            syncQueue();
+            continue;
+          }
           // Transient — keep the item queued (DB flag stays true) and stop.
           const msg = String((e as Error)?.message || e);
           setVerifyPaused(msg);
@@ -512,10 +592,14 @@ export function AdminPipeline() {
       }
     } finally {
       verifyingIdRef.current = null;
+      verifyAbortRef.current = null;
       setVerifyingId(null);
+      setVerifyStartedAt(null);
       runningRef.current = false;
     }
   }, [proveStream, pushLog]);
+
+  const terminateVerification = () => verifyAbortRef.current?.abort();
 
   // Add to the verification queue — persists queued=true so it survives reloads.
   const enqueueVerify = useCallback(
@@ -623,94 +707,114 @@ export function AdminPipeline() {
   const generateOne = useCallback(async () => {
     const bridgeUrl =
       (connFor(true).bridgeUrl as string) || 'http://localhost:4123';
+    const ctrl = new AbortController();
+    genAbortRef.current = ctrl;
+    setGenStartedAt(Date.now());
     setGenStage('generating');
-
-    const prompt = buildPrompt(
-      modeRef.current,
-      buildAvoidContext(generatedRef.current, liveRef.current),
-    );
-    let genRes: Response;
     try {
-      genRes = await callBridge(true, '/run', {
-        method: 'POST',
-        body: JSON.stringify({ prompt, options: GEN_RUN_OPTIONS }),
-      });
-    } catch {
-      throw new Error(
-        `Couldn't reach the generation bridge at ${bridgeUrl}. Check a bridge is running there, the URL is a full http:// URL, and you're on Chrome/Edge/Firefox.`,
+      const prompt = buildPrompt(
+        modeRef.current,
+        buildAvoidContext(generatedRef.current, liveRef.current),
       );
-    }
-    if (!genRes.ok) {
-      const body = await genRes.text().catch(() => '');
-      const detail = `${JSON.stringify(
-        { bridge: bridgeUrl, httpStatus: genRes.status, mode: modeRef.current },
-        null,
-        2,
-      )}\n\n----- response body -----\n${body || '(empty)'}`;
-      throw Object.assign(new Error(`Bridge /run failed (${genRes.status})`), {
-        detail,
-      });
-    }
-    const genData = await genRes.json();
-    const raw = String(genData.text || genData.proof || '');
-    const gen = extractJson(raw);
-    if (!gen?.lean) {
-      // Rich diagnostic: the bridge's own metadata explains an empty/failed run
-      // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
-      // cause, not just the symptom. Plus the full raw output for parse issues.
-      const stderr = String(genData.stderr || '').trim();
-      const reason = raw
-        ? 'could not parse a problem from the output'
-        : genData.timedOut
-          ? `generation timed out after ${genData.durationMs ?? '?'}ms`
-          : genData.ok === false
-            ? `claude exited ${genData.exitCode ?? '?'}${stderr ? `: ${stderr.split('\n')[0].slice(0, 120)}` : ' (no stderr)'}`
-            : 'empty output (claude returned no text)';
-      const meta = {
-        mode: modeRef.current,
-        bridge: bridgeUrl,
-        httpStatus: genRes.status,
-        ok: genData.ok,
-        exitCode: genData.exitCode,
-        timedOut: genData.timedOut,
-        durationMs: genData.durationMs,
-        textLength: raw.length,
-        promptChars: prompt.length,
-      };
-      const detail = `${JSON.stringify(meta, null, 2)}${
-        stderr ? `\n\n----- stderr -----\n${stderr}` : ''
-      }\n\n----- raw output (${raw.length} chars) -----\n${raw || '(empty)'}`;
-      throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
-    }
-    setStats((s) => ({ ...s, generated: s.generated + 1 }));
-
-    setGenStage('saving');
-    const res = await fetch('/api/admin/generated', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        ...gen,
-        verified: false,
-        proof: '',
-        error: null,
-        queued: true,
-        toolchain: TOOLCHAIN,
-      }),
-    });
-    if (res.ok) {
-      const j = await res.json();
-      if (j.item) {
-        setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
-        // Already persisted queued=true; just add to the in-memory queue.
-        if (!queueRef.current.some((x) => x.id === j.item.id)) {
-          queueRef.current = [...queueRef.current, j.item];
-          syncQueue();
-        }
-        runVerifier();
+      let genRes: Response;
+      try {
+        genRes = await callBridge(true, '/run', {
+          method: 'POST',
+          body: JSON.stringify({ prompt, options: GEN_RUN_OPTIONS }),
+          signal: ctrl.signal,
+        });
+      } catch {
+        if (ctrl.signal.aborted)
+          throw new Error('Generation terminated by you');
+        throw new Error(
+          `Couldn't reach the generation bridge at ${bridgeUrl}. Check a bridge is running there, the URL is a full http:// URL, and you're on Chrome/Edge/Firefox.`,
+        );
       }
+      if (!genRes.ok) {
+        const body = await genRes.text().catch(() => '');
+        const detail = `${JSON.stringify(
+          {
+            bridge: bridgeUrl,
+            httpStatus: genRes.status,
+            mode: modeRef.current,
+          },
+          null,
+          2,
+        )}\n\n----- response body -----\n${body || '(empty)'}`;
+        throw Object.assign(
+          new Error(`Bridge /run failed (${genRes.status})`),
+          {
+            detail,
+          },
+        );
+      }
+      const genData = await genRes.json();
+      recordUsage(genData.usage, genData.costUsd);
+      const raw = String(genData.text || genData.proof || '');
+      const gen = extractJson(raw);
+      if (!gen?.lean) {
+        // Rich diagnostic: the bridge's own metadata explains an empty/failed run
+        // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
+        // cause, not just the symptom. Plus the full raw output for parse issues.
+        const stderr = String(genData.stderr || '').trim();
+        const reason = raw
+          ? 'could not parse a problem from the output'
+          : genData.timedOut
+            ? `generation timed out after ${genData.durationMs ?? '?'}ms`
+            : genData.ok === false
+              ? `claude exited ${genData.exitCode ?? '?'}${stderr ? `: ${stderr.split('\n')[0].slice(0, 120)}` : ' (no stderr)'}`
+              : 'empty output (claude returned no text)';
+        const meta = {
+          mode: modeRef.current,
+          bridge: bridgeUrl,
+          httpStatus: genRes.status,
+          ok: genData.ok,
+          exitCode: genData.exitCode,
+          timedOut: genData.timedOut,
+          durationMs: genData.durationMs,
+          textLength: raw.length,
+          promptChars: prompt.length,
+        };
+        const detail = `${JSON.stringify(meta, null, 2)}${
+          stderr ? `\n\n----- stderr -----\n${stderr}` : ''
+        }\n\n----- raw output (${raw.length} chars) -----\n${raw || '(empty)'}`;
+        throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
+      }
+      setStats((s) => ({ ...s, generated: s.generated + 1 }));
+
+      setGenStage('saving');
+      const res = await fetch('/api/admin/generated', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...gen,
+          verified: false,
+          proof: '',
+          error: null,
+          queued: true,
+          toolchain: TOOLCHAIN,
+        }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        if (j.item) {
+          setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
+          // Already persisted queued=true; just add to the in-memory queue.
+          if (!queueRef.current.some((x) => x.id === j.item.id)) {
+            queueRef.current = [...queueRef.current, j.item];
+            syncQueue();
+          }
+          runVerifier();
+        }
+      }
+    } finally {
+      genAbortRef.current = null;
+      setGenStartedAt(null);
+      setGenStage('idle');
     }
-    setGenStage('idle');
-  }, [callBridge, runVerifier]);
+  }, [callBridge, runVerifier, recordUsage]);
+
+  const terminateGeneration = () => genAbortRef.current?.abort();
 
   // Manual: add one fresh unproven generation to the verify queue.
   const addUnprovenGeneration = useCallback(async () => {
@@ -964,9 +1068,23 @@ export function AdminPipeline() {
           <Stat label="Queued" value={queued ?? '—'} />
         </div>
 
-        <div className="mt-3 flex items-center gap-2 text-xs">
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
           <span className="font-medium">Generation:</span>
-          <span className="capitalize text-muted-foreground">{genStage}</span>
+          {genStartedAt != null ? (
+            <span className="flex items-center gap-1.5 text-amber-600">
+              <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+              {genStage} ({MODE_LABEL[mode]}) · {fmtElapsed(genStartedAt)}
+              <button
+                type="button"
+                onClick={terminateGeneration}
+                className="ml-1 rounded border border-red-500/40 px-1.5 py-0.5 text-red-500 hover:bg-red-500/10"
+              >
+                Terminate
+              </button>
+            </span>
+          ) : (
+            <span className="capitalize text-muted-foreground">{genStage}</span>
+          )}
           {stats.errors > 0 && (
             <span className="text-red-500">· {stats.errors} errors</span>
           )}
@@ -974,12 +1092,36 @@ export function AdminPipeline() {
             size="sm"
             variant="outline"
             className="ml-auto h-7 px-2 text-xs"
-            disabled={generatingOne}
+            disabled={generatingOne || genStartedAt != null}
             onClick={addUnprovenGeneration}
           >
             {generatingOne ? 'Generating…' : '+ Generate one → queue'}
           </Button>
         </div>
+
+        {/* Usage / metadata */}
+        <div className="mt-3 grid grid-cols-3 gap-2 rounded-md border p-2 text-center text-[11px]">
+          <div>
+            <div className="font-semibold">{usage.calls}</div>
+            <div className="text-muted-foreground">claude calls</div>
+          </div>
+          <div>
+            <div className="font-semibold">{fmtTokens(usage.tokens)}</div>
+            <div className="text-muted-foreground">total tokens</div>
+          </div>
+          <div>
+            <div className="font-semibold">${usage.costUsd.toFixed(3)}</div>
+            <div className="text-muted-foreground">session cost</div>
+          </div>
+        </div>
+        {usage.lastTokens > 0 && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Last generation: {fmtTokens(usage.lastTokens)} tokens ($
+            {usage.lastCostUsd.toFixed(3)}) —{' '}
+            {((usage.lastTokens / CONTEXT_WINDOW) * 100).toFixed(1)}% of the{' '}
+            {fmtTokens(CONTEXT_WINDOW)} context window.
+          </p>
+        )}
       </div>
 
       {/* Activity / error log */}
@@ -1103,6 +1245,19 @@ export function AdminPipeline() {
             <span className="font-medium">Paused: </span>
             <span className="font-mono">{verifyPaused}</span>. Items stay
             queued; fix the shared bridge and resume.
+          </div>
+        )}
+        {verifyingId && verifyStartedAt != null && (
+          <div className="mb-2 flex items-center gap-2 text-xs text-amber-600">
+            <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+            Verifying · {fmtElapsed(verifyStartedAt)}
+            <button
+              type="button"
+              onClick={terminateVerification}
+              className="rounded border border-red-500/40 px-1.5 py-0.5 text-red-500 hover:bg-red-500/10"
+            >
+              Terminate
+            </button>
           </div>
         )}
         {verifyingId && verifyActivity.length > 0 && (

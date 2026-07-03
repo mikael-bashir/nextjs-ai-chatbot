@@ -139,6 +139,20 @@ function extractText(stdout) {
   }
 }
 
+// Pull token usage + cost out of claude's --output-format json result so the UI
+// can display per-call token counts and running totals.
+function extractMeta(stdout) {
+  try {
+    const p = JSON.parse(stdout.trim())
+    return {
+      usage: p?.usage ?? null,
+      costUsd: typeof p?.total_cost_usd === "number" ? p.total_cost_usd : null,
+    }
+  } catch {
+    return { usage: null, costUsd: null }
+  }
+}
+
 function runClaude(args, { cwd, timeoutMs }) {
   return new Promise((resolve) => {
     const start = Date.now()
@@ -183,9 +197,12 @@ function runClaude(args, { cwd, timeoutMs }) {
     child.stderr?.on("data", (c) => (stderr += c))
     child.on("close", (code) => {
       clearTimeout(timer)
+      const meta = extractMeta(stdout)
       resolve({
         ok: code === 0 && !timedOut,
         text: extractText(stdout),
+        usage: meta.usage,
+        costUsd: meta.costUsd,
         exitCode: code,
         durationMs: Date.now() - start,
         timedOut,
