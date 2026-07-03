@@ -51,6 +51,15 @@ interface LiveProblem {
   difficulty?: string;
 }
 
+interface LogEntry {
+  id: number;
+  ts: number;
+  level: 'error' | 'warn' | 'info';
+  message: string;
+  // Optional payload, e.g. the raw generation output that failed to parse.
+  detail?: string;
+}
+
 // Summarise problems that already exist (here + live on CompeteMath) so the
 // model can deliberately avoid repeating topics/structures.
 function buildAvoidContext(
@@ -126,16 +135,33 @@ function repairJsonStrings(s: string): string {
       if (c === '"') inStr = true;
       continue;
     }
-    if (c === '"') {
-      out += c;
-      inStr = false;
-    } else if (c === '\\') {
+    // Inside a string value.
+    if (c === '\\') {
       const next = s[i + 1];
       if (next && '"\\/bfnrtu'.includes(next)) {
         out += c + next; // keep a valid escape intact
         i++;
       } else {
         out += '\\\\'; // lone backslash (LaTeX) → escape it
+      }
+    } else if (c === '"') {
+      // A `"` really closes the string only if the next non-space char is a
+      // JSON delimiter (, } ] :) or the end. Otherwise it's an unescaped quote
+      // inside the value (e.g. a "friendly" pair) — escape it.
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      const nxt = s[j];
+      if (
+        nxt === undefined ||
+        nxt === ',' ||
+        nxt === '}' ||
+        nxt === ']' ||
+        nxt === ':'
+      ) {
+        out += c;
+        inStr = false;
+      } else {
+        out += '\\"';
       }
     } else if (c === '\n') out += '\\n';
     else if (c === '\r') out += '\\r';
@@ -145,23 +171,55 @@ function repairJsonStrings(s: string): string {
   return out;
 }
 
+// Return the first BALANCED {...} object starting at `start`, respecting strings
+// (so braces inside the Lean code or problem text don't end it early). Handles
+// prose that trails the object and contains stray braces.
+function firstJsonObject(s: string, start: number): string | null {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
 function extractJson(text: string): GenProblem | null {
   if (!text) return null;
   let s = text.trim();
   // Unwrap a ```json … ``` fence if present.
   const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fence) s = fence[1].trim();
-  // Slice from the first { to the last } (drops any surrounding prose).
   const start = s.indexOf('{');
-  const end = s.lastIndexOf('}');
-  if (start === -1 || end <= start) return null;
-  const candidate = s.slice(start, end + 1);
-  // Try strict first; fall back to a repaired version for raw LaTeX/newlines.
-  for (const attempt of [candidate, repairJsonStrings(candidate)]) {
-    try {
-      return JSON.parse(attempt) as GenProblem;
-    } catch {
-      /* try the next candidate */
+  if (start === -1) return null;
+  // Two candidate slices: the first balanced object (best for trailing prose),
+  // and first-{ to last-} (best when unescaped quotes confuse brace matching).
+  const balanced = firstJsonObject(s, start);
+  const lastEnd = s.lastIndexOf('}');
+  const greedy = lastEnd > start ? s.slice(start, lastEnd + 1) : null;
+  const candidates: string[] = [];
+  for (const c of [balanced, greedy]) {
+    if (c && !candidates.includes(c)) candidates.push(c);
+  }
+  // For each candidate try strict, then a repaired version (raw LaTeX
+  // backslashes, literal newlines, unescaped inner quotes).
+  for (const cand of candidates) {
+    for (const attempt of [cand, repairJsonStrings(cand)]) {
+      try {
+        return JSON.parse(attempt) as GenProblem;
+      } catch {
+        /* try the next candidate */
+      }
     }
   }
   return null;
@@ -204,7 +262,26 @@ export function AdminPipeline() {
     failed: 0,
     errors: 0,
   });
-  const [lastError, setLastError] = useState<string | null>(null);
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const [logOpen, setLogOpen] = useState<Set<number>>(new Set());
+
+  const pushLog = useCallback(
+    (level: LogEntry['level'], message: string, detail?: string) => {
+      setLog((l) =>
+        [
+          {
+            id: Date.now() + Math.random(),
+            ts: Date.now(),
+            level,
+            message,
+            detail,
+          },
+          ...l,
+        ].slice(0, 100),
+      );
+    },
+    [],
+  );
   const [queued, setQueued] = useState<number | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [items, setItems] = useState<StagedItem[]>([]);
@@ -368,7 +445,9 @@ export function AdminPipeline() {
           proof = out.proof;
         } catch (e) {
           // Transient — keep the item queued (DB flag stays true) and stop.
-          setVerifyPaused(String((e as Error)?.message || e));
+          const msg = String((e as Error)?.message || e);
+          setVerifyPaused(msg);
+          pushLog('warn', `Verification paused: ${msg} (items stay queued)`);
           break;
         }
 
@@ -384,6 +463,12 @@ export function AdminPipeline() {
           verified: s.verified + (verified ? 1 : 0),
           failed: s.failed + (verified ? 0 : 1),
         }));
+        pushLog(
+          verified ? 'info' : 'warn',
+          `${verified ? 'Proved' : 'Did not verify'}: ${
+            item.questionTitle || item.problem?.slice(0, 60) || item.id
+          }`,
+        );
         queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
         syncQueue();
       }
@@ -392,7 +477,7 @@ export function AdminPipeline() {
       setVerifyingId(null);
       runningRef.current = false;
     }
-  }, [proveStream]);
+  }, [proveStream, pushLog]);
 
   // Add to the verification queue — persists queued=true so it survives reloads.
   const enqueueVerify = useCallback(
@@ -501,7 +586,6 @@ export function AdminPipeline() {
     const bridgeUrl =
       (connFor(true).bridgeUrl as string) || 'http://localhost:4123';
     setGenStage('generating');
-    setLastError(null);
 
     const prompt = buildPrompt(
       modeRef.current,
@@ -520,18 +604,22 @@ export function AdminPipeline() {
     }
     if (!genRes.ok) {
       const detail = await genRes.text().catch(() => '');
-      throw new Error(
-        `Bridge /run failed (${genRes.status})${detail ? `: ${detail.slice(0, 200)}` : ''}`,
-      );
+      throw Object.assign(new Error(`Bridge /run failed (${genRes.status})`), {
+        detail,
+      });
     }
     const genData = await genRes.json();
     const raw = String(genData.text || genData.proof || '');
     const gen = extractJson(raw);
     if (!gen?.lean) {
-      throw new Error(
-        `Couldn't parse a problem from the generation output${
-          raw ? `: ${raw.slice(0, 160)}…` : ' (empty response)'
-        }`,
+      // Keep the full raw output so it can be inspected (and recovered) in the log.
+      throw Object.assign(
+        new Error(
+          raw
+            ? 'Discarded — could not parse a problem from the generation output'
+            : 'Discarded — empty generation output',
+        ),
+        { detail: raw },
       );
     }
     setStats((s) => ({ ...s, generated: s.generated + 1 }));
@@ -570,12 +658,13 @@ export function AdminPipeline() {
     try {
       await generateOne();
     } catch (e) {
+      const err = e as Error & { detail?: string };
       setStats((s) => ({ ...s, errors: s.errors + 1 }));
-      setLastError(String((e as Error)?.message || e));
+      pushLog('error', err.message, err.detail);
     } finally {
       setGeneratingOne(false);
     }
-  }, [generateOne]);
+  }, [generateOne, pushLog]);
 
   // The Work loop: keep generating (each generation enqueues itself).
   useEffect(() => {
@@ -590,8 +679,9 @@ export function AdminPipeline() {
         try {
           await generateOne();
         } catch (e) {
+          const err = e as Error & { detail?: string };
           setStats((s) => ({ ...s, errors: s.errors + 1 }));
-          setLastError(String((e as Error)?.message || e));
+          pushLog('error', err.message, err.detail);
           await new Promise((res) => setTimeout(res, 3000));
         }
       }
@@ -600,7 +690,7 @@ export function AdminPipeline() {
     return () => {
       cancelled = true;
     };
-  }, [work, generateOne]);
+  }, [work, generateOne, pushLog]);
 
   // ---- per-item actions -------------------------------------------------
 
@@ -830,12 +920,77 @@ export function AdminPipeline() {
             {generatingOne ? 'Generating…' : '+ Generate one → queue'}
           </Button>
         </div>
-        {lastError && (
-          <div className="mt-2 rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-500">
-            <span className="font-medium">Last error: </span>
-            <span className="break-all font-mono">{lastError}</span>
-          </div>
-        )}
+      </div>
+
+      {/* Activity / error log */}
+      <div className="mt-8">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">
+            Log{' '}
+            <span className="text-sm font-normal text-muted-foreground">
+              ({log.length})
+            </span>
+          </h2>
+          {log.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setLog([])}
+              className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+            >
+              Clear
+            </button>
+          )}
+        </div>
+        <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border p-2">
+          {log.length === 0 && (
+            <p className="text-xs text-muted-foreground">
+              Errors, discarded generations, and verification results appear
+              here.
+            </p>
+          )}
+          {log.map((e) => (
+            <div key={e.id} className="text-xs">
+              <div className="flex items-start gap-2">
+                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                  {new Date(e.ts).toLocaleTimeString()}
+                </span>
+                <span
+                  className={cn(
+                    'break-words',
+                    e.level === 'error'
+                      ? 'text-red-500'
+                      : e.level === 'warn'
+                        ? 'text-amber-600'
+                        : 'text-muted-foreground',
+                  )}
+                >
+                  {e.message}
+                </span>
+                {e.detail && (
+                  <button
+                    type="button"
+                    className="ml-auto shrink-0 text-[10px] text-muted-foreground underline-offset-2 hover:underline"
+                    onClick={() =>
+                      setLogOpen((s) => {
+                        const n = new Set(s);
+                        if (n.has(e.id)) n.delete(e.id);
+                        else n.add(e.id);
+                        return n;
+                      })
+                    }
+                  >
+                    {logOpen.has(e.id) ? 'hide raw' : 'view raw'}
+                  </button>
+                )}
+              </div>
+              {e.detail && logOpen.has(e.id) && (
+                <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-[10px]">
+                  {e.detail}
+                </pre>
+              )}
+            </div>
+          ))}
+        </div>
       </div>
 
       {/* Verification queue */}
