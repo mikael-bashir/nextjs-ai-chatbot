@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useSession } from 'next-auth/react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import {
@@ -99,6 +100,7 @@ export function AdminPanel({ className }: { className?: string }) {
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [workBridgeUrl, setWorkBridgeUrl] = useState('');
 
   const workRef = useRef(false);
 
@@ -191,9 +193,15 @@ export function AdminPanel({ className }: { className?: string }) {
     [loadQueue],
   );
 
+  // The Work loop can target its own bridge (lca.workBridgeUrl) so it runs on a
+  // dedicated port while chat/manual verification keeps using the shared bridge
+  // (lca.connection). Falls back to the shared bridge when unset. The token is
+  // shared — same-machine bridges accept the same browser token.
   const getConn = () => {
     try {
-      return JSON.parse(localStorage.getItem('lca.connection') || '{}');
+      const base = JSON.parse(localStorage.getItem('lca.connection') || '{}');
+      const workUrl = localStorage.getItem('lca.workBridgeUrl') || '';
+      return workUrl ? { ...base, bridgeUrl: workUrl } : base;
     } catch {
       return {};
     }
@@ -328,8 +336,20 @@ export function AdminPanel({ className }: { className?: string }) {
 
   // Refresh both views whenever the dropdown is opened.
   useEffect(() => {
-    if (open) loadAll();
+    if (open) {
+      loadAll();
+      setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
+    }
   }, [open, loadAll]);
+
+  const persistWorkBridgeUrl = (value: string) => {
+    setWorkBridgeUrl(value);
+    if (value.trim()) {
+      localStorage.setItem('lca.workBridgeUrl', value.trim());
+    } else {
+      localStorage.removeItem('lca.workBridgeUrl');
+    }
+  };
 
   useEffect(() => {
     workRef.current = work;
@@ -395,6 +415,24 @@ export function AdminPanel({ className }: { className?: string }) {
             </p>
           </div>
           <Switch id="admin-work" checked={work} onCheckedChange={setWork} />
+        </div>
+
+        <div className="mt-2">
+          <Label htmlFor="admin-work-bridge" className="text-[11px]">
+            Work bridge URL (optional)
+          </Label>
+          <Input
+            id="admin-work-bridge"
+            value={workBridgeUrl}
+            placeholder="defaults to your shared bridge"
+            className="mt-1 h-8 text-xs"
+            onChange={(e) => persistWorkBridgeUrl(e.target.value)}
+          />
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Point the Work loop at its own bridge (e.g. http://localhost:4124)
+            so it runs separately from chat/manual verification. Uses the same
+            token.
+          </p>
         </div>
 
         <div className="mt-3 grid grid-cols-4 gap-2 text-center text-xs">
