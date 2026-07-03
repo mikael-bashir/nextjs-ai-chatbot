@@ -229,7 +229,12 @@ jobs:
               >> "$PREVIEW_DIR/stripe-listener.log" 2>&1 &
             echo $! > "$STRIPE_PID_FILE"
 
-            docker image prune -f
+            # Remove ALL images not used by a running container — not just
+            # dangling ones. Every push pulls a fresh preview-nextjs/python:${SHA}
+            # (large), and the old tagged SHAs would otherwise accumulate until the
+            # disk fills. Running previews (this PR + any other open ones) keep
+            # their in-use images; only the superseded ones are reclaimed.
+            docker image prune -a -f 2>/dev/null || true
 
       # ── Post (or update) PR comment ───────────────────────────────────────
       - name: Post preview URL
