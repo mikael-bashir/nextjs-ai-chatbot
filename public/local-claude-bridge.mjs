@@ -153,7 +153,7 @@ function extractMeta(stdout) {
   }
 }
 
-function runClaude(args, { cwd, timeoutMs }) {
+function runClaude(args, { cwd, timeoutMs, killSignal }) {
   return new Promise((resolve) => {
     const start = Date.now()
     let child
@@ -174,13 +174,29 @@ function runClaude(args, { cwd, timeoutMs }) {
     let stderr = ""
     let bytes = 0
     let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill("SIGKILL")
-    }, timeoutMs)
+    let aborted = false
+    // timeoutMs <= 0 means "no cap" (caller relies on the UI terminate button).
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true
+            child.kill("SIGKILL")
+          }, timeoutMs)
+        : null
+    // Kill the process if the caller (browser) disconnects — this is what makes
+    // the UI "Terminate" button actually stop claude, so an uncapped run can't
+    // keep burning tokens after you cancel it.
+    if (killSignal) {
+      const onAbort = () => {
+        aborted = true
+        child.kill("SIGKILL")
+      }
+      if (killSignal.aborted) onAbort()
+      else killSignal.addEventListener("abort", onAbort, { once: true })
+    }
 
     child.on("error", (err) => {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       resolve({
         ok: false,
         text: "",
@@ -196,16 +212,17 @@ function runClaude(args, { cwd, timeoutMs }) {
     })
     child.stderr?.on("data", (c) => (stderr += c))
     child.on("close", (code) => {
-      clearTimeout(timer)
+      if (timer) clearTimeout(timer)
       const meta = extractMeta(stdout)
       resolve({
-        ok: code === 0 && !timedOut,
+        ok: code === 0 && !timedOut && !aborted,
         text: extractText(stdout),
         usage: meta.usage,
         costUsd: meta.costUsd,
         exitCode: code,
         durationMs: Date.now() - start,
         timedOut,
+        aborted,
         stderr: stderr.slice(0, 4000),
       })
     })
@@ -496,12 +513,26 @@ const server = createServer(async (req, res) => {
         return json(res, 400, { error: "prompt_required" })
       }
       const options = body.options || {}
-      const timeoutMs = Math.min(Math.max(Number(options.timeoutMs) || 120000, 5000), 1800000)
+      // timeoutMs === 0 means "no cap" — the browser's Terminate button controls
+      // it instead (and disconnecting kills the process, see killSignal below).
+      const timeoutMs =
+        Number(options.timeoutMs) === 0
+          ? 0
+          : Math.min(Math.max(Number(options.timeoutMs) || 120000, 5000), 1800000)
       const cwd =
         typeof options.workingDirectory === "string" && options.workingDirectory.trim()
           ? options.workingDirectory.trim()
           : undefined
-      const result = await runClaude(buildArgs(prompt, options), { cwd, timeoutMs })
+      // Kill claude if the client disconnects before we respond (Terminate).
+      const killer = new AbortController()
+      res.on("close", () => {
+        if (!res.writableEnded) killer.abort()
+      })
+      const result = await runClaude(buildArgs(prompt, options), {
+        cwd,
+        timeoutMs,
+        killSignal: killer.signal,
+      })
       return json(res, 200, result)
     }
 
