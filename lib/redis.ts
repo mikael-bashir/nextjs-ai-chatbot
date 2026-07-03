@@ -133,6 +133,9 @@ export interface GeneratedRecord {
   verified: boolean;
   proof?: string;
   error?: string | null;
+  // DB-backed membership of the verification queue, so a queued problem survives
+  // reloads and the verifier can resume it later.
+  queued?: boolean;
   toolchain?: string;
   createdAt: string;
 }

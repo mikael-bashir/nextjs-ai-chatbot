@@ -45,6 +45,7 @@ interface StagedItem extends GenProblem {
 interface GeneratedItem extends StagedItem {
   verified: boolean;
   error?: string | null;
+  queued?: boolean;
 }
 
 interface Health {
@@ -117,6 +118,7 @@ export function AdminPipeline() {
   // by a single verifier so generation and proving stay decoupled.
   const [verifyQueue, setVerifyQueue] = useState<GeneratedItem[]>([]);
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
+  const [verifyPaused, setVerifyPaused] = useState<string | null>(null);
   const [verifyActivity, setVerifyActivity] = useState<
     Array<{ id: number; tool: string }>
   >([]);
@@ -161,18 +163,29 @@ export function AdminPipeline() {
     }
   };
 
-  // Prove via the SHARED bridge; collect tool activity for display.
+  // Prove via the SHARED bridge; collect tool activity for display. THROWS on a
+  // connectivity/protocol failure (unreachable bridge, non-2xx, no completion
+  // event) so the verifier can treat that as transient and keep the item queued,
+  // rather than mis-marking it "failed". Returns an outcome only on a real
+  // `done` event.
   const proveStream = useCallback(
     async (lean: string, mcpServers: Array<{ name: string; url: string }>) => {
-      const res = await callBridge(false, '/prove-stream', {
-        method: 'POST',
-        body: JSON.stringify({ theorem: lean, mcpServers }),
-      });
-      if (!res.ok || !res.body) return { verified: false, proof: '' };
+      let res: Response;
+      try {
+        res = await callBridge(false, '/prove-stream', {
+          method: 'POST',
+          body: JSON.stringify({ theorem: lean, mcpServers }),
+        });
+      } catch {
+        throw new Error("couldn't reach the verification (shared) bridge");
+      }
+      if (!res.ok || !res.body) {
+        throw new Error(`prove bridge returned ${res.status}`);
+      }
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       let buf = '';
-      let outcome = { verified: false, proof: '' };
+      let outcome: { verified: boolean; proof: string } | null = null;
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -196,16 +209,33 @@ export function AdminPipeline() {
           }
         }
       }
+      if (!outcome) throw new Error('prove stream ended without a result');
       return outcome;
     },
     [callBridge],
   );
 
+  const patchGenerated = async (id: string, patch: Record<string, unknown>) => {
+    const res = await fetch('/api/admin/generated', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id, ...patch }),
+    });
+    if (res.ok) {
+      const j = await res.json();
+      if (j.item)
+        setGenerated((g) => g.map((x) => (x.id === j.item.id ? j.item : x)));
+    }
+  };
+
   // The single verifier: pulls the head of the queue, proves it on the shared
-  // bridge, persists the outcome, and moves on. Guarded so only one runs.
+  // bridge, persists the outcome (clearing the DB `queued` flag), and moves on.
+  // A connectivity/protocol failure PAUSES the loop and leaves the item queued —
+  // so a bridge that's down never mis-marks problems as failed.
   const runVerifier = useCallback(async () => {
     if (runningRef.current) return;
     runningRef.current = true;
+    setVerifyPaused(null);
     try {
       while (queueRef.current.length > 0) {
         const item = queueRef.current[0];
@@ -215,41 +245,29 @@ export function AdminPipeline() {
 
         let verified = false;
         let proof = '';
-        let error: string | null = null;
         try {
           const mcpServers = await fetchMcp();
           const out = await proveStream(item.lean as string, mcpServers);
           verified = out.verified;
           proof = out.proof;
-          if (!verified) error = 'Lean proof did not verify';
         } catch (e) {
-          error = String((e as Error)?.message || e);
+          // Transient — keep the item queued (DB flag stays true) and stop.
+          setVerifyPaused(String((e as Error)?.message || e));
+          break;
         }
 
-        try {
-          const res = await fetch('/api/admin/generated', {
-            method: 'PATCH',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ id: item.id, verified, proof, error }),
-          });
-          if (res.ok) {
-            const j = await res.json();
-            if (j.item)
-              setGenerated((g) =>
-                g.map((x) => (x.id === j.item.id ? j.item : x)),
-              );
-          }
-        } catch {
-          /* leave the record as-is if persistence fails */
-        }
-
+        // Genuine outcome: persist it and clear the queued flag.
+        await patchGenerated(item.id, {
+          verified,
+          proof,
+          error: verified ? null : 'Lean proof did not verify',
+          queued: false,
+        });
         setStats((s) => ({
           ...s,
           verified: s.verified + (verified ? 1 : 0),
           failed: s.failed + (verified ? 0 : 1),
         }));
-
-        // Remove the processed item (it may already have been deleted).
         queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
         syncQueue();
       }
@@ -260,25 +278,41 @@ export function AdminPipeline() {
     }
   }, [proveStream]);
 
+  // Add to the verification queue — persists queued=true so it survives reloads.
   const enqueueVerify = useCallback(
-    (item: GeneratedItem) => {
+    async (item: GeneratedItem) => {
       if (
         verifyingIdRef.current === item.id ||
         queueRef.current.some((x) => x.id === item.id)
       ) {
         return;
       }
-      queueRef.current = [...queueRef.current, item];
+      queueRef.current = [...queueRef.current, { ...item, queued: true }];
       syncQueue();
+      await patchGenerated(item.id, { queued: true });
       runVerifier();
     },
     [runVerifier],
   );
 
-  const removeFromVerifyQueue = (id: string) => {
+  const removeFromVerifyQueue = async (id: string) => {
     queueRef.current = queueRef.current.filter((x) => x.id !== id);
     syncQueue();
+    await patchGenerated(id, { queued: false });
   };
+
+  // Rebuild the in-memory queue from the DB `queued` flags (on load), preserving
+  // FIFO order, and resume verifying.
+  const rebuildQueue = useCallback(
+    (list: GeneratedItem[]) => {
+      queueRef.current = list
+        .filter((g) => g.queued)
+        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      syncQueue();
+      if (queueRef.current.length > 0) runVerifier();
+    },
+    [runVerifier],
+  );
 
   // ---- loaders (hydrate on mount / manual refresh) ----------------------
 
@@ -300,12 +334,14 @@ export function AdminPipeline() {
       const r = await fetch('/api/admin/generated');
       if (!r.ok) return;
       const j = await r.json();
-      setGenerated(Array.isArray(j.items) ? j.items : []);
+      const list: GeneratedItem[] = Array.isArray(j.items) ? j.items : [];
+      setGenerated(list);
       if (typeof j.cap === 'number') setGenCap(j.cap);
+      rebuildQueue(list);
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [rebuildQueue]);
 
   const loadAll = useCallback(() => {
     loadQueue();
@@ -374,6 +410,7 @@ export function AdminPipeline() {
         verified: false,
         proof: '',
         error: null,
+        queued: true,
         toolchain: TOOLCHAIN,
       }),
     });
@@ -381,11 +418,16 @@ export function AdminPipeline() {
       const j = await res.json();
       if (j.item) {
         setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
-        enqueueVerify(j.item);
+        // Already persisted queued=true; just add to the in-memory queue.
+        if (!queueRef.current.some((x) => x.id === j.item.id)) {
+          queueRef.current = [...queueRef.current, j.item];
+          syncQueue();
+        }
+        runVerifier();
       }
     }
     setGenStage('idle');
-  }, [callBridge, enqueueVerify]);
+  }, [callBridge, runVerifier]);
 
   // Manual: add one fresh unproven generation to the verify queue.
   const addUnprovenGeneration = useCallback(async () => {
@@ -475,7 +517,9 @@ export function AdminPipeline() {
       );
       if (res.ok) {
         setGenerated((g) => g.filter((x) => x.id !== id));
-        removeFromVerifyQueue(id);
+        // The record is gone; just drop it from the in-memory queue.
+        queueRef.current = queueRef.current.filter((x) => x.id !== id);
+        syncQueue();
       }
     } finally {
       setBusy(null);
@@ -628,12 +672,31 @@ export function AdminPipeline() {
 
       {/* Verification queue */}
       <div className="mt-8">
-        <h2 className="mb-2 text-lg font-semibold">
-          Verification queue{' '}
-          <span className="text-sm font-normal text-muted-foreground">
-            ({verifyQueue.length})
-          </span>
-        </h2>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">
+            Verification queue{' '}
+            <span className="text-sm font-normal text-muted-foreground">
+              ({verifyQueue.length})
+            </span>
+          </h2>
+          {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-7 px-2 text-xs"
+              onClick={() => runVerifier()}
+            >
+              Resume verifying
+            </Button>
+          )}
+        </div>
+        {verifyPaused && (
+          <div className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-600">
+            <span className="font-medium">Paused: </span>
+            <span className="font-mono">{verifyPaused}</span>. Items stay
+            queued; fix the shared bridge and resume.
+          </div>
+        )}
         {verifyingId && verifyActivity.length > 0 && (
           <div className="mb-2 flex flex-wrap gap-1">
             {verifyActivity.map((t) => (

@@ -57,6 +57,8 @@ export async function POST(request: NextRequest) {
       verified,
       proof: verified ? (body.proof ?? '') : '',
       error: body.error ?? null,
+      // Whether it should sit in the (DB-backed) verification queue.
+      queued: !!body.queued,
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
     };
     const item = await saveGenerated(record);
@@ -93,6 +95,7 @@ export async function PATCH(request: NextRequest) {
     if ('verified' in body) patch.verified = !!body.verified;
     if ('proof' in body) patch.proof = body.proof ?? '';
     if ('error' in body) patch.error = body.error ?? null;
+    if ('queued' in body) patch.queued = !!body.queued;
     const updated = await updateGenerated(body.id, patch);
     return updated
       ? Response.json({ ok: true, item: updated })
