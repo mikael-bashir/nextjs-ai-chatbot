@@ -220,6 +220,16 @@ export function AdminPipeline() {
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
   }, [loadAll]);
 
+  // Passive auto-refresh so newly generated/staged problems appear without a
+  // manual click (the Work loop only refreshes the tab it runs in). Skips while
+  // the tab is hidden to avoid needless polling.
+  useEffect(() => {
+    const id = setInterval(() => {
+      if (!document.hidden) loadAll();
+    }, 15000);
+    return () => clearInterval(id);
+  }, [loadAll]);
+
   const persistWorkBridgeUrl = (value: string) => {
     setWorkBridgeUrl(value);
     if (value.trim()) localStorage.setItem('lca.workBridgeUrl', value.trim());
