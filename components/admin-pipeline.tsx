@@ -94,12 +94,13 @@ function fmtCountdown(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
 }
 
-type GenMode = 'standard' | 'hard' | 'nested';
+type GenMode = 'standard' | 'hard' | 'nested' | 'reverse';
 
 const MODE_LABEL: Record<GenMode, string> = {
   standard: 'Standard',
   hard: 'Hard',
   nested: 'Nested insights',
+  reverse: 'Reverse-built',
 };
 
 const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
@@ -125,6 +126,13 @@ const MODE_BLOCKS: Record<GenMode, string> = {
   nested: `
 - NESTED INSIGHTS MODE. The solution must require chaining 2-3 DISTINCT, non-obvious insights, each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. A strong solver needs a genuine multi-step derivation to reach the integer answer.
 - The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
+  reverse: `
+- REVERSE-CONSTRUCTION MODE. Build the problem BACKWARD, so its answer is KNOWN by construction (this is how many elegant competition problems are actually made — and it means you never have to solve a problem you're inventing):
+  1. SEED: start from a base object whose value/count/identity you already know exactly — a closed-form sum, a bijection or counting identity, an algebraic identity, an invariant, or a deliberately chosen small integer answer.
+  2. NEST: apply a chain of answer-preserving (or answer-trackable) manipulations — substitutions, changes of variable, reparametrizations, added-but-cancelling conditions, reframings across a different domain (number theory ↔ combinatorics ↔ geometry). Track the exact integer answer at EVERY step.
+  3. DISGUISE: state the final result as a clean, self-contained problem whose connection to the seed is hidden, so a solver must peel back the layers — that hidden nesting is what makes it hard.
+- Because you built it forward from the seed, you ALREADY KNOW the exact integer answer — state it directly; do NOT re-derive it.
+- Lean 4 theorem: encode the final answer in a form the prover can confirm — prefer native_decide over a bounded instance, or a clean closed-form/identity. It is true by your construction.`,
 };
 
 const RESPONSE_FORMAT = `
@@ -1181,21 +1189,23 @@ export function AdminPipeline() {
         <div className="mt-3">
           <Label className="text-xs">Difficulty mode</Label>
           <div className="mt-1 flex flex-wrap gap-1 text-xs">
-            {(['standard', 'hard', 'nested'] as GenMode[]).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => persistMode(m)}
-                className={cn(
-                  'rounded border px-2 py-1',
-                  mode === m
-                    ? 'border-foreground bg-foreground text-background'
-                    : 'text-muted-foreground hover:text-foreground',
-                )}
-              >
-                {MODE_LABEL[m]}
-              </button>
-            ))}
+            {(['standard', 'hard', 'nested', 'reverse'] as GenMode[]).map(
+              (m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => persistMode(m)}
+                  className={cn(
+                    'rounded border px-2 py-1',
+                    mode === m
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {MODE_LABEL[m]}
+                </button>
+              ),
+            )}
           </div>
           <p className="mt-1 text-[11px] text-muted-foreground">
             {mode === 'standard' &&
@@ -1204,6 +1214,8 @@ export function AdminPipeline() {
               'No brute-force / small-search solution; Lean theorem is general (not decide) — harder to auto-prove, but the workflow still tries.'}
             {mode === 'nested' &&
               'Requires chaining 2-3 distinct insights; general (non-decide) Lean statement. Hardest to prove automatically.'}
+            {mode === 'reverse' &&
+              'Built backward from a known seed → answer is correct by construction, so generation is fast AND cheap. Nesting + disguise make it hard for solvers.'}
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             De-duplicating against {generated.length} generated +{' '}
