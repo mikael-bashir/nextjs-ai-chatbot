@@ -10,19 +10,76 @@ import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
 import { MathMarkdown } from '@/components/math-markdown';
 
-const GEN_PROMPT = `You are a creative competition-math problem setter. Invent ONE original problem.
+const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
 
-Requirements:
+type GenMode = 'standard' | 'hard' | 'nested';
+
+const MODE_LABEL: Record<GenMode, string> = {
+  standard: 'Standard',
+  hard: 'Hard',
+  nested: 'Nested insights',
+};
+
+const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
+
+Core requirements:
 - Creative and NON-standard: not a textbook exercise, not a famous/known competition problem, not a classic named result. Fresh setup and phrasing.
 - The answer is a specific INTEGER.
-- Solvable BY HAND with at most a basic calculator: it must hinge on an elegant insight, NOT brute force or a computer. A strong student derives the integer on paper.
-- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. STRONGLY prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range n, Finset.Icc, functions between small Fin types) so it is machine-checkable, or a clean closed-form equality. It MUST be true — compute the answer correctly. Assume "import Mathlib" is present; do NOT include imports.
-- Also give it presentation metadata: a short evocative title, a 1-3 word subtitle, a difficulty of exactly "Easy" | "Medium" | "Hard" | "Extreme", and points = 50 for Easy, 100 for Medium, 150 for Hard, 200 for Extreme.
+- Give presentation metadata: a short evocative title, a 1-3 word subtitle, a difficulty of exactly "Easy" | "Medium" | "Hard" | "Extreme", and points = 50 for Easy, 100 for Medium, 150 for Hard, 200 for Extreme.`;
 
+const MODE_BLOCKS: Record<GenMode, string> = {
+  standard: `
+- Solvable BY HAND with at most a basic calculator via an elegant insight, NOT brute force.
+- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It MUST be true.`,
+  hard: `
+- HARD MODE. The problem must NOT be solvable by a short brute-force script: avoid small finite search spaces. Use large or unbounded domains, a general n, or structures where naive enumeration is infeasible. It must hinge on a genuine, non-obvious insight, yet still be solvable by hand to a specific integer.
+- The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It MUST be true. Still attempt to make it provable in Mathlib.`,
+  nested: `
+- NESTED INSIGHTS MODE. The solution must require chaining 2-3 DISTINCT, non-obvious insights, each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. A strong solver needs a genuine multi-step derivation to reach the integer answer.
+- The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It MUST be true. Still attempt to make it provable in Mathlib.`,
+};
+
+const RESPONSE_FORMAT = `
+
+Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
-{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"insight":"<key trick, 1-2 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
+{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
-const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
+interface LiveProblem {
+  title: string;
+  subtitle?: string;
+  difficulty?: string;
+}
+
+// Summarise problems that already exist (here + live on CompeteMath) so the
+// model can deliberately avoid repeating topics/structures.
+function buildAvoidContext(
+  gen: { questionTitle?: string; problem?: string }[],
+  live: LiveProblem[],
+): string {
+  const genLines = gen
+    .slice(0, 60)
+    .map(
+      (g) =>
+        `- "${g.questionTitle ?? 'untitled'}"${g.problem ? `: ${g.problem.replace(/\s+/g, ' ').slice(0, 110)}` : ''}`,
+    );
+  const liveLines = live
+    .slice(0, 120)
+    .map((p) => `- "${p.title}"${p.subtitle ? ` — ${p.subtitle}` : ''}`);
+  const parts: string[] = [];
+  if (genLines.length)
+    parts.push(`Already generated here:\n${genLines.join('\n')}`);
+  if (liveLines.length)
+    parts.push(`Already live on CompeteMath:\n${liveLines.join('\n')}`);
+  return parts.join('\n\n');
+}
+
+function buildPrompt(mode: GenMode, avoid: string): string {
+  const avoidBlock = avoid
+    ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
+    : '';
+  return BASE_REQS + MODE_BLOCKS[mode] + avoidBlock + RESPONSE_FORMAT;
+}
 
 interface GenProblem {
   questionTitle?: string;
@@ -109,7 +166,9 @@ export function AdminPipeline() {
   const [generated, setGenerated] = useState<GeneratedItem[]>([]);
   const [genCap, setGenCap] = useState(200);
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
-  const [previewId, setPreviewId] = useState<string | null>(null);
+  const [previewIds, setPreviewIds] = useState<string[]>([]);
+  const [mode, setMode] = useState<GenMode>('standard');
+  const [liveProblems, setLiveProblems] = useState<LiveProblem[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [workBridgeUrl, setWorkBridgeUrl] = useState('');
   const [generatingOne, setGeneratingOne] = useState(false);
@@ -127,8 +186,20 @@ export function AdminPipeline() {
   const queueRef = useRef<GeneratedItem[]>([]);
   const verifyingIdRef = useRef<string | null>(null);
   const runningRef = useRef(false);
+  // Refs so generateOne reads the latest mode + existing problems for the prompt
+  // without depending on that state (which would restart the Work loop).
+  const modeRef = useRef<GenMode>('standard');
+  const generatedRef = useRef<GeneratedItem[]>([]);
+  const liveRef = useRef<LiveProblem[]>([]);
 
   const syncQueue = () => setVerifyQueue([...queueRef.current]);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    generatedRef.current = generated;
+  }, [generated]);
 
   const callBridge = useCallback(
     (useWork: boolean, path: string, init?: RequestInit) => {
@@ -351,7 +422,25 @@ export function AdminPipeline() {
   useEffect(() => {
     loadAll();
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
+    const savedMode = localStorage.getItem('lca.genMode') as GenMode | null;
+    if (savedMode && savedMode in MODE_LABEL) setMode(savedMode);
+    // Pull already-live CompeteMath problems so generation can avoid them.
+    fetch('/api/admin/live-problems')
+      .then((r) => (r.ok ? r.json() : { problems: [] }))
+      .then((j) => {
+        const p: LiveProblem[] = Array.isArray(j.problems) ? j.problems : [];
+        liveRef.current = p;
+        setLiveProblems(p);
+      })
+      .catch(() => {
+        /* live context is best-effort */
+      });
   }, [loadAll]);
+
+  const persistMode = (m: GenMode) => {
+    setMode(m);
+    localStorage.setItem('lca.genMode', m);
+  };
 
   const persistWorkBridgeUrl = (value: string) => {
     setWorkBridgeUrl(value);
@@ -369,14 +458,15 @@ export function AdminPipeline() {
     setGenStage('generating');
     setLastError(null);
 
+    const prompt = buildPrompt(
+      modeRef.current,
+      buildAvoidContext(generatedRef.current, liveRef.current),
+    );
     let genRes: Response;
     try {
       genRes = await callBridge(true, '/run', {
         method: 'POST',
-        body: JSON.stringify({
-          prompt: GEN_PROMPT,
-          options: { timeoutMs: 180000 },
-        }),
+        body: JSON.stringify({ prompt, options: { timeoutMs: 180000 } }),
       });
     } catch {
       throw new Error(
@@ -619,6 +709,39 @@ export function AdminPipeline() {
         </div>
 
         <div className="mt-3">
+          <Label className="text-xs">Difficulty mode</Label>
+          <div className="mt-1 flex flex-wrap gap-1 text-xs">
+            {(['standard', 'hard', 'nested'] as GenMode[]).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => persistMode(m)}
+                className={cn(
+                  'rounded border px-2 py-1',
+                  mode === m
+                    ? 'border-foreground bg-foreground text-background'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {MODE_LABEL[m]}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {mode === 'standard' &&
+              'Elegant, hand-solvable; Lean proof usually machine-checkable (decide).'}
+            {mode === 'hard' &&
+              'No brute-force / small-search solution; Lean theorem is general (not decide) — harder to auto-prove, but the workflow still tries.'}
+            {mode === 'nested' &&
+              'Requires chaining 2-3 distinct insights; general (non-decide) Lean statement. Hardest to prove automatically.'}
+          </p>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            De-duplicating against {generated.length} generated +{' '}
+            {liveProblems.length} live CompeteMath problems.
+          </p>
+        </div>
+
+        <div className="mt-3">
           <Label htmlFor="admin-work-bridge" className="text-xs">
             Generation bridge URL (optional)
           </Label>
@@ -824,10 +947,14 @@ export function AdminPipeline() {
                     variant="outline"
                     className="h-7 px-2 text-xs"
                     onClick={() =>
-                      setPreviewId((p) => (p === g.id ? null : g.id))
+                      setPreviewIds((p) =>
+                        p.includes(g.id)
+                          ? p.filter((x) => x !== g.id)
+                          : [...p, g.id],
+                      )
                     }
                   >
-                    {previewId === g.id ? 'Hide preview' : 'Preview'}
+                    {previewIds.includes(g.id) ? 'Hide preview' : 'Preview'}
                   </Button>
                   <Button
                     size="sm"
@@ -863,7 +990,7 @@ export function AdminPipeline() {
                   </Button>
                 </div>
 
-                {previewId === g.id && (
+                {previewIds.includes(g.id) && (
                   <div className="mt-3 space-y-3 border-t pt-3">
                     {g.problem && <MathMarkdown>{g.problem}</MathMarkdown>}
                     {g.insight && (
