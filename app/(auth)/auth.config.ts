@@ -71,7 +71,10 @@ export const authConfig = {
         if (auth?.user?.hasLeakAccount) return true;
         if (!isLoggedIn) return false;
         if (accountResolved === undefined) {
-          accountResolved = await isProvisioned(auth?.user?.id);
+          accountResolved = await isProvisioned(
+            auth?.user?.id,
+            auth?.user?.email,
+          );
         }
         return accountResolved;
       };

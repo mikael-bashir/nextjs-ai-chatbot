@@ -1,7 +1,7 @@
 import NextAuth, { type DefaultSession } from 'next-auth';
 
 import { authConfig } from './auth.config';
-import { leakAccountProvisioned } from '@/lib/db/queries';
+import { reconcileLeakAccount } from '@/lib/db/queries';
 
 declare module 'next-auth' {
   interface User {
@@ -43,8 +43,12 @@ export const {
       // leak subdomain (including preview deployments).
       if (!token.hasLeakAccount && token.id) {
         try {
-          const account = await leakAccountProvisioned({
+          // reconcileLeakAccount also self-heals a competemath id change by
+          // migrating the user's existing row (matched by email) to the current
+          // id, so a re-registration can never orphan the account.
+          const account = await reconcileLeakAccount({
             id: token.id as string,
+            email: token.email as string | null,
           });
           token.hasLeakAccount = !!account;
           if (account?.username) token.name = account.username;
@@ -57,8 +61,9 @@ export const {
 
       if (trigger === 'update') {
         try {
-          const account = await leakAccountProvisioned({
+          const account = await reconcileLeakAccount({
             id: token.id as string,
+            email: token.email as string | null,
           });
           token.hasLeakAccount = !!account;
           if (account?.username) token.name = account.username;

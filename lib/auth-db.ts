@@ -10,12 +10,20 @@ import { sql } from '@vercel/postgres';
 // re-login). The middleware runs in edge and cannot run the node jwt callback, so
 // without a direct DB check it would 403/modal a genuinely provisioned user
 // whenever the cookie lacks the flag. Fails closed (false) on any error.
+// Matches by id OR email. The email fallback means a user whose competemath id
+// changed (re-registration) is still recognized as provisioned immediately in
+// middleware, avoiding a modal flash before the node side migrates their row.
 export async function isProvisioned(
   id: string | undefined | null,
+  email?: string | undefined | null,
 ): Promise<boolean> {
-  if (!id) return false;
+  if (!id && !email) return false;
   try {
-    const { rows } = await sql`SELECT 1 FROM "User" WHERE id = ${id} LIMIT 1`;
+    const { rows } = await sql`
+      SELECT 1 FROM "User"
+      WHERE (${id ?? null}::text IS NOT NULL AND id = ${id ?? null}::uuid)
+         OR (${email ?? null}::text IS NOT NULL AND email = ${email ?? null})
+      LIMIT 1`;
     return rows.length > 0;
   } catch {
     return false;
