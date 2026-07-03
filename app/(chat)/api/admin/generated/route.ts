@@ -7,6 +7,7 @@ import {
   listGenerated,
   pushProblem,
   saveGenerated,
+  updateGenerated,
 } from '@/lib/redis';
 
 // The full generation history: every problem Claude produces is stored here,
@@ -69,6 +70,31 @@ export async function POST(request: NextRequest) {
     return Response.json({ ok: true, count, queued });
   } catch (error) {
     console.error('Error saving generated problem:', error);
+    return new Response('Internal Server Error', { status: 500 });
+  }
+}
+
+// Re-verification updates a stored problem's outcome in place. It does NOT push
+// to staging — that stays a deliberate, manual action.
+export async function PATCH(request: NextRequest) {
+  if (!(await requireAdmin())) {
+    return new Response('Forbidden', { status: 403 });
+  }
+  try {
+    const body = await request.json().catch(() => null);
+    if (!body?.id || typeof body.id !== 'string') {
+      return new Response('id required', { status: 400 });
+    }
+    const patch: Record<string, unknown> = {};
+    if ('verified' in body) patch.verified = !!body.verified;
+    if ('proof' in body) patch.proof = body.proof ?? '';
+    if ('error' in body) patch.error = body.error ?? null;
+    const updated = await updateGenerated(body.id, patch);
+    return updated
+      ? Response.json({ ok: true, item: updated })
+      : new Response('Not found', { status: 404 });
+  } catch (error) {
+    console.error('Error updating generated problem:', error);
     return new Response('Internal Server Error', { status: 500 });
   }
 }

@@ -42,8 +42,10 @@ export async function POST(request: NextRequest) {
   }
   try {
     const body = await request.json().catch(() => null);
-    if (!body || typeof body !== 'object' || !body.lean || !body.proof) {
-      return new Response('problem must include at least { lean, proof }', {
+    // `lean` is required; `proof` is optional so a problem can be staged
+    // manually (the admin decides), even if it hasn't been re-verified here.
+    if (!body || typeof body !== 'object' || !body.lean) {
+      return new Response('problem must include at least { lean }', {
         status: 400,
       });
     }
@@ -56,7 +58,7 @@ export async function POST(request: NextRequest) {
       points: body.points ?? null,
       insight: body.insight ?? null,
       lean: body.lean,
-      proof: body.proof,
+      proof: body.proof ?? '',
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
       createdAt: new Date().toISOString(),
     };

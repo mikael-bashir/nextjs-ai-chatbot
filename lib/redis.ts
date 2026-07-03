@@ -184,6 +184,28 @@ export async function deleteGenerated(id: string): Promise<boolean> {
   return false;
 }
 
+// Merge a patch into the stored generated record in place (used by re-verify).
+export async function updateGenerated(
+  id: string,
+  patch: Partial<GeneratedRecord>,
+): Promise<GeneratedRecord | null> {
+  const redis = getRedis();
+  const raws: string[] = await redis.lrange(GENERATED_STORE_KEY, 0, -1);
+  for (let i = 0; i < raws.length; i++) {
+    try {
+      const rec = JSON.parse(raws[i]) as GeneratedRecord;
+      if (rec.id === id) {
+        const updated = { ...rec, ...patch, id: rec.id };
+        await redis.lset(GENERATED_STORE_KEY, i, JSON.stringify(updated));
+        return updated;
+      }
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return null;
+}
+
 // Push a payload onto the production weekly-problems queue (separate instance).
 export async function pushToProd(
   payload: Record<string, unknown>,
@@ -212,7 +234,10 @@ export async function redisHealth(): Promise<{
           5000,
         ),
       );
-      return { ok: true, length: await Promise.race([client.llen(key), timeout]) };
+      return {
+        ok: true,
+        length: await Promise.race([client.llen(key), timeout]),
+      };
     } catch (e) {
       const wrapper = String((e as Error)?.message || e);
       // ioredis's "max retries"/"Connection is closed" wrappers hide the cause —
