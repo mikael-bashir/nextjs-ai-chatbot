@@ -6,6 +6,7 @@ import {
   deleteGenerated,
   listGenerated,
   pushProblem,
+  queueLength,
   saveGenerated,
   updateGenerated,
 } from '@/lib/redis';
@@ -58,16 +59,19 @@ export async function POST(request: NextRequest) {
       error: body.error ?? null,
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
     };
-    const count = await saveGenerated(record);
+    const item = await saveGenerated(record);
     // Verified ones additionally enter the promotable review queue.
+    let staged: unknown;
     let queued: number | undefined;
     if (verified) {
-      queued = await pushProblem({
+      staged = await pushProblem({
         ...record,
         createdAt: new Date().toISOString(),
       });
+      queued = await queueLength();
     }
-    return Response.json({ ok: true, count, queued });
+    // Return the stored records so the client can update state without a refetch.
+    return Response.json({ ok: true, item, staged, queued });
   } catch (error) {
     console.error('Error saving generated problem:', error);
     return new Response('Internal Server Error', { status: 500 });

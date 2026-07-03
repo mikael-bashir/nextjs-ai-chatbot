@@ -75,11 +75,13 @@ export interface StagedProblem {
 
 export async function pushProblem(
   problem: Record<string, unknown>,
-): Promise<number> {
+): Promise<StagedProblem> {
   // Stamp a stable id so the item can later be targeted for delete/promote.
-  const record = { id: crypto.randomUUID(), ...problem };
-  // LPUSH so consumers RPOP/LPOP in FIFO order; return the new queue length.
-  return getRedis().lpush(PROBLEM_QUEUE_KEY, JSON.stringify(record));
+  const record = { id: crypto.randomUUID(), ...problem } as StagedProblem;
+  // LPUSH so consumers RPOP/LPOP in FIFO order; return the stored record so the
+  // client can update its list without re-fetching.
+  await getRedis().lpush(PROBLEM_QUEUE_KEY, JSON.stringify(record));
+  return record;
 }
 
 export async function queueLength(): Promise<number> {
@@ -139,16 +141,16 @@ export interface GeneratedRecord {
 // then LTRIMs so at most GENERATED_CAP records are retained (oldest dropped).
 export async function saveGenerated(
   rec: Record<string, unknown>,
-): Promise<number> {
+): Promise<GeneratedRecord> {
   const redis = getRedis();
   const record = {
     ...rec,
     id: crypto.randomUUID(),
     createdAt: new Date().toISOString(),
-  };
+  } as GeneratedRecord;
   await redis.lpush(GENERATED_STORE_KEY, JSON.stringify(record));
   await redis.ltrim(GENERATED_STORE_KEY, 0, GENERATED_CAP - 1);
-  return redis.llen(GENERATED_STORE_KEY);
+  return record;
 }
 
 export async function listGenerated(): Promise<GeneratedRecord[]> {

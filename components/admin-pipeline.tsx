@@ -215,19 +215,12 @@ export function AdminPipeline() {
     loadGenerated();
   }, [loadQueue, loadGenerated]);
 
+  // Hydrate once from the server; after this, state is updated directly from
+  // each mutation's result (below). The manual "Refresh" buttons re-pull if you
+  // want to see changes made from another tab.
   useEffect(() => {
     loadAll();
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
-  }, [loadAll]);
-
-  // Passive auto-refresh so newly generated/staged problems appear without a
-  // manual click (the Work loop only refreshes the tab it runs in). Skips while
-  // the tab is hidden to avoid needless polling.
-  useEffect(() => {
-    const id = setInterval(() => {
-      if (!document.hidden) loadAll();
-    }, 15000);
-    return () => clearInterval(id);
   }, [loadAll]);
 
   const persistWorkBridgeUrl = (value: string) => {
@@ -258,102 +251,111 @@ export function AdminPipeline() {
         } catch (e) {
           error = String((e as Error)?.message || e);
         }
-        await fetch('/api/admin/generated', {
+        const res = await fetch('/api/admin/generated', {
           method: 'PATCH',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ id: item.id, verified, proof, error }),
         });
-        await loadGenerated();
+        if (res.ok) {
+          const j = await res.json();
+          if (j.item)
+            setGenerated((g) =>
+              g.map((x) => (x.id === j.item.id ? j.item : x)),
+            );
+        }
       } finally {
         setBusy(null);
       }
     },
-    [proveStream, loadGenerated],
+    [proveStream],
   );
 
   // Manually add a problem to the staging review queue (deliberate action).
-  const addToStaging = useCallback(
-    async (item: GeneratedItem | StagedItem) => {
-      if (!item.lean) return;
-      setBusy(`stage:${item.id}`);
-      try {
-        await fetch('/api/admin/problems', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            questionTitle: item.questionTitle ?? null,
-            subtitle: item.subtitle ?? null,
-            problem: item.problem ?? null,
-            answer: item.answer ?? null,
-            difficulty: item.difficulty ?? null,
-            points: item.points ?? null,
-            insight: item.insight ?? null,
-            lean: item.lean,
-            proof: item.proof ?? '',
-            toolchain: item.toolchain ?? TOOLCHAIN,
-          }),
-        });
-        await loadQueue();
-      } finally {
-        setBusy(null);
+  const addToStaging = useCallback(async (item: GeneratedItem | StagedItem) => {
+    if (!item.lean) return;
+    setBusy(`stage:${item.id}`);
+    try {
+      const res = await fetch('/api/admin/problems', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          questionTitle: item.questionTitle ?? null,
+          subtitle: item.subtitle ?? null,
+          problem: item.problem ?? null,
+          answer: item.answer ?? null,
+          difficulty: item.difficulty ?? null,
+          points: item.points ?? null,
+          insight: item.insight ?? null,
+          lean: item.lean,
+          proof: item.proof ?? '',
+          toolchain: item.toolchain ?? TOOLCHAIN,
+        }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        if (j.staged)
+          setItems((it) => [
+            j.staged,
+            ...it.filter((x) => x.id !== j.staged.id),
+          ]);
+        if (typeof j.queued === 'number') setQueued(j.queued);
       }
-    },
-    [loadQueue],
-  );
+    } finally {
+      setBusy(null);
+    }
+  }, []);
 
-  const removeGenerated = useCallback(
-    async (id: string) => {
-      setBusy(`del:${id}`);
-      try {
-        await fetch(`/api/admin/generated?id=${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-        });
-        await loadGenerated();
-      } finally {
-        setBusy(null);
-      }
-    },
-    [loadGenerated],
-  );
+  const removeGenerated = useCallback(async (id: string) => {
+    setBusy(`del:${id}`);
+    try {
+      const res = await fetch(
+        `/api/admin/generated?id=${encodeURIComponent(id)}`,
+        { method: 'DELETE' },
+      );
+      if (res.ok) setGenerated((g) => g.filter((x) => x.id !== id));
+    } finally {
+      setBusy(null);
+    }
+  }, []);
 
-  const removeItem = useCallback(
-    async (id: string) => {
-      setBusy(`del:${id}`);
-      try {
-        await fetch(`/api/admin/problems?id=${encodeURIComponent(id)}`, {
-          method: 'DELETE',
-        });
-        await loadQueue();
-      } finally {
-        setBusy(null);
-      }
-    },
-    [loadQueue],
-  );
+  const dropStaged = (id: string) => {
+    setItems((it) => it.filter((x) => x.id !== id));
+    setQueued((q) => (typeof q === 'number' ? Math.max(0, q - 1) : q));
+  };
 
-  const promoteItem = useCallback(
-    async (id: string) => {
-      setBusy(`promote:${id}`);
-      try {
-        const r = await fetch('/api/admin/problems/promote', {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ id }),
-        });
-        if (!r.ok) throw new Error((await r.text()) || `failed (${r.status})`);
-        await loadQueue();
-      } catch (e) {
-        setHealth((h) =>
-          h
-            ? { ...h, prod: { ok: false, error: String((e as Error).message) } }
-            : h,
-        );
-      } finally {
-        setBusy(null);
-      }
-    },
-    [loadQueue],
-  );
+  const removeItem = useCallback(async (id: string) => {
+    setBusy(`del:${id}`);
+    try {
+      const res = await fetch(
+        `/api/admin/problems?id=${encodeURIComponent(id)}`,
+        { method: 'DELETE' },
+      );
+      if (res.ok) dropStaged(id);
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const promoteItem = useCallback(async (id: string) => {
+    setBusy(`promote:${id}`);
+    try {
+      const r = await fetch('/api/admin/problems/promote', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      if (!r.ok) throw new Error((await r.text()) || `failed (${r.status})`);
+      dropStaged(id);
+    } catch (e) {
+      setHealth((h) =>
+        h
+          ? { ...h, prod: { ok: false, error: String((e as Error).message) } }
+          : h,
+      );
+    } finally {
+      setBusy(null);
+    }
+  }, []);
 
   // ---- the Work loop ----------------------------------------------------
 
@@ -427,6 +429,10 @@ export function AdminPipeline() {
     });
     if (r.ok) {
       const j = await r.json();
+      if (j.item)
+        setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
+      if (j.staged)
+        setItems((it) => [j.staged, ...it.filter((x) => x.id !== j.staged.id)]);
       if (typeof j.queued === 'number') setQueued(j.queued);
     }
     setStats((s) => ({
@@ -434,8 +440,7 @@ export function AdminPipeline() {
       verified: s.verified + (verified ? 1 : 0),
       failed: s.failed + (verified ? 0 : 1),
     }));
-    loadAll();
-  }, [callBridge, proveStream, loadAll]);
+  }, [callBridge, proveStream]);
 
   useEffect(() => {
     workRef.current = work;

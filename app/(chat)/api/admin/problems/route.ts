@@ -5,6 +5,7 @@ import {
   deleteProblem,
   listProblems,
   pushProblem,
+  queueLength,
   redisHealth,
 } from '@/lib/redis';
 
@@ -62,8 +63,9 @@ export async function POST(request: NextRequest) {
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
       createdAt: new Date().toISOString(),
     };
-    const queued = await pushProblem(record);
-    return Response.json({ ok: true, queued });
+    const staged = await pushProblem(record);
+    const queued = await queueLength();
+    return Response.json({ ok: true, staged, queued });
   } catch (error) {
     console.error('Error pushing problem to queue:', error);
     return new Response('Internal Server Error', { status: 500 });
