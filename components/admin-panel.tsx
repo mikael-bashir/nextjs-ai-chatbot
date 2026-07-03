@@ -50,10 +50,17 @@ interface StagedItem extends GenProblem {
   createdAt?: string;
 }
 
+interface GeneratedItem extends StagedItem {
+  verified: boolean;
+  error?: string | null;
+}
+
 interface Health {
   staging: { ok: boolean; length?: number; error?: string };
   prod: { ok: boolean; length?: number; error?: string };
 }
+
+type GenFilter = 'all' | 'verified' | 'failed';
 
 function extractJson(text: string): GenProblem | null {
   const m = text.match(/\{[\s\S]*\}/);
@@ -72,7 +79,7 @@ export function AdminPanel({ className }: { className?: string }) {
   const [open, setOpen] = useState(false);
   const [work, setWork] = useState(false);
   const [stage, setStage] = useState<
-    'idle' | 'generating' | 'proving' | 'queuing'
+    'idle' | 'generating' | 'proving' | 'saving'
   >('idle');
   const [current, setCurrent] = useState<GenProblem | null>(null);
   const [activity, setActivity] = useState<Array<{ id: number; tool: string }>>(
@@ -81,18 +88,21 @@ export function AdminPanel({ className }: { className?: string }) {
   const [stats, setStats] = useState({
     generated: 0,
     verified: 0,
-    discarded: 0,
+    failed: 0,
     errors: 0,
   });
   const [queued, setQueued] = useState<number | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [items, setItems] = useState<StagedItem[]>([]);
+  const [generated, setGenerated] = useState<GeneratedItem[]>([]);
+  const [genCap, setGenCap] = useState(200);
+  const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [expanded, setExpanded] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
 
   const workRef = useRef(false);
 
-  // Load the queue: Redis health for both instances + the staged items.
+  // Load the review queue: Redis health for both instances + the staged items.
   const loadQueue = useCallback(async () => {
     try {
       const r = await fetch('/api/admin/problems');
@@ -105,6 +115,39 @@ export function AdminPanel({ className }: { className?: string }) {
       /* ignore */
     }
   }, []);
+
+  // Load the full generation history (verified + failed), capped server-side.
+  const loadGenerated = useCallback(async () => {
+    try {
+      const r = await fetch('/api/admin/generated');
+      if (!r.ok) return;
+      const j = await r.json();
+      setGenerated(Array.isArray(j.items) ? j.items : []);
+      if (typeof j.cap === 'number') setGenCap(j.cap);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const loadAll = useCallback(() => {
+    loadQueue();
+    loadGenerated();
+  }, [loadQueue, loadGenerated]);
+
+  const removeGenerated = useCallback(
+    async (id: string) => {
+      setBusy(id);
+      try {
+        await fetch(`/api/admin/generated?id=${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        await loadGenerated();
+      } finally {
+        setBusy(null);
+      }
+    },
+    [loadGenerated],
+  );
 
   const removeItem = useCallback(
     async (id: string) => {
@@ -245,30 +288,48 @@ export function AdminPanel({ className }: { className?: string }) {
     setCurrent(gen);
 
     setStage('proving');
-    const { verified, proof } = await proveStream(gen.lean, mcpServers);
-
-    if (verified) {
-      setStage('queuing');
-      const r = await fetch('/api/admin/problems', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ ...gen, proof, toolchain: TOOLCHAIN }),
-      });
-      if (r.ok) {
-        const j = await r.json();
-        setQueued(j.queued);
-        setStats((s) => ({ ...s, verified: s.verified + 1 }));
-        loadQueue();
-      }
-    } else {
-      setStats((s) => ({ ...s, discarded: s.discarded + 1 }));
+    let verified = false;
+    let proof = '';
+    let proveError: string | null = null;
+    try {
+      const out = await proveStream(gen.lean, mcpServers);
+      verified = out.verified;
+      proof = out.proof;
+      if (!verified) proveError = 'Lean proof did not verify';
+    } catch (e) {
+      proveError = String((e as Error)?.message || e);
     }
-  }, [callBridge, proveStream, loadQueue]);
 
-  // Refresh the queue view whenever the dropdown is opened.
+    // Persist EVERY generated problem (verified or not) — never discard.
+    // Verified ones are additionally pushed to the promotable review queue.
+    setStage('saving');
+    const r = await fetch('/api/admin/generated', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...gen,
+        verified,
+        proof,
+        error: proveError,
+        toolchain: TOOLCHAIN,
+      }),
+    });
+    if (r.ok) {
+      const j = await r.json();
+      if (typeof j.queued === 'number') setQueued(j.queued);
+    }
+    setStats((s) => ({
+      ...s,
+      verified: s.verified + (verified ? 1 : 0),
+      failed: s.failed + (verified ? 0 : 1),
+    }));
+    loadAll();
+  }, [callBridge, proveStream, loadAll]);
+
+  // Refresh both views whenever the dropdown is opened.
   useEffect(() => {
-    if (open) loadQueue();
-  }, [open, loadQueue]);
+    if (open) loadAll();
+  }, [open, loadAll]);
 
   useEffect(() => {
     workRef.current = work;
@@ -329,8 +390,8 @@ export function AdminPanel({ className }: { className?: string }) {
           <div>
             <Label htmlFor="admin-work">Work</Label>
             <p className="text-xs text-muted-foreground">
-              Generate creative problems → prove in Lean → queue the verified
-              ones.
+              Generate creative problems → prove in Lean → keep every one;
+              verified problems also enter the review queue.
             </p>
           </div>
           <Switch id="admin-work" checked={work} onCheckedChange={setWork} />
@@ -343,7 +404,7 @@ export function AdminPanel({ className }: { className?: string }) {
             value={stats.verified}
             tone="text-emerald-600"
           />
-          <Stat label="Discarded" value={stats.discarded} />
+          <Stat label="Failed" value={stats.failed} />
           <Stat label="Queued" value={queued ?? '—'} />
         </div>
 
@@ -382,6 +443,137 @@ export function AdminPanel({ className }: { className?: string }) {
               ))}
             </div>
           )}
+        </div>
+
+        <Separator className="my-3" />
+
+        {/* Generated history — every problem, verified or not (capped) */}
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-medium">
+            Generated{' '}
+            <span className="text-muted-foreground">
+              ({generated.length}/{genCap})
+            </span>
+          </span>
+          <div className="flex items-center gap-1 text-[11px]">
+            {(['all', 'verified', 'failed'] as GenFilter[]).map((f) => (
+              <button
+                key={f}
+                type="button"
+                onClick={() => setGenFilter(f)}
+                className={cn(
+                  'rounded px-1.5 py-0.5 capitalize',
+                  genFilter === f
+                    ? 'bg-muted font-medium text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {f}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={loadGenerated}
+              className="ml-1 text-muted-foreground underline-offset-2 hover:underline"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-2 space-y-1.5">
+          {generated.filter(
+            (g) =>
+              genFilter === 'all' ||
+              (genFilter === 'verified' ? g.verified : !g.verified),
+          ).length === 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              No {genFilter === 'all' ? '' : `${genFilter} `}problems yet.
+            </p>
+          )}
+          {generated
+            .filter(
+              (g) =>
+                genFilter === 'all' ||
+                (genFilter === 'verified' ? g.verified : !g.verified),
+            )
+            .map((g) => (
+              <div key={g.id} className="rounded-md border p-2 text-xs">
+                <div className="flex items-start justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setExpanded((e) => (e === g.id ? null : g.id))
+                    }
+                    className="min-w-0 flex-1 text-left"
+                  >
+                    <span className="flex items-center gap-1.5">
+                      <span
+                        className={cn(
+                          'shrink-0 rounded px-1 text-[9px] font-medium uppercase',
+                          g.verified
+                            ? 'bg-emerald-500/15 text-emerald-600'
+                            : 'bg-red-500/15 text-red-500',
+                        )}
+                      >
+                        {g.verified ? 'proved' : 'failed'}
+                      </span>
+                      <span className="truncate font-medium">
+                        {g.questionTitle || g.problem || 'Untitled problem'}
+                      </span>
+                    </span>
+                    <span className="mt-0.5 block text-[10px] text-muted-foreground">
+                      {[
+                        g.difficulty,
+                        g.points ? `${g.points}pts` : null,
+                        g.answer != null ? `ans ${g.answer}` : null,
+                        g.createdAt
+                          ? new Date(g.createdAt).toLocaleString()
+                          : null,
+                      ]
+                        .filter(Boolean)
+                        .join(' · ')}
+                    </span>
+                  </button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-6 shrink-0 px-2 text-[11px] text-red-500 hover:text-red-600"
+                    disabled={busy === g.id}
+                    onClick={() => removeGenerated(g.id)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+
+                {expanded === g.id && (
+                  <div className="mt-2 space-y-1 border-t pt-2 text-[11px] text-muted-foreground">
+                    {g.problem && <p>{g.problem}</p>}
+                    {g.insight && (
+                      <p>
+                        <span className="font-medium text-foreground">
+                          Insight:{' '}
+                        </span>
+                        {g.insight}
+                      </p>
+                    )}
+                    {!g.verified && g.error && (
+                      <p className="text-red-500">Reason: {g.error}</p>
+                    )}
+                    {g.lean && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted/50 p-1.5 text-[10px] text-foreground">
+                        {g.lean}
+                      </pre>
+                    )}
+                    {g.verified && g.proof && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-emerald-500/10 p-1.5 text-[10px] text-foreground">
+                        {g.proof}
+                      </pre>
+                    )}
+                  </div>
+                )}
+              </div>
+            ))}
         </div>
 
         <Separator className="my-3" />

@@ -32,6 +32,10 @@ export function getCompetemathRedis(): Redis {
 export const PROBLEM_QUEUE_KEY = 'competemath:problems:queue';
 // Production queue consumed by the main app's weekly-problems cron via LPOP.
 export const PROD_QUEUE_KEY = 'weekly-problems';
+// Full generation history — EVERY problem produced (verified or not) is kept
+// here for browsing, capped so it can't grow unbounded.
+export const GENERATED_STORE_KEY = 'competemath:problems:generated';
+export const GENERATED_CAP = 200;
 
 export interface StagedProblem {
   id: string;
@@ -91,6 +95,72 @@ export async function deleteProblem(id: string): Promise<StagedProblem | null> {
     }
   }
   return null;
+}
+
+export interface GeneratedRecord {
+  id: string;
+  questionTitle?: string;
+  subtitle?: string;
+  problem?: string;
+  answer?: number | string | null;
+  difficulty?: string;
+  points?: number;
+  insight?: string;
+  lean: string;
+  verified: boolean;
+  proof?: string;
+  error?: string | null;
+  toolchain?: string;
+  createdAt: string;
+}
+
+// Save a generated problem to the history store. Server stamps id + createdAt,
+// then LTRIMs so at most GENERATED_CAP records are retained (oldest dropped).
+export async function saveGenerated(
+  rec: Record<string, unknown>,
+): Promise<number> {
+  const redis = getRedis();
+  const record = {
+    ...rec,
+    id: crypto.randomUUID(),
+    createdAt: new Date().toISOString(),
+  };
+  await redis.lpush(GENERATED_STORE_KEY, JSON.stringify(record));
+  await redis.ltrim(GENERATED_STORE_KEY, 0, GENERATED_CAP - 1);
+  return redis.llen(GENERATED_STORE_KEY);
+}
+
+export async function listGenerated(): Promise<GeneratedRecord[]> {
+  const raws: string[] = await getRedis().lrange(GENERATED_STORE_KEY, 0, -1);
+  return raws
+    .map((r: string): GeneratedRecord | null => {
+      try {
+        return JSON.parse(r) as GeneratedRecord;
+      } catch {
+        return null;
+      }
+    })
+    .filter((x: GeneratedRecord | null): x is GeneratedRecord => !!x);
+}
+
+export async function generatedCount(): Promise<number> {
+  return getRedis().llen(GENERATED_STORE_KEY);
+}
+
+export async function deleteGenerated(id: string): Promise<boolean> {
+  const redis = getRedis();
+  const raws: string[] = await redis.lrange(GENERATED_STORE_KEY, 0, -1);
+  for (const raw of raws) {
+    try {
+      if ((JSON.parse(raw) as GeneratedRecord).id === id) {
+        await redis.lrem(GENERATED_STORE_KEY, 1, raw);
+        return true;
+      }
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return false;
 }
 
 // Push a payload onto the production weekly-problems queue (separate instance).
