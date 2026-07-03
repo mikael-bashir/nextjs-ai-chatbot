@@ -210,6 +210,12 @@ jobs:
               echo "RESEND_API_KEY=${RESEND_API_KEY}"
             } > "$PREVIEW_DIR/.env"
 
+            # Reclaim space BEFORE pulling so a disk already full of superseded
+            # images can't fail the pull ("no space left on device"). Removes
+            # images not used by a running container; the currently-running
+            # preview keeps its image. This makes a full VPS self-heal next deploy.
+            docker image prune -a -f 2>/dev/null || true
+
             # Start containers
             cd "$PREVIEW_DIR"
             docker compose -p "preview-${SUBDOMAIN}" pull --quiet
