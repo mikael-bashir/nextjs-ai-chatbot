@@ -623,7 +623,12 @@ export function AdminPipeline() {
       );
     }
     if (!genRes.ok) {
-      const detail = await genRes.text().catch(() => '');
+      const body = await genRes.text().catch(() => '');
+      const detail = `${JSON.stringify(
+        { bridge: bridgeUrl, httpStatus: genRes.status, mode: modeRef.current },
+        null,
+        2,
+      )}\n\n----- response body -----\n${body || '(empty)'}`;
       throw Object.assign(new Error(`Bridge /run failed (${genRes.status})`), {
         detail,
       });
@@ -632,15 +637,32 @@ export function AdminPipeline() {
     const raw = String(genData.text || genData.proof || '');
     const gen = extractJson(raw);
     if (!gen?.lean) {
-      // Keep the full raw output so it can be inspected (and recovered) in the log.
-      throw Object.assign(
-        new Error(
-          raw
-            ? 'Discarded — could not parse a problem from the generation output'
-            : 'Discarded — empty generation output',
-        ),
-        { detail: raw },
-      );
+      // Rich diagnostic: the bridge's own metadata explains an empty/failed run
+      // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
+      // cause, not just the symptom. Plus the full raw output for parse issues.
+      const stderr = String(genData.stderr || '').trim();
+      const reason = raw
+        ? 'could not parse a problem from the output'
+        : genData.timedOut
+          ? `generation timed out after ${genData.durationMs ?? '?'}ms`
+          : genData.ok === false
+            ? `claude exited ${genData.exitCode ?? '?'}${stderr ? `: ${stderr.split('\n')[0].slice(0, 120)}` : ' (no stderr)'}`
+            : 'empty output (claude returned no text)';
+      const meta = {
+        mode: modeRef.current,
+        bridge: bridgeUrl,
+        httpStatus: genRes.status,
+        ok: genData.ok,
+        exitCode: genData.exitCode,
+        timedOut: genData.timedOut,
+        durationMs: genData.durationMs,
+        textLength: raw.length,
+        promptChars: prompt.length,
+      };
+      const detail = `${JSON.stringify(meta, null, 2)}${
+        stderr ? `\n\n----- stderr -----\n${stderr}` : ''
+      }\n\n----- raw output (${raw.length} chars) -----\n${raw || '(empty)'}`;
+      throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
     }
     setStats((s) => ({ ...s, generated: s.generated + 1 }));
 
