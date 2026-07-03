@@ -26,6 +26,9 @@ const GEN_RUN_OPTIONS = {
     'Bash Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
   strictMcpConfig: true,
   excludeDynamicSections: true,
+  // Hard/nested reasoning can blow past Claude Code's default 32k output-token
+  // cap (which counts thinking) and error out. Raise it to the model max.
+  maxOutputTokens: 64000,
 };
 
 // The model's context window, for a rough "% of context used" readout.
@@ -873,13 +876,18 @@ export function AdminPipeline() {
             { limit: lim, detail: raw || stderr },
           );
         }
-        const reason = raw
-          ? 'could not parse a problem from the output'
-          : genData.timedOut
-            ? `generation timed out after ${genData.durationMs ?? '?'}ms`
-            : genData.ok === false
-              ? `claude exited ${genData.exitCode ?? '?'}${stderr ? `: ${stderr.split('\n')[0].slice(0, 120)}` : ' (no stderr)'}`
-              : 'empty output (claude returned no text)';
+        // A claude API error is returned as the "result" text, not JSON — report
+        // it verbatim rather than mislabeling it a parse failure.
+        const apiErr = raw.match(/API Error:[^\n]*/i);
+        const reason = apiErr
+          ? apiErr[0].slice(0, 180)
+          : raw
+            ? 'could not parse a problem from the output'
+            : genData.timedOut
+              ? `generation timed out after ${genData.durationMs ?? '?'}ms`
+              : genData.ok === false
+                ? `claude exited ${genData.exitCode ?? '?'}${stderr ? `: ${stderr.split('\n')[0].slice(0, 120)}` : ' (no stderr)'}`
+                : 'empty output (claude returned no text)';
         const meta = {
           mode: modeRef.current,
           bridge: bridgeUrl,

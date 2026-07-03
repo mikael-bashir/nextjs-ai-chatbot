@@ -153,7 +153,7 @@ function extractMeta(stdout) {
   }
 }
 
-function runClaude(args, { cwd, timeoutMs, killSignal }) {
+function runClaude(args, { cwd, timeoutMs, killSignal, maxOutputTokens }) {
   return new Promise((resolve) => {
     const start = Date.now()
     let child
@@ -161,10 +161,15 @@ function runClaude(args, { cwd, timeoutMs, killSignal }) {
       // Array args + shell:false => the prompt is passed literally and can
       // never be reinterpreted by a shell. stdin ignored: the prompt is passed
       // via -p, so closing stdin avoids the CLI's "no stdin data" 3s warning.
+      // maxOutputTokens raises CLAUDE_CODE_MAX_OUTPUT_TOKENS (default 32k) so a
+      // heavily-reasoning task (hard/nested generation) doesn't error out.
       child = spawn(CLAUDE_BIN, args, {
         cwd: cwd || process.cwd(),
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
+        env: maxOutputTokens
+          ? { ...process.env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxOutputTokens) }
+          : process.env,
       })
     } catch (err) {
       resolve({ ok: false, text: "", exitCode: null, durationMs: 0, timedOut: false, stderr: String(err) })
@@ -532,6 +537,7 @@ const server = createServer(async (req, res) => {
         cwd,
         timeoutMs,
         killSignal: killer.signal,
+        maxOutputTokens: Number(options.maxOutputTokens) || 0,
       })
       return json(res, 200, result)
     }
