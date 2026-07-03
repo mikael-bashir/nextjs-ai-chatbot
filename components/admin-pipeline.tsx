@@ -16,10 +16,12 @@ const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
 // tokens of context instead of ~17k (default system prompt + tool schemas),
 // which drastically cuts subscription rate-limit pressure when looping.
 const GEN_RUN_OPTIONS = {
-  // Inventing an original problem + a correct Lean theorem is genuinely ~2 min
-  // of model reasoning (measured 116–154s); 180s was too tight and killed
-  // normal-variance runs. 7 min gives ample headroom (hard/nested think longer).
-  timeoutMs: 420000,
+  // This is a SAFETY NET, not a work limit: the Work loop awaits each generation
+  // and a browser fetch to localhost never times out, so without a cap a single
+  // genuinely-stuck `claude -p` (dead connection, deadlock) would freeze the loop
+  // forever. Real generation is ~2 min (measured 116–154s), so a very generous
+  // 20 min ensures the cap only ever fires on a true hang, never on real work.
+  timeoutMs: 1200000,
   systemPrompt:
     'You are a creative competition-math problem setter. Follow the user instructions exactly and respond with ONLY the requested JSON object.',
   disallowedTools:
