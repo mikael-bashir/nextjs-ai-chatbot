@@ -77,14 +77,23 @@ function metaLine(p: GeneratedItem | StagedItem, withDate = false): string {
     .join(' · ');
 }
 
+// Read a bridge connection from localStorage. `useWork` prefers the dedicated
+// Work-loop bridge (lca.workBridgeUrl); verification uses the shared bridge so
+// generation and proving can run in parallel on two bridges.
+function connFor(useWork: boolean) {
+  try {
+    const base = JSON.parse(localStorage.getItem('lca.connection') || '{}');
+    const workUrl = localStorage.getItem('lca.workBridgeUrl') || '';
+    return useWork && workUrl ? { ...base, bridgeUrl: workUrl } : base;
+  } catch {
+    return {} as { bridgeUrl?: string; token?: string };
+  }
+}
+
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
-  const [stage, setStage] = useState<
-    'idle' | 'generating' | 'proving' | 'saving'
-  >('idle');
-  const [current, setCurrent] = useState<GenProblem | null>(null);
-  const [activity, setActivity] = useState<Array<{ id: number; tool: string }>>(
-    [],
+  const [genStage, setGenStage] = useState<'idle' | 'generating' | 'saving'>(
+    'idle',
   );
   const [stats, setStats] = useState({
     generated: 0,
@@ -92,6 +101,7 @@ export function AdminPipeline() {
     failed: 0,
     errors: 0,
   });
+  const [lastError, setLastError] = useState<string | null>(null);
   const [queued, setQueued] = useState<number | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [items, setItems] = useState<StagedItem[]>([]);
@@ -101,34 +111,40 @@ export function AdminPipeline() {
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [workBridgeUrl, setWorkBridgeUrl] = useState('');
-  const [lastError, setLastError] = useState<string | null>(null);
+  const [generatingOne, setGeneratingOne] = useState(false);
+
+  // Verification queue (client-side): problems awaiting proof, processed serially
+  // by a single verifier so generation and proving stay decoupled.
+  const [verifyQueue, setVerifyQueue] = useState<GeneratedItem[]>([]);
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
+  const [verifyActivity, setVerifyActivity] = useState<
+    Array<{ id: number; tool: string }>
+  >([]);
 
   const workRef = useRef(false);
+  const queueRef = useRef<GeneratedItem[]>([]);
+  const verifyingIdRef = useRef<string | null>(null);
+  const runningRef = useRef(false);
 
-  const getConn = () => {
-    try {
-      const base = JSON.parse(localStorage.getItem('lca.connection') || '{}');
-      const workUrl = localStorage.getItem('lca.workBridgeUrl') || '';
-      return workUrl ? { ...base, bridgeUrl: workUrl } : base;
-    } catch {
-      return {};
-    }
-  };
+  const syncQueue = () => setVerifyQueue([...queueRef.current]);
 
-  const callBridge = useCallback((path: string, init?: RequestInit) => {
-    const conn = getConn();
-    let base = (conn.bridgeUrl || 'http://localhost:4123').replace(/\/$/, '');
-    // Tolerate a bare host:port (e.g. "localhost:4123") — fetch needs a scheme.
-    if (!/^https?:\/\//i.test(base)) base = `http://${base}`;
-    return fetch(`${base}${path}`, {
-      ...init,
-      headers: {
-        'content-type': 'application/json',
-        'x-bridge-token': conn.token || '',
-        ...(init?.headers || {}),
-      },
-    });
-  }, []);
+  const callBridge = useCallback(
+    (useWork: boolean, path: string, init?: RequestInit) => {
+      const conn = connFor(useWork);
+      let base = (conn.bridgeUrl || 'http://localhost:4123').replace(/\/$/, '');
+      // Tolerate a bare host:port (e.g. "localhost:4123") — fetch needs a scheme.
+      if (!/^https?:\/\//i.test(base)) base = `http://${base}`;
+      return fetch(`${base}${path}`, {
+        ...init,
+        headers: {
+          'content-type': 'application/json',
+          'x-bridge-token': conn.token || '',
+          ...(init?.headers || {}),
+        },
+      });
+    },
+    [],
+  );
 
   const fetchMcp = async (): Promise<Array<{ name: string; url: string }>> => {
     try {
@@ -145,10 +161,10 @@ export function AdminPipeline() {
     }
   };
 
-  // Prove via the bridge stream; collect a little activity, return the outcome.
+  // Prove via the SHARED bridge; collect tool activity for display.
   const proveStream = useCallback(
     async (lean: string, mcpServers: Array<{ name: string; url: string }>) => {
-      const res = await callBridge('/prove-stream', {
+      const res = await callBridge(false, '/prove-stream', {
         method: 'POST',
         body: JSON.stringify({ theorem: lean, mcpServers }),
       });
@@ -168,7 +184,7 @@ export function AdminPipeline() {
           try {
             const d = JSON.parse(e.replace(/^data:\s*/, ''));
             if (d.type === 'message-annotation' && d.tool) {
-              setActivity((a) => [
+              setVerifyActivity((a) => [
                 ...a.slice(-9),
                 { id: Date.now() + a.length, tool: String(d.tool) },
               ]);
@@ -184,6 +200,87 @@ export function AdminPipeline() {
     },
     [callBridge],
   );
+
+  // The single verifier: pulls the head of the queue, proves it on the shared
+  // bridge, persists the outcome, and moves on. Guarded so only one runs.
+  const runVerifier = useCallback(async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    try {
+      while (queueRef.current.length > 0) {
+        const item = queueRef.current[0];
+        verifyingIdRef.current = item.id;
+        setVerifyingId(item.id);
+        setVerifyActivity([]);
+
+        let verified = false;
+        let proof = '';
+        let error: string | null = null;
+        try {
+          const mcpServers = await fetchMcp();
+          const out = await proveStream(item.lean as string, mcpServers);
+          verified = out.verified;
+          proof = out.proof;
+          if (!verified) error = 'Lean proof did not verify';
+        } catch (e) {
+          error = String((e as Error)?.message || e);
+        }
+
+        try {
+          const res = await fetch('/api/admin/generated', {
+            method: 'PATCH',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ id: item.id, verified, proof, error }),
+          });
+          if (res.ok) {
+            const j = await res.json();
+            if (j.item)
+              setGenerated((g) =>
+                g.map((x) => (x.id === j.item.id ? j.item : x)),
+              );
+          }
+        } catch {
+          /* leave the record as-is if persistence fails */
+        }
+
+        setStats((s) => ({
+          ...s,
+          verified: s.verified + (verified ? 1 : 0),
+          failed: s.failed + (verified ? 0 : 1),
+        }));
+
+        // Remove the processed item (it may already have been deleted).
+        queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
+        syncQueue();
+      }
+    } finally {
+      verifyingIdRef.current = null;
+      setVerifyingId(null);
+      runningRef.current = false;
+    }
+  }, [proveStream]);
+
+  const enqueueVerify = useCallback(
+    (item: GeneratedItem) => {
+      if (
+        verifyingIdRef.current === item.id ||
+        queueRef.current.some((x) => x.id === item.id)
+      ) {
+        return;
+      }
+      queueRef.current = [...queueRef.current, item];
+      syncQueue();
+      runVerifier();
+    },
+    [runVerifier],
+  );
+
+  const removeFromVerifyQueue = (id: string) => {
+    queueRef.current = queueRef.current.filter((x) => x.id !== id);
+    syncQueue();
+  };
+
+  // ---- loaders (hydrate on mount / manual refresh) ----------------------
 
   const loadQueue = useCallback(async () => {
     try {
@@ -215,9 +312,6 @@ export function AdminPipeline() {
     loadGenerated();
   }, [loadQueue, loadGenerated]);
 
-  // Hydrate once from the server; after this, state is updated directly from
-  // each mutation's result (below). The manual "Refresh" buttons re-pull if you
-  // want to see changes made from another tab.
   useEffect(() => {
     loadAll();
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
@@ -229,48 +323,115 @@ export function AdminPipeline() {
     else localStorage.removeItem('lca.workBridgeUrl');
   };
 
+  // ---- generation (produces unverified problems, enqueues them) ---------
+
+  // Generate ONE problem on the work bridge, save it unverified, and enqueue it
+  // for verification. Returns nothing; throws on generation failure.
+  const generateOne = useCallback(async () => {
+    const bridgeUrl =
+      (connFor(true).bridgeUrl as string) || 'http://localhost:4123';
+    setGenStage('generating');
+    setLastError(null);
+
+    let genRes: Response;
+    try {
+      genRes = await callBridge(true, '/run', {
+        method: 'POST',
+        body: JSON.stringify({
+          prompt: GEN_PROMPT,
+          options: { timeoutMs: 180000 },
+        }),
+      });
+    } catch {
+      throw new Error(
+        `Couldn't reach the generation bridge at ${bridgeUrl}. Check a bridge is running there, the URL is a full http:// URL, and you're on Chrome/Edge/Firefox.`,
+      );
+    }
+    if (!genRes.ok) {
+      const detail = await genRes.text().catch(() => '');
+      throw new Error(
+        `Bridge /run failed (${genRes.status})${detail ? `: ${detail.slice(0, 200)}` : ''}`,
+      );
+    }
+    const genData = await genRes.json();
+    const raw = String(genData.text || genData.proof || '');
+    const gen = extractJson(raw);
+    if (!gen?.lean) {
+      throw new Error(
+        `Couldn't parse a problem from the generation output${
+          raw ? `: ${raw.slice(0, 160)}…` : ' (empty response)'
+        }`,
+      );
+    }
+    setStats((s) => ({ ...s, generated: s.generated + 1 }));
+
+    setGenStage('saving');
+    const res = await fetch('/api/admin/generated', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        ...gen,
+        verified: false,
+        proof: '',
+        error: null,
+        toolchain: TOOLCHAIN,
+      }),
+    });
+    if (res.ok) {
+      const j = await res.json();
+      if (j.item) {
+        setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
+        enqueueVerify(j.item);
+      }
+    }
+    setGenStage('idle');
+  }, [callBridge, enqueueVerify]);
+
+  // Manual: add one fresh unproven generation to the verify queue.
+  const addUnprovenGeneration = useCallback(async () => {
+    setGeneratingOne(true);
+    try {
+      await generateOne();
+    } catch (e) {
+      setStats((s) => ({ ...s, errors: s.errors + 1 }));
+      setLastError(String((e as Error)?.message || e));
+    } finally {
+      setGeneratingOne(false);
+    }
+  }, [generateOne]);
+
+  // The Work loop: keep generating (each generation enqueues itself).
+  useEffect(() => {
+    workRef.current = work;
+    if (!work) {
+      setGenStage('idle');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      while (!cancelled && workRef.current) {
+        try {
+          await generateOne();
+        } catch (e) {
+          setStats((s) => ({ ...s, errors: s.errors + 1 }));
+          setLastError(String((e as Error)?.message || e));
+          await new Promise((res) => setTimeout(res, 3000));
+        }
+      }
+      if (!cancelled) setGenStage('idle');
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [work, generateOne]);
+
   // ---- per-item actions -------------------------------------------------
 
-  // Re-run the Lean proof for a stored problem and persist the new outcome.
-  // Deliberately does NOT push to staging — that's a separate manual action.
-  const verifyAgain = useCallback(
-    async (item: GeneratedItem) => {
-      if (!item.lean) return;
-      setBusy(`verify:${item.id}`);
-      setActivity([]);
-      try {
-        const mcpServers = await fetchMcp();
-        let verified = false;
-        let proof = '';
-        let error: string | null = null;
-        try {
-          const out = await proveStream(item.lean, mcpServers);
-          verified = out.verified;
-          proof = out.proof;
-          if (!verified) error = 'Lean proof did not verify';
-        } catch (e) {
-          error = String((e as Error)?.message || e);
-        }
-        const res = await fetch('/api/admin/generated', {
-          method: 'PATCH',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ id: item.id, verified, proof, error }),
-        });
-        if (res.ok) {
-          const j = await res.json();
-          if (j.item)
-            setGenerated((g) =>
-              g.map((x) => (x.id === j.item.id ? j.item : x)),
-            );
-        }
-      } finally {
-        setBusy(null);
-      }
-    },
-    [proveStream],
-  );
+  // "Verify again" simply (re)enqueues the problem — the verifier handles it.
+  const verifyAgain = (item: GeneratedItem) => {
+    if (item.lean) enqueueVerify(item);
+  };
 
-  // Manually add a problem to the staging review queue (deliberate action).
   const addToStaging = useCallback(async (item: GeneratedItem | StagedItem) => {
     if (!item.lean) return;
     setBusy(`stage:${item.id}`);
@@ -312,7 +473,10 @@ export function AdminPipeline() {
         `/api/admin/generated?id=${encodeURIComponent(id)}`,
         { method: 'DELETE' },
       );
-      if (res.ok) setGenerated((g) => g.filter((x) => x.id !== id));
+      if (res.ok) {
+        setGenerated((g) => g.filter((x) => x.id !== id));
+        removeFromVerifyQueue(id);
+      }
     } finally {
       setBusy(null);
     }
@@ -357,114 +521,23 @@ export function AdminPipeline() {
     }
   }, []);
 
-  // ---- the Work loop ----------------------------------------------------
+  // ---- derived ----------------------------------------------------------
 
-  const runOnce = useCallback(async () => {
-    const bridgeUrl =
-      (getConn().bridgeUrl as string) || 'http://localhost:4123';
-    const mcpServers = await fetchMcp();
-    setStage('generating');
-    setActivity([]);
-    setCurrent(null);
-    setLastError(null);
+  const statusOf = (g: GeneratedItem) => {
+    if (verifyingId === g.id) return 'verifying';
+    if (verifyQueue.some((x) => x.id === g.id)) return 'queued';
+    if (g.verified) return 'proved';
+    if (g.error) return 'failed';
+    return 'unverified';
+  };
 
-    let genRes: Response;
-    try {
-      genRes = await callBridge('/run', {
-        method: 'POST',
-        body: JSON.stringify({
-          prompt: GEN_PROMPT,
-          options: { timeoutMs: 180000 },
-        }),
-      });
-    } catch {
-      // A failed fetch to the bridge is opaque (TypeError). Point at the URL.
-      throw new Error(
-        `Couldn't reach the bridge at ${bridgeUrl}. Check: a bridge is running on that port, the URL is a full http:// URL (not just "localhost:4123"), and you're on Chrome/Edge/Firefox (Safari blocks HTTPS→localhost).`,
-      );
-    }
-    if (!genRes.ok) {
-      const detail = await genRes.text().catch(() => '');
-      throw new Error(
-        `Bridge /run failed (${genRes.status})${detail ? `: ${detail.slice(0, 200)}` : ''}`,
-      );
-    }
-    const genData = await genRes.json();
-    const raw = String(genData.text || genData.proof || '');
-    const gen = extractJson(raw);
-    if (!gen?.lean) {
-      throw new Error(
-        `Couldn't parse a problem from the generation output${
-          raw ? `: ${raw.slice(0, 160)}…` : ' (empty response)'
-        }`,
-      );
-    }
-    setStats((s) => ({ ...s, generated: s.generated + 1 }));
-    setCurrent(gen);
-
-    setStage('proving');
-    let verified = false;
-    let proof = '';
-    let proveError: string | null = null;
-    try {
-      const out = await proveStream(gen.lean, mcpServers);
-      verified = out.verified;
-      proof = out.proof;
-      if (!verified) proveError = 'Lean proof did not verify';
-    } catch (e) {
-      proveError = String((e as Error)?.message || e);
-    }
-
-    setStage('saving');
-    const r = await fetch('/api/admin/generated', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        ...gen,
-        verified,
-        proof,
-        error: proveError,
-        toolchain: TOOLCHAIN,
-      }),
-    });
-    if (r.ok) {
-      const j = await r.json();
-      if (j.item)
-        setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
-      if (j.staged)
-        setItems((it) => [j.staged, ...it.filter((x) => x.id !== j.staged.id)]);
-      if (typeof j.queued === 'number') setQueued(j.queued);
-    }
-    setStats((s) => ({
-      ...s,
-      verified: s.verified + (verified ? 1 : 0),
-      failed: s.failed + (verified ? 0 : 1),
-    }));
-  }, [callBridge, proveStream]);
-
-  useEffect(() => {
-    workRef.current = work;
-    if (!work) {
-      setStage('idle');
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      while (!cancelled && workRef.current) {
-        try {
-          await runOnce();
-        } catch (e) {
-          setStats((s) => ({ ...s, errors: s.errors + 1 }));
-          setLastError(String((e as Error)?.message || e));
-          await new Promise((res) => setTimeout(res, 3000));
-        }
-      }
-      if (!cancelled) setStage('idle');
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [work, runOnce]);
+  const badgeClass: Record<string, string> = {
+    verifying: 'bg-amber-500/15 text-amber-600 animate-pulse',
+    queued: 'bg-blue-500/15 text-blue-600',
+    proved: 'bg-emerald-500/15 text-emerald-600',
+    failed: 'bg-red-500/15 text-red-500',
+    unverified: 'bg-muted text-muted-foreground',
+  };
 
   const filtered = generated.filter(
     (g) =>
@@ -478,7 +551,7 @@ export function AdminPipeline() {
         <div>
           <h1 className="text-2xl font-semibold">Content pipeline</h1>
           <p className="text-sm text-muted-foreground">
-            Generate creative problems, prove them in Lean, review, and publish.
+            Generate → queue for proof → review → publish.
           </p>
         </div>
         <Button asChild variant="ghost" size="sm">
@@ -486,7 +559,7 @@ export function AdminPipeline() {
         </Button>
       </div>
 
-      {/* Work control */}
+      {/* Work / generation control */}
       <div className="rounded-lg border p-4">
         <div className="flex items-center justify-between">
           <div>
@@ -494,8 +567,8 @@ export function AdminPipeline() {
               Work
             </Label>
             <p className="text-xs text-muted-foreground">
-              While on: generate → prove in Lean → keep every one. Verified
-              problems also enter the review queue automatically.
+              While on: continuously generate problems and add them to the
+              verification queue below.
             </p>
           </div>
           <Switch id="admin-work" checked={work} onCheckedChange={setWork} />
@@ -503,7 +576,7 @@ export function AdminPipeline() {
 
         <div className="mt-3">
           <Label htmlFor="admin-work-bridge" className="text-xs">
-            Work bridge URL (optional)
+            Generation bridge URL (optional)
           </Label>
           <Input
             id="admin-work-bridge"
@@ -513,8 +586,8 @@ export function AdminPipeline() {
             onChange={(e) => persistWorkBridgeUrl(e.target.value)}
           />
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Point the Work loop at its own bridge (e.g. http://localhost:4124),
-            separate from chat/manual verification. Uses the same token.
+            Generation runs here (e.g. http://localhost:4124); verification runs
+            on your shared bridge, so the two can work in parallel.
           </p>
         </div>
 
@@ -530,35 +603,90 @@ export function AdminPipeline() {
         </div>
 
         <div className="mt-3 flex items-center gap-2 text-xs">
-          <span className="font-medium">Status:</span>
-          <span className="capitalize text-muted-foreground">{stage}</span>
+          <span className="font-medium">Generation:</span>
+          <span className="capitalize text-muted-foreground">{genStage}</span>
           {stats.errors > 0 && (
-            <span className="text-red-500">· {stats.errors} loop errors</span>
+            <span className="text-red-500">· {stats.errors} errors</span>
           )}
-          {activity.length > 0 && (
-            <div className="flex flex-wrap gap-1">
-              {activity.map((t) => (
-                <span
-                  key={t.id}
-                  className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-                >
-                  {t.tool}
-                </span>
-              ))}
-            </div>
-          )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-auto h-7 px-2 text-xs"
+            disabled={generatingOne}
+            onClick={addUnprovenGeneration}
+          >
+            {generatingOne ? 'Generating…' : '+ Generate one → queue'}
+          </Button>
         </div>
-        {current?.questionTitle && (
-          <p className="mt-2 text-xs text-muted-foreground">
-            Current: {current.questionTitle}
-          </p>
-        )}
         {lastError && (
           <div className="mt-2 rounded-md border border-red-500/40 bg-red-500/5 p-2 text-xs text-red-500">
             <span className="font-medium">Last error: </span>
             <span className="break-all font-mono">{lastError}</span>
           </div>
         )}
+      </div>
+
+      {/* Verification queue */}
+      <div className="mt-8">
+        <h2 className="mb-2 text-lg font-semibold">
+          Verification queue{' '}
+          <span className="text-sm font-normal text-muted-foreground">
+            ({verifyQueue.length})
+          </span>
+        </h2>
+        {verifyingId && verifyActivity.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-1">
+            {verifyActivity.map((t) => (
+              <span
+                key={t.id}
+                className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+              >
+                {t.tool}
+              </span>
+            ))}
+          </div>
+        )}
+        <div className="space-y-1.5">
+          {verifyQueue.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              Nothing queued. Turn Work on, hit “Generate one”, or “Verify
+              again” on any problem below.
+            </p>
+          )}
+          {verifyQueue.map((q, i) => {
+            const active = verifyingId === q.id;
+            return (
+              <div
+                key={q.id}
+                className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm"
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <span
+                    className={cn(
+                      'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+                      active ? badgeClass.verifying : badgeClass.queued,
+                    )}
+                  >
+                    {active ? 'verifying' : `#${i + 1}`}
+                  </span>
+                  <span className="truncate">
+                    {q.questionTitle || q.problem || 'Untitled problem'}
+                  </span>
+                </div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 shrink-0 px-2 text-xs text-red-500 hover:text-red-600"
+                  disabled={active}
+                  title={active ? 'Currently verifying' : 'Remove from queue'}
+                  onClick={() => removeFromVerifyQueue(q.id)}
+                >
+                  Remove
+                </Button>
+              </div>
+            );
+          })}
+        </div>
       </div>
 
       {/* Generated history */}
@@ -602,98 +730,103 @@ export function AdminPipeline() {
               No {genFilter === 'all' ? '' : `${genFilter} `}problems yet.
             </p>
           )}
-          {filtered.map((g) => (
-            <div key={g.id} className="rounded-lg border p-3">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={cn(
-                        'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
-                        g.verified
-                          ? 'bg-emerald-500/15 text-emerald-600'
-                          : 'bg-red-500/15 text-red-500',
-                      )}
-                    >
-                      {g.verified ? 'proved' : 'failed'}
-                    </span>
-                    <span className="truncate font-medium">
-                      {g.questionTitle || g.problem || 'Untitled problem'}
-                    </span>
-                  </div>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    {metaLine(g, true)}
-                  </p>
-                </div>
-              </div>
-
-              <div className="mt-2 flex flex-wrap gap-1.5">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 px-2 text-xs"
-                  onClick={() =>
-                    setPreviewId((p) => (p === g.id ? null : g.id))
-                  }
-                >
-                  {previewId === g.id ? 'Hide preview' : 'Preview'}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="h-7 px-2 text-xs"
-                  disabled={busy === `verify:${g.id}`}
-                  onClick={() => verifyAgain(g)}
-                >
-                  {busy === `verify:${g.id}` ? 'Verifying…' : 'Verify again'}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  className="h-7 px-2 text-xs"
-                  disabled={busy === `stage:${g.id}`}
-                  onClick={() => addToStaging(g)}
-                  title="Add this problem to the staging review queue"
-                >
-                  {busy === `stage:${g.id}` ? 'Adding…' : 'Add to staging'}
-                </Button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2 text-xs text-red-500 hover:text-red-600"
-                  disabled={busy === `del:${g.id}`}
-                  onClick={() => removeGenerated(g.id)}
-                >
-                  Delete
-                </Button>
-              </div>
-
-              {previewId === g.id && (
-                <div className="mt-3 space-y-3 border-t pt-3">
-                  {g.problem && <MathMarkdown>{g.problem}</MathMarkdown>}
-                  {g.insight && (
-                    <div className="rounded bg-muted/40 p-2 text-xs">
-                      <span className="font-medium">Insight. </span>
-                      <MathMarkdown>{g.insight}</MathMarkdown>
+          {filtered.map((g) => {
+            const status = statusOf(g);
+            return (
+              <div key={g.id} className="rounded-lg border p-3">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={cn(
+                          'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+                          badgeClass[status],
+                        )}
+                      >
+                        {status}
+                      </span>
+                      <span className="truncate font-medium">
+                        {g.questionTitle || g.problem || 'Untitled problem'}
+                      </span>
                     </div>
-                  )}
-                  {!g.verified && g.error && (
-                    <p className="text-xs text-red-500">Reason: {g.error}</p>
-                  )}
-                  {g.lean && (
-                    <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-[11px]">
-                      {g.lean}
-                    </pre>
-                  )}
-                  {g.verified && g.proof && (
-                    <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-emerald-500/10 p-2 text-[11px]">
-                      {g.proof}
-                    </pre>
-                  )}
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {metaLine(g, true)}
+                    </p>
+                  </div>
                 </div>
-              )}
-            </div>
-          ))}
+
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    onClick={() =>
+                      setPreviewId((p) => (p === g.id ? null : g.id))
+                    }
+                  >
+                    {previewId === g.id ? 'Hide preview' : 'Preview'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    disabled={status === 'queued' || status === 'verifying'}
+                    onClick={() => verifyAgain(g)}
+                  >
+                    {status === 'queued'
+                      ? 'Queued'
+                      : status === 'verifying'
+                        ? 'Verifying…'
+                        : 'Verify again'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 px-2 text-xs"
+                    disabled={busy === `stage:${g.id}`}
+                    onClick={() => addToStaging(g)}
+                    title="Add this problem to the staging review queue"
+                  >
+                    {busy === `stage:${g.id}` ? 'Adding…' : 'Add to staging'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2 text-xs text-red-500 hover:text-red-600"
+                    disabled={busy === `del:${g.id}`}
+                    onClick={() => removeGenerated(g.id)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+
+                {previewId === g.id && (
+                  <div className="mt-3 space-y-3 border-t pt-3">
+                    {g.problem && <MathMarkdown>{g.problem}</MathMarkdown>}
+                    {g.insight && (
+                      <div className="rounded bg-muted/40 p-2 text-xs">
+                        <span className="font-medium">Insight. </span>
+                        <MathMarkdown>{g.insight}</MathMarkdown>
+                      </div>
+                    )}
+                    {!g.verified && g.error && (
+                      <p className="text-xs text-red-500">Reason: {g.error}</p>
+                    )}
+                    {g.lean && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-[11px]">
+                        {g.lean}
+                      </pre>
+                    )}
+                    {g.verified && g.proof && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-emerald-500/10 p-2 text-[11px]">
+                        {g.proof}
+                      </pre>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       </div>
 
@@ -791,10 +924,9 @@ export function AdminPipeline() {
       </div>
 
       <p className="mt-8 text-xs text-muted-foreground">
-        Requires your bridge running (Local Agent → set it up). “Add to staging”
-        and “Verify again” are manual — re-verifying never auto-stages. “Push to
-        prod” publishes to the main CompeteMath queue and archives the Lean
-        proof to the database.
+        Requires your bridge running (Local Agent → set it up). Verifying never
+        auto-stages — “Add to staging” is manual. “Push to prod” publishes to
+        the main CompeteMath queue and archives the Lean proof to the database.
       </p>
     </div>
   );
