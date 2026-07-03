@@ -602,11 +602,30 @@ export function AdminPanel({ className }: { className?: string }) {
           <HealthChip label="Prod" state={health?.prod} />
         </div>
 
+        {(health?.staging.error || health?.prod.error) && (
+          <div className="mt-2 space-y-1 rounded-md border border-red-500/40 bg-red-500/5 p-2 text-[10px] leading-snug text-red-500">
+            {health?.staging.error && (
+              <p>
+                <span className="font-medium">Staging: </span>
+                <span className="break-all font-mono">
+                  {health.staging.error}
+                </span>
+              </p>
+            )}
+            {health?.prod.error && (
+              <p>
+                <span className="font-medium">Prod: </span>
+                <span className="break-all font-mono">{health.prod.error}</span>
+              </p>
+            )}
+          </div>
+        )}
+
         <div className="mt-2 space-y-1.5">
           {items.length === 0 && (
             <p className="text-[11px] text-muted-foreground">
               {health && !health.staging.ok
-                ? 'Staging Redis unreachable — see error above.'
+                ? 'Staging Redis unreachable — see the error above.'
                 : 'Queue is empty.'}
             </p>
           )}

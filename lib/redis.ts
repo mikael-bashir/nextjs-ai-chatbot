@@ -182,7 +182,15 @@ export async function redisHealth(): Promise<{
 }> {
   const probe = async (fn: () => Promise<number>) => {
     try {
-      return { ok: true, length: await fn() };
+      // Race against a timeout so an unreachable host reports a clear error
+      // quickly instead of hanging on ioredis's reconnect backoff.
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(
+          () => reject(new Error('connection timed out after 5s')),
+          5000,
+        ),
+      );
+      return { ok: true, length: await Promise.race([fn(), timeout]) };
     } catch (e) {
       return { ok: false, error: String((e as Error)?.message || e) };
     }
