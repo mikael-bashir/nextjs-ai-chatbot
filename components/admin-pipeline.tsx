@@ -60,6 +60,15 @@ interface LogEntry {
   detail?: string;
 }
 
+// Serialize a log entry to a self-contained, copy-pasteable block (includes the
+// full raw output) so it can be dropped straight into a bug report.
+function formatLogEntry(e: LogEntry): string {
+  const head = `[${new Date(e.ts).toISOString()}] ${e.level.toUpperCase()}: ${e.message}`;
+  return e.detail
+    ? `${head}\n----- raw output -----\n${e.detail}\n----------------------`
+    : head;
+}
+
 // Summarise problems that already exist (here + live on CompeteMath) so the
 // model can deliberately avoid repeating topics/structures.
 function buildAvoidContext(
@@ -264,6 +273,17 @@ export function AdminPipeline() {
   });
   const [log, setLog] = useState<LogEntry[]>([]);
   const [logOpen, setLogOpen] = useState<Set<number>>(new Set());
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const copy = useCallback(async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied((c) => (c === key ? null : c)), 1500);
+    } catch {
+      /* clipboard blocked — ignore */
+    }
+  }, []);
 
   const pushLog = useCallback(
     (level: LogEntry['level'], message: string, detail?: string) => {
@@ -932,15 +952,31 @@ export function AdminPipeline() {
             </span>
           </h2>
           {log.length > 0 && (
-            <button
-              type="button"
-              onClick={() => setLog([])}
-              className="text-xs text-muted-foreground underline-offset-2 hover:underline"
-            >
-              Clear
-            </button>
+            <div className="flex items-center gap-3 text-xs">
+              <button
+                type="button"
+                onClick={() =>
+                  copy('all', log.map(formatLogEntry).join('\n\n'))
+                }
+                className="text-muted-foreground underline-offset-2 hover:underline"
+              >
+                {copied === 'all' ? 'Copied ✓' : 'Copy all'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setLog([])}
+                className="text-muted-foreground underline-offset-2 hover:underline"
+              >
+                Clear
+              </button>
+            </div>
           )}
         </div>
+        <p className="mb-2 text-[11px] text-muted-foreground">
+          Something break? Hit “Copy all” (or a row’s “copy”) and paste it to
+          Claude — each entry includes the full raw output, so the exact failure
+          can be diagnosed.
+        </p>
         <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border p-2">
           {log.length === 0 && (
             <p className="text-xs text-muted-foreground">
@@ -966,22 +1002,31 @@ export function AdminPipeline() {
                 >
                   {e.message}
                 </span>
-                {e.detail && (
+                <div className="ml-auto flex shrink-0 gap-2 text-[10px] text-muted-foreground">
                   <button
                     type="button"
-                    className="ml-auto shrink-0 text-[10px] text-muted-foreground underline-offset-2 hover:underline"
-                    onClick={() =>
-                      setLogOpen((s) => {
-                        const n = new Set(s);
-                        if (n.has(e.id)) n.delete(e.id);
-                        else n.add(e.id);
-                        return n;
-                      })
-                    }
+                    className="underline-offset-2 hover:underline"
+                    onClick={() => copy(String(e.id), formatLogEntry(e))}
                   >
-                    {logOpen.has(e.id) ? 'hide raw' : 'view raw'}
+                    {copied === String(e.id) ? 'copied ✓' : 'copy'}
                   </button>
-                )}
+                  {e.detail && (
+                    <button
+                      type="button"
+                      className="underline-offset-2 hover:underline"
+                      onClick={() =>
+                        setLogOpen((s) => {
+                          const n = new Set(s);
+                          if (n.has(e.id)) n.delete(e.id);
+                          else n.add(e.id);
+                          return n;
+                        })
+                      }
+                    >
+                      {logOpen.has(e.id) ? 'hide raw' : 'view raw'}
+                    </button>
+                  )}
+                </div>
               </div>
               {e.detail && logOpen.has(e.id) && (
                 <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-[10px]">
