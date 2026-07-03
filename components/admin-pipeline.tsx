@@ -104,6 +104,12 @@ const MODE_LABEL: Record<GenMode, string> = {
 
 const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
 
+Work EFFICIENTLY. Commit to ONE idea and derive its answer directly — do not
+explore many candidates or exhaustively re-verify in your head. Your Lean theorem
+will be MACHINE-CHECKED by a Lean prover afterward, so you do NOT need to prove it
+yourself; a best-effort answer that turns out wrong is caught cheaply downstream.
+Keep your reasoning brief and get to the JSON.
+
 Core requirements:
 - Creative and NON-standard: not a textbook exercise, not a famous/known competition problem, not a classic named result. Fresh setup and phrasing.
 - The answer is a specific INTEGER.
@@ -112,13 +118,13 @@ Core requirements:
 const MODE_BLOCKS: Record<GenMode, string> = {
   standard: `
 - Solvable BY HAND with at most a basic calculator via an elegant insight, NOT brute force.
-- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It MUST be true.`,
+- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).`,
   hard: `
 - HARD MODE. The problem must NOT be solvable by a short brute-force script: avoid small finite search spaces. Use large or unbounded domains, a general n, or structures where naive enumeration is infeasible. It must hinge on a genuine, non-obvious insight, yet still be solvable by hand to a specific integer.
-- The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It MUST be true. Still attempt to make it provable in Mathlib.`,
+- The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
   nested: `
 - NESTED INSIGHTS MODE. The solution must require chaining 2-3 DISTINCT, non-obvious insights, each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. A strong solver needs a genuine multi-step derivation to reach the integer answer.
-- The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It MUST be true. Still attempt to make it provable in Mathlib.`,
+- The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
 };
 
 const RESPONSE_FORMAT = `
