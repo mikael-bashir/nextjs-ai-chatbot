@@ -112,14 +112,59 @@ interface Health {
 
 type GenFilter = 'all' | 'verified' | 'failed';
 
-function extractJson(text: string): GenProblem | null {
-  const m = text.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try {
-    return JSON.parse(m[0]);
-  } catch {
-    return null;
+// LLMs emit JSON whose string values contain raw LaTeX backslashes (\sum,
+// \lfloor, …) and sometimes literal newlines/tabs — both invalid inside a JSON
+// string, so JSON.parse throws. Walk the candidate string-aware and escape those
+// so the (otherwise well-formed) object parses. Only applied as a fallback.
+function repairJsonStrings(s: string): string {
+  let out = '';
+  let inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inStr) {
+      out += c;
+      if (c === '"') inStr = true;
+      continue;
+    }
+    if (c === '"') {
+      out += c;
+      inStr = false;
+    } else if (c === '\\') {
+      const next = s[i + 1];
+      if (next && '"\\/bfnrtu'.includes(next)) {
+        out += c + next; // keep a valid escape intact
+        i++;
+      } else {
+        out += '\\\\'; // lone backslash (LaTeX) → escape it
+      }
+    } else if (c === '\n') out += '\\n';
+    else if (c === '\r') out += '\\r';
+    else if (c === '\t') out += '\\t';
+    else out += c;
   }
+  return out;
+}
+
+function extractJson(text: string): GenProblem | null {
+  if (!text) return null;
+  let s = text.trim();
+  // Unwrap a ```json … ``` fence if present.
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  // Slice from the first { to the last } (drops any surrounding prose).
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start === -1 || end <= start) return null;
+  const candidate = s.slice(start, end + 1);
+  // Try strict first; fall back to a repaired version for raw LaTeX/newlines.
+  for (const attempt of [candidate, repairJsonStrings(candidate)]) {
+    try {
+      return JSON.parse(attempt) as GenProblem;
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return null;
 }
 
 function metaLine(p: GeneratedItem | StagedItem, withDate = false): string {
