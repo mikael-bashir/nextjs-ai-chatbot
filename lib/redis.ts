@@ -6,13 +6,32 @@ import Redis from 'ioredis';
 //   - staging  (REDIS_URL)             : this sub-service's review queue
 //   - prod     (COMPETEMATH_REDIS_URL) : the main CompeteMath app's live queue
 // (mirrors the singleton pattern in lib/pricing.ts).
+
+// ioredis rejects commands with a generic "Reached the max retries per request
+// limit" message that hides the real cause (bad host, refused, auth). Capture
+// the underlying connection error off the `error` event so health checks can
+// report it (e.g. "ENOTFOUND <host>") instead of the useless wrapper.
+const lastConnError = new WeakMap<Redis, string>();
+function withErrorCapture(client: Redis): Redis {
+  client.on('error', (e: unknown) => {
+    const err = e as { code?: string; message?: string };
+    lastConnError.set(
+      client,
+      `${err?.code ? `${err.code} ` : ''}${err?.message || String(e)}`.trim(),
+    );
+  });
+  return client;
+}
+
 let _redis: Redis | null = null;
 export function getRedis(): Redis {
   if (!_redis) {
-    _redis = new Redis(process.env.REDIS_URL!, {
-      lazyConnect: true,
-      maxRetriesPerRequest: 2,
-    });
+    _redis = withErrorCapture(
+      new Redis(process.env.REDIS_URL!, {
+        lazyConnect: true,
+        maxRetriesPerRequest: 2,
+      }),
+    );
   }
   return _redis;
 }
@@ -20,10 +39,12 @@ export function getRedis(): Redis {
 let _prodRedis: Redis | null = null;
 export function getCompetemathRedis(): Redis {
   if (!_prodRedis) {
-    _prodRedis = new Redis(process.env.COMPETEMATH_REDIS_URL!, {
-      lazyConnect: true,
-      maxRetriesPerRequest: 2,
-    });
+    _prodRedis = withErrorCapture(
+      new Redis(process.env.COMPETEMATH_REDIS_URL!, {
+        lazyConnect: true,
+        maxRetriesPerRequest: 2,
+      }),
+    );
   }
   return _prodRedis;
 }
@@ -180,7 +201,8 @@ export async function redisHealth(): Promise<{
   staging: { ok: boolean; length?: number; error?: string };
   prod: { ok: boolean; length?: number; error?: string };
 }> {
-  const probe = async (fn: () => Promise<number>) => {
+  const probe = async (getClient: () => Redis, key: string) => {
+    const client = getClient();
     try {
       // Race against a timeout so an unreachable host reports a clear error
       // quickly instead of hanging on ioredis's reconnect backoff.
@@ -190,14 +212,20 @@ export async function redisHealth(): Promise<{
           5000,
         ),
       );
-      return { ok: true, length: await Promise.race([fn(), timeout]) };
+      return { ok: true, length: await Promise.race([client.llen(key), timeout]) };
     } catch (e) {
-      return { ok: false, error: String((e as Error)?.message || e) };
+      const wrapper = String((e as Error)?.message || e);
+      // ioredis's "max retries"/"Connection is closed" wrappers hide the cause —
+      // prefer the real connection error we captured off the `error` event.
+      const real = lastConnError.get(client);
+      const useReal =
+        real && /max retries per request|connection is closed/i.test(wrapper);
+      return { ok: false, error: useReal ? real : wrapper };
     }
   };
   const [staging, prod] = await Promise.all([
-    probe(queueLength),
-    probe(prodQueueLength),
+    probe(getRedis, PROBLEM_QUEUE_KEY),
+    probe(getCompetemathRedis, PROD_QUEUE_KEY),
   ]);
   return { staging, prod };
 }
