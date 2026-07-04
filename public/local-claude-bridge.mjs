@@ -271,10 +271,25 @@ function buildMcpConfig(mcpServers) {
   return { mcpServers: servers }
 }
 
-// Minimal prompt on purpose — the goal is to let Claude use the tools logically
-// on its own, not to script the proof. Verified to work this way.
+// The goal is to let Claude use the tools logically on its own — but a bare
+// "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
+// on hard theorems and never actually build or check a proof. So we hand it an
+// explicit, verification-first workflow: draft → verify_full_script → iterate,
+// with library search as a *subordinate* step, not the main loop.
 function provePrompt(theorem) {
-  return `Prove this Lean 4 theorem using your MCP tools, and verify it compiles with no errors. Then give the final verified proof.\n\n${theorem}`
+  return `You are proving the following Lean 4 theorem. You have MCP tools available: proof/tactic tools (e.g. init_proof / apply_tactic) and a compiler tool (verify_full_script) for checking a whole script, plus library-search tools (moogle_search, loogle_search).
+
+WORKFLOW — follow it in order, do not get stuck searching:
+1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
+2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If tactic tools (init_proof / apply_tactic) are available, use them to advance the goal step by step and confirm each step compiles.
+3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal — at most a couple of lookups, then go straight back to verify_full_script. Do not enumerate the library; do not search without an attempt to verify in between.
+4. A proof is done ONLY when verify_full_script reports success with no errors and no \`sorry\`. Keep iterating until then.
+5. Then output the final verified proof as a single \`\`\`lean code block.
+
+Never end by only having searched. Every few turns you must have called verify_full_script.
+
+Theorem:
+${theorem}`
 }
 
 async function runProve(theorem, mcpServers, opts = {}) {
