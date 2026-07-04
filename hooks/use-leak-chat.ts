@@ -5,6 +5,7 @@ import { useState, useCallback, useRef } from "react"
 import { generateUUID } from "@/lib/utils"
 import { toast } from "sonner"
 import { useApiClient } from "@/lib/hooks/useApiClient"
+import { fetchProverMcpServers } from "@/lib/mcp/fetch-prover-servers"
 
 // Single source of truth for the "verified proof" toolchain stamp, applied once
 // at stream end for every model (they all check against the same daemon).
@@ -76,20 +77,7 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
             /* ignore */
           }
           const base = (conn.bridgeUrl || "http://localhost:4123").replace(/\/$/, "")
-          let mcpServers: Array<{ name: string; url: string }> = []
-          try {
-            const mr = await apiClient("/api/mcp/servers")
-            if (mr.ok) {
-              const s = await mr.json()
-              if (Array.isArray(s)) {
-                mcpServers = s
-                  .filter((x: any) => x?.url && x?.name && x?.isActive !== false)
-                  .map((x: any) => ({ name: x.name, url: x.url }))
-              }
-            }
-          } catch {
-            /* ignore */
-          }
+          const mcpServers = await fetchProverMcpServers(apiClient)
           const theorem =
             [...currentMessages].reverse().find((m) => m.role === "user")?.content || ""
           response = await fetch(`${base}/prove-stream`, {

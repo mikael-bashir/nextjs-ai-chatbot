@@ -8,6 +8,10 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
 import { cn } from '@/lib/utils';
+import {
+  fetchProverMcpServers,
+  type ProverMcpServer,
+} from '@/lib/mcp/fetch-prover-servers';
 import { MathMarkdown } from '@/components/math-markdown';
 
 const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
@@ -531,20 +535,7 @@ export function AdminPipeline() {
     [],
   );
 
-  const fetchMcp = async (): Promise<Array<{ name: string; url: string }>> => {
-    try {
-      const r = await fetch('/api/mcp/servers');
-      if (!r.ok) return [];
-      const s = await r.json();
-      return Array.isArray(s)
-        ? s
-            .filter((x: any) => x?.url && x?.name && x?.isActive !== false)
-            .map((x: any) => ({ name: x.name, url: x.url }))
-        : [];
-    } catch {
-      return [];
-    }
-  };
+  const fetchMcp = (): Promise<ProverMcpServer[]> => fetchProverMcpServers();
 
   // Prove via the SHARED bridge; collect tool activity for display. THROWS on a
   // connectivity/protocol failure (unreachable bridge, non-2xx, no completion
@@ -554,7 +545,7 @@ export function AdminPipeline() {
   const proveStream = useCallback(
     async (
       lean: string,
-      mcpServers: Array<{ name: string; url: string }>,
+      mcpServers: ProverMcpServer[],
       signal?: AbortSignal,
     ) => {
       let res: Response;

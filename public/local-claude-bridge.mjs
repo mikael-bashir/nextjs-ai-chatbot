@@ -278,25 +278,42 @@ function buildMcpConfig(mcpServers) {
 // with library search as a *subordinate* step, not the main loop.
 function provePrompt(theorem, mcpServers = []) {
   // Claude Code prefixes MCP tools as mcp__<server>__<tool>, sanitizing the
-  // server name (e.g. "Leak II" -> "Leak_II"). Mirror that here so the names we
-  // hand the agent match the real tool ids exactly and it can't guess wrong.
-  const names = (mcpServers || [])
-    .map((s) => s && s.name)
-    .filter(Boolean)
-    .map((n) => n.replace(/[^a-zA-Z0-9_]/g, "_"))
-  const serverList = names.length ? names.join(", ") : "the configured MCP servers"
+  // server name (e.g. "Leak II" -> "Leak_II"). We build the tool list from the
+  // LIVE inventory the app pulled from the MCP manager (name + arg keys), so the
+  // agent gets exact tool ids and can't invent one like "mcp__Lean_I__...".
+  const sanitize = (n) => String(n || "").replace(/[^a-zA-Z0-9_]/g, "_")
+  const servers = (mcpServers || []).filter((s) => s && s.name)
+  const toolLines = []
+  for (const s of servers) {
+    const prefix = sanitize(s.name)
+    for (const t of Array.isArray(s.tools) ? s.tools : []) {
+      const tn = typeof t === "string" ? t : t && t.name
+      if (!tn) continue
+      const args =
+        t && Array.isArray(t.args) && t.args.length ? ` — args: { ${t.args.join(", ")} }` : ""
+      toolLines.push(`- mcp__${prefix}__${tn}${args}`)
+    }
+  }
+
+  let toolSection
+  if (toolLines.length) {
+    toolSection =
+      "These MCP tools are live and callable by these EXACT names (call them directly — do NOT invent names or waste turns on ToolSearch):\n" +
+      toolLines.join("\n")
+  } else if (servers.length) {
+    toolSection =
+      "Your MCP tools are provided by these servers: " +
+      servers.map((s) => sanitize(s.name)).join(", ") +
+      '. Every tool id is "mcp__<server>__<tool>" using one of those exact server names — never invent a server name. If a direct call returns "No such tool available", load it with ToolSearch "select:mcp__<server>__<tool>" then call it.'
+  } else {
+    toolSection = "Use your available Lean MCP tools (a whole-script compiler and library search)."
+  }
+
   return `You are proving the following Lean 4 theorem.
 
-Your Lean MCP tools are provided by these servers (use these EXACT sanitized names in the mcp__<server>__<tool> prefix): ${serverList}. Never invent a server name (do not guess "Lean_I" or similar) — use only the names listed here.
+${toolSection}
 
-Expected tools and their usual server:
-- mcp__Leak_II__verify_full_script — compile a whole script. Arg: { script }.
-- mcp__Leak_II__init_proof / mcp__Leak_II__apply_tactic — advance the goal step by step.
-- mcp__Leak_I__moogle_search — semantic library search. Arg: { concept } (NOT "query").
-- mcp__Leak_I__loogle_search — signature/pattern search. Arg: { query }.
-(If your server names above differ from Leak_I/Leak_II, substitute: search tools live on the search server, the compiler/tactic tools on the Lean-daemon server.)
-
-Calling convention: try the full tool name directly. If a call returns "No such tool available", the tool is deferred or on a different server — recover with ToolSearch "select:mcp__<server>__<tool>" (exact name) to load it, then call it; or retry with the other server's prefix. Do NOT fall back to endless library search just because one tool name missed. If verify_full_script genuinely does not exist on ANY listed server, say so explicitly and stop — do not pretend to verify.
+Tool roles: verify_full_script compiles a whole script and is your source of truth (a proof only counts when it reports success with no errors and no \`sorry\`); init_proof/apply_tactic advance a goal incrementally; moogle_search/loogle_search look up lemma names. Use the exact names from the list above.
 
 WORKFLOW — follow it in order, do not get stuck searching:
 1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
