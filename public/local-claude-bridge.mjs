@@ -283,39 +283,56 @@ function provePrompt(theorem, mcpServers = []) {
   // agent gets exact tool ids and can't invent one like "mcp__Lean_I__...".
   const sanitize = (n) => String(n || "").replace(/[^a-zA-Z0-9_]/g, "_")
   const servers = (mcpServers || []).filter((s) => s && s.name)
+  const toolIds = []
   const toolLines = []
   for (const s of servers) {
     const prefix = sanitize(s.name)
     for (const t of Array.isArray(s.tools) ? s.tools : []) {
       const tn = typeof t === "string" ? t : t && t.name
       if (!tn) continue
+      const id = `mcp__${prefix}__${tn}`
+      toolIds.push(id)
       const args =
         t && Array.isArray(t.args) && t.args.length ? ` — args: { ${t.args.join(", ")} }` : ""
-      toolLines.push(`- mcp__${prefix}__${tn}${args}`)
+      toolLines.push(`- ${id}${args}`)
     }
   }
 
+  // These MCP tools are DEFERRED by Claude Code (verified against the live CLI):
+  // a tool CANNOT be called until it has been loaded with ToolSearch
+  // "select:<exact id>". So the reliable pattern is to select ALL of them up
+  // front, then call them. Telling the agent to "call directly / skip
+  // ToolSearch" is what made earlier runs fail with "No such tool available".
   let toolSection
-  if (toolLines.length) {
-    toolSection =
-      "These MCP tools are live and callable by these EXACT names (call them directly — do NOT invent names or waste turns on ToolSearch):\n" +
-      toolLines.join("\n")
+  if (toolIds.length) {
+    toolSection = `Your Lean tools are provided over MCP but are DEFERRED — you MUST load a tool before you can call it. As your VERY FIRST action, make ONE ToolSearch call to load them all:
+
+  ToolSearch  query: "select:${toolIds.join(",")}"
+
+After that they are callable by these EXACT names (never invent a name):
+${toolLines.join("\n")}
+
+If ToolSearch returns nothing for a given id, that tool's server isn't connected right now — proceed with whichever loaded. If verify_full_script fails to load, say so explicitly and stop; do not fake a verification.`
   } else if (servers.length) {
-    toolSection =
-      "Your MCP tools are provided by these servers: " +
-      servers.map((s) => sanitize(s.name)).join(", ") +
-      '. Every tool id is "mcp__<server>__<tool>" using one of those exact server names — never invent a server name. If a direct call returns "No such tool available", load it with ToolSearch "select:mcp__<server>__<tool>" then call it.'
+    const prefixes = servers.map((s) => sanitize(s.name))
+    toolSection = `Your Lean tools are provided over MCP by these servers: ${prefixes.join(", ")}. They are DEFERRED, so load them first with ONE ToolSearch call before calling any:
+
+  ToolSearch  query: "select:${prefixes.map((p) => `mcp__${p}__verify_full_script`).join(",")},${prefixes.map((p) => `mcp__${p}__moogle_search`).join(",")},${prefixes.map((p) => `mcp__${p}__loogle_search`).join(",")},${prefixes.map((p) => `mcp__${p}__init_proof`).join(",")},${prefixes.map((p) => `mcp__${p}__apply_tactic`).join(",")}"
+
+Only the ids that actually exist will load; use those. Never invent a server name. If verify_full_script does not load on any server, say so and stop.`
   } else {
-    toolSection = "Use your available Lean MCP tools (a whole-script compiler and library search)."
+    toolSection =
+      'Load your Lean MCP tools first with ToolSearch "select:mcp__<server>__<tool>" (they are deferred), then use a whole-script compiler (verify_full_script) and library search.'
   }
 
   return `You are proving the following Lean 4 theorem.
 
 ${toolSection}
 
-Tool roles: verify_full_script compiles a whole script and is your source of truth (a proof only counts when it reports success with no errors and no \`sorry\`); init_proof/apply_tactic advance a goal incrementally; moogle_search/loogle_search look up lemma names. Use the exact names from the list above.
+Tool roles: verify_full_script compiles a whole script and is your source of truth (a proof only counts when it reports success with no errors and no \`sorry\`); init_proof/apply_tactic advance a goal incrementally; moogle_search/loogle_search look up lemma names.
 
 WORKFLOW — follow it in order, do not get stuck searching:
+0. Load the tools (ToolSearch select, as above). This is mandatory and comes first.
 1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
 2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If the tactic tools work, use them to advance the goal step by step and confirm each step compiles. (If init_proof/apply_tactic return a server error, don't retry them in a loop — fall back to editing the full script and verify_full_script.)
 3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal — at most a couple of lookups, then go straight back to verify_full_script. Do not enumerate the library; do not search without an attempt to verify in between.
