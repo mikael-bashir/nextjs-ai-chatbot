@@ -277,11 +277,17 @@ function buildMcpConfig(mcpServers) {
 // explicit, verification-first workflow: draft → verify_full_script → iterate,
 // with library search as a *subordinate* step, not the main loop.
 function provePrompt(theorem, mcpServers = []) {
-  const names = (mcpServers || []).map((s) => s && s.name).filter(Boolean)
+  // Claude Code prefixes MCP tools as mcp__<server>__<tool>, sanitizing the
+  // server name (e.g. "Leak II" -> "Leak_II"). Mirror that here so the names we
+  // hand the agent match the real tool ids exactly and it can't guess wrong.
+  const names = (mcpServers || [])
+    .map((s) => s && s.name)
+    .filter(Boolean)
+    .map((n) => n.replace(/[^a-zA-Z0-9_]/g, "_"))
   const serverList = names.length ? names.join(", ") : "the configured MCP servers"
   return `You are proving the following Lean 4 theorem.
 
-Your Lean MCP tools are provided by these servers: ${serverList}. Every tool's real name is "mcp__<server>__<tool>" using one of those EXACT server names. Never invent a server name (do not guess "Lean_I" or similar) — use only the names listed above.
+Your Lean MCP tools are provided by these servers (use these EXACT sanitized names in the mcp__<server>__<tool> prefix): ${serverList}. Never invent a server name (do not guess "Lean_I" or similar) — use only the names listed here.
 
 Expected tools and their usual server:
 - mcp__Leak_II__verify_full_script — compile a whole script. Arg: { script }.
