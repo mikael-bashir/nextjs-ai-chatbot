@@ -271,6 +271,40 @@ function buildMcpConfig(mcpServers) {
   return { mcpServers: servers }
 }
 
+// --- Target-theorem gate ----------------------------------------------------
+// The user's input is always the bare theorem signature proven by `sorry`
+// (e.g. `theorem foo (n : ℕ) : P n := by sorry`). A verify_full_script success
+// only counts as a real proof if the compiled script actually contains THAT
+// theorem (same signature) — not just a helper `example`/lemma that happens to
+// compile. Compilation success already implies no `sorry` (the Lean daemon
+// reports `sorry` as an error), so a signature match on a successful compile
+// means the target theorem itself is genuinely proved.
+
+// Collapse whitespace so trivial reformatting doesn't break the comparison.
+function normalizeLean(s) {
+  return String(s == null ? "" : s).replace(/\s+/g, " ").trim()
+}
+
+// Extract a declaration's signature: everything from the `theorem`/`lemma`
+// keyword up to (but not including) the `:=` that begins the proof, normalized.
+// Returns "" if no such declaration is found.
+function theoremSignature(src) {
+  const m = String(src == null ? "" : src).match(/\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/)
+  return m ? normalizeLean(m[0]) : ""
+}
+
+// True if `script` contains a theorem/lemma whose signature equals targetSig.
+// Scans every declaration in the script (a proof may define helper lemmas too).
+function scriptProvesTarget(script, targetSig) {
+  if (!targetSig) return false
+  const re = /\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/g
+  let m
+  while ((m = re.exec(script)) !== null) {
+    if (normalizeLean(m[0]) === targetSig) return true
+  }
+  return false
+}
+
 // The goal is to let Claude use the tools logically on its own — but a bare
 // "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
 // on hard theorems and never actually build or check a proof. So we hand it an
@@ -336,8 +370,8 @@ WORKFLOW — follow it in order, do not get stuck searching:
 1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
 2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If the tactic tools work, use them to advance the goal step by step and confirm each step compiles. (If init_proof/apply_tactic return a server error, don't retry them in a loop — fall back to editing the full script and verify_full_script.)
 3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal.
-4. A proof is done ONLY when verify_full_script reports success with no errors and no \`sorry\`. Keep iterating until then.
-5. Then output the final verified proof as a single \`\`\`lean code block.
+4. A proof is done ONLY when verify_full_script reports success on a script that contains the ORIGINAL theorem below — same name and signature — proven with no \`sorry\`. Verifying helper \`example\`s or side lemmas is fine for exploration but does NOT count as success; the run is only accepted when the target theorem itself compiles. Keep iterating until then.
+5. Then output that final verified proof (the one containing the target theorem) as a single \`\`\`lean code block.
 
 HARD RULE — this is the difference between working and failing: NEVER make more than 2 search calls (moogle_search/loogle_search) in a row. After at most 2 searches you MUST call verify_full_script again with an updated script. If you have not resolved a subgoal, keep \`sorry\` on that part and verify the rest anyway — a partial script that compiles-with-sorry tells you what actually works and isolates the real problem. A long run of searches with no verify in between is the failure mode we are preventing: do not do it. Count your consecutive searches; at 2, stop and verify. verify_full_script should be your most-used tool by far, not moogle/loogle.
 
@@ -421,9 +455,15 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   // System gate: the ONE enforced restriction. We only accept a proof that the
   // harness itself watched pass verify_full_script — not one Claude merely
   // claims. Map each verify_full_script call id -> its script, and record the
-  // script when the matching result reports success.
+  // script when the matching result reports success AND that script actually
+  // contains the user's target theorem (not just a helper example that compiles).
   const verifyCalls = {}
   let verifiedScript = null
+  // Parsed once from the input (always the target signature proven by `sorry`).
+  // If we can't parse a signature, fall back to the old behaviour (accept any
+  // successful compile) rather than silently rejecting every run.
+  const targetSig = theoremSignature(theorem)
+  const gateAccepts = (script) => (targetSig ? scriptProvesTarget(script, targetSig) : true)
 
   let child
   try {
@@ -500,7 +540,19 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
               verifyCalls[c.tool_use_id] &&
               /compilation successful|100% verified|no goals/i.test(t)
             ) {
-              verifiedScript = verifyCalls[c.tool_use_id]
+              const okScript = verifyCalls[c.tool_use_id]
+              if (gateAccepts(okScript)) {
+                verifiedScript = okScript
+              } else {
+                // Compiled, but it's a helper/example — NOT the target theorem.
+                send({
+                  type: "message-annotation",
+                  subtype: "status",
+                  thought:
+                    "✔️ A script compiled, but it does not contain the target theorem — still unproven.",
+                  metrics,
+                })
+              }
             }
             send({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t, metrics })
           }
