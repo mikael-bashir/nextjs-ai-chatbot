@@ -535,14 +535,27 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
             const t = Array.isArray(c.content)
               ? c.content.map((x) => x.text || "").join("\n")
               : String(c.content ?? "")
-            if (
-              c.tool_use_id &&
-              verifyCalls[c.tool_use_id] &&
-              /compilation successful|100% verified|no goals/i.test(t)
-            ) {
+            // Success detection is intentionally strict: verify_full_script
+            // reports success ONLY as "Compilation Successful" / "100% verified".
+            // We must NOT match on "no goals" — that phrase appears in FAILURE
+            // messages (e.g. `❌ Compilation Failed: Line 5: no goals`, the common
+            // error from a tactic after the proof is already closed), which would
+            // otherwise be mis-read as success.
+            const verifySucceeded =
+              /compilation successful|100% verified/i.test(t) &&
+              !/compilation failed|❌/i.test(t)
+            if (!verifiedScript && c.tool_use_id && verifyCalls[c.tool_use_id] && verifySucceeded) {
               const okScript = verifyCalls[c.tool_use_id]
               if (gateAccepts(okScript)) {
                 verifiedScript = okScript
+                // Target theorem proved. Claude won't self-terminate on a tool
+                // success, so stop it now instead of letting it wander until the
+                // timeout; the close handler emits the verified proof.
+                try {
+                  child.kill("SIGKILL")
+                } catch {
+                  /* already gone */
+                }
               } else {
                 // Compiled, but it's a helper/example — NOT the target theorem.
                 send({
