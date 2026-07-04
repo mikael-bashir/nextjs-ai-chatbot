@@ -335,11 +335,11 @@ WORKFLOW — follow it in order, do not get stuck searching:
 0. Load the tools (ToolSearch select, as above). This is mandatory and comes first.
 1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
 2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If the tactic tools work, use them to advance the goal step by step and confirm each step compiles. (If init_proof/apply_tactic return a server error, don't retry them in a loop — fall back to editing the full script and verify_full_script.)
-3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal — at most a couple of lookups, then go straight back to verify_full_script. Do not enumerate the library; do not search without an attempt to verify in between.
+3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal.
 4. A proof is done ONLY when verify_full_script reports success with no errors and no \`sorry\`. Keep iterating until then.
 5. Then output the final verified proof as a single \`\`\`lean code block.
 
-Never end by only having searched. Every few turns you must have called verify_full_script.
+HARD RULE — this is the difference between working and failing: NEVER make more than 2 search calls (moogle_search/loogle_search) in a row. After at most 2 searches you MUST call verify_full_script again with an updated script. If you have not resolved a subgoal, keep \`sorry\` on that part and verify the rest anyway — a partial script that compiles-with-sorry tells you what actually works and isolates the real problem. A long run of searches with no verify in between is the failure mode we are preventing: do not do it. Count your consecutive searches; at 2, stop and verify. verify_full_script should be your most-used tool by far, not moogle/loogle.
 
 Theorem:
 ${theorem}`
