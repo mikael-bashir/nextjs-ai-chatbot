@@ -52,6 +52,7 @@ export async function POST(request: NextRequest) {
       answer: body.answer ?? null,
       difficulty: body.difficulty ?? null,
       points: body.points ?? null,
+      level: body.level ?? null,
       insight: body.insight ?? null,
       lean: body.lean,
       verified,

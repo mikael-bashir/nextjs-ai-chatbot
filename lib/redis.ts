@@ -66,6 +66,9 @@ export interface StagedProblem {
   answer?: number | string | null;
   difficulty?: string;
   points?: number;
+  // Prerequisite-knowledge level 1-5 (see admin-pipeline BASE_REQS). Flows to
+  // CompeteMath as `knowledge: "Level N"` on promotion.
+  level?: number;
   insight?: string;
   lean: string;
   proof: string;
@@ -128,6 +131,7 @@ export interface GeneratedRecord {
   answer?: number | string | null;
   difficulty?: string;
   points?: number;
+  level?: number;
   insight?: string;
   lean: string;
   verified: boolean;

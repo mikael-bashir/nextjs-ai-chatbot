@@ -30,6 +30,12 @@ export async function POST(request: NextRequest) {
       return new Response('Not found', { status: 404 });
     }
 
+    // Prerequisite-knowledge level (1-5) → CompeteMath's `knowledge` column as
+    // "Level N"; omitted (null) if the model didn't assign a valid level.
+    const lvl = Number(rec.level);
+    const knowledge =
+      Number.isInteger(lvl) && lvl >= 1 && lvl <= 5 ? `Level ${lvl}` : null;
+
     // Exactly the fields the weekly-problems cron reads.
     const prodPayload = {
       questionTitle: rec.questionTitle ?? 'Generated Problem',
@@ -38,6 +44,7 @@ export async function POST(request: NextRequest) {
       difficulty: rec.difficulty ?? 'Medium',
       points: rec.points ?? 100,
       answer: rec.answer ?? null,
+      knowledge,
     };
 
     // Order matters: publish to prod + persist metadata BEFORE removing from

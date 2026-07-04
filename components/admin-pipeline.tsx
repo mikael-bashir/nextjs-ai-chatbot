@@ -118,7 +118,13 @@ Keep your reasoning brief and get to the JSON.
 Core requirements:
 - Creative and NON-standard: not a textbook exercise, not a famous/known competition problem, not a classic named result. Fresh setup and phrasing.
 - The answer is a specific INTEGER.
-- Give presentation metadata: a short evocative title, a 1-3 word subtitle, a difficulty of exactly "Easy" | "Medium" | "Hard" | "Extreme", and points = 50 for Easy, 100 for Medium, 150 for Hard, 200 for Extreme.`;
+- Give presentation metadata: a short evocative title, a 1-3 word subtitle, a difficulty of exactly "Easy" | "Medium" | "Hard" | "Extreme", and points = 50 for Easy, 100 for Medium, 150 for Hard, 200 for Extreme.
+- Also assign a "level" as an INTEGER 1-5 = the prerequisite mathematical KNOWLEDGE required to attempt it (this is about background needed, NOT how hard the puzzle is — a level-1 problem can still be a tough puzzle):
+  1 = a first-year primary school student would technically have the base knowledge to attempt it;
+  2 = knowledge content up to early high / secondary school;
+  3 = knowledge up to the end of sixth form / college;
+  4 = built around a single advanced, university-level concept;
+  5 = several advanced concepts combined together.`;
 
 const MODE_BLOCKS: Record<GenMode, string> = {
   standard: `
@@ -152,7 +158,7 @@ const RESPONSE_FORMAT = `
 
 Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
-{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
+{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
 interface LiveProblem {
   title: string;
@@ -215,6 +221,7 @@ interface GenProblem {
   answer?: number;
   difficulty?: string;
   points?: number;
+  level?: number;
   insight?: string;
   lean?: string;
 }
@@ -346,6 +353,7 @@ function extractJson(text: string): GenProblem | null {
 function metaLine(p: GeneratedItem | StagedItem, withDate = false): string {
   return [
     p.difficulty,
+    p.level ? `Level ${p.level}` : null,
     p.points ? `${p.points}pts` : null,
     p.answer != null ? `ans ${p.answer}` : null,
     withDate && (p as GeneratedItem).createdAt
@@ -1027,6 +1035,7 @@ export function AdminPipeline() {
           answer: item.answer ?? null,
           difficulty: item.difficulty ?? null,
           points: item.points ?? null,
+          level: item.level ?? null,
           insight: item.insight ?? null,
           lean: item.lean,
           proof: item.proof ?? '',
