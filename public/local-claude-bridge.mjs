@@ -276,14 +276,21 @@ function buildMcpConfig(mcpServers) {
 // on hard theorems and never actually build or check a proof. So we hand it an
 // explicit, verification-first workflow: draft → verify_full_script → iterate,
 // with library search as a *subordinate* step, not the main loop.
-function provePrompt(theorem) {
+function provePrompt(theorem, mcpServers = []) {
+  const names = (mcpServers || []).map((s) => s && s.name).filter(Boolean)
+  const serverList = names.length ? names.join(", ") : "the configured MCP servers"
   return `You are proving the following Lean 4 theorem.
 
-Your Lean MCP tools are ALREADY LOADED and directly callable (their real names are prefixed like mcp__<server>__<tool>). Call them straight away. Do NOT use ToolSearch on them; they are not deferred, so ToolSearch returns nothing and just wastes turns. The tools, by function:
-- verify_full_script — compile a whole script. Arg: { script }.
-- init_proof / apply_tactic — advance the goal step by step (use if available).
-- moogle_search — semantic library search. Arg: { concept } (NOT "query").
-- loogle_search — signature/pattern search. Arg: { query }.
+Your Lean MCP tools are provided by these servers: ${serverList}. Every tool's real name is "mcp__<server>__<tool>" using one of those EXACT server names. Never invent a server name (do not guess "Lean_I" or similar) — use only the names listed above.
+
+Expected tools and their usual server:
+- mcp__Leak_II__verify_full_script — compile a whole script. Arg: { script }.
+- mcp__Leak_II__init_proof / mcp__Leak_II__apply_tactic — advance the goal step by step.
+- mcp__Leak_I__moogle_search — semantic library search. Arg: { concept } (NOT "query").
+- mcp__Leak_I__loogle_search — signature/pattern search. Arg: { query }.
+(If your server names above differ from Leak_I/Leak_II, substitute: search tools live on the search server, the compiler/tactic tools on the Lean-daemon server.)
+
+Calling convention: try the full tool name directly. If a call returns "No such tool available", the tool is deferred or on a different server — recover with ToolSearch "select:mcp__<server>__<tool>" (exact name) to load it, then call it; or retry with the other server's prefix. Do NOT fall back to endless library search just because one tool name missed. If verify_full_script genuinely does not exist on ANY listed server, say so explicitly and stop — do not pretend to verify.
 
 WORKFLOW — follow it in order, do not get stuck searching:
 1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
@@ -314,7 +321,7 @@ async function runProve(theorem, mcpServers, opts = {}) {
   // servers, dangerously-skip-permissions lets the agent call the MCP tools
   // without prompting (it's the user's own machine + own tools).
   const args = [
-    "-p", provePrompt(theorem),
+    "-p", provePrompt(theorem, mcpServers),
     "--output-format", "json",
     "--mcp-config", cfgPath,
     "--strict-mcp-config",
@@ -352,7 +359,7 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   }
 
   const args = [
-    "-p", provePrompt(theorem),
+    "-p", provePrompt(theorem, mcpServers),
     "--output-format", "stream-json", "--verbose",
     "--mcp-config", cfgPath, "--strict-mcp-config", "--dangerously-skip-permissions",
   ]
