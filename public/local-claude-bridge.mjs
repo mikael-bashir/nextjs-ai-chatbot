@@ -277,11 +277,17 @@ function buildMcpConfig(mcpServers) {
 // explicit, verification-first workflow: draft → verify_full_script → iterate,
 // with library search as a *subordinate* step, not the main loop.
 function provePrompt(theorem) {
-  return `You are proving the following Lean 4 theorem. You have MCP tools available: proof/tactic tools (e.g. init_proof / apply_tactic) and a compiler tool (verify_full_script) for checking a whole script, plus library-search tools (moogle_search, loogle_search).
+  return `You are proving the following Lean 4 theorem.
+
+Your Lean MCP tools are ALREADY LOADED and directly callable (their real names are prefixed like mcp__<server>__<tool>). Call them straight away. Do NOT use ToolSearch on them; they are not deferred, so ToolSearch returns nothing and just wastes turns. The tools, by function:
+- verify_full_script — compile a whole script. Arg: { script }.
+- init_proof / apply_tactic — advance the goal step by step (use if available).
+- moogle_search — semantic library search. Arg: { concept } (NOT "query").
+- loogle_search — signature/pattern search. Arg: { query }.
 
 WORKFLOW — follow it in order, do not get stuck searching:
 1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
-2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If tactic tools (init_proof / apply_tactic) are available, use them to advance the goal step by step and confirm each step compiles.
+2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If the tactic tools work, use them to advance the goal step by step and confirm each step compiles. (If init_proof/apply_tactic return a server error, don't retry them in a loop — fall back to editing the full script and verify_full_script.)
 3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal — at most a couple of lookups, then go straight back to verify_full_script. Do not enumerate the library; do not search without an attempt to verify in between.
 4. A proof is done ONLY when verify_full_script reports success with no errors and no \`sorry\`. Keep iterating until then.
 5. Then output the final verified proof as a single \`\`\`lean code block.
