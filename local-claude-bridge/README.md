@@ -64,7 +64,7 @@ WORKER_SECRET='<LEAK_WORKER_SECRET from the app env>' \
 | `WORKER_ID` | `bridge-<pid>` | Label recorded on leased jobs. |
 | `WORKER_POLL_MS` | `5000` | How often to poll when the queue is empty. |
 | `WORKER_MODEL` | CLI default | e.g. `claude-opus-4-8`; empty = your Max plan default. |
-| `WORKER_MCP_CONFIG` | `[]` | JSON array of prover MCP servers (`{name,url}`) for the agent to drive. |
+| `WORKER_MCP_CONFIG` | `[]` | Fallback prover MCP servers (`{name,url}`) if the lease response doesn't carry them. Normally the app supplies the hard-set Leak_I/Leak_II servers on each lease, so you don't set this. |
 
 It reuses the app's worker data-plane: `POST /api/worker/lease`,
 `/api/worker/heartbeat`, `/api/worker/complete`. Runs happily in the same

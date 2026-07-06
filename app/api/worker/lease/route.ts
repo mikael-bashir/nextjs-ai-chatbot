@@ -2,6 +2,7 @@ import type { NextRequest } from 'next/server';
 
 import { authenticateWorker } from '@/lib/leak/worker-auth';
 import { leaseNextJob } from '@/lib/db/leak-queries';
+import { getProverMcpServers } from '@/lib/leak/prover-servers';
 
 
 // Default lease window. The worker must heartbeat within this or the job is
@@ -29,7 +30,13 @@ export async function POST(request: NextRequest) {
   const job = await leaseNextJob({ workerId, leaseMs });
   if (!job) return Response.json({ job: null });
 
-  // Worker-facing view: it needs the problem text and identifiers only.
+  // Hand the worker the hard-set Leak prover MCP servers so its direct
+  // claude+MCP run drives the real Leak_I/Leak_II tools — the same servers the
+  // interactive /prove flow uses. Non-fatal if unavailable (worker falls back
+  // to its own WORKER_MCP_CONFIG).
+  const mcpServers = await getProverMcpServers().catch(() => []);
+
+  // Worker-facing view: problem text, identifiers, and the prover servers.
   return Response.json({
     job: {
       id: job.id,
@@ -37,6 +44,7 @@ export async function POST(request: NextRequest) {
       pricingClass: job.pricingClass,
       attempts: job.attempts,
       leaseExpiresAt: job.leaseExpiresAt,
+      mcpServers,
     },
   });
 }
