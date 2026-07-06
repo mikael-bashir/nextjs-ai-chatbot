@@ -84,6 +84,10 @@ jobs:
               env_file:
                 - .env
               restart: unless-stopped
+              # Bound each preview so one can't OOM the box (or the prod prover
+              # co-located on this VPS). Tune with the box's total RAM.
+              mem_limit: 640m
+              mem_reservation: 256m
               depends_on:
                 - python-backend
 
@@ -94,6 +98,8 @@ jobs:
               expose:
                 - "5328"
               restart: unless-stopped
+              mem_limit: 768m
+              mem_reservation: 256m
           YAML
 
           # Caddy virtual-host snippet — auto-TLS via Let's Encrypt HTTP-01
@@ -109,12 +115,23 @@ jobs:
           echo "COMPOSE_B64=$(base64 -w0 /tmp/preview-compose.yml)" >> "$GITHUB_ENV"
           echo "CADDY_B64=$(base64 -w0 /tmp/preview-caddy.caddy)"   >> "$GITHUB_ENV"
 
+      # ── Open PRs (so the VPS can reap previews for closed/merged ones) ────
+      - name: List open PRs
+        id: openprs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NUMS=$(gh pr list --repo "${{ github.repository }}" --state open --json number --jq '[.[].number] | join(" ")')
+          echo "numbers=${NUMS}" >> "$GITHUB_OUTPUT"
+          echo "Open PRs: ${NUMS}"
+
       # ── Deploy on VPS ─────────────────────────────────────────────────────
       - name: Deploy to VPS
         uses: appleboy/ssh-action@v1.0.3
         env:
           SUBDOMAIN:    ${{ steps.preview.outputs.subdomain }}
           PORT:         ${{ steps.preview.outputs.port }}
+          OPEN_PRS:     ${{ steps.openprs.outputs.numbers }}
           COMPOSE_B64:  ${{ env.COMPOSE_B64 }}
           CADDY_B64:    ${{ env.CADDY_B64 }}
           GHCR_TOKEN:   ${{ secrets.GITHUB_TOKEN }}
@@ -141,7 +158,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key:      ${{ secrets.SSH_PRIVATE_KEY }}
           envs: >-
-            SUBDOMAIN,PORT,COMPOSE_B64,CADDY_B64,GHCR_TOKEN,GITHUB_ACTOR,
+            SUBDOMAIN,PORT,OPEN_PRS,COMPOSE_B64,CADDY_B64,GHCR_TOKEN,GITHUB_ACTOR,
             POSTGRES_URL,AUTH_SECRET,AUTH_URL,NEXT_PUBLIC_APP_URL,XAI_MASTER,
             XAI_FREE_KEY_1,XAI_FREE_KEY_2,XAI_FREE_KEY_3,
             MEM0_API_KEY,REDIS_URL,COMPETEMATH_REDIS_URL,STRIPE_SECRET,RESEND_API_KEY
@@ -209,6 +226,41 @@ jobs:
               echo "STRIPE_WEBHOOK_SECRET=${CLI_WEBHOOK_SECRET}"
               echo "RESEND_API_KEY=${RESEND_API_KEY}"
             } > "$PREVIEW_DIR/.env"
+
+            # ── Self-heal: reap previews whose PR is no longer open ──────────
+            # Closed/merged PRs whose teardown didn't run (e.g. the box was
+            # unreachable at close) leave orphaned stacks that pile up until the
+            # box OOMs. Reclaim them here before adding another.
+            OPEN_SET=" ${OPEN_PRS:-} "
+            for dir in /opt/previews/pr-*; do
+              [ -d "$dir" ] || continue
+              sub=$(basename "$dir")
+              [ "$sub" = "$SUBDOMAIN" ] && continue   # never reap the one we're deploying
+              n=$(printf '%s' "$sub" | sed -E 's/^pr-([0-9]+)-.*/\1/')
+              case "$OPEN_SET" in
+                *" $n "*) ;;                            # PR still open — keep
+                *)
+                  echo "Reaping orphaned preview $sub (PR #$n not open)"
+                  [ -f "$dir/stripe-listener.pid" ] && kill "$(cat "$dir/stripe-listener.pid")" 2>/dev/null || true
+                  ( cd "$dir" && docker compose -p "preview-$sub" down --volumes --remove-orphans ) 2>/dev/null || true
+                  rm -rf "$dir"
+                  sudo rm -f "/etc/caddy/sites/$sub.caddy" 2>/dev/null || true
+                  ;;
+              esac
+            done
+            sudo systemctl reload caddy 2>/dev/null || true
+
+            # ── Safety gate: is it safe to add this preview? ─────────────────
+            # After reaping orphans, refuse to deploy if the box lacks headroom,
+            # rather than letting the OOM killer take down prod.
+            AVAIL_MB=$(free -m | awk '/^Mem:/{print $7}')
+            MIN_AVAIL_MB=600
+            if [ "${AVAIL_MB:-0}" -lt "$MIN_AVAIL_MB" ]; then
+              echo "❌ Only ${AVAIL_MB}MB available (need >= ${MIN_AVAIL_MB}MB) after reaping orphans."
+              echo "   Refusing to deploy to avoid OOM-ing the box. Close a stale PR or resize the VPS."
+              exit 1
+            fi
+            echo "✅ ${AVAIL_MB}MB available — safe to deploy."
 
             # Reclaim space BEFORE pulling so a disk already full of superseded
             # images can't fail the pull ("no space left on device"). Removes
