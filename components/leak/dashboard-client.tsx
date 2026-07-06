@@ -191,11 +191,11 @@ export function DashboardClient({
           </div>
           {isAdmin && (
             <Link
-              href="/queue"
+              href="/admin"
               className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/40 bg-amber-500/10 px-3 py-1 text-xs font-medium text-amber-600 transition-colors hover:bg-amber-500/20 dark:text-amber-400"
             >
               <ShieldCheck className="size-3.5" />
-              Admin · resolution queue
+              Admin · prover console
             </Link>
           )}
         </div>
