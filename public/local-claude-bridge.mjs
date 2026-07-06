@@ -276,13 +276,40 @@ function buildMcpConfig(mcpServers) {
 // (e.g. `theorem foo (n : ℕ) : P n := by sorry`). A verify_full_script success
 // only counts as a real proof if the compiled script actually contains THAT
 // theorem (same signature) — not just a helper `example`/lemma that happens to
-// compile. Compilation success already implies no `sorry` (the Lean daemon
-// reports `sorry` as an error), so a signature match on a successful compile
-// means the target theorem itself is genuinely proved.
+// compile — AND the script does not cheat with `sorry`.
+//
+// CRITICAL: compilation success does NOT imply the absence of `sorry`. In Lean 4
+// `sorry` (and its alias `admit`, and the underlying `sorryAx`) is a WARNING,
+// not an error — `verify_full_script` still reports "Compilation Successful".
+// So a script like `theorem foo : P := by sorry` compiles and matches the target
+// signature, yet proves nothing. We must reject any accepted script that closes
+// (or partially closes) a goal with sorry, or we bill customers / promote ACG
+// problems for proofs that are literally holes.
 
 // Collapse whitespace so trivial reformatting doesn't break the comparison.
 function normalizeLean(s) {
   return String(s == null ? "" : s).replace(/\s+/g, " ").trim()
+}
+
+// Strip Lean comments so a stray "sorry" in prose (e.g. `-- replaced the sorry`)
+// doesn't trip the cheat detector. Handles `-- line` and (repeatedly, for nesting)
+// `/- block -/` comments. Imperfect for pathological nesting, but errs toward
+// leaving code intact — the detector only ever causes a (safe) rejection.
+function stripLeanComments(s) {
+  let out = String(s == null ? "" : s)
+  let prev
+  do {
+    prev = out
+    out = out.replace(/\/-(?:[^-]|-(?!\/))*-\//g, " ")
+  } while (out !== prev)
+  return out.replace(/--[^\n]*/g, " ")
+}
+
+// True if the script cheats: any `sorry`, `admit`, or `sorryAx` as a real token
+// (not inside a comment). This is the guardrail that stops a hole from being sold
+// or promoted as a finished proof.
+function scriptHasSorry(script) {
+  return /\b(?:sorry|sorryAx|admit)\b/.test(stripLeanComments(script))
 }
 
 // Extract a declaration's signature: everything from the `theorem`/`lemma`
@@ -463,7 +490,12 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   // If we can't parse a signature, fall back to the old behaviour (accept any
   // successful compile) rather than silently rejecting every run.
   const targetSig = theoremSignature(theorem)
-  const gateAccepts = (script) => (targetSig ? scriptProvesTarget(script, targetSig) : true)
+  // Two conditions, both required: (1) the script contains the target theorem
+  // (signature match, or accept-any if we couldn't parse a signature) and
+  // (2) it does NOT cheat with sorry/admit anywhere — a hole in a helper lemma
+  // poisons the main result just as much as a hole in the target itself.
+  const gateAccepts = (script) =>
+    (targetSig ? scriptProvesTarget(script, targetSig) : true) && !scriptHasSorry(script)
 
   let child
   try {
@@ -560,12 +592,15 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
                   /* already gone */
                 }
               } else {
-                // Compiled, but it's a helper/example — NOT the target theorem.
+                // Compiled, but not accepted — either it cheats with `sorry`
+                // (compiles with only a warning) or it doesn't contain the
+                // target theorem. Say which, so the agent knows to keep going.
                 send({
                   type: "message-annotation",
                   subtype: "status",
-                  thought:
-                    "✔️ A script compiled, but it does not contain the target theorem — still unproven.",
+                  thought: scriptHasSorry(okScript)
+                    ? "✔️ A script compiled, but it still uses `sorry`/`admit` — that's a hole, not a proof. Still unproven."
+                    : "✔️ A script compiled, but it does not contain the target theorem — still unproven.",
                   metrics,
                 })
               }
