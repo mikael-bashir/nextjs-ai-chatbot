@@ -699,9 +699,11 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
         }
       } else if (o.type === "result") {
         finalText = o.result || ""
-      } else if (o.type === "system") {
-        // Claude Code init frame — surface the run context (model, the MCP
-        // servers it connected, how many tools it can drive).
+      } else if (o.type === "system" && (o.subtype === "init" || o.model)) {
+        // ONLY the init frame — it carries the run context (model, the MCP
+        // servers it connected, how many tools it can drive). Claude Code also
+        // emits other bare `system` frames (status / MCP (re)connect); relaying
+        // those spams the UI with meaningless "Prover initialised" rows.
         const servers = Array.isArray(o.mcp_servers)
           ? o.mcp_servers.map((s) => s?.name || s).filter(Boolean).join(", ")
           : ""

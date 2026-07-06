@@ -103,13 +103,21 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
         case 'received':
           emit('received', 'Problem received by prover', { detail: d.problem });
           break;
-        case 'system':
-          emit(
-            'system',
-            d.model ? `Model: ${d.model}` : 'Prover initialised',
-            { detail: d.detail || d.text, metrics },
-          );
+        case 'system': {
+          // Claude Code emits the rich init frame (model + connected MCP servers
+          // + tool count) once, but also bare `system` frames (status / MCP
+          // (re)connect). Only surface ones that carry real info — never render a
+          // bare frame as a repeated "Prover initialised".
+          const sysDetail = d.detail || d.text || '';
+          if (d.model)
+            emit('system', `Model: ${d.model}`, { detail: sysDetail, metrics });
+          else if (sysDetail.trim())
+            emit('system', sysDetail.slice(0, 140), {
+              detail: sysDetail,
+              metrics,
+            });
           break;
+        }
         case 'thinking':
           emit('thinking', 'Thinking…', { detail: d.text || d.content, metrics });
           break;
