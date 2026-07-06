@@ -96,6 +96,7 @@ export function AdminQueueResolver({
           problem: job.problem,
           mcpServers,
           onEvent: append,
+          source: 'queue',
         });
         if (out.verified && out.proof.trim()) {
           await resolve(job.id, { proof: out.proof });

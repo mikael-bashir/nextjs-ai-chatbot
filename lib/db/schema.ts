@@ -387,3 +387,31 @@ export const problemJob = pgTable('ProblemJob', {
 });
 
 export type ProblemJob = InferSelectModel<typeof problemJob>;
+
+// ---------------------------------------------------------------------------
+// Admin debug log. When an admin drives the prover, we capture the EXACT and
+// FULL context handed to the agent — the system prompt the bridge built, the
+// resolved MCP tool inventory, the theorem, the model — plus the outcome, so
+// we can see precisely what the agent saw when it flails. Admin-only; written
+// only for admin sessions.
+// ---------------------------------------------------------------------------
+export const agentRunLog = pgTable('AgentRunLog', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  userId: uuid('userId').references(() => user.id, { onDelete: 'set null' }),
+  // Where the run came from: 'playground' | 'acg' | 'queue' | 'decompose' | …
+  source: varchar('source', { length: 32 }).notNull().default('playground'),
+  theorem: text('theorem').notNull(),
+  model: varchar('model', { length: 128 }),
+  // The full system prompt the bridge sent to claude (provePrompt output).
+  prompt: text('prompt'),
+  // Resolved MCP servers + their tool inventory, exactly as attached.
+  mcpServers: json('mcpServers'),
+  // Outcome, filled in when the run ends.
+  verified: boolean('verified'),
+  proof: text('proof'),
+  finalText: text('finalText'),
+  metrics: json('metrics'),
+  createdAt: timestamp('createdAt').notNull().defaultNow(),
+});
+
+export type AgentRunLog = InferSelectModel<typeof agentRunLog>;

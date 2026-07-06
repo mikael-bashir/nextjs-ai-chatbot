@@ -28,7 +28,7 @@ export function ProverPlayground() {
     const append = (e: ProverEvent) => setEvents((prev) => [...prev, e]);
     try {
       const mcpServers = await fetchProverMcpServers();
-      const out = await runProverStream({ problem, mcpServers, onEvent: append });
+      const out = await runProverStream({ problem, mcpServers, onEvent: append, source: 'playground' });
       setOutcome(out);
     } catch {
       /* the console already shows the error event */

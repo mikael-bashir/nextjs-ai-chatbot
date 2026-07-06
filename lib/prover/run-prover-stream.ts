@@ -29,6 +29,24 @@ interface RunOpts {
   token?: string;
   signal?: AbortSignal;
   onEvent: (e: ProverEvent) => void;
+  // When set, the FULL agent context (system prompt, model, MCP inventory) and
+  // the outcome are persisted to the admin debug log. The endpoint is admin-
+  // gated server-side, so this is a no-op (silently ignored) for non-admins.
+  source?: string;
+}
+
+// Fire-and-forget: persist a run to the admin debug log. Admin-gated server-side.
+async function logAgentRun(record: Record<string, unknown>) {
+  try {
+    await fetch('/api/admin/agent-log', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(record),
+      keepalive: true,
+    });
+  } catch {
+    /* logging must never affect the prove */
+  }
 }
 
 /**
@@ -38,7 +56,7 @@ interface RunOpts {
  * playground page, etc. Resolves to the final {verified, proof} outcome.
  */
 export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
-  const { problem, mcpServers, model, signal, onEvent } = opts;
+  const { problem, mcpServers, model, signal, onEvent, source } = opts;
   const conn = bridgeConnection();
   const base = normalizeBase(opts.bridgeUrl ?? conn.bridgeUrl);
   const token = opts.token ?? conn.token ?? '';
@@ -82,6 +100,29 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
   const dec = new TextDecoder();
   let buf = '';
   let outcome: ProverOutcome | null = null;
+  // Captured for the admin debug log: the exact context the bridge handed the
+  // agent (from the `prompt` event) plus the closing text + latest metrics.
+  let context: {
+    prompt?: string;
+    model?: string | null;
+    mcpServers?: unknown;
+  } | null = null;
+  let finalText = '';
+  let lastMetrics: unknown;
+  const flush = () => {
+    if (!source) return;
+    logAgentRun({
+      source,
+      theorem: problem,
+      model: context?.model ?? model ?? null,
+      prompt: context?.prompt ?? null,
+      mcpServers: context?.mcpServers ?? mcpServers,
+      verified: outcome?.verified ?? false,
+      proof: outcome?.proof ?? '',
+      finalText,
+      metrics: lastMetrics,
+    });
+  };
 
   for (;;) {
     const { done, value } = await reader.read();
@@ -98,10 +139,20 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
         continue;
       }
       const metrics = d.metrics;
+      if (metrics) lastMetrics = metrics;
 
       switch (d.type) {
         case 'received':
           emit('received', 'Problem received by prover', { detail: d.problem });
+          break;
+        case 'prompt':
+          // The exact context the bridge built for the agent (admin debug log).
+          context = {
+            prompt: d.prompt,
+            model: d.model,
+            mcpServers: d.mcpServers,
+          };
+          emit('system', 'Full agent context captured', { detail: d.prompt });
           break;
         case 'system': {
           // Claude Code emits the rich init frame (model + connected MCP servers
@@ -122,8 +173,10 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
           emit('thinking', 'Thinking…', { detail: d.text || d.content, metrics });
           break;
         case 'text-delta':
-          if (typeof d.content === 'string' && d.content.trim())
+          if (typeof d.content === 'string' && d.content.trim()) {
+            finalText += d.content;
             emit('text', 'Output', { detail: d.content, metrics });
+          }
           break;
         case 'message-annotation': {
           if (d.subtype === 'tool_intent') {
@@ -175,11 +228,13 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
 
   if (!outcome) {
     emit('error', 'Prover stream ended without a result');
+    flush();
     throw new Error('prove stream ended without a result');
   }
   emit('done', outcome.verified ? 'Done — verified' : 'Done — unverified', {
     verified: outcome.verified,
     proof: outcome.proof,
   });
+  flush();
   return outcome;
 }

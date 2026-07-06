@@ -583,8 +583,9 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
     return
   }
 
+  const systemPrompt = provePrompt(theorem, mcpServers)
   const args = [
-    "-p", provePrompt(theorem, mcpServers),
+    "-p", systemPrompt,
     "--output-format", "stream-json", "--verbose",
     "--mcp-config", cfgPath, "--strict-mcp-config", "--dangerously-skip-permissions",
   ]
@@ -598,6 +599,23 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
       /* client gone */
     }
   }
+
+  // Surface the EXACT context handed to the agent so the app can log it for
+  // debugging (admin only): the full system prompt, the model, and the resolved
+  // MCP servers + tool inventory. Emitted before anything runs.
+  send({
+    type: "prompt",
+    prompt: systemPrompt,
+    model: opts.model || null,
+    theorem,
+    mcpServers: (mcpServers || []).map((s) => ({
+      name: s?.name,
+      url: s?.url,
+      tools: Array.isArray(s?.tools)
+        ? s.tools.map((t) => (typeof t === "string" ? t : t?.name)).filter(Boolean)
+        : undefined,
+    })),
+  })
 
   const start = Date.now()
   const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }

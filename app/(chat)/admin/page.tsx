@@ -7,6 +7,7 @@ import { isAdminEmail } from '@/lib/admin';
 import { listAdminJobs } from '@/lib/db/leak-queries';
 import { AdminPipeline } from '@/components/admin-pipeline';
 import { AdminQueueResolver } from '@/components/leak/admin-queue-resolver';
+import { AdminAgentLogs } from '@/components/leak/admin-agent-logs';
 import { LocalClaudeAgentManagement } from '@/components/local-claude-agent-management';
 import { MCPServerManagement } from '@/components/mcp-server-management';
 
@@ -57,6 +58,9 @@ async function AdminContent() {
 
       {/* Generate + prove + promote problems to CompeteMath */}
       <AdminPipeline />
+
+      {/* Full agent context + outcome for every prover run (admin debugging) */}
+      <AdminAgentLogs />
     </div>
   );
 }

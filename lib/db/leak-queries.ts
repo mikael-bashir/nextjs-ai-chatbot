@@ -5,8 +5,10 @@ import { sql as vercelSql } from '@vercel/postgres';
 import { drizzle } from 'drizzle-orm/vercel-postgres';
 
 import {
+  agentRunLog,
   apiKey,
   problemJob,
+  type AgentRunLog,
   type ApiKey,
   type ProblemJob,
 } from './schema';
@@ -18,7 +20,48 @@ if (!process.env.POSTGRES_URL) {
 // Self-contained client for the Leak API-service domain. drizzle-orm's
 // vercel-postgres adapter is stateless (HTTP), so a second instance is cheap
 // and keeps this feature decoupled from the large legacy queries.ts.
-const db = drizzle(vercelSql, { schema: { apiKey, problemJob } });
+const db = drizzle(vercelSql, { schema: { apiKey, problemJob, agentRunLog } });
+
+// ---------------------------------------------------------------------------
+// Admin debug log — full agent context + outcome per prover run (admin only).
+// ---------------------------------------------------------------------------
+export async function createAgentRunLog(input: {
+  userId?: string | null;
+  source: string;
+  theorem: string;
+  model?: string | null;
+  prompt?: string | null;
+  mcpServers?: unknown;
+  verified?: boolean | null;
+  proof?: string | null;
+  finalText?: string | null;
+  metrics?: unknown;
+}): Promise<AgentRunLog> {
+  const [row] = await db
+    .insert(agentRunLog)
+    .values({
+      userId: input.userId ?? null,
+      source: input.source,
+      theorem: input.theorem,
+      model: input.model ?? null,
+      prompt: input.prompt ?? null,
+      mcpServers: input.mcpServers ?? null,
+      verified: input.verified ?? null,
+      proof: input.proof ?? null,
+      finalText: input.finalText ?? null,
+      metrics: input.metrics ?? null,
+    })
+    .returning();
+  return row;
+}
+
+export async function listAgentRunLogs(limit = 50): Promise<AgentRunLog[]> {
+  return db
+    .select()
+    .from(agentRunLog)
+    .orderBy(desc(agentRunLog.createdAt))
+    .limit(limit);
+}
 
 // ---------------------------------------------------------------------------
 // API keys

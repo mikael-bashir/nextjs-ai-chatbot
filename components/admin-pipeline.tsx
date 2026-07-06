@@ -576,6 +576,7 @@ export function AdminPipeline() {
           token: conn.token,
           signal,
           onEvent,
+          source: 'acg',
         });
         const lim = detectSessionLimit(content);
         if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
