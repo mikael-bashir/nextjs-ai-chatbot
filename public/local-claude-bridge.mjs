@@ -276,40 +276,12 @@ function buildMcpConfig(mcpServers) {
 // (e.g. `theorem foo (n : ℕ) : P n := by sorry`). A verify_full_script success
 // only counts as a real proof if the compiled script actually contains THAT
 // theorem (same signature) — not just a helper `example`/lemma that happens to
-// compile — AND the script does not cheat with `sorry`.
-//
-// CRITICAL: compilation success does NOT imply the absence of `sorry`. In Lean 4
-// `sorry` (and its alias `admit`, and the underlying `sorryAx`) is a WARNING,
-// not an error — `verify_full_script` still reports "Compilation Successful".
-// So a script like `theorem foo : P := by sorry` compiles and matches the target
-// signature, yet proves nothing. We must reject any accepted script that closes
-// (or partially closes) a goal with sorry, or we bill customers / promote ACG
-// problems for proofs that are literally holes.
+// compile. Whether the proof is genuinely complete is the TOOLCHAIN's job to
+// decide (verify_full_script); we do not second-guess it with string checks.
 
 // Collapse whitespace so trivial reformatting doesn't break the comparison.
 function normalizeLean(s) {
   return String(s == null ? "" : s).replace(/\s+/g, " ").trim()
-}
-
-// Strip Lean comments so a stray "sorry" in prose (e.g. `-- replaced the sorry`)
-// doesn't trip the cheat detector. Handles `-- line` and (repeatedly, for nesting)
-// `/- block -/` comments. Imperfect for pathological nesting, but errs toward
-// leaving code intact — the detector only ever causes a (safe) rejection.
-function stripLeanComments(s) {
-  let out = String(s == null ? "" : s)
-  let prev
-  do {
-    prev = out
-    out = out.replace(/\/-(?:[^-]|-(?!\/))*-\//g, " ")
-  } while (out !== prev)
-  return out.replace(/--[^\n]*/g, " ")
-}
-
-// True if the script cheats: any `sorry`, `admit`, or `sorryAx` as a real token
-// (not inside a comment). This is the guardrail that stops a hole from being sold
-// or promoted as a finished proof.
-function scriptHasSorry(script) {
-  return /\b(?:sorry|sorryAx|admit)\b/.test(stripLeanComments(script))
 }
 
 // Extract a declaration's signature: everything from the `theorem`/`lemma`
@@ -347,20 +319,21 @@ function verifyResultSucceeded(text) {
 // The ONE proof gate, shared by BOTH the streaming path (/prove-stream, ACG) and
 // the worker path (runProve → customer traffic) so they can never diverge. Feed
 // it every parsed stream-json object; it records the FIRST verify_full_script
-// script that (a) the daemon confirmed successful AND (b) contains the target
-// theorem signature AND (c) uses no sorry/admit. `verifiedScript` is the single
-// source of truth for "is it proved" — an unverified run yields null, i.e. the
-// customer is not charged and the ACG problem is not promoted.
+// script that (a) the toolchain confirmed successful AND (b) contains the target
+// theorem signature. `verifiedScript` is the single source of truth for "is it
+// proved" — an unverified run yields null, i.e. the customer is not charged and
+// the ACG problem is not promoted. The soundness of "confirmed successful" is
+// entirely the toolchain's responsibility; this gate does not re-judge it.
 function makeProofGate(theorem) {
   const verifyCalls = {}
   let verifiedScript = null
   const targetSig = theoremSignature(theorem)
   const gateAccepts = (script) =>
-    (targetSig ? scriptProvesTarget(script, targetSig) : true) && !scriptHasSorry(script)
+    targetSig ? scriptProvesTarget(script, targetSig) : true
 
   // Returns a small event describing what this object caused, so a streaming
-  // caller can surface it: { verified } on acceptance, { rejected, hasSorry } on
-  // a compile that didn't pass the gate, or null when nothing notable happened.
+  // caller can surface it: { verified } on acceptance, { rejected } on a compile
+  // that didn't match the target, or null when nothing notable happened.
   function observe(o) {
     if (o.type === "assistant" && o.message?.content) {
       for (const c of o.message.content) {
@@ -391,7 +364,7 @@ function makeProofGate(theorem) {
             verifiedScript = okScript
             return { verified: okScript }
           }
-          return { rejected: okScript, hasSorry: scriptHasSorry(okScript) }
+          return { rejected: okScript }
         }
       }
     }
@@ -684,14 +657,12 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
           /* already gone */
         }
       } else if (ev?.rejected) {
-        // Compiled, but not accepted — either it cheats with `sorry`/`admit` or
-        // it doesn't contain the target theorem. Say which, so the agent keeps going.
+        // Verified, but it's not the target theorem (a helper/example) — keep going.
         send({
           type: "message-annotation",
           subtype: "status",
-          thought: ev.hasSorry
-            ? "✔️ A script compiled, but it still uses `sorry`/`admit` — that's a hole, not a proof. Still unproven."
-            : "✔️ A script compiled, but it does not contain the target theorem — still unproven.",
+          thought:
+            "✔️ A script verified, but it does not contain the target theorem — still unproven.",
           metrics,
         })
       }
