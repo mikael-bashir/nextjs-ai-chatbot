@@ -332,6 +332,80 @@ function scriptProvesTarget(script, targetSig) {
   return false
 }
 
+// True iff a verify_full_script tool result reports a genuine success. Verified
+// LIVE against the Leak II daemon (barkingtree-leak-ii.hf.space): a real proof
+// returns "✅ Compilation Successful! The proof is 100% verified.", while ANY
+// hole — bare `sorry`, `admit`, or a `sorry` inside a helper lemma — returns
+// "❌ Compilation Failed: … declaration uses `sorry`". So the daemon itself is
+// the first line of defence; we accept ONLY on the success phrase and never when
+// a failure/❌ marker is present (guards the "❌ … no goals" false-positive too).
+function verifyResultSucceeded(text) {
+  const t = String(text == null ? "" : text)
+  return /compilation successful|100% verified/i.test(t) && !/compilation failed|❌/i.test(t)
+}
+
+// The ONE proof gate, shared by BOTH the streaming path (/prove-stream, ACG) and
+// the worker path (runProve → customer traffic) so they can never diverge. Feed
+// it every parsed stream-json object; it records the FIRST verify_full_script
+// script that (a) the daemon confirmed successful AND (b) contains the target
+// theorem signature AND (c) uses no sorry/admit. `verifiedScript` is the single
+// source of truth for "is it proved" — an unverified run yields null, i.e. the
+// customer is not charged and the ACG problem is not promoted.
+function makeProofGate(theorem) {
+  const verifyCalls = {}
+  let verifiedScript = null
+  const targetSig = theoremSignature(theorem)
+  const gateAccepts = (script) =>
+    (targetSig ? scriptProvesTarget(script, targetSig) : true) && !scriptHasSorry(script)
+
+  // Returns a small event describing what this object caused, so a streaming
+  // caller can surface it: { verified } on acceptance, { rejected, hasSorry } on
+  // a compile that didn't pass the gate, or null when nothing notable happened.
+  function observe(o) {
+    if (o.type === "assistant" && o.message?.content) {
+      for (const c of o.message.content) {
+        if (
+          c.type === "tool_use" &&
+          String(c.name || "").endsWith("verify_full_script") &&
+          c.input &&
+          typeof c.input === "object" &&
+          typeof c.input.script === "string"
+        ) {
+          verifyCalls[c.id] = c.input.script
+        }
+      }
+    } else if (o.type === "user" && o.message?.content) {
+      for (const c of o.message.content) {
+        if (c.type !== "tool_result") continue
+        const t = Array.isArray(c.content)
+          ? c.content.map((x) => x.text || "").join("\n")
+          : String(c.content ?? "")
+        if (
+          !verifiedScript &&
+          c.tool_use_id &&
+          verifyCalls[c.tool_use_id] &&
+          verifyResultSucceeded(t)
+        ) {
+          const okScript = verifyCalls[c.tool_use_id]
+          if (gateAccepts(okScript)) {
+            verifiedScript = okScript
+            return { verified: okScript }
+          }
+          return { rejected: okScript, hasSorry: scriptHasSorry(okScript) }
+        }
+      }
+    }
+    return null
+  }
+
+  return {
+    observe,
+    get verifiedScript() {
+      return verifiedScript
+    },
+  }
+}
+
 // The goal is to let Claude use the tools logically on its own — but a bare
 // "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
 // on hard theorems and never actually build or check a proof. So we hand it an
@@ -406,41 +480,114 @@ Theorem:
 ${theorem}`
 }
 
-async function runProve(theorem, mcpServers, opts = {}) {
-  const start = Date.now()
+// Non-streaming prove used by the /prove route AND the customer-traffic worker.
+// GUARDRAIL: this must NOT trust the model's final prose. Like /prove-stream it
+// runs stream-json and feeds every line through the SHARED makeProofGate, so a
+// result is only "verified" when the daemon confirmed a target-matching, sorry-
+// free script. `verified`/`proof` reflect that gate; `finalText` is the model's
+// closing message, kept only for diagnostics. The worker charges on `verified`.
+function runProve(theorem, mcpServers, opts = {}) {
+  return new Promise((resolve) => {
+    const start = Date.now()
 
-  let cfgPath
-  try {
-    const dir = mkdtempSync(join(tmpdir(), "claude-prove-"))
-    cfgPath = join(dir, "mcp.json")
-    writeFileSync(cfgPath, JSON.stringify(buildMcpConfig(mcpServers)))
-  } catch (e) {
-    return { ok: false, proof: "", stderr: `failed to write mcp config: ${e.message}`, durationMs: 0 }
-  }
+    let cfgPath
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "claude-prove-"))
+      cfgPath = join(dir, "mcp.json")
+      writeFileSync(cfgPath, JSON.stringify(buildMcpConfig(mcpServers)))
+    } catch (e) {
+      resolve({ ok: false, verified: false, proof: "", finalText: "", stderr: `failed to write mcp config: ${e.message}`, durationMs: 0 })
+      return
+    }
 
-  // Flags verified against Claude Code 2.1.x: strict-mcp-config uses only these
-  // servers, dangerously-skip-permissions lets the agent call the MCP tools
-  // without prompting (it's the user's own machine + own tools).
-  const args = [
-    "-p", provePrompt(theorem, mcpServers),
-    "--output-format", "json",
-    "--mcp-config", cfgPath,
-    "--strict-mcp-config",
-    "--dangerously-skip-permissions",
-  ]
-  if (opts.model) args.push("--model", opts.model)
+    // Flags verified against Claude Code 2.1.x: strict-mcp-config uses only these
+    // servers, dangerously-skip-permissions lets the agent call the MCP tools
+    // without prompting (it's the user's own machine + own tools). stream-json
+    // (not json) so we can watch each verify_full_script result as it lands.
+    const args = [
+      "-p", provePrompt(theorem, mcpServers),
+      "--output-format", "stream-json", "--verbose",
+      "--mcp-config", cfgPath,
+      "--strict-mcp-config",
+      "--dangerously-skip-permissions",
+    ]
+    if (opts.model) args.push("--model", opts.model)
 
-  const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 3600000)
-  const result = await runClaude(args, { cwd: opts.workingDirectory || undefined, timeoutMs })
+    let child
+    try {
+      child = spawn(CLAUDE_BIN, args, {
+        cwd: opts.workingDirectory || process.cwd(),
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      })
+    } catch (e) {
+      resolve({ ok: false, verified: false, proof: "", finalText: "", stderr: `Failed to launch "${CLAUDE_BIN}": ${e.message}`, durationMs: Date.now() - start })
+      return
+    }
 
-  return {
-    ok: result.ok,
-    proof: result.text,
-    exitCode: result.exitCode,
-    durationMs: Date.now() - start,
-    timedOut: result.timedOut,
-    stderr: result.stderr,
-  }
+    const gate = makeProofGate(theorem)
+    const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 3600000)
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      child.kill("SIGKILL")
+    }, timeoutMs)
+
+    let buf = ""
+    let stderr = ""
+    let finalText = ""
+
+    child.stdout.on("data", (chunk) => {
+      buf += chunk.toString("utf8")
+      let nl
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        if (!line.trim()) continue
+        let o
+        try {
+          o = JSON.parse(line)
+        } catch {
+          continue
+        }
+        const ev = gate.observe(o)
+        if (ev?.verified) {
+          // Target proved and daemon-confirmed — stop now instead of letting the
+          // agent wander to the timeout; the close handler resolves the result.
+          try {
+            child.kill("SIGKILL")
+          } catch {
+            /* already gone */
+          }
+        }
+        if (o.type === "result") finalText = o.result || ""
+      }
+    })
+
+    child.stderr.on("data", (c) => {
+      stderr += c.toString("utf8")
+    })
+
+    child.on("error", (e) => {
+      clearTimeout(timer)
+      resolve({ ok: false, verified: false, proof: "", finalText, exitCode: null, durationMs: Date.now() - start, timedOut, stderr: e.message })
+    })
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      const verifiedScript = gate.verifiedScript
+      resolve({
+        // ok = the process ran cleanly; verified = the daemon-gated proof exists.
+        ok: (code === 0 || !!verifiedScript) && !timedOut,
+        verified: !!verifiedScript,
+        proof: verifiedScript || "",
+        finalText,
+        exitCode: code,
+        durationMs: Date.now() - start,
+        timedOut,
+        stderr,
+      })
+    })
+  })
 }
 
 // Streaming variant of /prove: runs Claude with stream-json and translates each
@@ -481,21 +628,9 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
 
   // System gate: the ONE enforced restriction. We only accept a proof that the
   // harness itself watched pass verify_full_script — not one Claude merely
-  // claims. Map each verify_full_script call id -> its script, and record the
-  // script when the matching result reports success AND that script actually
-  // contains the user's target theorem (not just a helper example that compiles).
-  const verifyCalls = {}
-  let verifiedScript = null
-  // Parsed once from the input (always the target signature proven by `sorry`).
-  // If we can't parse a signature, fall back to the old behaviour (accept any
-  // successful compile) rather than silently rejecting every run.
-  const targetSig = theoremSignature(theorem)
-  // Two conditions, both required: (1) the script contains the target theorem
-  // (signature match, or accept-any if we couldn't parse a signature) and
-  // (2) it does NOT cheat with sorry/admit anywhere — a hole in a helper lemma
-  // poisons the main result just as much as a hole in the target itself.
-  const gateAccepts = (script) =>
-    (targetSig ? scriptProvesTarget(script, targetSig) : true) && !scriptHasSorry(script)
+  // claims. This is the SAME makeProofGate the worker's runProve uses, so the
+  // ACG/interactive path and customer traffic can never diverge on what counts.
+  const gate = makeProofGate(theorem)
 
   let child
   try {
@@ -535,20 +670,38 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
       }
       metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
 
+      // Feed EVERY object to the shared proof gate first — it tracks
+      // verify_full_script calls and records a daemon-verified, gate-passing
+      // script. Then emit the display events below.
+      const ev = gate.observe(o)
+      if (ev?.verified) {
+        // Target theorem proved. Claude won't self-terminate on a tool success,
+        // so stop it now instead of letting it wander until the timeout; the
+        // close handler emits the verified proof.
+        try {
+          child.kill("SIGKILL")
+        } catch {
+          /* already gone */
+        }
+      } else if (ev?.rejected) {
+        // Compiled, but not accepted — either it cheats with `sorry`/`admit` or
+        // it doesn't contain the target theorem. Say which, so the agent keeps going.
+        send({
+          type: "message-annotation",
+          subtype: "status",
+          thought: ev.hasSorry
+            ? "✔️ A script compiled, but it still uses `sorry`/`admit` — that's a hole, not a proof. Still unproven."
+            : "✔️ A script compiled, but it does not contain the target theorem — still unproven.",
+          metrics,
+        })
+      }
+
       if (o.type === "assistant" && o.message?.content) {
         metrics.llm_invocations++
         for (const c of o.message.content) {
           if (c.type === "tool_use") {
             metrics.tools_invoked++
             const name = stripName(c.name)
-            if (
-              String(c.name || "").endsWith("verify_full_script") &&
-              c.input &&
-              typeof c.input === "object" &&
-              typeof c.input.script === "string"
-            ) {
-              verifyCalls[c.id] = c.input.script
-            }
             send({
               type: "message-annotation",
               subtype: "tool_intent",
@@ -570,41 +723,6 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
             const t = Array.isArray(c.content)
               ? c.content.map((x) => x.text || "").join("\n")
               : String(c.content ?? "")
-            // Success detection is intentionally strict: verify_full_script
-            // reports success ONLY as "Compilation Successful" / "100% verified".
-            // We must NOT match on "no goals" — that phrase appears in FAILURE
-            // messages (e.g. `❌ Compilation Failed: Line 5: no goals`, the common
-            // error from a tactic after the proof is already closed), which would
-            // otherwise be mis-read as success.
-            const verifySucceeded =
-              /compilation successful|100% verified/i.test(t) &&
-              !/compilation failed|❌/i.test(t)
-            if (!verifiedScript && c.tool_use_id && verifyCalls[c.tool_use_id] && verifySucceeded) {
-              const okScript = verifyCalls[c.tool_use_id]
-              if (gateAccepts(okScript)) {
-                verifiedScript = okScript
-                // Target theorem proved. Claude won't self-terminate on a tool
-                // success, so stop it now instead of letting it wander until the
-                // timeout; the close handler emits the verified proof.
-                try {
-                  child.kill("SIGKILL")
-                } catch {
-                  /* already gone */
-                }
-              } else {
-                // Compiled, but not accepted — either it cheats with `sorry`
-                // (compiles with only a warning) or it doesn't contain the
-                // target theorem. Say which, so the agent knows to keep going.
-                send({
-                  type: "message-annotation",
-                  subtype: "status",
-                  thought: scriptHasSorry(okScript)
-                    ? "✔️ A script compiled, but it still uses `sorry`/`admit` — that's a hole, not a proof. Still unproven."
-                    : "✔️ A script compiled, but it does not contain the target theorem — still unproven.",
-                  metrics,
-                })
-              }
-            }
             send({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t, metrics })
           }
         }
@@ -641,6 +759,7 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   child.on("close", () => {
     clearTimeout(timer)
     // Enforce the gate: accept only a harness-verified script.
+    const verifiedScript = gate.verifiedScript
     if (verifiedScript) {
       send({
         type: "message-annotation",
@@ -1033,15 +1152,17 @@ async function proveLeasedJob(job) {
       model: WORKER_MODEL || undefined,
     })
     clearInterval(beat)
-    // NOTE (plumbing): success == claude returned a non-empty proof. Kernel-level
-    // verification (scriptProvesTarget) should gate this before it charges money;
-    // wired later with the real prover MCP servers.
-    if (out.ok && out.proof && out.proof.trim()) {
+    // GUARDRAIL: complete (and charge) ONLY on a daemon-verified proof. runProve
+    // now runs the SAME makeProofGate as /prove-stream — out.verified is true
+    // only when verify_full_script confirmed a target-matching, sorry-free
+    // script. A model that merely claims success (out.finalText) does NOT count.
+    if (out.verified && out.proof && out.proof.trim()) {
       await workerComplete(job.id, { proof: out.proof, modelId: WORKER_MODEL || "claude" })
       console.log(`[worker] proved ${job.id} in ${out.durationMs}ms`)
     } else {
-      const error =
-        out.stderr || (out.timedOut ? "prover timed out" : "no proof produced")
+      const error = out.timedOut
+        ? "prover timed out"
+        : out.stderr || "no verified proof produced"
       await workerComplete(job.id, { error, modelId: WORKER_MODEL || "claude" })
       console.log(`[worker] failed ${job.id}: ${error.slice(0, 120)}`)
     }
