@@ -437,17 +437,21 @@ Only the ids that actually exist will load; use those. Never invent a server nam
 
 ${toolSection}
 
-Tool roles: verify_full_script compiles a whole script and is your source of truth (a proof only counts when it reports success with no errors and no \`sorry\`); init_proof/apply_tactic advance a goal incrementally; moogle_search/loogle_search look up lemma names.
+You have a full toolkit. Reach for it — don't reason in the abstract when a tool can answer the question for you. Each tool is for a different job:
+- verify_full_script — compiles a whole script; it is the SOURCE OF TRUTH. A proof only counts when it reports success on the target theorem with no errors and no \`sorry\`.
+- init_proof + apply_tactic — open the goal as a LIVE proof state and advance it ONE tactic at a time, seeing the exact resulting goals, hypotheses and elaborated types after each step (the Lean Infoview, as an API). Lean on these whenever a goal is intricate, a signature is fiddly, or a whole-script attempt fails in a way you don't understand — stepping through interactively shows you what actually works far faster than guessing at a full script.
+- get_current_proof_state — dump the script built so far and the remaining goals for a proof state.
+- moogle_search — semantic/English search to DISCOVER a lemma name or Mathlib naming convention. loogle_search — exact type/pattern search once you know roughly what you're after.
 
-WORKFLOW — follow it in order, do not get stuck searching:
-0. Load the tools (ToolSearch select, as above). This is mandatory and comes first.
-1. Immediately write a first candidate proof script based on the goal (start from the statement below, replacing \`sorry\` with your best attempt) and call verify_full_script on it. Do this BEFORE any library search — you learn the most from the compiler's actual errors.
-2. Read the compiler errors and fix them. Iterate: edit the script and call verify_full_script again. If the tactic tools work, use them to advance the goal step by step and confirm each step compiles. (If init_proof/apply_tactic return a server error, don't retry them in a loop — fall back to editing the full script and verify_full_script.)
-3. Only use moogle_search / loogle_search when you need a SPECIFIC lemma name to close a specific goal.
-4. A proof is done ONLY when verify_full_script reports success on a script that contains the ORIGINAL theorem below — same name and signature — proven with no \`sorry\`. Verifying helper \`example\`s or side lemmas is fine for exploration but does NOT count as success; the run is only accepted when the target theorem itself compiles. Keep iterating until then.
-5. Then output that final verified proof (the one containing the target theorem) as a single \`\`\`lean code block.
+WORKFLOW:
+0. Load the tools (ToolSearch select, as above). Mandatory, first.
+1. Write a first candidate proof from the statement below (replace \`sorry\`) and call verify_full_script — do this BEFORE searching; the compiler's real errors teach you the most.
+2. Iterate. Read the errors and fix the script; re-run verify_full_script. When a subgoal is intricate or an error is opaque, OPEN it with init_proof/apply_tactic and step through it to see the true goal state, then fold what worked back into the script. Prefer stepping through a hard goal over staring at it.
+3. Search when you need a specific lemma: moogle_search first to find a name, then loogle_search to pin the exact signature.
+4. If ANY tool errors or hangs, do NOT retry it in a loop — pivot to a different tool or approach and keep moving.
+5. A proof is done ONLY when verify_full_script reports success on a script containing the ORIGINAL theorem below — same name and signature — with no \`sorry\`. Verifying helper \`example\`s or side lemmas is fine for exploration but does NOT count. Then output that final verified proof as a single \`\`\`lean code block.
 
-HARD RULE — this is the difference between working and failing: NEVER make more than 2 search calls (moogle_search/loogle_search) in a row. After at most 2 searches you MUST call verify_full_script again with an updated script. If you have not resolved a subgoal, keep \`sorry\` on that part and verify the rest anyway — a partial script that compiles-with-sorry tells you what actually works and isolates the real problem. A long run of searches with no verify in between is the failure mode we are preventing: do not do it. Count your consecutive searches; at 2, stop and verify. verify_full_script should be your most-used tool by far, not moogle/loogle.
+Keep momentum: attempt → verify → when stuck, step through with the interactive tools or look up the lemma → attempt again. Don't spend a long stretch only searching or only thinking; put the goal through the tools.
 
 Theorem:
 ${theorem}`
