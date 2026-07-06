@@ -12,6 +12,9 @@ import {
   fetchProverMcpServers,
   type ProverMcpServer,
 } from '@/lib/mcp/fetch-prover-servers';
+import { runProverStream } from '@/lib/prover/run-prover-stream';
+import { ProverConsole } from '@/components/prover/prover-console';
+import type { ProverEvent } from '@/lib/prover/types';
 import { MathMarkdown } from '@/components/math-markdown';
 
 const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
@@ -454,9 +457,9 @@ export function AdminPipeline() {
   const [verifyQueue, setVerifyQueue] = useState<GeneratedItem[]>([]);
   const [verifyingId, setVerifyingId] = useState<string | null>(null);
   const [verifyPaused, setVerifyPaused] = useState<string | null>(null);
-  const [verifyActivity, setVerifyActivity] = useState<
-    Array<{ id: number; tool: string }>
-  >([]);
+  // Full, normalized prover activity for the shared <ProverConsole> (thinking,
+  // tool calls, tool results/errors, verify attempts, metrics) — not just names.
+  const [verifyEvents, setVerifyEvents] = useState<ProverEvent[]>([]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -545,68 +548,46 @@ export function AdminPipeline() {
 
   const fetchMcp = (): Promise<ProverMcpServer[]> => fetchProverMcpServers();
 
-  // Prove via the SHARED bridge; collect tool activity for display. THROWS on a
-  // connectivity/protocol failure (unreachable bridge, non-2xx, no completion
-  // event) so the verifier can treat that as transient and keep the item queued,
+  // Prove via the SHARED bridge, streaming EVERY step into <ProverConsole> via
+  // the same runProverStream the admin queue resolver + playground use. THROWS on
+  // a connectivity/protocol failure (unreachable bridge, non-2xx, no completion
+  // event) so the verifier treats it as transient and keeps the item queued,
   // rather than mis-marking it "failed". Returns an outcome only on a real
-  // `done` event.
+  // `done` event. A usage-limit message is detected from the streamed text and
+  // rethrown as `__limit__` so the loop pauses instead of failing the item.
   const proveStream = useCallback(
     async (
       lean: string,
       mcpServers: ProverMcpServer[],
       signal?: AbortSignal,
     ) => {
-      let res: Response;
-      try {
-        res = await callBridge(false, '/prove-stream', {
-          method: 'POST',
-          body: JSON.stringify({ theorem: lean, mcpServers }),
-          signal,
-        });
-      } catch {
-        if (signal?.aborted) throw new Error('__aborted__');
-        throw new Error("couldn't reach the verification (shared) bridge");
-      }
-      if (!res.ok || !res.body) {
-        throw new Error(`prove bridge returned ${res.status}`);
-      }
-      const reader = res.body.getReader();
-      const dec = new TextDecoder();
-      let buf = '';
+      const conn = connFor(false); // shared (verification) bridge
       let content = ''; // accumulate text to detect a session-limit message
-      let outcome: { verified: boolean; proof: string } | null = null;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
-        const events = buf.split('\n\n');
-        buf = events.pop() || '';
-        for (const e of events) {
-          if (!e.startsWith('data:')) continue;
-          try {
-            const d = JSON.parse(e.replace(/^data:\s*/, ''));
-            if (d.type === 'message-annotation' && d.tool) {
-              setVerifyActivity((a) => [
-                ...a.slice(-9),
-                { id: Date.now() + a.length, tool: String(d.tool) },
-              ]);
-            }
-            if (typeof d.content === 'string') content += d.content;
-            if (typeof d.message === 'string') content += ` ${d.message}`;
-            if (d.type === 'done')
-              outcome = { verified: !!d.verified, proof: d.proof || '' };
-          } catch {
-            /* ignore */
-          }
-        }
+      const onEvent = (ev: ProverEvent) => {
+        setVerifyEvents((prev) => [...prev, ev]);
+        if (ev.detail) content += ` ${ev.detail}`;
+        if (ev.label) content += ` ${ev.label}`;
+      };
+      try {
+        const outcome = await runProverStream({
+          problem: lean,
+          mcpServers,
+          bridgeUrl: conn.bridgeUrl,
+          token: conn.token,
+          signal,
+          onEvent,
+        });
+        const lim = detectSessionLimit(content);
+        if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
+        return outcome;
+      } catch (e) {
+        // A usage limit takes priority even when the stream ended abruptly.
+        const lim = detectSessionLimit(content);
+        if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
+        throw e; // abort (runVerifier checks signal.aborted) or transient
       }
-      // Surface a usage-limit hit so the verifier pauses instead of failing.
-      const lim = detectSessionLimit(content);
-      if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
-      if (!outcome) throw new Error('prove stream ended without a result');
-      return outcome;
     },
-    [callBridge],
+    [],
   );
 
   const patchGenerated = async (id: string, patch: Record<string, unknown>) => {
@@ -637,7 +618,7 @@ export function AdminPipeline() {
         const item = queueRef.current[0];
         verifyingIdRef.current = item.id;
         setVerifyingId(item.id);
-        setVerifyActivity([]);
+        setVerifyEvents([]);
         const ctrl = new AbortController();
         verifyAbortRef.current = ctrl;
         setVerifyStartedAt(Date.now());
@@ -1452,17 +1433,13 @@ export function AdminPipeline() {
             </button>
           </div>
         )}
-        {verifyingId && verifyActivity.length > 0 && (
-          <div className="mb-2 flex flex-wrap gap-1">
-            {verifyActivity.map((t) => (
-              <span
-                key={t.id}
-                className="rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
-              >
-                {t.tool}
-              </span>
-            ))}
-          </div>
+        {verifyEvents.length > 0 && (
+          <ProverConsole
+            events={verifyEvents}
+            running={!!verifyingId}
+            title="Verification activity"
+            className="mb-2"
+          />
         )}
         <div className="space-y-1.5">
           {verifyQueue.length === 0 && (
