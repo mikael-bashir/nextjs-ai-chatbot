@@ -914,3 +914,108 @@ async function connectRelay() {
 if (RELAY_URL && RELAY_TOKEN) {
   connectRelay()
 }
+
+// ---------------------------------------------------------------------------
+// Worker mode (optional). When WORKER_URL + WORKER_SECRET are set, this machine
+// also drains the app's deployment queue (the Leak API service): it leases a
+// queued problem, proves it with the SAME runProve() that backs /prove,
+// heartbeats while proving, and posts the result back. It reuses the app's
+// worker data-plane (/api/worker/lease|heartbeat|complete) and everything the
+// bridge already has (claude spawn, prove prompt, mcp config, timeouts).
+// ---------------------------------------------------------------------------
+const WORKER_URL = (process.env.WORKER_URL || "").replace(/\/$/, "")
+const WORKER_SECRET = process.env.WORKER_SECRET || ""
+const WORKER_ID = process.env.WORKER_ID || `bridge-${process.pid}`
+const WORKER_POLL_MS = Math.max(Number(process.env.WORKER_POLL_MS) || 5000, 1000)
+// Empty model => the CLI's configured default (i.e. the operator's Max plan).
+const WORKER_MODEL = process.env.WORKER_MODEL || ""
+// Prover MCP servers the agent may drive. Provided by the lease response when
+// the app supplies them, else from WORKER_MCP_CONFIG (a JSON array), else none.
+let WORKER_MCP = []
+try {
+  WORKER_MCP = process.env.WORKER_MCP_CONFIG
+    ? JSON.parse(process.env.WORKER_MCP_CONFIG)
+    : []
+} catch {
+  console.error("[worker] WORKER_MCP_CONFIG is not valid JSON — ignoring")
+}
+
+function workerHeaders() {
+  return { "content-type": "application/json", "x-worker-secret": WORKER_SECRET }
+}
+
+async function leaseJob() {
+  const res = await fetch(`${WORKER_URL}/api/worker/lease`, {
+    method: "POST",
+    headers: workerHeaders(),
+    body: JSON.stringify({ workerId: WORKER_ID }),
+  })
+  if (!res.ok) throw new Error(`lease responded ${res.status}`)
+  const data = await res.json()
+  return data.job || null
+}
+
+async function workerComplete(jobId, body) {
+  await fetch(`${WORKER_URL}/api/worker/complete`, {
+    method: "POST",
+    headers: workerHeaders(),
+    body: JSON.stringify({ jobId, workerId: WORKER_ID, ...body }),
+  }).catch((e) => console.error("[worker] complete POST failed:", e.message))
+}
+
+async function workerHeartbeat(jobId) {
+  await fetch(`${WORKER_URL}/api/worker/heartbeat`, {
+    method: "POST",
+    headers: workerHeaders(),
+    body: JSON.stringify({ jobId, workerId: WORKER_ID, status: "proving" }),
+  }).catch(() => {})
+}
+
+async function proveLeasedJob(job) {
+  const mcp = Array.isArray(job.mcpServers) ? job.mcpServers : WORKER_MCP
+  // Keep the lease alive across a long proof (lease window is minutes).
+  const beat = setInterval(() => workerHeartbeat(job.id), 30000)
+  try {
+    const out = await runProve(job.problem, mcp, {
+      model: WORKER_MODEL || undefined,
+    })
+    clearInterval(beat)
+    // NOTE (plumbing): success == claude returned a non-empty proof. Kernel-level
+    // verification (scriptProvesTarget) should gate this before it charges money;
+    // wired later with the real prover MCP servers.
+    if (out.ok && out.proof && out.proof.trim()) {
+      await workerComplete(job.id, { proof: out.proof, modelId: WORKER_MODEL || "claude" })
+      console.log(`[worker] proved ${job.id} in ${out.durationMs}ms`)
+    } else {
+      const error =
+        out.stderr || (out.timedOut ? "prover timed out" : "no proof produced")
+      await workerComplete(job.id, { error, modelId: WORKER_MODEL || "claude" })
+      console.log(`[worker] failed ${job.id}: ${error.slice(0, 120)}`)
+    }
+  } catch (e) {
+    clearInterval(beat)
+    await workerComplete(job.id, { error: e.message })
+  }
+}
+
+async function workerLoop() {
+  console.log(`[worker] draining queue at ${WORKER_URL} as ${WORKER_ID}`)
+  for (;;) {
+    let got = false
+    try {
+      const job = await leaseJob()
+      if (job) {
+        console.log(`[worker] leased ${job.id}`)
+        await proveLeasedJob(job)
+        got = true // a job was handled — loop again immediately
+      }
+    } catch (e) {
+      console.error("[worker] lease error:", e.message)
+    }
+    if (!got) await new Promise((r) => setTimeout(r, WORKER_POLL_MS))
+  }
+}
+
+if (WORKER_URL && WORKER_SECRET) {
+  workerLoop()
+}

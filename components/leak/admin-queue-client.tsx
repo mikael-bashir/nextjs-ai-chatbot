@@ -43,6 +43,11 @@ export function AdminQueueClient({ initialJobs }: { initialJobs: JobView[] }) {
     return { open, resolved };
   }, [jobs]);
 
+  const origin = typeof window !== 'undefined' ? window.location.origin : '';
+  const workerCmd = `curl -fsSL '${origin}/local-claude-bridge.mjs' -o claude-bridge.mjs && \\
+WORKER_URL='${origin}' WORKER_SECRET='<LEAK_WORKER_SECRET>' WORKER_MODEL='claude-opus-4-8' \\
+  node claude-bridge.mjs`;
+
   const refresh = useCallback(async () => {
     setRefreshing(true);
     try {
@@ -224,6 +229,20 @@ export function AdminQueueClient({ initialJobs }: { initialJobs: JobView[] }) {
           ))}
         </ul>
       )}
+
+      {/* Run a worker to drain the queue automatically */}
+      <div className="mt-10 rounded-lg border bg-muted/40 p-4">
+        <p className="mb-1 text-sm font-semibold">Drain automatically</p>
+        <p className="mb-3 text-xs text-muted-foreground">
+          Run this on your machine (with Claude Code logged in) to prove queued
+          problems on your Max/Opus plan. Replace{' '}
+          <code className="font-mono">&lt;LEAK_WORKER_SECRET&gt;</code> with the
+          value from your app env.
+        </p>
+        <pre className="overflow-x-auto rounded bg-background/60 p-3 font-mono text-[11px] leading-relaxed">
+          {workerCmd}
+        </pre>
+      </div>
     </div>
   );
 }

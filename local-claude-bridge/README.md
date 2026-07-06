@@ -44,6 +44,34 @@ irm 'https://<app-origin>/local-claude-bridge.mjs' -OutFile claude-bridge.mjs
 $env:BRIDGE_TOKEN='<generated>'; $env:ALLOWED_ORIGINS='https://<app-origin>'; node claude-bridge.mjs
 ```
 
+## Worker mode — drain the Leak API queue
+
+The same script can act as a **worker** for the Leak API service: it leases
+queued problems from the app, proves each one with the *same* `runProve()` that
+backs `/prove`, heartbeats while proving, and posts the result back. Set two env
+vars and it starts a poll loop alongside (or instead of) the HTTP server:
+
+```sh
+WORKER_URL='https://leak.competemath.com' \
+WORKER_SECRET='<LEAK_WORKER_SECRET from the app env>' \
+  node claude-bridge.mjs
+```
+
+| Var | Default | Meaning |
+|-----|---------|---------|
+| `WORKER_URL` | — | App origin. Set (with `WORKER_SECRET`) to enable worker mode. |
+| `WORKER_SECRET` | — | Must equal the app's `LEAK_WORKER_SECRET`. |
+| `WORKER_ID` | `bridge-<pid>` | Label recorded on leased jobs. |
+| `WORKER_POLL_MS` | `5000` | How often to poll when the queue is empty. |
+| `WORKER_MODEL` | CLI default | e.g. `claude-opus-4-8`; empty = your Max plan default. |
+| `WORKER_MCP_CONFIG` | `[]` | JSON array of prover MCP servers (`{name,url}`) for the agent to drive. |
+
+It reuses the app's worker data-plane: `POST /api/worker/lease`,
+`/api/worker/heartbeat`, `/api/worker/complete`. Runs happily in the same
+process as the loopback server (both, one, or neither activate based on which
+env vars you set). A crashed/closed worker's in-flight job auto-requeues once its
+lease expires, so it's safe to just Ctrl-C.
+
 ## Security
 
 - Binds to `127.0.0.1` only — not reachable from your network.
