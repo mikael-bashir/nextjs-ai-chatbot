@@ -308,3 +308,82 @@ export const generatedProblem = pgTable('GeneratedProblem', {
 });
 
 export type GeneratedProblem = InferSelectModel<typeof generatedProblem>;
+
+// ---------------------------------------------------------------------------
+// Leak API service — customers authenticate to the public /v1 API with a
+// bearer API key (not a browser session). We store only the SHA-256 hash of
+// the secret; the plaintext is shown exactly once, at creation time.
+// ---------------------------------------------------------------------------
+export const apiKey = pgTable('ApiKey', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  userId: uuid('userId')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+  // Human label so a user can tell keys apart (e.g. "production", "laptop").
+  name: varchar('name', { length: 64 }).notNull().default('default'),
+  // SHA-256 (hex) of the full secret. Unique so a lookup can be a single eq().
+  keyHash: varchar('keyHash', { length: 64 }).notNull().unique(),
+  // Non-secret display prefix, e.g. "leak_sk_9f2a…" for the dashboard list.
+  prefix: varchar('prefix', { length: 24 }).notNull(),
+  lastUsedAt: timestamp('lastUsedAt'),
+  revokedAt: timestamp('revokedAt'),
+  createdAt: timestamp('createdAt').notNull().defaultNow(),
+});
+
+export type ApiKey = InferSelectModel<typeof apiKey>;
+
+// ---------------------------------------------------------------------------
+// Deployment queue. One row per submitted problem. The operator's worker
+// leases queued jobs (lease + heartbeat so a dead worker's job re-queues),
+// proves them, and reports back. Refund-on-failure and the pricing-research
+// fields (class, quoted vs charged credits, token usage) live here so we can
+// mine historical data to set margins.
+// ---------------------------------------------------------------------------
+export const problemJob = pgTable('ProblemJob', {
+  id: uuid('id').primaryKey().notNull().defaultRandom(),
+  userId: uuid('userId')
+    .notNull()
+    .references(() => user.id, { onDelete: 'cascade' }),
+  // Which key submitted it (null if revoked/deleted later). Not the auth path.
+  apiKeyId: uuid('apiKeyId').references(() => apiKey.id, {
+    onDelete: 'set null',
+  }),
+  problem: text('problem').notNull(),
+  // Mock jobs skip the prover and resolve to a canned proved result so a new
+  // user can exercise the whole submit→poll flow immediately after signup.
+  isMock: boolean('isMock').notNull().default(false),
+  status: varchar('status', {
+    enum: [
+      'queued',
+      'leased',
+      'proving',
+      'proved',
+      'failed',
+      'refunded',
+      'cancelled',
+    ],
+  })
+    .notNull()
+    .default('queued'),
+  // Pricing research: assigned class + the credits held at submit vs finally
+  // captured. On failure chargedCredits stays 0 (money-back guarantee).
+  pricingClass: varchar('pricingClass', { length: 32 }),
+  quotedCredits: real('quotedCredits'),
+  chargedCredits: real('chargedCredits'),
+  // Worker lease bookkeeping.
+  leasedBy: varchar('leasedBy', { length: 128 }),
+  leaseExpiresAt: timestamp('leaseExpiresAt'),
+  heartbeatAt: timestamp('heartbeatAt'),
+  attempts: integer('attempts').notNull().default(0),
+  // Result + telemetry for the pricing model.
+  proof: text('proof'),
+  resultError: text('resultError'),
+  tokensInput: integer('tokensInput'),
+  tokensOutput: integer('tokensOutput'),
+  modelId: varchar('modelId', { length: 128 }),
+  createdAt: timestamp('createdAt').notNull().defaultNow(),
+  leasedAt: timestamp('leasedAt'),
+  finishedAt: timestamp('finishedAt'),
+});
+
+export type ProblemJob = InferSelectModel<typeof problemJob>;

@@ -97,6 +97,17 @@ export const authConfig = {
 
       if (nextUrl.pathname.startsWith('/api/auth')) return true;
 
+      // Public Leak API: authenticated by a bearer API key (not a session
+      // cookie) and verified inside each handler. Must bypass the session gate
+      // below or every API call would 401. Likewise the worker data-plane,
+      // which authenticates with a relay token.
+      if (
+        nextUrl.pathname.startsWith('/api/v1') ||
+        nextUrl.pathname.startsWith('/api/worker')
+      ) {
+        return true;
+      }
+
       // Stripe webhooks are signature-verified inside the handler
       if (nextUrl.pathname.startsWith('/api/webhooks')) return true;
 
