@@ -1,4 +1,5 @@
 import { Suspense } from 'react';
+import Link from 'next/link';
 import { redirect } from 'next/navigation';
 
 import { auth } from '@/app/(auth)/auth';
@@ -42,6 +43,12 @@ async function AdminContent() {
         <div className="mt-4 flex flex-wrap items-center gap-2">
           <LocalClaudeAgentManagement />
           <MCPServerManagement />
+          <Link
+            href="/playground"
+            className="inline-flex h-[34px] items-center rounded-md border px-3 text-sm font-medium transition-colors hover:bg-muted"
+          >
+            Playground →
+          </Link>
         </div>
       </div>
 

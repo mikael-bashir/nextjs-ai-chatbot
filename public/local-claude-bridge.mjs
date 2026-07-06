@@ -527,6 +527,9 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
             })
           } else if (c.type === "text" && c.text && c.text.trim()) {
             send({ type: "message-annotation", subtype: "status", thought: c.text.trim().slice(0, 300), metrics })
+          } else if (c.type === "thinking" && c.thinking) {
+            // Extended-thinking blocks — stream the model's reasoning.
+            send({ type: "thinking", text: String(c.thinking).slice(0, 2000), metrics })
           }
         }
       } else if (o.type === "user" && o.message?.content) {
@@ -572,6 +575,21 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
         }
       } else if (o.type === "result") {
         finalText = o.result || ""
+      } else if (o.type === "system") {
+        // Claude Code init frame — surface the run context (model, the MCP
+        // servers it connected, how many tools it can drive).
+        const servers = Array.isArray(o.mcp_servers)
+          ? o.mcp_servers.map((s) => s?.name || s).filter(Boolean).join(", ")
+          : ""
+        const nTools = Array.isArray(o.tools) ? o.tools.length : undefined
+        send({
+          type: "system",
+          model: o.model,
+          detail: [servers && `MCP: ${servers}`, nTools != null && `${nTools} tools`]
+            .filter(Boolean)
+            .join(" · "),
+          metrics,
+        })
       }
     }
   })

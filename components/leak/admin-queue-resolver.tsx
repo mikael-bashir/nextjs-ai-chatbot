@@ -1,22 +1,14 @@
 'use client';
 
 import { useCallback, useMemo, useState } from 'react';
-import {
-  Check,
-  Loader2,
-  RefreshCw,
-  X,
-  Coins,
-  Cpu,
-  Zap,
-} from 'lucide-react';
+import { Check, Loader2, RefreshCw, X, Coins, Cpu, Zap } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import {
-  fetchProverMcpServers,
-  type ProverMcpServer,
-} from '@/lib/mcp/fetch-prover-servers';
+import { fetchProverMcpServers } from '@/lib/mcp/fetch-prover-servers';
+import { runProverStream } from '@/lib/prover/run-prover-stream';
+import { ProverConsole } from '@/components/prover/prover-console';
+import type { ProverEvent, ProverOutcome } from '@/lib/prover/types';
 
 interface JobView {
   id: string;
@@ -39,69 +31,6 @@ const STATUS_STYLE: Record<string, string> = {
   failed: 'bg-destructive/15 text-destructive',
 };
 
-// ── Bridge connection (same localStorage contract AdminPipeline uses) ────────
-function bridgeConn(): { bridgeUrl?: string; token?: string } {
-  try {
-    return JSON.parse(localStorage.getItem('lca.connection') || '{}');
-  } catch {
-    return {};
-  }
-}
-function bridgeBase(conn: { bridgeUrl?: string }): string {
-  let b = (conn.bridgeUrl || 'http://localhost:4123').replace(/\/$/, '');
-  if (!/^https?:\/\//i.test(b)) b = `http://${b}`;
-  return b;
-}
-
-export interface ProveOutcome {
-  verified: boolean;
-  proof: string;
-}
-
-// Prove a problem on the local Claude bridge with the given MCP servers, using
-// the SAME /prove-stream endpoint + guardrail (`done.verified`) as generation.
-async function proveOnBridge(
-  problem: string,
-  mcpServers: ProverMcpServer[],
-  onTool: (tool: string) => void,
-): Promise<ProveOutcome> {
-  const conn = bridgeConn();
-  const res = await fetch(`${bridgeBase(conn)}/prove-stream`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-bridge-token': conn.token || '',
-    },
-    body: JSON.stringify({ theorem: problem, mcpServers }),
-  });
-  if (!res.ok || !res.body) throw new Error(`bridge returned ${res.status}`);
-
-  const reader = res.body.getReader();
-  const dec = new TextDecoder();
-  let buf = '';
-  let outcome: ProveOutcome | null = null;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    const events = buf.split('\n\n');
-    buf = events.pop() || '';
-    for (const e of events) {
-      if (!e.startsWith('data:')) continue;
-      try {
-        const d = JSON.parse(e.replace(/^data:\s*/, ''));
-        if (d.type === 'message-annotation' && d.tool) onTool(String(d.tool));
-        if (d.type === 'done')
-          outcome = { verified: !!d.verified, proof: d.proof || '' };
-      } catch {
-        /* ignore malformed event */
-      }
-    }
-  }
-  if (!outcome) throw new Error('prove stream ended without a result');
-  return outcome;
-}
-
 export function AdminQueueResolver({
   initialJobs,
 }: {
@@ -109,10 +38,10 @@ export function AdminQueueResolver({
 }) {
   const [jobs, setJobs] = useState<JobView[]>(initialJobs);
   const [proofs, setProofs] = useState<Record<string, string>>({});
-  const [busy, setBusy] = useState<string | null>(null); // manual resolve
-  const [provingId, setProvingId] = useState<string | null>(null); // bridge prove
-  const [activity, setActivity] = useState<string[]>([]);
+  const [events, setEvents] = useState<Record<string, ProverEvent[]>>({});
   const [note, setNote] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null); // manual resolve
+  const [provingId, setProvingId] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [granting, setGranting] = useState(false);
   const [draining, setDraining] = useState(false);
@@ -152,33 +81,36 @@ export function AdminQueueResolver({
     [refresh],
   );
 
-  // Prove one job on the bridge; auto-resolve only if the guardrail verified it.
+  // Prove a job on the bridge, streaming every step into its console. Only
+  // auto-resolves when the guardrail verified the proof.
   const proveWithBridge = useCallback(
-    async (job: JobView): Promise<ProveOutcome | null> => {
+    async (job: JobView): Promise<ProverOutcome | null> => {
       setProvingId(job.id);
-      setActivity([]);
+      setEvents((m) => ({ ...m, [job.id]: [] }));
       setNote((n) => ({ ...n, [job.id]: '' }));
+      const append = (e: ProverEvent) =>
+        setEvents((m) => ({ ...m, [job.id]: [...(m[job.id] ?? []), e] }));
       try {
         const mcpServers = await fetchProverMcpServers();
-        const out = await proveOnBridge(job.problem, mcpServers, (tool) =>
-          setActivity((a) => [...a.slice(-11), tool]),
-        );
+        const out = await runProverStream({
+          problem: job.problem,
+          mcpServers,
+          onEvent: append,
+        });
         if (out.verified && out.proof.trim()) {
           await resolve(job.id, { proof: out.proof });
-          return out;
+        } else {
+          setProofs((p) => ({ ...p, [job.id]: out.proof }));
+          setNote((n) => ({
+            ...n,
+            [job.id]: out.proof
+              ? 'Produced a proof but it did NOT verify — review before resolving.'
+              : 'No verified proof produced.',
+          }));
         }
-        // Not verified: surface the draft proof for manual review, don't charge.
-        setProofs((p) => ({ ...p, [job.id]: out.proof }));
-        setNote((n) => ({
-          ...n,
-          [job.id]: out.proof
-            ? 'Bridge produced a proof but it did NOT verify against your MCP server — review before resolving.'
-            : 'Bridge could not produce a verified proof.',
-        }));
         return out;
-      } catch (e) {
-        setNote((n) => ({ ...n, [job.id]: `Bridge error: ${String(e)}` }));
-        return null;
+      } catch {
+        return null; // event stream already logged the error
       } finally {
         setProvingId(null);
       }
@@ -186,14 +118,13 @@ export function AdminQueueResolver({
     [resolve],
   );
 
-  // Prove every open job in sequence (stop on the first bridge/connection error).
   const autoDrain = useCallback(async () => {
     setDraining(true);
     try {
       for (const job of open) {
         if (!OPEN.has(job.status)) continue;
         const out = await proveWithBridge(job);
-        if (out === null) break; // bridge unreachable — stop the run
+        if (out === null) break; // bridge unreachable — stop
       }
       await refresh();
     } finally {
@@ -222,8 +153,8 @@ export function AdminQueueResolver({
             API resolution queue
           </h2>
           <p className="mt-0.5 text-sm text-muted-foreground">
-            Prove real submissions on your bridge — auto-resolves only when your
-            MCP server verifies the proof.
+            Prove real submissions on your bridge — every step is logged below,
+            and a job resolves only when your MCP server verifies the proof.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -261,9 +192,7 @@ export function AdminQueueResolver({
             disabled={refreshing}
             className="gap-1.5"
           >
-            <RefreshCw
-              className={`size-3.5 ${refreshing ? 'animate-spin' : ''}`}
-            />
+            <RefreshCw className={`size-3.5 ${refreshing ? 'animate-spin' : ''}`} />
             Refresh
           </Button>
         </div>
@@ -292,11 +221,10 @@ export function AdminQueueResolver({
               </div>
               <p className="mb-3 whitespace-pre-wrap text-sm">{j.problem}</p>
 
-              {/* Prove on the bridge (guardrailed) */}
-              <div className="mb-3 flex flex-wrap items-center gap-2">
+              <div className="mb-3">
                 <Button
                   size="sm"
-                  className="gap-1.5"
+                  className="mb-2 gap-1.5"
                   disabled={provingId === j.id || draining}
                   onClick={() => proveWithBridge(j)}
                 >
@@ -307,17 +235,11 @@ export function AdminQueueResolver({
                   )}
                   Prove on bridge
                 </Button>
-                {provingId === j.id && activity.length > 0 && (
-                  <div className="flex flex-wrap gap-1">
-                    {activity.map((t, i) => (
-                      <span
-                        key={`${t}-${i}`}
-                        className="rounded bg-muted px-1.5 py-0.5 font-mono text-[10px] text-muted-foreground"
-                      >
-                        {t}
-                      </span>
-                    ))}
-                  </div>
+                {(events[j.id]?.length ?? 0) > 0 && (
+                  <ProverConsole
+                    events={events[j.id] ?? []}
+                    running={provingId === j.id}
+                  />
                 )}
               </div>
               {note[j.id] && (
@@ -326,7 +248,6 @@ export function AdminQueueResolver({
                 </p>
               )}
 
-              {/* Manual review / override */}
               <Textarea
                 placeholder="Or paste a Lean proof to resolve manually…"
                 value={proofs[j.id] ?? ''}
@@ -352,9 +273,7 @@ export function AdminQueueResolver({
                   variant="outline"
                   className="gap-1.5 text-destructive"
                   disabled={busy === j.id}
-                  onClick={() =>
-                    resolve(j.id, { error: 'Could not be proven.' })
-                  }
+                  onClick={() => resolve(j.id, { error: 'Could not be proven.' })}
                 >
                   <X className="size-3.5" />
                   Mark failed (no charge)
