@@ -284,12 +284,37 @@ function normalizeLean(s) {
   return String(s == null ? "" : s).replace(/\s+/g, " ").trim()
 }
 
+// Canonical form of a signature for IMMUTABILITY comparison. The agent re-types
+// the target signature when it writes a proof/decomposition, and a single
+// incidental spacing difference around an operator (`(2:ℤ)^m` vs `(2 : ℤ) ^ m`,
+// `∑ i, v i^2` vs `∑ i, v i ^ 2`, `{v :` vs `{ v :`) must NOT be treated as a
+// different statement — on a notation-heavy signature that mismatch is almost
+// guaranteed and was silently rejecting valid proofs. We drop whitespace EXCEPT
+// between two "word" characters (identifiers/numbers/greek/subscripts), so token
+// boundaries are preserved: this tolerates formatting but can never alias two
+// genuinely different Lean statements (their token streams still differ).
+const _isWordChar = (c) => c != null && /[\p{L}\p{N}_]/u.test(c)
+function canonicalSig(s) {
+  const collapsed = String(s == null ? "" : s).replace(/\s+/g, " ").trim()
+  let out = ""
+  for (let i = 0; i < collapsed.length; i++) {
+    const ch = collapsed[i]
+    if (ch === " ") {
+      if (_isWordChar(out[out.length - 1]) && _isWordChar(collapsed[i + 1])) out += " "
+    } else {
+      out += ch
+    }
+  }
+  return out
+}
+
 // Extract a declaration's signature: everything from the `theorem`/`lemma`
-// keyword up to (but not including) the `:=` that begins the proof, normalized.
-// Returns "" if no such declaration is found.
+// keyword up to (but not including) the `:=` that begins the proof, canonically
+// normalized so incidental formatting doesn't break the comparison. Returns ""
+// if no such declaration is found.
 function theoremSignature(src) {
   const m = String(src == null ? "" : src).match(/\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/)
-  return m ? normalizeLean(m[0]) : ""
+  return m ? canonicalSig(m[0]) : ""
 }
 
 // True if `script` contains a theorem/lemma whose signature equals targetSig.
@@ -299,9 +324,19 @@ function scriptProvesTarget(script, targetSig) {
   const re = /\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/g
   let m
   while ((m = re.exec(script)) !== null) {
-    if (normalizeLean(m[0]) === targetSig) return true
+    if (canonicalSig(m[0]) === targetSig) return true
   }
   return false
+}
+
+// All theorem/lemma signatures declared in a script (canonical) — for surfacing
+// a near-miss when the immutability check rejects a scaffold.
+function scriptSignatures(script) {
+  const re = /\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/g
+  const out = []
+  let m
+  while ((m = re.exec(script)) !== null) out.push(canonicalSig(m[0]))
+  return out
 }
 
 // True iff a verify_full_script tool result reports a genuine success. Verified
@@ -426,16 +461,28 @@ function parseVerifyOutput(text) {
 }
 
 // True iff a compiled scaffold PROVES its node modulo stubbed helpers: no real
-// errors, no non-sorry warnings, ≥1 sorry (the helpers). A fully-successful
-// compile is handled by the caller as "already proved directly", not a decomp.
+// ERRORS and ≥1 sorry (the helpers). We deliberately TOLERATE non-sorry warnings
+// (deprecations like "`push_neg` has been deprecated", linter notes such as
+// unused variables): those are not soundness holes and must not reject an
+// otherwise-valid reduction — a real type error is severity Error, which we do
+// reject. A fully-successful compile (no sorry at all) is handled by the caller
+// as "already proved directly", not a decomposition.
 function isStructurallyValidDecomposition(parsed) {
   return (
     !parsed.serverError &&
     !parsed.success &&
     parsed.errors.length === 0 &&
-    parsed.otherWarnings.length === 0 &&
     parsed.sorryWarnings.length > 0
   )
+}
+
+// True iff a compiled script is HOLE-FREE: no errors and no `sorry`/`admit`. The
+// daemon's own ✅ additionally requires zero warnings, so it rejects a correct,
+// hole-free proof that merely uses a deprecated tactic. For the tree's final
+// acceptance the promise is "a true, hole-free proof", so we accept hole-free
+// even with benign warnings (still never with an error or a sorry).
+function isHoleFreeProof(parsed) {
+  return !parsed.serverError && parsed.errors.length === 0 && parsed.sorryWarnings.length === 0
 }
 
 // Heuristic top-level declaration parser. Declarations start at a line boundary
@@ -764,9 +811,14 @@ Produce a single self-contained Lean scaffold with this exact shape:
   2. The ORIGINAL theorem below, VERBATIM — same name, same signature, do NOT change one character of the statement — proved USING the helper lemmas. Its proof must contain NO \`sorry\`: every remaining hole must live inside a helper, not in the main theorem.
   3. Write the helpers ABOVE the theorem (Lean requires a name to be declared before it is used).
 
-The decomposition is correct when compiling the scaffold yields ONLY "declaration uses \`sorry\`" warnings (one per helper) and NO errors — that proves the main theorem really does follow from the helpers. Use verify_full_script to check exactly this: iterate until the only diagnostics are the helper \`sorry\` warnings. Use init_proof/apply_tactic to discover which intermediate facts the main proof actually needs, so your helper statements are the RIGHT ones. Each helper should be a genuinely smaller step than the original — if a "helper" is just the original theorem restated, you have not decomposed anything.
+The decomposition is correct when compiling the scaffold yields NO errors and the only holes are the helper \`sorry\`s — that proves the main theorem really does follow from the helpers. Use verify_full_script to check this: iterate until there are no ERRORS (deprecation/linter warnings are fine; the helper \`sorry\` warnings are expected). Use init_proof/apply_tactic to discover which intermediate facts the main proof actually needs, so your helper statements are the RIGHT ones. Each helper should be a genuinely smaller step than the original — if a "helper" is just the original theorem restated, you have not decomposed anything.
 
-When the scaffold compiles with only the helper \`sorry\` warnings, output it as a single \`\`\`lean code block.
+CRITICAL — the target statement is IMMUTABLE. Your scaffold MUST contain the original theorem with its signature reproduced EXACTLY as given below (same name, binders, and statement up to \`:=\`). If you rename it, drop a hypothesis, restate it inductively, or otherwise change the signature, the decomposition is REJECTED even if it compiles. Copy the line below verbatim and only fill in its proof:
+
+  ${normalizeLean(theorem).replace(/\s*:=\s*by\s+sorry\s*$/i, "")} := by
+    <your proof using the helper lemmas>
+
+When the scaffold compiles with no errors, output it as a single \`\`\`lean code block.
 
 Original theorem (immutable — reproduce its signature exactly):
 ${theorem}`
@@ -1314,9 +1366,14 @@ async function runDecomposer(node, ctx) {
   const targetSig = node.signature
   const verifyCalls = {}
   const candidates = []
+  const nearMisses = [] // scaffolds with ≥2 decls but no signature-preserving match
   const consider = (script) => {
-    if (script && scriptProvesTarget(script, targetSig) && helperDeclarations(script, targetSig).length) {
+    if (!script) return
+    if (scriptProvesTarget(script, targetSig) && helperDeclarations(script, targetSig).length) {
       candidates.push(script)
+    } else {
+      const sigs = scriptSignatures(script)
+      if (sigs.length >= 2) nearMisses.push(sigs)
     }
   }
   const onObject = (o) => {
@@ -1370,7 +1427,7 @@ async function runDecomposer(node, ctx) {
     const ordered = normalizeScaffoldOrder(cand, targetSig)
     const v = await verifyViaDaemon(ordered, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     const parsed = parseVerifyOutput(v.text)
-    if (v.ok && parsed.success) {
+    if (v.ok && isHoleFreeProof(parsed)) {
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Scaffold compiled with no holes — node fully proved.` })
       return { ok: true, fullyProved: true, scaffold: ordered, children: [], reason: "scaffold compiled sorry-free" }
     }
@@ -1380,9 +1437,24 @@ async function runDecomposer(node, ctx) {
       return { ok: true, scaffold: ordered, children: helpers, reason: `reduces to ${helpers.length} lemma(s)` }
     }
   }
+  if (!uniq.length && nearMisses.length) {
+    // The decomposer built a scaffold but no declaration reproduced the target
+    // signature. Surface the closest miss so the mismatch is visible (usually a
+    // restated statement or a changed binder) rather than an opaque failure.
+    const produced = nearMisses[nearMisses.length - 1].filter((s) => s !== targetSig)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `${ctx.stage}✂️ Scaffold did not reproduce the target signature.\n  target:   ${oneLine(targetSig)}\n  produced: ${produced.map(oneLine).join("\n            ")}`,
+    })
+  }
   return {
     ok: false,
-    reason: uniq.length ? "no candidate reduced the goal cleanly (real errors remained)" : "decomposer produced no signature-preserving scaffold",
+    reason: uniq.length
+      ? "no candidate reduced the goal cleanly (a real type error remained)"
+      : nearMisses.length
+        ? "decomposer changed the target signature (see the near-miss above) — it must reproduce it verbatim"
+        : "decomposer produced no scaffold containing the target theorem",
   }
 }
 
@@ -1462,13 +1534,15 @@ async function proveNode(node, ctx) {
     }
   }
 
-  // 4. Assemble the whole subtree and gate on ONE final sorry-free compile.
+  // 4. Assemble the whole subtree and gate on ONE final HOLE-FREE compile (no
+  // errors, no sorry) that contains the immutable node signature. Benign
+  // warnings (deprecations/linters) are tolerated — they are not holes.
   if (ctx.signal?.aborted) return false
   const assembled = assembleScript(node)
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Assembling ${declName(node.signature)} from ${node.children.length} proved lemma(s) — final verify…` })
   const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
   const parsed = parseVerifyOutput(v.text)
-  if (v.ok && parsed.success && scriptProvesTarget(assembled, node.signature)) {
+  if (v.ok && isHoleFreeProof(parsed) && scriptProvesTarget(assembled, node.signature)) {
     node.proof = assembled
     node.status = "proved-assembled"
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled and verified sorry-free.` })
