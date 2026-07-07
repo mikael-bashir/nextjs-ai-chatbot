@@ -271,6 +271,196 @@ function buildMcpConfig(mcpServers) {
   return { mcpServers: servers }
 }
 
+// ===========================================================================
+// SEARCH GOVERNOR — forcible "hack, don't search" throttle
+// ---------------------------------------------------------------------------
+// The prover kept burning turns on loogle/moogle instead of compiling. To make
+// search EARNED, we ration it: the bridge hosts a governed MCP proxy of the
+// search server (Leak I). Each subagent run's MCP config points its search tools
+// at the bridge itself (127.0.0.1) instead of Leak I; the bridge forwards a call
+// only while the run has search budget, and otherwise returns a message telling
+// the agent to prove instead. Budget starts small and is refilled ONLY when
+// verify_full_script reports a SYNTAX error (an unknown name / parse error) —
+// the one situation where a lookup actually helps. Verify + Pantograph are never
+// throttled (those are hacking, not searching).
+// ---------------------------------------------------------------------------
+const SEARCH_TOOL_RE = /loogle|moogle|search/i
+const isSearchToolName = (n) => SEARCH_TOOL_RE.test(String(n || ""))
+// A verify failure worth a search grant: the compiler didn't understand a NAME
+// or the syntax — as opposed to a type/logic error, which a lookup won't fix.
+const SYNTAX_ERR_RE =
+  /unknown (identifier|constant|package|namespace|tactic)|unexpected token|unexpected end|unterminated|unexpected identifier|expected |has not been declared|invalid field notation/i
+function verifyTextIsSyntaxError(text) {
+  const p = parseVerifyOutput(text)
+  return p.errors.some((e) => SYNTAX_ERR_RE.test(e.message))
+}
+
+const GOV_INITIAL = Number(process.env.SEARCH_BUDGET_INITIAL || 3)
+const GOV_GRANT = Number(process.env.SEARCH_BUDGET_GRANT || 3)
+const governors = new Map() // id -> governor
+let govSeq = 0
+
+function createGovernor() {
+  const id = `${(++govSeq).toString(36)}${randomBytes(4).toString("hex")}`
+  const g = {
+    id,
+    budget: GOV_INITIAL,
+    searchServer: null, // { url, tools: [{ name, argKey }] } — the upstream we proxy
+    sessions: new Map(), // sseSessionId -> res
+    searchCount: 0,
+    grantCount: 0,
+    blockedCount: 0,
+  }
+  governors.set(id, g)
+  return g
+}
+function destroyGovernor(g) {
+  if (!g) return
+  for (const res of g.sessions.values()) {
+    try {
+      res.end()
+    } catch {
+      /* gone */
+    }
+  }
+  governors.delete(g.id)
+}
+function grantSearch(g, why) {
+  if (!g) return
+  g.budget += GOV_GRANT
+  g.grantCount++
+}
+
+// Build an MCP config where any PURE search server (all its tools are searches,
+// e.g. Leak I) is redirected through this run's governor; everything else stays
+// direct. Records the upstream on the governor so it can proxy allowed calls.
+function buildGovernedMcpConfig(mcpServers, governor) {
+  const servers = {}
+  for (const s of mcpServers || []) {
+    if (!s || !s.name || !s.url) continue
+    const tools = (Array.isArray(s.tools) ? s.tools : [])
+      .map((t) => (typeof t === "string" ? { name: t } : t))
+      .filter((t) => t && t.name)
+    const searchTools = tools.filter((t) => isSearchToolName(t.name))
+    if (governor && searchTools.length && searchTools.length === tools.length) {
+      // Pure search server -> govern it.
+      governor.searchServer = {
+        url: s.url,
+        tools: searchTools.map((t) => ({
+          name: t.name,
+          argKey: (Array.isArray(t.args) && t.args[0]) || "query",
+        })),
+      }
+      servers[s.name] = { type: "sse", url: `http://127.0.0.1:${PORT}/gov/${governor.id}/sse` }
+      console.log(`[gov ${governor.id}] governing "${s.name}" search (budget ${governor.budget}) -> ${s.url}`)
+    } else {
+      servers[s.name] = { type: "sse", url: s.url }
+    }
+  }
+  return { mcpServers: servers }
+}
+
+// The governor's response to a search tools/call: forward while in budget, else
+// return the "go prove instead" message so the agent SEES why it was refused.
+async function governedSearchCall(g, toolName, args) {
+  g.searchCount++
+  if (g.budget <= 0) {
+    g.blockedCount++
+    console.log(`[gov ${g.id}] search BLOCKED (budget 0) tool=${toolName}`)
+    return `🛑 Search budget spent — stop searching and PROVE. You already know Lean 4; write a candidate proof (lead with decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. The compiler's errors teach you far more than a lemma lookup. Your search allowance refills (+${GOV_GRANT}) only when verify_full_script reports an UNKNOWN identifier/name — the one case a lookup helps. If the goal is genuinely too big, decompose it.`
+  }
+  g.budget--
+  const srv = g.searchServer
+  if (!srv?.url) return "Search is unavailable right now — prove with the compiler and interactive tactics instead."
+  console.log(`[gov ${g.id}] search forwarded tool=${toolName} (${g.budget} left)`)
+  const r = await callRemoteMcpTool(srv.url, toolName, args, { timeoutMs: 60000 })
+  const body = r.ok ? r.text : `Search error: ${r.error || "unknown"} — don't retry; prove with the compiler instead.`
+  return `${body}\n\n[search budget: ${g.budget} left. Refills +${GOV_GRANT} only on a verify_full_script UNKNOWN-name error. Prefer compiling.]`
+}
+
+// ---- MCP-over-SSE SERVER for the governor (the inverse of callRemoteMcpTool) --
+// The claude CLI connects here as if to a normal SSE MCP server: GET opens the
+// stream and we advertise a POST endpoint; POSTed JSON-RPC replies go back over
+// the stream. We expose only the upstream's search tools, gated by the budget.
+function governorSse(req, res, govId) {
+  const g = governors.get(govId)
+  if (!g) {
+    res.writeHead(404)
+    res.end()
+    return
+  }
+  const sid = randomBytes(8).toString("hex")
+  res.writeHead(200, {
+    "content-type": "text/event-stream",
+    "cache-control": "no-cache, no-transform",
+    connection: "keep-alive",
+  })
+  g.sessions.set(sid, res)
+  res.write(`event: endpoint\ndata: /gov/${govId}/message?sessionId=${sid}\n\n`)
+  const ka = setInterval(() => {
+    try {
+      res.write(`: keep-alive\n\n`)
+    } catch {
+      /* gone */
+    }
+  }, 15000)
+  req.on("close", () => {
+    clearInterval(ka)
+    g.sessions.delete(sid)
+  })
+}
+
+async function governorMessage(req, res, govId, sid) {
+  const g = governors.get(govId)
+  const stream = g && g.sessions.get(sid)
+  const raw = await readBody(req)
+  res.writeHead(202)
+  res.end()
+  if (!g || !stream) return
+  let msg
+  try {
+    msg = JSON.parse(raw)
+  } catch {
+    return
+  }
+  const reply = (result) => {
+    try {
+      stream.write(`data: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result })}\n\n`)
+    } catch {
+      /* gone */
+    }
+  }
+  const method = msg.method
+  if (method === "initialize") {
+    reply({
+      protocolVersion: msg.params?.protocolVersion || "2024-11-05",
+      capabilities: { tools: {} },
+      serverInfo: { name: "leak-search-governor", version: "1.0.0" },
+    })
+  } else if (method === "notifications/initialized") {
+    /* notification — no reply */
+  } else if (method === "ping") {
+    reply({})
+  } else if (method === "tools/list") {
+    const tools = (g.searchServer?.tools || []).map((t) => ({
+      name: t.name,
+      description:
+        "Mathlib library search. RATIONED to force compiler-driven proving: prefer writing a proof and reading verify_full_script errors. Use only when you need a specific unknown lemma NAME.",
+      inputSchema: {
+        type: "object",
+        properties: { [t.argKey]: { type: "string", description: "search query" } },
+        required: [t.argKey],
+      },
+    }))
+    reply({ tools })
+  } else if (method === "tools/call") {
+    const text = await governedSearchCall(g, msg.params?.name, msg.params?.arguments || {})
+    reply({ content: [{ type: "text", text }] })
+  } else if (msg.id != null) {
+    reply({})
+  }
+}
+
 // --- Target-theorem gate ----------------------------------------------------
 // The user's input is always the bare theorem signature proven by `sorry`
 // (e.g. `theorem foo (n : ℕ) : P n := by sorry`). A verify_full_script success
@@ -626,16 +816,17 @@ function resolveVerifyUrl(mcpServers) {
   return servers[0]?.url || null
 }
 
-// Compile a script against the verify daemon DIRECTLY over MCP-SSE. The
-// orchestrator does not trust the agent's own verify calls for scaffolds/
-// assemblies IT constructs — it checks them itself. One-shot SSE session.
-function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
+// Call ANY tool on a remote MCP-SSE server, one-shot. `toolMatch` is a string
+// (exact tool name) or RegExp (matched against the server's tool names). Returns
+// { ok, text, error }. Used both to verify scaffolds on the daemon and to proxy
+// governed search calls to Leak I.
+function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {}) {
   return new Promise((resolve) => {
     let base
     try {
       base = new URL(sseUrl)
     } catch {
-      resolve({ ok: false, text: "", error: `bad daemon url: ${sseUrl}` })
+      resolve({ ok: false, text: "", error: `bad mcp url: ${sseUrl}` })
       return
     }
     const origin = `${base.protocol}//${base.host}`
@@ -657,7 +848,7 @@ function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
       resolve(out)
     }
     const timer = setTimeout(
-      () => done({ ok: false, text: "", error: `verify timed out after ${timeoutMs}ms` }),
+      () => done({ ok: false, text: "", error: `mcp call timed out after ${timeoutMs}ms` }),
       timeoutMs,
     )
     const handle = (evt, data) => {
@@ -732,10 +923,13 @@ function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
         await rpc("notifications/initialized", undefined, { notify: true })
         const list = await rpc("tools/list", {})
         const tools = list?.result?.tools || []
-        const verify = tools.find((t) => /verify.*full.*script|verify_full_script/i.test(t.name))
-        if (!verify) throw new Error("verify_full_script not found on daemon")
-        const r = await rpc("tools/call", { name: verify.name, arguments: { script } })
-        if (r?.error) throw new Error(`daemon RPC error: ${JSON.stringify(r.error)}`)
+        const tool =
+          typeof toolMatch === "string"
+            ? tools.find((t) => t.name === toolMatch) || tools.find((t) => String(t.name).endsWith(toolMatch))
+            : tools.find((t) => toolMatch.test(t.name))
+        if (!tool) throw new Error(`tool not found on server: ${toolMatch}`)
+        const r = await rpc("tools/call", { name: tool.name, arguments: args || {} })
+        if (r?.error) throw new Error(`mcp RPC error: ${JSON.stringify(r.error)}`)
         const c = r?.result?.content
         const text = Array.isArray(c)
           ? c.map((x) => x?.text ?? "").join("\n")
@@ -746,6 +940,13 @@ function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
       }
     })()
   })
+}
+
+// Compile a script against the verify daemon DIRECTLY over MCP-SSE. The
+// orchestrator does not trust the agent's own verify calls for scaffolds/
+// assemblies IT constructs — it checks them itself.
+function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
+  return callRemoteMcpTool(sseUrl, /verify.*full.*script|verify_full_script/i, { script }, { timeoutMs })
 }
 
 // Build the "how to load your deferred MCP tools" section shared by the prover
@@ -1268,15 +1469,23 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // decomposer. Resolves when the process exits.
 function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, stage, metrics, signal }, { onObject, emit }) {
   return new Promise((resolve) => {
+    // Each subagent run gets its OWN search governor (budget resets per node /
+    // per decomposition — a fresh sub-goal earns a fresh allowance). Search tools
+    // are routed through the bridge; verify + Pantograph stay direct.
+    const governor = createGovernor()
     let cfgPath
     try {
       const dir = mkdtempSync(join(tmpdir(), "claude-tree-"))
       cfgPath = join(dir, "mcp.json")
-      writeFileSync(cfgPath, JSON.stringify(buildMcpConfig(mcpServers)))
+      writeFileSync(cfgPath, JSON.stringify(buildGovernedMcpConfig(mcpServers, governor)))
     } catch (e) {
+      destroyGovernor(governor)
       resolve({ ok: false, finalText: "", exitCode: null, timedOut: false, stderr: `mcp config: ${e.message}` })
       return
     }
+    // Track which tool_use ids are verify calls so we can refill the search
+    // budget when the compiler reports an unknown NAME (a syntax error).
+    const verifyCallIds = new Set()
     const args = [
       "-p", prompt,
       "--output-format", "stream-json", "--verbose",
@@ -1337,6 +1546,36 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
         } catch {
           /* observer must never crash the run */
         }
+        // Refill the search budget when verify_full_script reports a syntax /
+        // unknown-name error — the one case where a lookup is warranted.
+        try {
+          if (o.type === "assistant" && o.message?.content) {
+            for (const c of o.message.content) {
+              if (c.type === "tool_use" && String(c.name || "").endsWith("verify_full_script") && c.id) {
+                verifyCallIds.add(c.id)
+              }
+            }
+          } else if (o.type === "user" && o.message?.content) {
+            for (const c of o.message.content) {
+              if (c.type === "tool_result" && verifyCallIds.has(c.tool_use_id)) {
+                const t = Array.isArray(c.content)
+                  ? c.content.map((x) => x.text || "").join("\n")
+                  : String(c.content ?? "")
+                if (verifyTextIsSyntaxError(t)) {
+                  grantSearch(governor, "verify syntax error")
+                  if (emit)
+                    emit({
+                      type: "message-annotation",
+                      subtype: "status",
+                      thought: `${stage ? stage + " " : ""}🔎 Compiler flagged an unknown name — search budget +${GOV_GRANT} (now ${governor.budget}).`,
+                    })
+                }
+              }
+            }
+          }
+        } catch {
+          /* budget accounting must never crash the run */
+        }
         if (emit) mapObjectToEvents(o, emit, stage, metrics)
         if (o.type === "result") finalText = o.result || finalText
         if (stop && !stopped) {
@@ -1351,11 +1590,19 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
     child.on("error", (e) => {
       clearTimeout(timer)
       if (signal) signal.removeEventListener?.("abort", onAbort)
+      destroyGovernor(governor)
       resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message })
     })
     child.on("close", (code) => {
       clearTimeout(timer)
       if (signal) signal.removeEventListener?.("abort", onAbort)
+      if (governor.searchCount)
+        emit?.({
+          type: "message-annotation",
+          subtype: "status",
+          thought: `${stage ? stage + " " : ""}🔎 Search used ${governor.searchCount}× (${governor.blockedCount} blocked, ${governor.grantCount} refills).`,
+        })
+      destroyGovernor(governor)
       resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr })
     })
   })
@@ -1737,6 +1984,23 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
 }
 
 const server = createServer(async (req, res) => {
+  const url = new URL(req.url, `http://localhost:${PORT}`)
+
+  // The search governor is an MCP-SSE server the LOCAL `claude` process talks to.
+  // It carries no bridge token / browser Origin, so it is handled BEFORE the CORS
+  // + token gate. The whole bridge binds 127.0.0.1 only, and these routes proxy
+  // read-only library search behind a per-run id, so this is safe.
+  const govMatch = url.pathname.match(/^\/gov\/([^/]+)\/(sse|message)$/)
+  if (govMatch) {
+    const [, govId, kind] = govMatch
+    if (req.method === "GET" && kind === "sse") return governorSse(req, res, govId)
+    if (req.method === "POST" && kind === "message")
+      return governorMessage(req, res, govId, url.searchParams.get("sessionId"))
+    res.writeHead(405)
+    res.end()
+    return
+  }
+
   const allowed = setCors(req, res)
 
   if (req.method === "OPTIONS") {
@@ -1746,8 +2010,6 @@ const server = createServer(async (req, res) => {
   }
   if (!allowed) return json(res, 403, { error: "origin_not_allowed" })
   if (!tokenValid(req)) return json(res, 401, { error: "invalid_token" })
-
-  const url = new URL(req.url, `http://localhost:${PORT}`)
 
   try {
     if (req.method === "GET" && url.pathname === "/health") {
@@ -1839,6 +2101,19 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log("  2. Keep this terminal open while you use the feature.")
   console.log("  3. The token is a secret — anyone with it can drive your Claude.")
   console.log(line)
+  // Diagnostic hook (off unless GOV_SELFTEST=<search server sse url>): stand up a
+  // persistent governor so the search throttle can be exercised without an agent.
+  if (process.env.GOV_SELFTEST) {
+    const g = createGovernor()
+    g.searchServer = {
+      url: process.env.GOV_SELFTEST,
+      tools: [
+        { name: "loogle_search", argKey: "query" },
+        { name: "moogle_search", argKey: "concept" },
+      ],
+    }
+    console.log(`[gov-selftest] id=${g.id} budget=${g.budget} sse=http://127.0.0.1:${PORT}/gov/${g.id}/sse`)
+  }
 })
 
 // ---------------------------------------------------------------------------
