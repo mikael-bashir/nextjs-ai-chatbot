@@ -37,6 +37,10 @@ interface RunOpts {
   // prover; 'prove-tree' is the decomposition orchestrator (prove-or-split proof
   // tree). Both emit the identical SSE shape, so this runner handles either.
   endpoint?: 'prove-stream' | 'prove-tree';
+  // Strategy mode for the tree path (A/B testing proof approaches): e.g.
+  // 'hacker' (compiler-driven) or 'pantograph' (interactive Leak II). Ignored by
+  // the single-agent path.
+  strategy?: string;
 }
 
 // Fire-and-forget: persist a run to the admin debug log. Admin-gated server-side.
@@ -87,7 +91,12 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
     res = await fetch(`${base}/${endpoint}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bridge-token': token },
-      body: JSON.stringify({ theorem: problem, mcpServers, model }),
+      body: JSON.stringify({
+        theorem: problem,
+        mcpServers,
+        model,
+        options: opts.strategy ? { strategy: opts.strategy } : undefined,
+      }),
       signal,
     });
   } catch (e) {

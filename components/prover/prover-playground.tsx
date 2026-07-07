@@ -22,6 +22,8 @@ export function ProverPlayground() {
   // Decomposition mode drives the /prove-tree orchestrator: prove-or-split, so a
   // stalled goal is broken into verified sub-lemmas instead of looping forever.
   const [decompose, setDecompose] = useState(false);
+  // Strategy mode for A/B testing proof approaches (tree path only).
+  const [strategy, setStrategy] = useState<'hacker' | 'pantograph'>('hacker');
 
   const run = useCallback(async () => {
     if (!problem.trim()) return;
@@ -35,8 +37,9 @@ export function ProverPlayground() {
         problem,
         mcpServers,
         onEvent: append,
-        source: decompose ? 'playground-tree' : 'playground',
+        source: decompose ? `playground-tree:${strategy}` : 'playground',
         endpoint: decompose ? 'prove-tree' : 'prove-stream',
+        strategy: decompose ? strategy : undefined,
       });
       setOutcome(out);
     } catch {
@@ -44,7 +47,7 @@ export function ProverPlayground() {
     } finally {
       setRunning(false);
     }
-  }, [problem, decompose]);
+  }, [problem, decompose, strategy]);
 
   return (
     <div className="space-y-4">
@@ -78,12 +81,32 @@ export function ProverPlayground() {
           <GitBranch className="size-3.5" />
           Decompose mode {decompose ? 'on' : 'off'}
         </button>
+        {decompose && (
+          <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+            Strategy
+            <select
+              value={strategy}
+              onChange={(e) =>
+                setStrategy(e.target.value as 'hacker' | 'pantograph')
+              }
+              disabled={running}
+              className="rounded-md border bg-background px-2 py-1.5 text-sm"
+            >
+              <option value="hacker">Hacker (compiler-driven)</option>
+              <option value="pantograph">Pantograph (interactive Leak II)</option>
+            </select>
+          </label>
+        )}
       </div>
       {decompose && (
         <p className="text-xs text-muted-foreground">
           Prove-or-split: each goal gets a bounded direct attempt, then is broken
           into toolchain-verified sub-lemmas (recursively) and assembled into one
-          sorry-free proof. Needs a verify_full_script MCP server connected.
+          sorry-free proof.{' '}
+          {strategy === 'pantograph'
+            ? 'Pantograph mode builds proofs interactively in Leak II; Leak IV is used only as the final guardrail.'
+            : 'Hacker mode leads with the compiler (verify_full_script) and strong automation.'}{' '}
+          Needs a verify_full_script MCP server connected.
         </p>
       )}
 

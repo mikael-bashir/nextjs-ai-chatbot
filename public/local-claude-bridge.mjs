@@ -271,6 +271,18 @@ function buildMcpConfig(mcpServers) {
   return { mcpServers: servers }
 }
 
+// The current toolchain (Lean 4.29.1 + recent Mathlib) REMOVED the legacy
+// big-operator `in` binder notation (`∑ x in s, …`) in favour of `∈`, so a
+// theorem written with `in` fails to even PARSE ("unexpected token 'in'"). Many
+// ACG-generated problems still use `in`. Normalize it to `∈` (identical meaning)
+// up front so the WHOLE pipeline — the agent's attempts, the drift guard, and the
+// gates — operate on syntax the compiler actually accepts. Only ` in ` that
+// follows a big-operator symbol is touched; `a ∈ s`, `let … in`, etc. are left
+// alone.
+function normalizeProblemSyntax(src) {
+  return String(src == null ? "" : src).replace(/([∑∏⨆⨅⋃⋂⨁⨂][^,\n]*?)\s+in\s+/g, "$1 ∈ ")
+}
+
 // ===========================================================================
 // SEARCH GOVERNOR — forcible "hack, don't search" throttle
 // ---------------------------------------------------------------------------
@@ -1069,6 +1081,96 @@ Original theorem (immutable — reproduce its signature exactly):
 ${theorem}`
 }
 
+// ===========================================================================
+// STRATEGY MODES — swappable prompt profiles for A/B testing proof approaches.
+// The orchestrator (proveNode/gate/assembly) is strategy-agnostic; a strategy
+// only changes the PROMPTS a node-prover and decomposer subagent receive. This
+// lets us measure which approach proves more, using the same tree + gates.
+// ---------------------------------------------------------------------------
+
+// PANTOGRAPH strategy: make the interactive proof assistant (Leak II) the PRIMARY
+// workspace — build the proof one tactic at a time, watching the goal state —
+// with verify_full_script (Leak IV) reserved for the FINAL certification/guardrail
+// only. Still automation-first, search-last.
+function pantographProvePrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving a Lean 4 + Mathlib theorem the way an expert does: INTERACTIVELY, advancing the goal one tactic at a time in a live proof assistant (Pantograph, via init_proof/apply_tactic) and watching the goal state evolve until no goals remain. You already know Lean 4 — lean on strong automation.
+
+${toolSection}
+
+PRIMARY WORKSPACE — Pantograph (Leak II). Spend your run HERE:
+- init_proof { proposition } — open the goal as a live state. The proposition must be CLOSED: quantify every free variable with ∀ (e.g. "∀ (n : ℕ), <goal>"). Use ∈ (never the word "in") for big-operator binders. Returns a state_id.
+- apply_tactic { state_id, tactic } — run ONE tactic against that state; see the resulting goals + hypotheses. Chain these (reuse the same state_id) to build the proof.
+- get_current_proof_state { state_id } — dump the tactic script so far and the remaining goals.
+- NEVER put \`sorry\` in a tactic — Pantograph rejects it. A goal you can't close is a signal to DECOMPOSE, not to sorry.
+
+GUARDRAIL — verify_full_script (Leak IV) is NOT for exploration. Use it ONCE, at the END: when Pantograph shows NO remaining goals, assemble the full \`theorem <original signature> := by <the tactic sequence that worked>\` and verify_full_script it to certify. A proof counts only when that final compile succeeds with no errors and no \`sorry\`.
+
+AUTOMATION FIRST — on each apply_tactic, try a tactic that closes the WHOLE goal before breaking it down by hand: \`decide\`, \`native_decide\`, \`omega\`, \`simp\`/\`simp_all\`, \`norm_num\`, \`nlinarith [sq_nonneg _]\`, \`ring\`, \`aesop\`, \`fin_cases\`/\`interval_cases\`, \`induction\`/\`Nat.strong_induction_on\`. Your FIRST apply_tactic should attempt to finish it outright.
+
+SEARCH (loogle/moogle) is a last resort — only for a specific lemma NAME the assistant says is unknown and you can't recall. Never browse.
+
+WORKFLOW:
+0. Load tools (ToolSearch select), first.
+1. init_proof with the CLOSED, ∈-normalized proposition, then immediately try to close it in ONE apply_tactic with strong automation.
+2. If not closed: intro/step with apply_tactic, making the mathematical move and closing subgoals with automation, watching the state after each step.
+3. When no goals remain: get_current_proof_state, assemble the full theorem with the ORIGINAL signature below, verify_full_script ONCE.
+4. Output the final verified proof as a single \`\`\`lean block.
+
+If interactive stepping shows the goal needs a substantial lemma best proven separately, say so and decompose.
+${extra ? `\n${extra}\n` : ""}
+Theorem (prove this EXACT statement; its signature is immutable):
+${theorem}`
+}
+
+// PANTOGRAPH decomposer: use the interactive assistant to DISCOVER which sub-
+// lemmas the proof actually needs (step until you hit goals you can't close;
+// those become the helpers), then emit the standard scaffold.
+function pantographDecomposePrompt(theorem, mcpServers = []) {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are DECOMPOSING a Lean 4 theorem you could not close directly, using the interactive proof assistant (Pantograph) to find the RIGHT sub-lemmas.
+
+${toolSection}
+
+METHOD — explore with Pantograph (Leak II) first:
+- init_proof { proposition } (CLOSED, ∀-quantified, ∈ not "in"), then apply_tactic step by step. Push the proof as far as strong automation takes you; the goals you CANNOT close are exactly the helper lemmas you need. Read them off the live state — don't guess.
+- NEVER use \`sorry\` inside a Pantograph tactic (it errors). Just stop stepping when you reach the hard goal and record its statement.
+
+Then emit a single self-contained Lean scaffold:
+  1. HELPER LEMMAS — each a real, well-typed statement (the goals you couldn't close), body exactly \`:= by sorry\`, descriptive unique names. Prefer helpers closable by automation.
+  2. The ORIGINAL theorem below, VERBATIM (same name and signature), proved FROM the helpers with NO \`sorry\` in its own body.
+  3. Helpers ABOVE the theorem (declare before use).
+
+Confirm the scaffold with verify_full_script (Leak IV): iterate until there are NO errors and the only holes are the helper \`sorry\`s. Do not spend this run searching the library.
+
+CRITICAL — the target statement is IMMUTABLE: reproduce its signature EXACTLY (up to \`:=\`). Copy the line below verbatim and only fill in its proof:
+
+  ${normalizeLean(theorem).replace(/\s*:=\s*by\s+sorry\s*$/i, "")} := by
+    <your proof using the helper lemmas>
+
+When it compiles with no errors, output the scaffold as a single \`\`\`lean block.
+
+Original theorem (immutable — reproduce its signature exactly):
+${theorem}`
+}
+
+// The registry. Each strategy supplies a node-prover and a decomposer prompt.
+const STRATEGIES = {
+  hacker: {
+    label: "Hacker — compiler-driven, verify_full_script as the main loop",
+    node: (t, m, x) => provePrompt(t, m, x),
+    decompose: (t, m) => decomposePrompt(t, m),
+  },
+  pantograph: {
+    label: "Pantograph — interactive Leak II as the workspace, Leak IV only as guardrail",
+    node: (t, m, x) => pantographProvePrompt(t, m, x),
+    decompose: (t, m) => pantographDecomposePrompt(t, m),
+  },
+}
+const pickStrategy = (name) => STRATEGIES[name] || STRATEGIES.hacker
+const nodePromptFor = (name, t, m, x) => pickStrategy(name).node(t, m, x)
+const decomposePromptFor = (name, t, m) => pickStrategy(name).decompose(t, m)
+
 // Non-streaming prove used by the /prove route AND the customer-traffic worker.
 // GUARDRAIL: this must NOT trust the model's final prose. Like /prove-stream it
 // runs stream-json and feeds every line through the SHARED makeProofGate, so a
@@ -1076,6 +1178,7 @@ ${theorem}`
 // free script. `verified`/`proof` reflect that gate; `finalText` is the model's
 // closing message, kept only for diagnostics. The worker charges on `verified`.
 function runProve(theorem, mcpServers, opts = {}) {
+  theorem = normalizeProblemSyntax(theorem)
   return new Promise((resolve) => {
     const start = Date.now()
 
@@ -1183,6 +1286,7 @@ function runProve(theorem, mcpServers, opts = {}) {
 // event into the app's SSE shape (message-annotation for tool activity,
 // text-delta for the final proof) so the main chat's activity panel renders it.
 function proveStream(res, theorem, mcpServers, opts = {}) {
+  theorem = normalizeProblemSyntax(theorem)
   let cfgPath
   try {
     const dir = mkdtempSync(join(tmpdir(), "claude-prove-"))
@@ -1617,7 +1721,7 @@ async function runNodeProver(node, ctx) {
   let decomposeRequested = false
   const extra =
     "EARLY DECOMPOSE (optional): if partway through you judge this goal is too large to close directly and would be better split into sub-lemmas, output a line that is exactly `DECOMPOSE: <one-line reason>` and stop — a dedicated decomposition run will then take over. Only do this when genuinely stuck; prefer to finish the proof if you can."
-  const prompt = provePrompt(node.statement, ctx.mcpServers, extra)
+  const prompt = nodePromptFor(ctx.strategy, node.statement, ctx.mcpServers, extra)
   const onObject = (o) => {
     const ev = gate.observe(o)
     if (ev?.verified) return true
@@ -1693,7 +1797,7 @@ async function runDecomposer(node, ctx) {
   }
   const r = await spawnProverStream(
     {
-      prompt: decomposePrompt(node.statement, ctx.mcpServers),
+      prompt: decomposePromptFor(ctx.strategy, node.statement, ctx.mcpServers),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
       maxTurns: ctx.decomposeTurnBudget,
@@ -1889,6 +1993,7 @@ async function proveNode(node, ctx) {
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
 function proveTreeStream(res, theorem, mcpServers, opts = {}) {
+  theorem = normalizeProblemSyntax(theorem)
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform" })
   const send = (obj) => {
     try {
@@ -1904,15 +2009,17 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     send({ ...obj, metrics })
   }
 
+  const strategy = STRATEGIES[opts.strategy] ? opts.strategy : "hacker"
   // Admin debug log: the exact prompts both subagent roles receive.
   send({
     type: "prompt",
     prompt:
-      "[DECOMPOSITION MODE — proof tree]\n\n=== NODE-PROVER PROMPT ===\n" +
-      provePrompt(theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
+      `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
+      nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
       "\n\n=== DECOMPOSER PROMPT ===\n" +
-      decomposePrompt(theorem, mcpServers),
+      decomposePromptFor(strategy, theorem, mcpServers),
     model: opts.model || null,
+    strategy,
     theorem,
     mcpServers: (mcpServers || []).map((s) => ({
       name: s?.name,
@@ -1935,6 +2042,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   const ctx = {
     mcpServers,
     model: opts.model,
+    strategy,
     verifyUrl,
     emit,
     metrics,
@@ -1963,7 +2071,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
 
   ;(async () => {
     try {
-      emit({ type: "message-annotation", subtype: "status", thought: `🌲 Decomposition mode: prove-or-split, ${ctx.turnBudget} turns/node, depth ≤ ${ctx.maxDepth}.` })
+      emit({ type: "message-annotation", subtype: "status", thought: `🌲 Decomposition mode [${strategy}]: prove-or-split, ${ctx.turnBudget} turns/node, depth ≤ ${ctx.maxDepth}.` })
       const ok = await proveNode(root, ctx)
       const proof = ok ? root.proof : ""
       if (ok && proof) {
