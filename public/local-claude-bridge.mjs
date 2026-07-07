@@ -329,16 +329,6 @@ function scriptProvesTarget(script, targetSig) {
   return false
 }
 
-// All theorem/lemma signatures declared in a script (canonical) — for surfacing
-// a near-miss when the immutability check rejects a scaffold.
-function scriptSignatures(script) {
-  const re = /\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/g
-  const out = []
-  let m
-  while ((m = re.exec(script)) !== null) out.push(canonicalSig(m[0]))
-  return out
-}
-
 // True iff a verify_full_script tool result reports a genuine success. Verified
 // LIVE against the Leak II daemon (barkingtree-leak-ii.hf.space): a real proof
 // returns "✅ Compilation Successful! The proof is 100% verified.", while ANY
@@ -490,6 +480,11 @@ function isHoleFreeProof(parsed) {
 // top-level declaration or EOF. Good enough for our generated scaffolds; a
 // parsing slip fails safe because the FINAL daemon verify is the real gate.
 const DECL_RE = /^[ \t]*(?:@\[[^\]]*\][ \t\r\n]*)*(theorem|lemma|def|instance|abbrev|example)\b/gm
+// The declared name of a `theorem`/`lemma` (up to its first binder/`:`).
+function declaredName(rawStmt) {
+  const m = String(rawStmt == null ? "" : rawStmt).match(/\b(?:theorem|lemma)\s+([^\s({\[:]+)/)
+  return m ? m[1] : null
+}
 function extractDeclarations(script) {
   const src = String(script == null ? "" : script)
   const starts = []
@@ -500,7 +495,7 @@ function extractDeclarations(script) {
     const from = starts[i].index
     const to = i + 1 < starts.length ? starts[i + 1].index : src.length
     const text = src.slice(from, to).trim()
-    decls.push({ kind: starts[i].kind, text, signature: theoremSignature(text) })
+    decls.push({ kind: starts[i].kind, text, signature: theoremSignature(text), name: declaredName(text) })
   }
   return decls
 }
@@ -514,35 +509,75 @@ function stripImports(script) {
     .trim()
 }
 
-// Just the target declaration's text from a scaffold (helper stubs dropped —
-// children supply the real proofs during assembly).
-function targetDeclarationOnly(scaffold, targetSig) {
-  for (const d of extractDeclarations(scaffold)) {
-    if (d.signature && d.signature === targetSig) return d.text
+// Identify the master declaration in a scaffold BY NAME (robust to the agent
+// renaming binders or re-spacing the statement — that drift is judged separately
+// by the semantic drift guard). Falls back to a signature match.
+function findMaster(decls, masterName, masterSig) {
+  if (masterName) {
+    const byName = decls.find((d) => d.name === masterName)
+    if (byName) return byName
   }
-  return ""
+  if (masterSig) return decls.find((d) => d.signature && d.signature === masterSig)
+  return undefined
 }
 
-// The helper lemmas a scaffold introduced (every theorem/lemma but the target).
-function helperDeclarations(scaffold, targetSig) {
-  return extractDeclarations(scaffold).filter(
-    (d) =>
-      (d.kind === "theorem" || d.kind === "lemma") &&
-      d.signature &&
-      d.signature !== targetSig,
+// Just the master declaration's text from a scaffold (helper stubs dropped —
+// children supply the real proofs during assembly).
+function targetDeclarationOnly(scaffold, masterName, masterSig) {
+  const d = findMaster(extractDeclarations(scaffold), masterName, masterSig)
+  return d ? d.text : ""
+}
+
+// The helper lemmas a scaffold introduced (every theorem/lemma but the master).
+function helperDeclarations(scaffold, masterName, masterSig) {
+  const decls = extractDeclarations(scaffold)
+  const master = findMaster(decls, masterName, masterSig)
+  return decls.filter(
+    (d) => (d.kind === "theorem" || d.kind === "lemma") && d !== master && d.name !== masterName,
   )
 }
 
 // Lean requires a name to be declared BEFORE use, so a scaffold that writes the
-// target first (referencing helpers below) fails purely on ordering. Rebuild it
-// with helpers first (given order) and the target LAST, so the structural gate
+// master first (referencing helpers below) fails purely on ordering. Rebuild it
+// with helpers first (given order) and the master LAST, so the structural gate
 // judges the reduction, not the author's ordering.
-function normalizeScaffoldOrder(scaffold, targetSig) {
+function normalizeScaffoldOrder(scaffold, masterName, masterSig) {
   const decls = extractDeclarations(stripImports(scaffold))
-  const target = decls.find((d) => d.signature && d.signature === targetSig)
-  if (!target) return stripImports(scaffold)
-  const others = decls.filter((d) => d !== target)
-  return [...others.map((d) => d.text), target.text].join("\n\n")
+  const master = findMaster(decls, masterName, masterSig)
+  if (!master) return stripImports(scaffold)
+  const others = decls.filter((d) => d !== master)
+  return [...others.map((d) => d.text), master.text].join("\n\n")
+}
+
+// ── semantic immutability: "did the agent drift the goal?" ───────────────────
+// Rather than string-compare signatures (brittle to spacing AND binder names),
+// ask the TOOLCHAIN: rename the agent's restated master to an internal name and
+// re-prove the TRUE master statement from it. If the two goals are the same up
+// to defeq, `exact`/`apply` closes it; if the agent drifted to a different or
+// weaker goal, it errors. This is the user's construction — identical signatures
+// prove each other. When the input already proves the agent's master, the result
+// is itself a hole-free proof of the customer's VERBATIM theorem.
+const _reEsc = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+function masterStatementHead(rawStmt) {
+  const s = String(rawStmt == null ? "" : rawStmt)
+  const idx = s.indexOf(":=")
+  return (idx >= 0 ? s.slice(0, idx) : s).trim()
+}
+function renameDecl(script, name, newName) {
+  const re = new RegExp("(\\b(?:theorem|lemma)\\s+)" + _reEsc(name) + "\\b")
+  return String(script).replace(re, "$1" + newName)
+}
+// Returns a script that re-proves the TRUE master from the agent's version, or
+// null if the scaffold has no declaration named like the master (a drift we
+// reject outright — the agent renamed or dropped the master theorem).
+function buildDriftGuardScript(script, masterStatement) {
+  const name = declaredName(masterStatement)
+  if (!name) return null
+  if (!new RegExp("\\b(?:theorem|lemma)\\s+" + _reEsc(name) + "\\b").test(script)) return null
+  const renamed = renameDecl(script, name, "leakInternalTarget")
+  const head = masterStatementHead(masterStatement)
+  const guard = `${head} := by\n  first\n  | exact leakInternalTarget\n  | (apply leakInternalTarget <;> assumption)`
+  return `${renamed}\n\n${guard}`
 }
 
 // Fold a proved subtree into one sorry-free script: each child's real proof
@@ -559,7 +594,7 @@ function assembleNode(node) {
   }
   if (node.children && node.children.length) {
     for (const child of node.children) for (const p of assembleNode(child)) parts.push(p)
-    const tgt = targetDeclarationOnly(node.scaffold || "", node.signature)
+    const tgt = targetDeclarationOnly(node.scaffold || "", declaredName(node.signature), node.signature)
     if (tgt) parts.push({ signature: theoremSignature(tgt) || tgt, text: tgt })
   } else if (node.proof) {
     push(stripImports(node.proof))
@@ -1363,18 +1398,21 @@ async function runNodeProver(node, ctx) {
 // (sorry-free) proof or a structurally-valid reduction. Returns
 // { ok, fullyProved?, scaffold, children, reason }.
 async function runDecomposer(node, ctx) {
-  const targetSig = node.signature
+  const masterName = declaredName(node.statement)
   const verifyCalls = {}
   const candidates = []
-  const nearMisses = [] // scaffolds with ≥2 decls but no signature-preserving match
+  const nearMisses = [] // scaffolds with ≥2 decls but no master-named declaration
   const consider = (script) => {
     if (!script) return
-    if (scriptProvesTarget(script, targetSig) && helperDeclarations(script, targetSig).length) {
-      candidates.push(script)
-    } else {
-      const sigs = scriptSignatures(script)
-      if (sigs.length >= 2) nearMisses.push(sigs)
-    }
+    const decls = extractDeclarations(script)
+    const master = decls.find((d) => d.name === masterName)
+    const helpers = decls.filter(
+      (d) => (d.kind === "theorem" || d.kind === "lemma") && d.name !== masterName,
+    )
+    // A candidate must keep the master theorem (by name) and add ≥1 helper. Its
+    // STATEMENT is checked for drift semantically below, not by string match.
+    if (master && helpers.length) candidates.push(script)
+    else if (decls.length >= 2) nearMisses.push(decls.map((d) => d.signature))
   }
   const onObject = (o) => {
     if (o.type === "assistant" && o.message?.content) {
@@ -1422,39 +1460,60 @@ async function runDecomposer(node, ctx) {
     seen.add(k)
     uniq.push(s)
   }
+  let sawReductionError = false
   for (const cand of uniq.slice(0, 3)) {
     if (ctx.signal?.aborted) break
-    const ordered = normalizeScaffoldOrder(cand, targetSig)
-    const v = await verifyViaDaemon(ordered, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    const ordered = normalizeScaffoldOrder(cand, masterName)
+    // "Verifying agent didn't drift the goal": rename the agent's restated master
+    // and re-prove the TRUE master from it. One daemon compile checks BOTH that
+    // the reduction type-checks AND that the goal was not drifted (a drift makes
+    // the re-proof error). Same-goal-up-to-defeq (incl. binder renames) passes.
+    const guarded = buildDriftGuardScript(ordered, node.statement) || ordered
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}🛡️ Verifying agent didn't drift the goal…` })
+    const v = await verifyViaDaemon(guarded, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     const parsed = parseVerifyOutput(v.text)
     if (v.ok && isHoleFreeProof(parsed)) {
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Scaffold compiled with no holes — node fully proved.` })
-      return { ok: true, fullyProved: true, scaffold: ordered, children: [], reason: "scaffold compiled sorry-free" }
+      // Fully proved AND goal preserved — `guarded` proves the verbatim master.
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Goal preserved ✓ — scaffold compiled with no holes; node fully proved.` })
+      return { ok: true, fullyProved: true, scaffold: guarded, children: [], reason: "scaffold compiled sorry-free, goal not drifted" }
     }
     if (v.ok && isStructurallyValidDecomposition(parsed)) {
-      const helpers = helperDeclarations(ordered, targetSig)
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Verified reduction → ${helpers.length} sub-lemma(s).` })
+      const helpers = helperDeclarations(ordered, masterName)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Goal preserved ✓ — reduces to ${helpers.length} sub-lemma(s).` })
       return { ok: true, scaffold: ordered, children: helpers, reason: `reduces to ${helpers.length} lemma(s)` }
     }
+    if (v.ok && parsed.errors.length) {
+      sawReductionError = true
+      // If the error is the drift guard failing to re-prove the master, the agent
+      // changed the goal — surface it distinctly from an ordinary reduction error.
+      if (/leakInternalTarget/.test(v.text)) {
+        ctx.emit({
+          type: "message-annotation",
+          subtype: "error",
+          thought: `${ctx.stage}🛡️ Goal DRIFTED — the agent's restated theorem does not prove the original. ${oneLine(parsed.errors[0]?.message || "")}`,
+        })
+      }
+    }
   }
-  if (!uniq.length && nearMisses.length) {
-    // The decomposer built a scaffold but no declaration reproduced the target
-    // signature. Surface the closest miss so the mismatch is visible (usually a
-    // restated statement or a changed binder) rather than an opaque failure.
-    const produced = nearMisses[nearMisses.length - 1].filter((s) => s !== targetSig)
+  if (!candidates.length && nearMisses.length) {
+    // Built a scaffold but no declaration kept the master's NAME — the agent
+    // renamed or dropped the master theorem. Surface what it produced instead.
+    const produced = nearMisses[nearMisses.length - 1]
     ctx.emit({
       type: "message-annotation",
       subtype: "error",
-      thought: `${ctx.stage}✂️ Scaffold did not reproduce the target signature.\n  target:   ${oneLine(targetSig)}\n  produced: ${produced.map(oneLine).join("\n            ")}`,
+      thought: `${ctx.stage}✂️ Scaffold dropped the master theorem "${masterName}".\n  produced: ${produced.map(oneLine).join("\n            ")}`,
     })
   }
   return {
     ok: false,
-    reason: uniq.length
-      ? "no candidate reduced the goal cleanly (a real type error remained)"
-      : nearMisses.length
-        ? "decomposer changed the target signature (see the near-miss above) — it must reproduce it verbatim"
-        : "decomposer produced no scaffold containing the target theorem",
+    reason: sawReductionError
+      ? "no candidate preserved the goal AND reduced it cleanly (drift or a real type error remained)"
+      : candidates.length
+        ? "the reduction did not compile"
+        : nearMisses.length
+          ? `decomposer dropped/renamed the master theorem "${masterName}" — it must keep it verbatim`
+          : "decomposer produced no scaffold containing the master theorem",
   }
 }
 
@@ -1534,12 +1593,25 @@ async function proveNode(node, ctx) {
     }
   }
 
-  // 4. Assemble the whole subtree and gate on ONE final HOLE-FREE compile (no
-  // errors, no sorry) that contains the immutable node signature. Benign
-  // warnings (deprecations/linters) are tolerated — they are not holes.
+  // 4. Assemble the whole subtree, then GATE it by re-proving the node's exact
+  // statement from the assembly ("verifying agent didn't drift the goal"). The
+  // guarded script, when hole-free, is itself a proof of the VERBATIM master —
+  // benign warnings (deprecations/linters) are tolerated, only errors/sorry are
+  // holes. Falls back to a plain hole-free + canonical-signature check.
   if (ctx.signal?.aborted) return false
   const assembled = assembleScript(node)
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Assembling ${declName(node.signature)} from ${node.children.length} proved lemma(s) — final verify…` })
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Assembling ${declName(node.signature)} from ${node.children.length} proved lemma(s) — 🛡️ verifying no goal drift…` })
+  const guarded = buildDriftGuardScript(assembled, node.statement)
+  if (guarded) {
+    const gv = await verifyViaDaemon(guarded, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (gv.ok && isHoleFreeProof(parseVerifyOutput(gv.text))) {
+      node.proof = guarded
+      node.status = "proved-assembled"
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled; goal preserved and verified hole-free.` })
+      return true
+    }
+  }
+  // Fallback: the plain assembly, hole-free and containing the exact signature.
   const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
   const parsed = parseVerifyOutput(v.text)
   if (v.ok && isHoleFreeProof(parsed) && scriptProvesTarget(assembled, node.signature)) {
