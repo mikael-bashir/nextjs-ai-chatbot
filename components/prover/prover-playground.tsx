@@ -23,7 +23,7 @@ export function ProverPlayground() {
   // stalled goal is broken into verified sub-lemmas instead of looping forever.
   const [decompose, setDecompose] = useState(false);
   // Strategy mode for A/B testing proof approaches (tree path only).
-  const [strategy, setStrategy] = useState<'hacker' | 'pantograph'>('hacker');
+  const [strategy, setStrategy] = useState('hacker');
 
   const run = useCallback(async () => {
     if (!problem.trim()) return;
@@ -86,14 +86,15 @@ export function ProverPlayground() {
             Strategy
             <select
               value={strategy}
-              onChange={(e) =>
-                setStrategy(e.target.value as 'hacker' | 'pantograph')
-              }
+              onChange={(e) => setStrategy(e.target.value)}
               disabled={running}
               className="rounded-md border bg-background px-2 py-1.5 text-sm"
             >
               <option value="hacker">Hacker (compiler-driven)</option>
               <option value="pantograph">Pantograph (interactive Leak II)</option>
+              <option value="librarian">Librarian (search-first control)</option>
+              <option value="sketch">Sketch (plan then formalize)</option>
+              <option value="brute">Brute (automation only)</option>
             </select>
           </label>
         )}

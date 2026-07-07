@@ -312,11 +312,11 @@ const GOV_GRANT = Number(process.env.SEARCH_BUDGET_GRANT || 3)
 const governors = new Map() // id -> governor
 let govSeq = 0
 
-function createGovernor() {
+function createGovernor({ initial } = {}) {
   const id = `${(++govSeq).toString(36)}${randomBytes(4).toString("hex")}`
   const g = {
     id,
-    budget: GOV_INITIAL,
+    budget: Number.isFinite(initial) ? initial : GOV_INITIAL,
     searchServer: null, // { url, tools: [{ name, argKey }] } — the upstream we proxy
     sessions: new Map(), // sseSessionId -> res
     searchCount: 0,
@@ -1154,22 +1154,107 @@ Original theorem (immutable — reproduce its signature exactly):
 ${theorem}`
 }
 
-// The registry. Each strategy supplies a node-prover and a decomposer prompt.
+// LIBRARIAN — the deliberate CONTROL for "does search actually help?". Search-
+// first: find the exact Mathlib lemmas, then assemble. Given a LARGE search
+// allowance so it's a fair opposite of hacker.
+function librarianProvePrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving a Lean 4 + Mathlib theorem by FINDING AND REUSING THE RIGHT LEMMAS. Mathlib is enormous; the fastest formal proofs cite existing results rather than reproving from scratch. Search first, assemble second.
+
+${toolSection}
+
+APPROACH — library-first:
+- moogle_search { concept } — English/semantic search to DISCOVER lemma names ("totient of a prime power", "sum over range is triangular").
+- loogle_search { query } — type/pattern search to pin an exact signature once you know roughly what you want. Loogle syntax: names in quotes ("Nat.totient"), patterns with _ placeholders (e.g. \`Nat.totient (_ ^ _)\`); a bare identifier like \`n\` is NOT valid.
+- You have a GENEROUS search budget in this mode — use it. Identify each fact the proof needs and find the Mathlib lemma for it.
+- verify_full_script (Leak IV) — compile the assembled proof; read errors; fix. init_proof/apply_tactic to inspect a goal state.
+
+WORKFLOW: list the key facts the proof depends on → search Mathlib for each lemma name/signature → write the proof citing them → verify_full_script → fix. Prefer a one-line cite of a library lemma over a hand-rolled argument.
+
+Done ONLY when verify_full_script succeeds on the ORIGINAL theorem below (same name/signature), no \`sorry\`. Output the final proof as one \`\`\`lean block.
+${extra ? `\n${extra}\n` : ""}
+Theorem:
+${theorem}`
+}
+
+// SKETCH — plan-then-formalize. Tests whether writing the mathematical argument
+// out first (before any tool) improves success on multi-step theorems.
+function sketchProvePrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving a Lean 4 + Mathlib theorem. FIRST think, THEN formalize.
+
+${toolSection}
+
+STEP 1 — SKETCH (before any tool call): write a concise natural-language proof sketch — the key mathematical steps and the lemma/identity each one needs. Name the central move (induction/descent, a reduction, a bijection, a known identity). Keep it tight: 3–8 bullet steps.
+
+STEP 2 — FORMALIZE the sketch step by step. Turn each sketch step into a Lean \`have\` and close it with strong automation (\`decide\`/\`native_decide\`/\`omega\`/\`simp\`/\`nlinarith\`/\`norm_num\`) or a cited lemma. Assemble the steps into the final proof and check with verify_full_script; fix from the compiler's errors. Use init_proof/apply_tactic to see a goal state when a step is fiddly. Search (loogle/moogle) only for a specific unknown lemma NAME.
+
+Done ONLY when verify_full_script succeeds on the ORIGINAL theorem below (same name/signature), no \`sorry\`. Output the final proof as one \`\`\`lean block.
+${extra ? `\n${extra}\n` : ""}
+Theorem:
+${theorem}`
+}
+
+// BRUTE — maximal automation only. Cheap baseline: how far does throwing every
+// closing tactic (aesop/decide/omega/simp_all/nlinarith/…) get on the ACG set?
+function bruteProvePrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving a Lean 4 + Mathlib theorem by AUTOMATION ALONE, if at all possible. Do NOT search; do minimal hand-work.
+
+${toolSection}
+
+In your FIRST verify_full_script, try heavy closers on the WHOLE goal — one per attempt, cheapest first: \`by decide\`, \`by native_decide\`, \`by omega\`, \`by simp\`, \`by norm_num\`, \`by simp_all\`, \`by aesop\`, \`by nlinarith [sq_nonneg _]\`, \`by positivity\`, and short combos (\`by intro _ <;> simp_all\`, \`by simp_all <;> omega\`, \`by constructor <;> aesop\`). Iterate through these based on the compiler's errors. If a goal splits, throw automation at each piece.
+
+Only if automation genuinely cannot finish, add the MINIMAL manual structure (an intro, an induction, a single rewrite) and hand the resulting subgoals back to automation. If it clearly needs a substantial lemma, say so and decompose.
+
+Done ONLY when verify_full_script succeeds on the ORIGINAL theorem below (same name/signature), no \`sorry\`. Output the final proof as one \`\`\`lean block.
+${extra ? `\n${extra}\n` : ""}
+Theorem:
+${theorem}`
+}
+
+// The registry. Each strategy supplies a node-prover prompt, a decomposer prompt,
+// and an optional search budget (how much library search that mode is rationed
+// to — the governor enforces it). `search` defaults to GOV_INITIAL.
 const STRATEGIES = {
   hacker: {
     label: "Hacker — compiler-driven, verify_full_script as the main loop",
     node: (t, m, x) => provePrompt(t, m, x),
     decompose: (t, m) => decomposePrompt(t, m),
+    search: GOV_INITIAL,
   },
   pantograph: {
     label: "Pantograph — interactive Leak II as the workspace, Leak IV only as guardrail",
     node: (t, m, x) => pantographProvePrompt(t, m, x),
     decompose: (t, m) => pantographDecomposePrompt(t, m),
+    search: GOV_INITIAL,
+  },
+  librarian: {
+    label: "Librarian — search-first control; find & cite Mathlib lemmas",
+    node: (t, m, x) => librarianProvePrompt(t, m, x),
+    decompose: (t, m) => decomposePrompt(t, m),
+    search: 30, // generous, so it's a fair opposite of hack-first
+  },
+  sketch: {
+    label: "Sketch — plan the argument in words, then formalize step by step",
+    node: (t, m, x) => sketchProvePrompt(t, m, x),
+    decompose: (t, m) => decomposePrompt(t, m),
+    search: GOV_INITIAL,
+  },
+  brute: {
+    label: "Brute — automation only (aesop/decide/omega/simp_all/nlinarith)",
+    node: (t, m, x) => bruteProvePrompt(t, m, x),
+    decompose: (t, m) => decomposePrompt(t, m),
+    search: 0, // brute mode does not search
   },
 }
 const pickStrategy = (name) => STRATEGIES[name] || STRATEGIES.hacker
 const nodePromptFor = (name, t, m, x) => pickStrategy(name).node(t, m, x)
 const decomposePromptFor = (name, t, m) => pickStrategy(name).decompose(t, m)
+const searchBudgetFor = (name) => {
+  const b = pickStrategy(name).search
+  return Number.isFinite(b) ? b : GOV_INITIAL
+}
 
 // Non-streaming prove used by the /prove route AND the customer-traffic worker.
 // GUARDRAIL: this must NOT trust the model's final prose. Like /prove-stream it
@@ -1571,12 +1656,13 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, stage, metrics, signal }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, stage, metrics, signal, searchBudget }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
-    // per decomposition — a fresh sub-goal earns a fresh allowance). Search tools
+    // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
+    // budget is strategy-dependent (e.g. librarian gets a large one). Search tools
     // are routed through the bridge; verify + Pantograph stay direct.
-    const governor = createGovernor()
+    const governor = createGovernor({ initial: searchBudget })
     let cfgPath
     try {
       const dir = mkdtempSync(join(tmpdir(), "claude-tree-"))
@@ -1745,6 +1831,7 @@ async function runNodeProver(node, ctx) {
       stage: ctx.stage,
       metrics: ctx.metrics,
       signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
     },
     { onObject, emit: ctx.emit },
   )
@@ -1805,6 +1892,7 @@ async function runDecomposer(node, ctx) {
       stage: `${ctx.stage}✂️`,
       metrics: ctx.metrics,
       signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
     },
     { onObject, emit: ctx.emit },
   )
@@ -2043,6 +2131,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     mcpServers,
     model: opts.model,
     strategy,
+    searchBudget: searchBudgetFor(strategy),
     verifyUrl,
     emit,
     metrics,

@@ -468,6 +468,13 @@ export function AdminPipeline() {
   useEffect(() => {
     verifyDecomposeRef.current = verifyDecompose;
   }, [verifyDecompose]);
+  // Strategy mode (A/B testing proof approaches) for the decompose path. Held in
+  // a ref for the same reason as verifyDecompose.
+  const [verifyStrategy, setVerifyStrategy] = useState('hacker');
+  const verifyStrategyRef = useRef(verifyStrategy);
+  useEffect(() => {
+    verifyStrategyRef.current = verifyStrategy;
+  }, [verifyStrategy]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -578,6 +585,7 @@ export function AdminPipeline() {
       };
       try {
         const decompose = verifyDecomposeRef.current;
+        const strategy = verifyStrategyRef.current;
         const outcome = await runProverStream({
           problem: lean,
           mcpServers,
@@ -585,8 +593,9 @@ export function AdminPipeline() {
           token: conn.token,
           signal,
           onEvent,
-          source: decompose ? 'acg-tree' : 'acg',
+          source: decompose ? `acg-tree:${strategy}` : 'acg',
           endpoint: decompose ? 'prove-tree' : 'prove-stream',
+          strategy: decompose ? strategy : undefined,
         });
         const lim = detectSessionLimit(content);
         if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
@@ -1428,6 +1437,23 @@ export function AdminPipeline() {
               <span aria-hidden>⑂</span>
               Decompose {verifyDecompose ? 'on' : 'off'}
             </button>
+            {verifyDecompose && (
+              <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                Strategy
+                <select
+                  value={verifyStrategy}
+                  onChange={(e) => setVerifyStrategy(e.target.value)}
+                  className="rounded-md border bg-background px-1.5 py-1 text-xs"
+                  title="A/B-test proof strategies; runs are tagged acg-tree:<strategy> in the agent debug log"
+                >
+                  <option value="hacker">Hacker (compiler-driven)</option>
+                  <option value="pantograph">Pantograph (interactive Leak II)</option>
+                  <option value="librarian">Librarian (search-first control)</option>
+                  <option value="sketch">Sketch (plan then formalize)</option>
+                  <option value="brute">Brute (automation only)</option>
+                </select>
+              </label>
+            )}
             {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
               <Button
                 size="sm"
