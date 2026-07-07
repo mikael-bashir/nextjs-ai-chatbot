@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useState } from 'react';
-import { Loader2, Play, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { Loader2, Play, ShieldCheck, ShieldAlert, GitBranch } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -19,6 +19,9 @@ export function ProverPlayground() {
   const [events, setEvents] = useState<ProverEvent[]>([]);
   const [running, setRunning] = useState(false);
   const [outcome, setOutcome] = useState<ProverOutcome | null>(null);
+  // Decomposition mode drives the /prove-tree orchestrator: prove-or-split, so a
+  // stalled goal is broken into verified sub-lemmas instead of looping forever.
+  const [decompose, setDecompose] = useState(false);
 
   const run = useCallback(async () => {
     if (!problem.trim()) return;
@@ -28,14 +31,20 @@ export function ProverPlayground() {
     const append = (e: ProverEvent) => setEvents((prev) => [...prev, e]);
     try {
       const mcpServers = await fetchProverMcpServers();
-      const out = await runProverStream({ problem, mcpServers, onEvent: append, source: 'playground' });
+      const out = await runProverStream({
+        problem,
+        mcpServers,
+        onEvent: append,
+        source: decompose ? 'playground-tree' : 'playground',
+        endpoint: decompose ? 'prove-tree' : 'prove-stream',
+      });
       setOutcome(out);
     } catch {
       /* the console already shows the error event */
     } finally {
       setRunning(false);
     }
-  }, [problem]);
+  }, [problem, decompose]);
 
   return (
     <div className="space-y-4">
@@ -46,14 +55,37 @@ export function ProverPlayground() {
         className="font-mono text-sm"
         placeholder="Enter a statement (Lean theorem, or a problem to prove)…"
       />
-      <Button onClick={run} disabled={running || !problem.trim()} className="gap-2">
-        {running ? (
-          <Loader2 className="size-4 animate-spin" />
-        ) : (
-          <Play className="size-4" />
-        )}
-        Send to prover
-      </Button>
+      <div className="flex flex-wrap items-center gap-3">
+        <Button onClick={run} disabled={running || !problem.trim()} className="gap-2">
+          {running ? (
+            <Loader2 className="size-4 animate-spin" />
+          ) : (
+            <Play className="size-4" />
+          )}
+          Send to prover
+        </Button>
+        <button
+          type="button"
+          onClick={() => setDecompose((v) => !v)}
+          disabled={running}
+          className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm transition-colors ${
+            decompose
+              ? 'border-violet-500/50 bg-violet-500/10 text-violet-600 dark:text-violet-400'
+              : 'text-muted-foreground hover:bg-muted'
+          }`}
+          title="Break the goal into verified sub-lemmas recursively (prove-or-split tree)"
+        >
+          <GitBranch className="size-3.5" />
+          Decompose mode {decompose ? 'on' : 'off'}
+        </button>
+      </div>
+      {decompose && (
+        <p className="text-xs text-muted-foreground">
+          Prove-or-split: each goal gets a bounded direct attempt, then is broken
+          into toolchain-verified sub-lemmas (recursively) and assembled into one
+          sorry-free proof. Needs a verify_full_script MCP server connected.
+        </p>
+      )}
 
       <ProverConsole events={events} running={running} />
 

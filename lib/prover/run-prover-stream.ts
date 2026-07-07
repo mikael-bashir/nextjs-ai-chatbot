@@ -33,6 +33,10 @@ interface RunOpts {
   // the outcome are persisted to the admin debug log. The endpoint is admin-
   // gated server-side, so this is a no-op (silently ignored) for non-admins.
   source?: string;
+  // Which bridge route to drive. 'prove-stream' (default) is the single-agent
+  // prover; 'prove-tree' is the decomposition orchestrator (prove-or-split proof
+  // tree). Both emit the identical SSE shape, so this runner handles either.
+  endpoint?: 'prove-stream' | 'prove-tree';
 }
 
 // Fire-and-forget: persist a run to the admin debug log. Admin-gated server-side.
@@ -57,6 +61,7 @@ async function logAgentRun(record: Record<string, unknown>) {
  */
 export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
   const { problem, mcpServers, model, signal, onEvent, source } = opts;
+  const endpoint = opts.endpoint ?? 'prove-stream';
   const conn = bridgeConnection();
   const base = normalizeBase(opts.bridgeUrl ?? conn.bridgeUrl);
   const token = opts.token ?? conn.token ?? '';
@@ -79,7 +84,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
 
   let res: Response;
   try {
-    res = await fetch(`${base}/prove-stream`, {
+    res = await fetch(`${base}/${endpoint}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bridge-token': token },
       body: JSON.stringify({ theorem: problem, mcpServers, model }),

@@ -379,16 +379,301 @@ function makeProofGate(theorem) {
   }
 }
 
-// The goal is to let Claude use the tools logically on its own — but a bare
-// "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
-// on hard theorems and never actually build or check a proof. So we hand it an
-// explicit, verification-first workflow: draft → verify_full_script → iterate,
-// with library search as a *subordinate* step, not the main loop.
-function provePrompt(theorem, mcpServers = []) {
-  // Claude Code prefixes MCP tools as mcp__<server>__<tool>, sanitizing the
-  // server name (e.g. "Leak II" -> "Leak_II"). We build the tool list from the
-  // LIVE inventory the app pulled from the MCP manager (name + arg keys), so the
-  // agent gets exact tool ids and can't invent one like "mcp__Lean_I__...".
+// ===========================================================================
+// PROOF-TREE DECOMPOSITION (Phase 2 + 3)
+// ---------------------------------------------------------------------------
+// When the agent "eternally theorises" and never closes a goal, we STOP letting
+// one run wander forever. A node is proved directly with a bounded turn budget;
+// if it stalls (or the agent asks), the focus shifts ENTIRELY to breaking the
+// node's goal into smaller EQUIVALENT sub-lemmas — recursively — until every
+// leaf is genuinely closed, then we assemble bottom-up and gate the whole thing
+// on ONE final sorry-free compile.
+//
+// Two invariants make this sound:
+//   1. Signatures are IMMUTABLE. The orchestrator owns every node's statement;
+//      a subagent may only add helper lemmas / write proof bodies, never edit a
+//      statement. Enforced by scriptProvesTarget (the exact signature must be
+//      present in what the subagent returns).
+//   2. Decompositions are VERIFIED, not trusted. A proposed decomposition is
+//      accepted ONLY if the toolchain, compiling the scaffold, reports that its
+//      sole diagnostics are `sorry` warnings on the stubbed helpers — i.e. the
+//      node's proof genuinely type-checks GIVEN the helpers (no real errors).
+//      This is the one place a `sorry` warning is a FEATURE, and the whole gate
+//      is derived purely from the daemon's own verify_full_script text.
+// ---------------------------------------------------------------------------
+
+// Parse the Leak daemon's verify_full_script text into a structured verdict.
+// Success => "✅ Compilation Successful!"; failure => "❌ Compilation Failed:"
+// followed by "Line N (Error|Warning): message" lines (a `sorry`/`admit`
+// surfaces as a Warning "declaration uses `sorry`").
+const SORRY_RE = /uses\s*[`'"]?\s*(sorry|admit)/i
+function parseVerifyOutput(text) {
+  const raw = String(text == null ? "" : text)
+  const success =
+    /compilation successful|100% verified/i.test(raw) && !/compilation failed|❌/i.test(raw)
+  const diagnostics = []
+  const re = /^\s*Line\s+(\d+)\s*\((Error|Warning)\)\s*:\s*(.*)$/gim
+  let m
+  while ((m = re.exec(raw)) !== null) {
+    diagnostics.push({ line: Number(m[1]), severity: m[2].toLowerCase(), message: m[3].trim() })
+  }
+  const errors = diagnostics.filter((d) => d.severity === "error")
+  const warnings = diagnostics.filter((d) => d.severity === "warning")
+  const sorryWarnings = warnings.filter((d) => SORRY_RE.test(d.message))
+  const otherWarnings = warnings.filter((d) => !SORRY_RE.test(d.message))
+  const serverError = /verification error|unexpected server error/i.test(raw)
+  return { raw, success, diagnostics, errors, warnings, sorryWarnings, otherWarnings, serverError }
+}
+
+// True iff a compiled scaffold PROVES its node modulo stubbed helpers: no real
+// errors, no non-sorry warnings, ≥1 sorry (the helpers). A fully-successful
+// compile is handled by the caller as "already proved directly", not a decomp.
+function isStructurallyValidDecomposition(parsed) {
+  return (
+    !parsed.serverError &&
+    !parsed.success &&
+    parsed.errors.length === 0 &&
+    parsed.otherWarnings.length === 0 &&
+    parsed.sorryWarnings.length > 0
+  )
+}
+
+// Heuristic top-level declaration parser. Declarations start at a line boundary
+// (optionally after attributes like `@[simp]`); each block runs to the next
+// top-level declaration or EOF. Good enough for our generated scaffolds; a
+// parsing slip fails safe because the FINAL daemon verify is the real gate.
+const DECL_RE = /^[ \t]*(?:@\[[^\]]*\][ \t\r\n]*)*(theorem|lemma|def|instance|abbrev|example)\b/gm
+function extractDeclarations(script) {
+  const src = String(script == null ? "" : script)
+  const starts = []
+  let m
+  while ((m = DECL_RE.exec(src)) !== null) starts.push({ index: m.index, kind: m[1] })
+  const decls = []
+  for (let i = 0; i < starts.length; i++) {
+    const from = starts[i].index
+    const to = i + 1 < starts.length ? starts[i + 1].index : src.length
+    const text = src.slice(from, to).trim()
+    decls.push({ kind: starts[i].kind, text, signature: theoremSignature(text) })
+  }
+  return decls
+}
+
+// Strip `import …` lines (the daemon injects `import Mathlib` itself).
+function stripImports(script) {
+  return String(script == null ? "" : script)
+    .split("\n")
+    .filter((l) => !/^\s*import\b/.test(l))
+    .join("\n")
+    .trim()
+}
+
+// Just the target declaration's text from a scaffold (helper stubs dropped —
+// children supply the real proofs during assembly).
+function targetDeclarationOnly(scaffold, targetSig) {
+  for (const d of extractDeclarations(scaffold)) {
+    if (d.signature && d.signature === targetSig) return d.text
+  }
+  return ""
+}
+
+// The helper lemmas a scaffold introduced (every theorem/lemma but the target).
+function helperDeclarations(scaffold, targetSig) {
+  return extractDeclarations(scaffold).filter(
+    (d) =>
+      (d.kind === "theorem" || d.kind === "lemma") &&
+      d.signature &&
+      d.signature !== targetSig,
+  )
+}
+
+// Lean requires a name to be declared BEFORE use, so a scaffold that writes the
+// target first (referencing helpers below) fails purely on ordering. Rebuild it
+// with helpers first (given order) and the target LAST, so the structural gate
+// judges the reduction, not the author's ordering.
+function normalizeScaffoldOrder(scaffold, targetSig) {
+  const decls = extractDeclarations(stripImports(scaffold))
+  const target = decls.find((d) => d.signature && d.signature === targetSig)
+  if (!target) return stripImports(scaffold)
+  const others = decls.filter((d) => d !== target)
+  return [...others.map((d) => d.text), target.text].join("\n\n")
+}
+
+// Fold a proved subtree into one sorry-free script: each child's real proof
+// (recursively), then this node's target-proof from the scaffold; children
+// before parents so names resolve; duplicate signatures collapsed. The caller
+// runs the FINAL daemon verify — that is what actually certifies the result.
+function assembleNode(node) {
+  const parts = []
+  const push = (text) => {
+    for (const d of extractDeclarations(text)) {
+      if (!d.text) continue
+      parts.push({ signature: d.signature || d.text, text: d.text })
+    }
+  }
+  if (node.children && node.children.length) {
+    for (const child of node.children) for (const p of assembleNode(child)) parts.push(p)
+    const tgt = targetDeclarationOnly(node.scaffold || "", node.signature)
+    if (tgt) parts.push({ signature: theoremSignature(tgt) || tgt, text: tgt })
+  } else if (node.proof) {
+    push(stripImports(node.proof))
+  }
+  return parts
+}
+function assembleScript(node) {
+  const seen = new Set()
+  const ordered = []
+  for (const p of assembleNode(node)) {
+    if (seen.has(p.signature)) continue
+    seen.add(p.signature)
+    ordered.push(p.text)
+  }
+  return ordered.join("\n\n")
+}
+
+// Pick the MCP server that actually exposes verify_full_script; else the first.
+function resolveVerifyUrl(mcpServers) {
+  const servers = (mcpServers || []).filter((s) => s && s.url)
+  for (const s of servers) {
+    const tools = Array.isArray(s.tools) ? s.tools : []
+    const has = tools.some((t) => {
+      const n = typeof t === "string" ? t : t && t.name
+      return n && /verify.*full.*script|verify_full_script/i.test(n)
+    })
+    if (has) return s.url
+  }
+  return servers[0]?.url || null
+}
+
+// Compile a script against the verify daemon DIRECTLY over MCP-SSE. The
+// orchestrator does not trust the agent's own verify calls for scaffolds/
+// assemblies IT constructs — it checks them itself. One-shot SSE session.
+function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
+  return new Promise((resolve) => {
+    let base
+    try {
+      base = new URL(sseUrl)
+    } catch {
+      resolve({ ok: false, text: "", error: `bad daemon url: ${sseUrl}` })
+      return
+    }
+    const origin = `${base.protocol}//${base.host}`
+    let postUrl = null
+    let settled = false
+    let reader = null
+    const pending = new Map()
+    let buf = ""
+    let nextId = 1
+    const done = (out) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      try {
+        reader?.cancel()
+      } catch {
+        /* ignore */
+      }
+      resolve(out)
+    }
+    const timer = setTimeout(
+      () => done({ ok: false, text: "", error: `verify timed out after ${timeoutMs}ms` }),
+      timeoutMs,
+    )
+    const handle = (evt, data) => {
+      if (evt === "endpoint") {
+        try {
+          postUrl = new URL(data, origin).toString()
+        } catch {
+          postUrl = origin + data
+        }
+        return
+      }
+      let msg
+      try {
+        msg = JSON.parse(data)
+      } catch {
+        return
+      }
+      if (msg.id != null && pending.has(msg.id)) {
+        const { resolve: r } = pending.get(msg.id)
+        pending.delete(msg.id)
+        r(msg)
+      }
+    }
+    const rpc = async (method, params, { notify = false } = {}) => {
+      const startWait = Date.now()
+      while (!postUrl) {
+        if (Date.now() - startWait > timeoutMs) throw new Error("no endpoint from daemon")
+        await new Promise((r) => setTimeout(r, 50))
+      }
+      const id = notify ? undefined : nextId++
+      const body = { jsonrpc: "2.0", method, ...(params ? { params } : {}) }
+      if (!notify) body.id = id
+      const p = notify ? Promise.resolve() : new Promise((r) => pending.set(id, { resolve: r }))
+      const res = await fetch(postUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok && !notify) throw new Error(`POST ${method} -> ${res.status}`)
+      return p
+    }
+    ;(async () => {
+      try {
+        const res = await fetch(sseUrl, { headers: { Accept: "text/event-stream" } })
+        if (!res.ok || !res.body) throw new Error(`SSE open failed: ${res.status}`)
+        reader = res.body.getReader()
+        const dec = new TextDecoder()
+        ;(async () => {
+          while (true) {
+            const { done: rdone, value } = await reader.read()
+            if (rdone) break
+            buf += dec.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+            let idx
+            while ((idx = buf.indexOf("\n\n")) !== -1) {
+              const chunk = buf.slice(0, idx)
+              buf = buf.slice(idx + 2)
+              let evt = "message"
+              const dataLines = []
+              for (const line of chunk.split("\n")) {
+                if (line.startsWith("event:")) evt = line.slice(6).trim()
+                else if (line.startsWith("data:")) dataLines.push(line.slice(5).trimStart())
+              }
+              if (dataLines.length) handle(evt, dataLines.join("\n"))
+            }
+          }
+        })().catch(() => {})
+        await rpc("initialize", {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "leak-orchestrator", version: "0.1.0" },
+        })
+        await rpc("notifications/initialized", undefined, { notify: true })
+        const list = await rpc("tools/list", {})
+        const tools = list?.result?.tools || []
+        const verify = tools.find((t) => /verify.*full.*script|verify_full_script/i.test(t.name))
+        if (!verify) throw new Error("verify_full_script not found on daemon")
+        const r = await rpc("tools/call", { name: verify.name, arguments: { script } })
+        if (r?.error) throw new Error(`daemon RPC error: ${JSON.stringify(r.error)}`)
+        const c = r?.result?.content
+        const text = Array.isArray(c)
+          ? c.map((x) => x?.text ?? "").join("\n")
+          : JSON.stringify(r?.result ?? r)
+        done({ ok: true, text })
+      } catch (e) {
+        done({ ok: false, text: "", error: String(e?.message || e) })
+      }
+    })()
+  })
+}
+
+// Build the "how to load your deferred MCP tools" section shared by the prover
+// and the decomposer prompts. Claude Code prefixes MCP tools as
+// mcp__<server>__<tool> (server name sanitized, e.g. "Leak II" -> "Leak_II") and
+// DEFERS them: a tool can't be called until loaded with ONE ToolSearch select.
+// We build the exact id list from the LIVE inventory so the agent can't invent
+// an id. Verified against the live CLI: telling it to "call directly" fails with
+// "No such tool available".
+function mcpToolSection(mcpServers = []) {
   const sanitize = (n) => String(n || "").replace(/[^a-zA-Z0-9_]/g, "_")
   const servers = (mcpServers || []).filter((s) => s && s.name)
   const toolIds = []
@@ -405,15 +690,8 @@ function provePrompt(theorem, mcpServers = []) {
       toolLines.push(`- ${id}${args}`)
     }
   }
-
-  // These MCP tools are DEFERRED by Claude Code (verified against the live CLI):
-  // a tool CANNOT be called until it has been loaded with ToolSearch
-  // "select:<exact id>". So the reliable pattern is to select ALL of them up
-  // front, then call them. Telling the agent to "call directly / skip
-  // ToolSearch" is what made earlier runs fail with "No such tool available".
-  let toolSection
   if (toolIds.length) {
-    toolSection = `Your Lean tools are provided over MCP but are DEFERRED — you MUST load a tool before you can call it. As your VERY FIRST action, make ONE ToolSearch call to load them all:
+    return `Your Lean tools are provided over MCP but are DEFERRED — you MUST load a tool before you can call it. As your VERY FIRST action, make ONE ToolSearch call to load them all:
 
   ToolSearch  query: "select:${toolIds.join(",")}"
 
@@ -421,17 +699,26 @@ After that they are callable by these EXACT names (never invent a name):
 ${toolLines.join("\n")}
 
 If ToolSearch returns nothing for a given id, that tool's server isn't connected right now — proceed with whichever loaded. If verify_full_script fails to load, say so explicitly and stop; do not fake a verification.`
-  } else if (servers.length) {
+  }
+  if (servers.length) {
     const prefixes = servers.map((s) => sanitize(s.name))
-    toolSection = `Your Lean tools are provided over MCP by these servers: ${prefixes.join(", ")}. They are DEFERRED, so load them first with ONE ToolSearch call before calling any:
+    return `Your Lean tools are provided over MCP by these servers: ${prefixes.join(", ")}. They are DEFERRED, so load them first with ONE ToolSearch call before calling any:
 
   ToolSearch  query: "select:${prefixes.map((p) => `mcp__${p}__verify_full_script`).join(",")},${prefixes.map((p) => `mcp__${p}__moogle_search`).join(",")},${prefixes.map((p) => `mcp__${p}__loogle_search`).join(",")},${prefixes.map((p) => `mcp__${p}__init_proof`).join(",")},${prefixes.map((p) => `mcp__${p}__apply_tactic`).join(",")}"
 
 Only the ids that actually exist will load; use those. Never invent a server name. If verify_full_script does not load on any server, say so and stop.`
-  } else {
-    toolSection =
-      'Load your Lean MCP tools first with ToolSearch "select:mcp__<server>__<tool>" (they are deferred), then use a whole-script compiler (verify_full_script) and library search.'
   }
+  return 'Load your Lean MCP tools first with ToolSearch "select:mcp__<server>__<tool>" (they are deferred), then use a whole-script compiler (verify_full_script) and library search.'
+}
+
+// The goal is to let Claude use the tools logically on its own — but a bare
+// "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
+// on hard theorems and never actually build or check a proof. So we hand it an
+// explicit, verification-first workflow: draft → verify_full_script → iterate,
+// with library search as a *subordinate* step, not the main loop. `extra` lets
+// the tree append a node-specific note (e.g. the voluntary-DECOMPOSE option).
+function provePrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
 
   return `You are proving the following Lean 4 theorem.
 
@@ -452,8 +739,36 @@ WORKFLOW:
 5. A proof is done ONLY when verify_full_script reports success on a script containing the ORIGINAL theorem below — same name and signature — with no \`sorry\`. Verifying helper \`example\`s or side lemmas is fine for exploration but does NOT count. Then output that final verified proof as a single \`\`\`lean code block.
 
 Keep momentum: attempt → verify → when stuck, step through with the interactive tools or look up the lemma → attempt again. Don't spend a long stretch only searching or only thinking; put the goal through the tools.
-
+${extra ? `\n${extra}\n` : ""}
 Theorem:
+${theorem}`
+}
+
+// The Decomposer subagent's prompt. This run's focus is NOT to finish the proof
+// but to BREAK the goal into smaller, equivalent sub-lemmas — the move the agent
+// keeps failing to make on its own. It must emit a self-contained scaffold:
+//   * helper lemmas H₁…Hₙ, each a real statement with body `:= by sorry`;
+//   * the ORIGINAL theorem, its signature untouched, proved FROM those helpers
+//     (its own proof has NO sorry — every hole lives in a helper);
+//   * helpers written BEFORE the theorem (Lean needs a name declared before use).
+// We accept it only if the toolchain confirms the scaffold's sole diagnostics
+// are `sorry` warnings — i.e. the reduction genuinely type-checks.
+function decomposePrompt(theorem, mcpServers = []) {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are DECOMPOSING a Lean 4 theorem you could not close directly. Your job on THIS run is not to finish the proof — it is to break the goal into smaller, independently-provable sub-lemmas, so that separate runs can each close one.
+
+${toolSection}
+
+Produce a single self-contained Lean scaffold with this exact shape:
+  1. One or more HELPER LEMMAS. Each has a real, well-typed signature and a body of exactly \`:= by sorry\`. Give them descriptive, unique names (e.g. \`theorem_name_step_mul_comm\`), never generic ones like \`helper\` or \`aux\`.
+  2. The ORIGINAL theorem below, VERBATIM — same name, same signature, do NOT change one character of the statement — proved USING the helper lemmas. Its proof must contain NO \`sorry\`: every remaining hole must live inside a helper, not in the main theorem.
+  3. Write the helpers ABOVE the theorem (Lean requires a name to be declared before it is used).
+
+The decomposition is correct when compiling the scaffold yields ONLY "declaration uses \`sorry\`" warnings (one per helper) and NO errors — that proves the main theorem really does follow from the helpers. Use verify_full_script to check exactly this: iterate until the only diagnostics are the helper \`sorry\` warnings. Use init_proof/apply_tactic to discover which intermediate facts the main proof actually needs, so your helper statements are the RIGHT ones. Each helper should be a genuinely smaller step than the original — if a "helper" is just the original theorem restated, you have not decomposed anything.
+
+When the scaffold compiles with only the helper \`sorry\` warnings, output it as a single \`\`\`lean code block.
+
+Original theorem (immutable — reproduce its signature exactly):
 ${theorem}`
 }
 
@@ -792,6 +1107,480 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
   })
 }
 
+// ===========================================================================
+// PROOF-TREE ORCHESTRATOR (Phase 3)
+// ---------------------------------------------------------------------------
+// Drives the tree: each node is proved directly with a bounded turn budget; if
+// it stalls (or the agent asks), a Decomposer run splits it into sub-lemmas
+// (structurally verified), each of which becomes a child node — recursively.
+// When all leaves are genuinely closed, the subtree is assembled bottom-up and
+// gated on ONE final sorry-free compile. All subagent runs stream into the same
+// SSE console via `emit`.
+// ---------------------------------------------------------------------------
+
+const clampNum = (v, lo, hi, dflt) => {
+  const n = Number(v)
+  return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : dflt
+}
+const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim().slice(0, 120)
+const declName = (sig) => {
+  const m = String(sig || "").match(/\b(?:theorem|lemma)\s+([^\s({\[:]+)/)
+  return m ? m[1] : "lemma"
+}
+
+// Map one claude stream-json object to the app's display SSE events (same shapes
+// proveStream uses, so the existing client renders them unchanged). `stage`
+// prefixes tool/status labels with the current tree position; `metrics` is the
+// shared live counter object attached by the caller's emit wrapper.
+function mapObjectToEvents(o, emit, stage, metrics) {
+  const tag = stage ? `${stage} ` : ""
+  const stripName = (n) => String(n || "").replace(/^mcp__[a-z0-9-]+__/i, "")
+  if (o.type === "assistant" && o.message?.content) {
+    if (metrics) metrics.llm_invocations++
+    for (const c of o.message.content) {
+      if (c.type === "tool_use") {
+        if (metrics) metrics.tools_invoked++
+        const name = stripName(c.name)
+        emit({
+          type: "message-annotation",
+          subtype: "tool_intent",
+          thought: `${tag}Using ${name}`,
+          tool: name,
+          input: typeof c.input === "string" ? c.input : JSON.stringify(c.input),
+        })
+      } else if (c.type === "text" && c.text && c.text.trim()) {
+        emit({ type: "message-annotation", subtype: "status", thought: `${tag}${c.text.trim().slice(0, 300)}` })
+      } else if (c.type === "thinking" && c.thinking) {
+        emit({ type: "thinking", text: String(c.thinking).slice(0, 2000) })
+      }
+    }
+  } else if (o.type === "user" && o.message?.content) {
+    for (const c of o.message.content) {
+      if (c.type === "tool_result") {
+        const t = Array.isArray(c.content)
+          ? c.content.map((x) => x.text || "").join("\n")
+          : String(c.content ?? "")
+        emit({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t })
+      }
+    }
+  }
+}
+
+// Spawn ONE focused claude subagent with stream-json, feed each parsed object to
+// `onObject` (which returns true to stop the run early — e.g. goal closed), and
+// mirror activity into the console via `emit`. Shared by the node-prover and the
+// decomposer. Resolves when the process exits.
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, stage, metrics, signal }, { onObject, emit }) {
+  return new Promise((resolve) => {
+    let cfgPath
+    try {
+      const dir = mkdtempSync(join(tmpdir(), "claude-tree-"))
+      cfgPath = join(dir, "mcp.json")
+      writeFileSync(cfgPath, JSON.stringify(buildMcpConfig(mcpServers)))
+    } catch (e) {
+      resolve({ ok: false, finalText: "", exitCode: null, timedOut: false, stderr: `mcp config: ${e.message}` })
+      return
+    }
+    const args = [
+      "-p", prompt,
+      "--output-format", "stream-json", "--verbose",
+      "--mcp-config", cfgPath, "--strict-mcp-config", "--dangerously-skip-permissions",
+    ]
+    if (model) args.push("--model", model)
+    if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
+
+    let child
+    try {
+      child = spawn(CLAUDE_BIN, args, { cwd: process.cwd(), shell: false, stdio: ["ignore", "pipe", "pipe"] })
+    } catch (e) {
+      resolve({ ok: false, finalText: "", exitCode: null, timedOut: false, stderr: `Failed to launch "${CLAUDE_BIN}": ${e.message}` })
+      return
+    }
+    const cap = clampNum(timeoutMs, 30000, 3600000, 900000)
+    let timedOut = false
+    let stopped = false
+    const kill = () => {
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        /* gone */
+      }
+    }
+    const timer = setTimeout(() => {
+      timedOut = true
+      kill()
+    }, cap)
+    const onAbort = () => {
+      stopped = true
+      kill()
+    }
+    if (signal) {
+      if (signal.aborted) onAbort()
+      else signal.addEventListener("abort", onAbort, { once: true })
+    }
+
+    let buf = ""
+    let stderr = ""
+    let finalText = ""
+    child.stdout.on("data", (chunk) => {
+      buf += chunk.toString("utf8")
+      let nl
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl)
+        buf = buf.slice(nl + 1)
+        if (!line.trim()) continue
+        let o
+        try {
+          o = JSON.parse(line)
+        } catch {
+          continue
+        }
+        let stop = false
+        try {
+          stop = onObject ? onObject(o) : false
+        } catch {
+          /* observer must never crash the run */
+        }
+        if (emit) mapObjectToEvents(o, emit, stage, metrics)
+        if (o.type === "result") finalText = o.result || finalText
+        if (stop && !stopped) {
+          stopped = true
+          kill()
+        }
+      }
+    })
+    child.stderr.on("data", (c) => {
+      stderr += c.toString("utf8")
+    })
+    child.on("error", (e) => {
+      clearTimeout(timer)
+      if (signal) signal.removeEventListener?.("abort", onAbort)
+      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message })
+    })
+    child.on("close", (code) => {
+      clearTimeout(timer)
+      if (signal) signal.removeEventListener?.("abort", onAbort)
+      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr })
+    })
+  })
+}
+
+// Prove ONE node's exact statement directly, bounded to ctx.turnBudget turns.
+// The gate enforces signature immutability (only a script containing the node's
+// exact signature counts). The agent may also volunteer to decompose early by
+// emitting a `DECOMPOSE:` line. Returns { verified, proof, decomposeRequested }.
+async function runNodeProver(node, ctx) {
+  const gate = makeProofGate(node.statement)
+  let decomposeRequested = false
+  const extra =
+    "EARLY DECOMPOSE (optional): if partway through you judge this goal is too large to close directly and would be better split into sub-lemmas, output a line that is exactly `DECOMPOSE: <one-line reason>` and stop — a dedicated decomposition run will then take over. Only do this when genuinely stuck; prefer to finish the proof if you can."
+  const prompt = provePrompt(node.statement, ctx.mcpServers, extra)
+  const onObject = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    if (o.type === "assistant" && o.message?.content) {
+      for (const c of o.message.content) {
+        if (c.type === "text" && /(^|\n)\s*DECOMPOSE\s*:/i.test(c.text || "")) {
+          decomposeRequested = true
+          return true
+        }
+      }
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt,
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: ctx.turnBudget,
+      timeoutMs: ctx.nodeTimeoutMs,
+      stage: ctx.stage,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+    },
+    { onObject, emit: ctx.emit },
+  )
+  const proof = gate.verifiedScript
+  return { verified: !!proof, proof: proof || "", decomposeRequested }
+}
+
+// Run the Decomposer subagent on a node, then GATE its output ourselves: take
+// the scaffolds it compiled (target-preserving, ≥1 helper), reorder helpers-
+// first, and verify each on the daemon. Accept the first that is either a full
+// (sorry-free) proof or a structurally-valid reduction. Returns
+// { ok, fullyProved?, scaffold, children, reason }.
+async function runDecomposer(node, ctx) {
+  const targetSig = node.signature
+  const verifyCalls = {}
+  const candidates = []
+  const consider = (script) => {
+    if (script && scriptProvesTarget(script, targetSig) && helperDeclarations(script, targetSig).length) {
+      candidates.push(script)
+    }
+  }
+  const onObject = (o) => {
+    if (o.type === "assistant" && o.message?.content) {
+      for (const c of o.message.content) {
+        if (
+          c.type === "tool_use" &&
+          String(c.name || "").endsWith("verify_full_script") &&
+          c.input &&
+          typeof c.input.script === "string"
+        ) {
+          verifyCalls[c.id] = c.input.script
+        }
+      }
+    } else if (o.type === "user" && o.message?.content) {
+      for (const c of o.message.content) {
+        if (c.type === "tool_result" && c.tool_use_id && verifyCalls[c.tool_use_id]) {
+          consider(verifyCalls[c.tool_use_id])
+        }
+      }
+    }
+    return false
+  }
+  const r = await spawnProverStream(
+    {
+      prompt: decomposePrompt(node.statement, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: ctx.decomposeTurnBudget,
+      timeoutMs: ctx.nodeTimeoutMs,
+      stage: `${ctx.stage}✂️`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+    },
+    { onObject, emit: ctx.emit },
+  )
+  // Also consider the final fenced scaffold the run printed.
+  consider(extractScript(r.finalText || ""))
+
+  // De-dup, most-recent first, and authoritatively verify up to 3 on the daemon.
+  const seen = new Set()
+  const uniq = []
+  for (const s of candidates.reverse()) {
+    const k = normalizeLean(s)
+    if (seen.has(k)) continue
+    seen.add(k)
+    uniq.push(s)
+  }
+  for (const cand of uniq.slice(0, 3)) {
+    if (ctx.signal?.aborted) break
+    const ordered = normalizeScaffoldOrder(cand, targetSig)
+    const v = await verifyViaDaemon(ordered, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    const parsed = parseVerifyOutput(v.text)
+    if (v.ok && parsed.success) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Scaffold compiled with no holes — node fully proved.` })
+      return { ok: true, fullyProved: true, scaffold: ordered, children: [], reason: "scaffold compiled sorry-free" }
+    }
+    if (v.ok && isStructurallyValidDecomposition(parsed)) {
+      const helpers = helperDeclarations(ordered, targetSig)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${ctx.stage}✂️ Verified reduction → ${helpers.length} sub-lemma(s).` })
+      return { ok: true, scaffold: ordered, children: helpers, reason: `reduces to ${helpers.length} lemma(s)` }
+    }
+  }
+  return {
+    ok: false,
+    reason: uniq.length ? "no candidate reduced the goal cleanly (real errors remained)" : "decomposer produced no signature-preserving scaffold",
+  }
+}
+
+// Recursively prove one node. Sound invariant: nothing is accepted until an
+// assembled, sorry-free script that CONTAINS this node's exact signature passes
+// the daemon. Everything else is heuristic to get there.
+async function proveNode(node, ctx) {
+  if (ctx.signal?.aborted) return false
+  if (ctx.nodeCount >= ctx.maxNodes) {
+    node.status = "failed"
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Node budget (${ctx.maxNodes}) exhausted — stopping.` })
+    return false
+  }
+  ctx.nodeCount++
+  const label = node.depth === 0 ? "root" : `depth ${node.depth}`
+  ctx.stage = `🌳[${label}]`
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌳 Proving (${label}): ${oneLine(node.signature)}` })
+
+  // 1. Bounded direct attempt.
+  const res = await runNodeProver(node, ctx)
+  if (res.verified) {
+    node.proof = res.proof
+    node.status = "proved-direct"
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Closed directly (${label}): ${declName(node.signature)}` })
+    return true
+  }
+  if (ctx.signal?.aborted) return false
+  if (node.depth >= ctx.maxDepth) {
+    node.status = "failed"
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Max depth (${ctx.maxDepth}) reached; cannot decompose ${declName(node.signature)} further.` })
+    return false
+  }
+
+  // 2. Decompose (forced after the turn budget, or voluntarily requested).
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: res.decomposeRequested
+      ? `🪓 Agent requested decomposition of ${declName(node.signature)}.`
+      : `🪓 Not closed in ${ctx.turnBudget} turns — forcing decomposition of ${declName(node.signature)}.`,
+  })
+  const dec = await runDecomposer(node, ctx)
+  if (!dec.ok) {
+    node.status = "failed"
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Decomposition failed: ${dec.reason}` })
+    return false
+  }
+  if (dec.fullyProved) {
+    node.proof = dec.scaffold
+    node.status = "proved-direct"
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Decomposer fully proved ${declName(node.signature)}.` })
+    return true
+  }
+  node.scaffold = dec.scaffold
+  node.children = dec.children.map((h, i) => ({
+    id: `${node.id}.${i + 1}`,
+    signature: h.signature,
+    statement: h.text,
+    status: "open",
+    children: [],
+    depth: node.depth + 1,
+  }))
+  node.status = "decomposed"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `➗ Split ${declName(node.signature)} into ${node.children.length} lemma(s): ${node.children.map((c) => declName(c.signature)).join(", ")}`,
+  })
+
+  // 3. Recurse into every child; a single unproved child fails the node.
+  for (const child of node.children) {
+    const ok = await proveNode(child, ctx)
+    if (!ok) {
+      node.status = "failed"
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Sub-lemma ${declName(child.signature)} could not be proved — ${declName(node.signature)} fails.` })
+      return false
+    }
+  }
+
+  // 4. Assemble the whole subtree and gate on ONE final sorry-free compile.
+  if (ctx.signal?.aborted) return false
+  const assembled = assembleScript(node)
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Assembling ${declName(node.signature)} from ${node.children.length} proved lemma(s) — final verify…` })
+  const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  const parsed = parseVerifyOutput(v.text)
+  if (v.ok && parsed.success && scriptProvesTarget(assembled, node.signature)) {
+    node.proof = assembled
+    node.status = "proved-assembled"
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled and verified sorry-free.` })
+    return true
+  }
+  node.status = "failed"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "error",
+    thought: `❌ Assembly of ${declName(node.signature)} did not verify: ${oneLine(v.text || v.error || "unknown")}`,
+  })
+  return false
+}
+
+// SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
+// as proveStream (prompt / message-annotation / thinking / text-delta / done),
+// so the existing client + ProverConsole render it with no changes.
+function proveTreeStream(res, theorem, mcpServers, opts = {}) {
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform" })
+  const send = (obj) => {
+    try {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    } catch {
+      /* client gone */
+    }
+  }
+  const start = Date.now()
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+  const emit = (obj) => {
+    metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    send({ ...obj, metrics })
+  }
+
+  // Admin debug log: the exact prompts both subagent roles receive.
+  send({
+    type: "prompt",
+    prompt:
+      "[DECOMPOSITION MODE — proof tree]\n\n=== NODE-PROVER PROMPT ===\n" +
+      provePrompt(theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
+      "\n\n=== DECOMPOSER PROMPT ===\n" +
+      decomposePrompt(theorem, mcpServers),
+    model: opts.model || null,
+    theorem,
+    mcpServers: (mcpServers || []).map((s) => ({
+      name: s?.name,
+      url: s?.url,
+      tools: Array.isArray(s?.tools)
+        ? s.tools.map((t) => (typeof t === "string" ? t : t?.name)).filter(Boolean)
+        : undefined,
+    })),
+  })
+
+  const verifyUrl = resolveVerifyUrl(mcpServers)
+  if (!verifyUrl) {
+    emit({ type: "error", message: "No verify_full_script MCP server is connected — decomposition needs one to gate scaffolds." })
+    send({ type: "done", metrics, verified: false, proof: "" })
+    res.end()
+    return
+  }
+
+  const abort = new AbortController()
+  const ctx = {
+    mcpServers,
+    model: opts.model,
+    verifyUrl,
+    emit,
+    metrics,
+    signal: abort.signal,
+    turnBudget: clampNum(opts.turnBudget, 1, 40, 10),
+    decomposeTurnBudget: clampNum(opts.decomposeTurnBudget, 1, 40, 12),
+    maxDepth: clampNum(opts.maxDepth, 1, 6, 3),
+    maxNodes: clampNum(opts.maxNodes, 1, 64, 24),
+    nodeTimeoutMs: clampNum(opts.nodeTimeoutMs, 30000, 3600000, 900000),
+    verifyTimeoutMs: 180000,
+    nodeCount: 0,
+    stage: "",
+  }
+  res.on("close", () => {
+    if (!res.writableEnded) abort.abort()
+  })
+
+  const root = {
+    id: "T",
+    signature: theoremSignature(theorem),
+    statement: theorem,
+    status: "open",
+    children: [],
+    depth: 0,
+  }
+
+  ;(async () => {
+    try {
+      emit({ type: "message-annotation", subtype: "status", thought: `🌲 Decomposition mode: prove-or-split, ${ctx.turnBudget} turns/node, depth ≤ ${ctx.maxDepth}.` })
+      const ok = await proveNode(root, ctx)
+      const proof = ok ? root.proof : ""
+      if (ok && proof) {
+        emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — full tree assembled and verified sorry-free." })
+        send({ type: "text-delta", content: `✅ **Verified proof** (decomposition tree, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+      } else {
+        emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the tree did not close every leaf." })
+        send({ type: "text-delta", content: "⚠️ Not accepted — the decomposition tree did not produce a verified, sorry-free proof of the target." })
+      }
+      send({ type: "done", metrics, verified: !!(ok && proof), proof })
+    } catch (e) {
+      emit({ type: "error", message: `tree error: ${String(e?.message || e)}` })
+      send({ type: "done", metrics, verified: false, proof: "" })
+    } finally {
+      res.end()
+    }
+  })()
+}
+
 const server = createServer(async (req, res) => {
   const allowed = setCors(req, res)
 
@@ -859,6 +1648,18 @@ const server = createServer(async (req, res) => {
         return json(res, 400, { error: "theorem_required" })
       }
       proveStream(res, theorem, body.mcpServers || [], body.options || {})
+      return
+    }
+
+    // Decomposition orchestrator: prove-or-split proof tree. Same SSE shape as
+    // /prove-stream, so the same client renders it.
+    if (req.method === "POST" && url.pathname === "/prove-tree") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const theorem = body.theorem || body.prompt
+      if (typeof theorem !== "string" || !theorem.trim()) {
+        return json(res, 400, { error: "theorem_required" })
+      }
+      proveTreeStream(res, theorem, body.mcpServers || [], body.options || {})
       return
     }
 
