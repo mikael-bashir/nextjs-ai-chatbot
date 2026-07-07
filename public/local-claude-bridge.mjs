@@ -1303,12 +1303,21 @@ function runProve(theorem, mcpServers, opts = {}) {
     }
 
     const gate = makeProofGate(theorem)
-    const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 3600000)
+    // Worker / non-streaming path: there's no browser Terminate here, so keep a
+    // generous default cap to protect the autonomous worker from a hung job —
+    // but honor opts.timeoutMs === 0 as "no cap" for callers that want it.
+    const timeoutMs =
+      Number(opts.timeoutMs) === 0
+        ? 0
+        : Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 21600000)
     let timedOut = false
-    const timer = setTimeout(() => {
-      timedOut = true
-      child.kill("SIGKILL")
-    }, timeoutMs)
+    const timer =
+      timeoutMs > 0
+        ? setTimeout(() => {
+            timedOut = true
+            child.kill("SIGKILL")
+          }, timeoutMs)
+        : null
 
     let buf = ""
     let stderr = ""
@@ -1441,11 +1450,18 @@ function proveStream(res, theorem, mcpServers, opts = {}) {
     return
   }
 
-  const timeoutMs = Math.min(Math.max(Number(opts.timeoutMs) || 900000, 30000), 3600000)
-  const timer = setTimeout(() => {
-    send({ type: "error", message: "Prover timed out." })
-    child.kill("SIGKILL")
-  }, timeoutMs)
+  // No hard timeout by default — a hard theorem can legitimately take a long time
+  // and shouldn't be killed mid-proof. Termination is the operator's job: the
+  // browser's Terminate button disconnects, and res "close" (below) kills the
+  // child. Pass a positive opts.timeoutMs to opt back into a cap.
+  const timeoutMs = Number(opts.timeoutMs) > 0 ? Math.min(Number(opts.timeoutMs), 21600000) : 0
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          send({ type: "error", message: "Prover timed out." })
+          child.kill("SIGKILL")
+        }, timeoutMs)
+      : null
 
   let buf = ""
   let stderr = ""
@@ -1691,7 +1707,10 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
       resolve({ ok: false, finalText: "", exitCode: null, timedOut: false, stderr: `Failed to launch "${CLAUDE_BIN}": ${e.message}` })
       return
     }
-    const cap = clampNum(timeoutMs, 30000, 3600000, 900000)
+    // No hard per-node cap by default (0 = uncapped). A tree node can be a long
+    // proof; the whole run is bounded by maxNodes and the operator's Terminate
+    // (abort signal below). A positive timeoutMs opts back into a cap.
+    const cap = Number(timeoutMs) > 0 ? clampNum(timeoutMs, 30000, 21600000, 900000) : 0
     let timedOut = false
     let stopped = false
     const kill = () => {
@@ -1701,10 +1720,13 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
         /* gone */
       }
     }
-    const timer = setTimeout(() => {
-      timedOut = true
-      kill()
-    }, cap)
+    const timer =
+      cap > 0
+        ? setTimeout(() => {
+            timedOut = true
+            kill()
+          }, cap)
+        : null
     const onAbort = () => {
       stopped = true
       kill()
@@ -2140,7 +2162,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     decomposeTurnBudget: clampNum(opts.decomposeTurnBudget, 1, 40, 12),
     maxDepth: clampNum(opts.maxDepth, 1, 6, 3),
     maxNodes: clampNum(opts.maxNodes, 1, 64, 24),
-    nodeTimeoutMs: clampNum(opts.nodeTimeoutMs, 30000, 3600000, 900000),
+    // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
+    // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
+    nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
     verifyTimeoutMs: 180000,
     nodeCount: 0,
     stage: "",
