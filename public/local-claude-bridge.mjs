@@ -802,25 +802,32 @@ Only the ids that actually exist will load; use those. Never invent a server nam
 function provePrompt(theorem, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
 
-  return `You are proving the following Lean 4 theorem.
+  return `You are a Lean 4 + Mathlib power user proving the theorem below. You already KNOW Lean 4 and a great deal of Mathlib. Prove by HACKING: write real Lean and let the compiler's errors drive you. Do NOT research the library first — that is a trap that wastes your turns.
 
 ${toolSection}
 
-You have a full toolkit. Reach for it — don't reason in the abstract when a tool can answer the question for you. Each tool is for a different job:
-- verify_full_script — compiles a whole script; it is the SOURCE OF TRUTH. A proof only counts when it reports success on the target theorem with no errors and no \`sorry\`.
-- init_proof + apply_tactic — open the goal as a LIVE proof state and advance it ONE tactic at a time, seeing the exact resulting goals, hypotheses and elaborated types after each step (the Lean Infoview, as an API). Lean on these whenever a goal is intricate, a signature is fiddly, or a whole-script attempt fails in a way you don't understand — stepping through interactively shows you what actually works far faster than guessing at a full script.
-- get_current_proof_state — dump the script built so far and the remaining goals for a proof state.
-- moogle_search — semantic/English search to DISCOVER a lemma name or Mathlib naming convention. loogle_search — exact type/pattern search once you know roughly what you're after.
+MINDSET: The compiler is your teacher, not the search index. Strong automation closes most goals — reach for it before any lemma hunt:
+- Decidable/finite goals: \`decide\`, \`native_decide\` (great for bounded integer/ZMod checks), \`Finset\`/\`Fintype\` card computations.
+- Arithmetic / linear / nonlinear: \`omega\`, \`linarith\`, \`nlinarith [sq_nonneg _, …]\`, \`positivity\`, \`ring\`, \`field_simp\`.
+- Simplification / rewriting: \`simp\`, \`simp only [...]\`, \`norm_num\`, \`push_cast\`, \`gcongr\`.
+- Case analysis / induction: \`fin_cases\`, \`interval_cases\`, \`rcases\`/\`obtain\`, \`induction\`, \`Nat.strong_induction_on\`.
+- Reductions: cast to \`ZMod n\` and \`decide\` for parity/mod facts; build an \`Equiv\` and use \`Nat.card_congr\` for counting.
+Try the one-liner your instinct suggests FIRST (\`by decide\`, \`by omega\`, \`by simp\`, \`by nlinarith [...]\`) — you will be right far more often than you expect, and a failed attempt's error is worth more than any search.
+
+TOOLS, in order of how much you should use them:
+- verify_full_script — your MAIN loop and the SOURCE OF TRUTH. Compile a whole script; read the errors; fix; recompile. Live here.
+- init_proof + apply_tactic — step a goal ONE tactic at a time to SEE the exact goal state when an error is opaque or a signature is fiddly. Use these to understand a goal, not to browse.
+- moogle_search / loogle_search — a LAST resort, only when the compiler tells you a specific NAME is unknown and you can't recall it. Never search to "explore" or before your first compile. Searching is slow and usually the wrong move; a good guess + the compiler beats it.
 
 WORKFLOW:
 0. Load the tools (ToolSearch select, as above). Mandatory, first.
-1. Write a first candidate proof from the statement below (replace \`sorry\`) and call verify_full_script — do this BEFORE searching; the compiler's real errors teach you the most.
-2. Iterate. Read the errors and fix the script; re-run verify_full_script. When a subgoal is intricate or an error is opaque, OPEN it with init_proof/apply_tactic and step through it to see the true goal state, then fold what worked back into the script. Prefer stepping through a hard goal over staring at it.
-3. Search when you need a specific lemma: moogle_search first to find a name, then loogle_search to pin the exact signature.
-4. If ANY tool errors or hangs, do NOT retry it in a loop — pivot to a different tool or approach and keep moving.
-5. A proof is done ONLY when verify_full_script reports success on a script containing the ORIGINAL theorem below — same name and signature — with no \`sorry\`. Verifying helper \`example\`s or side lemmas is fine for exploration but does NOT count. Then output that final verified proof as a single \`\`\`lean code block.
+1. IMMEDIATELY write a full candidate proof from your own knowledge (replace \`sorry\`) and call verify_full_script. Your very first tool call after loading should be verify_full_script — NOT a search. Lead with strong automation.
+2. Read the errors and fix the script; recompile. Repeat. When an error is opaque or a subgoal is intricate, step through it with init_proof/apply_tactic to see the real goal state, then fold what worked back in.
+3. ONLY if the compiler reports an UNKNOWN IDENTIFIER you cannot recall, do one quick search for that exact name — then get straight back to compiling. Do not chain searches.
+4. If a tool errors or hangs, don't retry in a loop — change tactic and keep compiling.
+5. Done ONLY when verify_full_script reports success on a script containing the ORIGINAL theorem below (same name and signature) with no \`sorry\`. Output that final verified proof as a single \`\`\`lean code block.
 
-Keep momentum: attempt → verify → when stuck, step through with the interactive tools or look up the lemma → attempt again. Don't spend a long stretch only searching or only thinking; put the goal through the tools.
+Bias: attempt → compile → read error → fix → compile. Spend your turns COMPILING, not searching or theorising. If after a few honest compile-and-fix rounds the goal is clearly too big for one script, say so and decompose rather than grinding.
 ${extra ? `\n${extra}\n` : ""}
 Theorem:
 ${theorem}`
@@ -846,7 +853,9 @@ Produce a single self-contained Lean scaffold with this exact shape:
   2. The ORIGINAL theorem below, VERBATIM — same name, same signature, do NOT change one character of the statement — proved USING the helper lemmas. Its proof must contain NO \`sorry\`: every remaining hole must live inside a helper, not in the main theorem.
   3. Write the helpers ABOVE the theorem (Lean requires a name to be declared before it is used).
 
-The decomposition is correct when compiling the scaffold yields NO errors and the only holes are the helper \`sorry\`s — that proves the main theorem really does follow from the helpers. Use verify_full_script to check this: iterate until there are no ERRORS (deprecation/linter warnings are fine; the helper \`sorry\` warnings are expected). Use init_proof/apply_tactic to discover which intermediate facts the main proof actually needs, so your helper statements are the RIGHT ones. Each helper should be a genuinely smaller step than the original — if a "helper" is just the original theorem restated, you have not decomposed anything.
+Think like a Lean hacker, not a librarian: pick the mathematical MOVE that cracks this goal (an induction/descent, a parity or mod-n reduction via \`ZMod\` + \`decide\`, a bounded finite check via \`native_decide\`, a bijection via an \`Equiv\` + \`Nat.card_congr\`, a key inequality), and make each helper a step of THAT plan — ideally one closable by strong automation (\`decide\`, \`omega\`, \`nlinarith\`, \`simp\`, \`native_decide\`). Use init_proof/apply_tactic to see the real goal state and discover exactly which intermediate facts the main proof needs. Do NOT spend this run searching the library — reason from your own Lean knowledge and let the compiler confirm the reduction. Each helper must be a genuinely smaller step than the original — a "helper" that just restates the original is not a decomposition.
+
+The decomposition is correct when compiling the scaffold yields NO errors and the only holes are the helper \`sorry\`s — that proves the main theorem really does follow from the helpers. Use verify_full_script to check this: iterate until there are no ERRORS (deprecation/linter warnings are fine; the helper \`sorry\` warnings are expected).
 
 CRITICAL — the target statement is IMMUTABLE. Your scaffold MUST contain the original theorem with its signature reproduced EXACTLY as given below (same name, binders, and statement up to \`:=\`). If you rename it, drop a hypothesis, restate it inductively, or otherwise change the signature, the decomposition is REJECTED even if it compiles. Copy the line below verbatim and only fill in its proof:
 
