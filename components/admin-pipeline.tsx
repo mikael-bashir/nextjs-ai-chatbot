@@ -460,6 +460,14 @@ export function AdminPipeline() {
   // Full, normalized prover activity for the shared <ProverConsole> (thinking,
   // tool calls, tool results/errors, verify attempts, metrics) — not just names.
   const [verifyEvents, setVerifyEvents] = useState<ProverEvent[]>([]);
+  // Decompose mode: when on, ACG verification drives the /prove-tree orchestrator
+  // (prove-or-split) instead of the single-agent /prove-stream. Held in a ref so
+  // proveStream can read the latest value without re-creating the verify loop.
+  const [verifyDecompose, setVerifyDecompose] = useState(false);
+  const verifyDecomposeRef = useRef(verifyDecompose);
+  useEffect(() => {
+    verifyDecomposeRef.current = verifyDecompose;
+  }, [verifyDecompose]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -569,6 +577,7 @@ export function AdminPipeline() {
         if (ev.label) content += ` ${ev.label}`;
       };
       try {
+        const decompose = verifyDecomposeRef.current;
         const outcome = await runProverStream({
           problem: lean,
           mcpServers,
@@ -576,7 +585,8 @@ export function AdminPipeline() {
           token: conn.token,
           signal,
           onEvent,
-          source: 'acg',
+          source: decompose ? 'acg-tree' : 'acg',
+          endpoint: decompose ? 'prove-tree' : 'prove-stream',
         });
         const lim = detectSessionLimit(content);
         if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
@@ -1403,17 +1413,40 @@ export function AdminPipeline() {
               ({verifyQueue.length})
             </span>
           </h2>
-          {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
-            <Button
-              size="sm"
-              variant="outline"
-              className="h-7 px-2 text-xs"
-              onClick={() => runVerifier()}
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setVerifyDecompose((v) => !v)}
+              className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors ${
+                verifyDecompose
+                  ? 'border-violet-500/50 bg-violet-500/10 text-violet-600 dark:text-violet-400'
+                  : 'text-muted-foreground hover:bg-muted'
+              }`}
+              title="Verify generated problems via the prove-or-split decomposition tree instead of a single agent run"
             >
-              Resume verifying
-            </Button>
-          )}
+              {/* branch glyph as text to avoid adding an icon dependency */}
+              <span aria-hidden>⑂</span>
+              Decompose {verifyDecompose ? 'on' : 'off'}
+            </button>
+            {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                onClick={() => runVerifier()}
+              >
+                Resume verifying
+              </Button>
+            )}
+          </div>
         </div>
+        {verifyDecompose && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            Decompose mode: each generated problem is proved-or-split into
+            toolchain-verified sub-lemmas (recursively) and assembled into one
+            sorry-free proof. Slower but closes goals a single run stalls on.
+          </p>
+        )}
         {verifyPaused && (
           <div className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-600">
             <span className="font-medium">Paused: </span>
