@@ -1218,6 +1218,33 @@ Theorem:
 ${theorem}`
 }
 
+// HAVE-based strategy: decompose IN CONTEXT. Instead of extracting top-level
+// helper lemmas (which force re-generalizing every local binder + hypothesis — a
+// notorious source of errors), the agent writes ONE proof of the master and
+// breaks hard steps into local `have <name> : <prop> := by sorry`, which inherit
+// the local context natively, then fills them bottom-up. Single agent, one
+// context — the deliberate A/B control against the top-level-lemma tree.
+function haveProvePrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving a Lean 4 + Mathlib theorem by IN-CONTEXT DECOMPOSITION. You write ONE self-contained proof of the theorem and break every hard step into a LOCAL \`have\`, NEVER a top-level helper lemma.
+
+${toolSection}
+
+METHOD — scaffold with \`have\`, then fill:
+1. Reproduce the ORIGINAL theorem below VERBATIM (same name and signature) and open its proof with \`by\`.
+2. Lay out the argument as local steps: \`have h₁ : <prop> := by sorry\`, \`have h₂ : <prop> := by sorry\`, … then close the main goal FROM those \`have\`s. Each \`have\` inherits all local hypotheses and bound variables automatically — do NOT re-quantify or re-pass them. That inheritance is the whole point: it eliminates the binder-generalization errors that top-level lemmas cause.
+3. verify_full_script this SKELETON first: it must compile with the ONLY holes being your \`have … := by sorry\` (deprecation/linter warnings are fine). That proves your decomposition is structurally valid before you invest in the hard parts.
+4. Then FILL each \`have\` one at a time, replacing its \`sorry\` with a real proof — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`); if a \`have\` is itself hard, nest more \`have\`s inside it. verify_full_script after each fill so the compiler guides you.
+
+RULES:
+- NEVER introduce a top-level \`theorem\`/\`lemma\` other than the master itself — ALL structure lives in \`have\`s inside the one proof.
+- Think like a Lean hacker: reason from your own knowledge + the compiler's errors; search is a last resort.
+- Done ONLY when verify_full_script succeeds on the master with NO \`sorry\` and NO errors. Output the final proof as one \`\`\`lean block.
+${extra ? `\n${extra}\n` : ""}
+Theorem (prove this EXACT statement; its signature is immutable):
+${theorem}`
+}
+
 // The registry. Each strategy supplies a node-prover prompt, a decomposer prompt,
 // and an optional search budget (how much library search that mode is rationed
 // to — the governor enforces it). `search` defaults to GOV_INITIAL.
@@ -1252,7 +1279,21 @@ const STRATEGIES = {
     decompose: (t, m, x) => decomposePrompt(t, m, x),
     search: 0, // brute mode does not search
   },
+  // A/B control for the whole tree approach: decompose via LOCAL `have`s inside
+  // ONE proof (single agent, no top-level lemmas, no cross-agent hand-off), vs
+  // the `lemma`-style strategies above that farm top-level helpers to a tree.
+  have: {
+    label: "Have — in-context `have` decomposition (single agent, no top-level lemmas)",
+    node: (t, m, x) => haveProvePrompt(t, m, x),
+    decompose: (t, m, x) => haveProvePrompt(t, m, x), // unused in `have` style; keeps the registry shape
+    search: GOV_INITIAL,
+    style: "have",
+  },
 }
+// Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
+// prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
+// with local `have`s (proveHaveFlat). Defaults to "lemma" for existing modes.
+const styleOf = (name) => pickStrategy(name).style || "lemma"
 const pickStrategy = (name) => STRATEGIES[name] || STRATEGIES.hacker
 const nodePromptFor = (name, t, m, x) => pickStrategy(name).node(t, m, x)
 const decomposePromptFor = (name, t, m, x) => pickStrategy(name).decompose(t, m, x)
@@ -2172,6 +2213,74 @@ async function proveNode(node, ctx) {
   }
 }
 
+// HAVE-mode orchestration (the `have` style): a single agent proves the master
+// in ONE context, decomposing via local `have`s — no tree, no cross-agent
+// hand-off, no top-level-binder re-generalization. Same soundness bar as the
+// tree: the agent's self-reported success is RE-VERIFIED independently on the
+// daemon before acceptance. Bounded outer retries feed the last compile failure
+// back in (like #2) so a stuck run gets a fresh, informed attempt.
+async function proveHaveFlat(theorem, ctx) {
+  const budget = ctx.haveTurnBudget || 24
+  const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
+  let extra = ""
+  for (let attempt = 0; ; attempt++) {
+    if (ctx.signal?.aborted) return { verified: false, proof: "" }
+    ctx.stage = "🧩"
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought:
+        attempt > 0
+          ? `♻️ Retrying have-based proof (attempt ${attempt + 1}) with the last compile error in hand.`
+          : `🧩 Proving in one context via local \`have\` decomposition (${budget} turns).`,
+    })
+    const gate = makeProofGate(theorem)
+    const verifyIds = new Set()
+    let lastVerifyError = ""
+    const onObject = (o) => {
+      const ev = gate.observe(o)
+      if (ev?.verified) return true
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content)
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyIds.add(c.id)
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyIds.has(c.tool_use_id)) continue
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          if (t && !/Compilation Successful|100% verified/i.test(t) && /error|Error|Line \d+|sorry/.test(t)) lastVerifyError = t
+        }
+      }
+      return false
+    }
+    await spawnProverStream(
+      {
+        prompt: haveProvePrompt(theorem, ctx.mcpServers, extra),
+        mcpServers: ctx.mcpServers,
+        model: ctx.model,
+        maxTurns: budget,
+        timeoutMs: ctx.nodeTimeoutMs,
+        stage: ctx.stage,
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      { onObject, emit: ctx.emit },
+    )
+    const candidate = gate.verifiedScript
+    if (candidate) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ Re-verifying the have-based proof independently on the daemon…" })
+      const v = await verifyViaDaemon(candidate, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+      if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(candidate, theoremSignature(theorem)))
+        return { verified: true, proof: candidate }
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Agent reported success but the independent re-verify did not confirm it: ${oneLine(v.text || v.error || "unknown")}` })
+    }
+    if (attempt >= maxRetry || ctx.signal?.aborted) return { verified: false, proof: "" }
+    extra = lastVerifyError
+      ? `YOUR PREVIOUS ATTEMPT FAILED. The last verify_full_script reported:\n${lastVerifyError.slice(0, 1400)}\n\nFix the SPECIFIC error above — adjust the failing \`have\` or the final assembly, and keep the parts that already compiled.`
+      : "YOUR PREVIOUS ATTEMPT did not produce a verified proof. Start from the skeleton-first approach: lay out the `have`s, compile the skeleton, then fill them."
+  }
+}
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -2193,14 +2302,18 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   }
 
   const strategy = STRATEGIES[opts.strategy] ? opts.strategy : "hacker"
-  // Admin debug log: the exact prompts both subagent roles receive.
+  const style = styleOf(strategy)
+  // Admin debug log: the exact prompt(s) the agent(s) receive.
   send({
     type: "prompt",
     prompt:
-      `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
-      nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
-      "\n\n=== DECOMPOSER PROMPT ===\n" +
-      decomposePromptFor(strategy, theorem, mcpServers),
+      style === "have"
+        ? `[DECOMPOSITION MODE — have-based (flat, single agent) · strategy: ${strategy}]\n\n=== PROVER PROMPT ===\n` +
+          haveProvePrompt(theorem, mcpServers)
+        : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
+          nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
+          "\n\n=== DECOMPOSER PROMPT ===\n" +
+          decomposePromptFor(strategy, theorem, mcpServers),
     model: opts.model || null,
     strategy,
     theorem,
@@ -2238,6 +2351,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // #5: how many times a node may re-decompose (with a DIFFERENT split) after
     // a child lemma or the assembly fails, before the node itself fails.
     maxRedecompose: clampNum(opts.maxRedecompose, 0, 5, 1),
+    // `have` style only: turn budget for the single flat agent (it does the whole
+    // proof in one context, so it gets a larger allowance than a tree node).
+    haveTurnBudget: clampNum(opts.haveTurnBudget, 5, 60, 24),
     // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
     nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
@@ -2260,15 +2376,32 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
 
   ;(async () => {
     try {
-      emit({ type: "message-annotation", subtype: "status", thought: `🌲 Decomposition mode [${strategy}]: prove-or-split, ${ctx.turnBudget} turns/node, depth ≤ ${ctx.maxDepth}.` })
-      const ok = await proveNode(root, ctx)
-      const proof = ok ? root.proof : ""
-      if (ok && proof) {
-        emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — full tree assembled and verified sorry-free." })
-        send({ type: "text-delta", content: `✅ **Verified proof** (decomposition tree, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+      let ok = false
+      let proof = ""
+      if (style === "have") {
+        // Flat, in-context `have` decomposition — one agent, no tree.
+        const r = await proveHaveFlat(theorem, ctx)
+        ok = r.verified
+        proof = r.proof
+        if (ok && proof) {
+          emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — have-based proof verified sorry-free." })
+          send({ type: "text-delta", content: `✅ **Verified proof** (in-context \`have\` decomposition, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+        } else {
+          emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the have-based proof did not verify." })
+          send({ type: "text-delta", content: "⚠️ Not accepted — the have-based run did not produce a verified, sorry-free proof of the target." })
+        }
       } else {
-        emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the tree did not close every leaf." })
-        send({ type: "text-delta", content: "⚠️ Not accepted — the decomposition tree did not produce a verified, sorry-free proof of the target." })
+        // Top-level-lemma prove-or-split tree.
+        emit({ type: "message-annotation", subtype: "status", thought: `🌲 Decomposition mode [${strategy}]: prove-or-split, ${ctx.turnBudget} turns/node, depth ≤ ${ctx.maxDepth}.` })
+        ok = await proveNode(root, ctx)
+        proof = ok ? root.proof : ""
+        if (ok && proof) {
+          emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — full tree assembled and verified sorry-free." })
+          send({ type: "text-delta", content: `✅ **Verified proof** (decomposition tree, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+        } else {
+          emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the tree did not close every leaf." })
+          send({ type: "text-delta", content: "⚠️ Not accepted — the decomposition tree did not produce a verified, sorry-free proof of the target." })
+        }
       }
       send({ type: "done", metrics, verified: !!(ok && proof), proof })
     } catch (e) {

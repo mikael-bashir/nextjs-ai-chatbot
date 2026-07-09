@@ -1479,6 +1479,7 @@ export function AdminPipeline() {
                   <option value="librarian">Librarian (search-first control)</option>
                   <option value="sketch">Sketch (plan then formalize)</option>
                   <option value="brute">Brute (automation only)</option>
+                  <option value="have">Have (in-context, no top-level lemmas)</option>
                 </select>
               </label>
             )}
