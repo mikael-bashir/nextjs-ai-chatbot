@@ -1055,11 +1055,13 @@ ${theorem}`
 //   * helpers written BEFORE the theorem (Lean needs a name declared before use).
 // We accept it only if the toolchain confirms the scaffold's sole diagnostics
 // are `sorry` warnings — i.e. the reduction genuinely type-checks.
-function decomposePrompt(theorem, mcpServers = []) {
+function decomposePrompt(theorem, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
   return `You are DECOMPOSING a Lean 4 theorem you could not close directly. Your job on THIS run is not to finish the proof — it is to break the goal into smaller, independently-provable sub-lemmas, so that separate runs can each close one.
-
+${extra ? `\n${extra}\n` : ""}
 ${toolSection}
+
+MANDATORY FIRST ACTION — get a scaffold on the board before anything else. Your VERY FIRST verify_full_script call (right after loading tools) MUST submit a COMPLETE scaffold: the original theorem reproduced VERBATIM by name, at least one HELPER LEMMA with body \`:= by sorry\`, and your best-attempt proof of the main theorem FROM those helpers. It does NOT need to compile on this first shot — submitting it immediately is what matters. Do NOT explore, search, or step in Pantograph before this scaffold exists. THEN spend every remaining turn fixing ONLY the compile errors (adjust helper statements or the assembly proof), re-running verify_full_script each time, until the sole remaining diagnostics are the helper \`sorry\` warnings. Never end the run without having submitted at least one scaffold that contains the original theorem by name — a run that reaches its turn limit with no master-containing scaffold compiled is a total failure.
 
 Produce a single self-contained Lean scaffold with this exact shape:
   1. One or more HELPER LEMMAS. Each has a real, well-typed signature and a body of exactly \`:= by sorry\`. Give them descriptive, unique names (e.g. \`theorem_name_step_mul_comm\`), never generic ones like \`helper\` or \`aux\`.
@@ -1126,15 +1128,18 @@ ${theorem}`
 // PANTOGRAPH decomposer: use the interactive assistant to DISCOVER which sub-
 // lemmas the proof actually needs (step until you hit goals you can't close;
 // those become the helpers), then emit the standard scaffold.
-function pantographDecomposePrompt(theorem, mcpServers = []) {
+function pantographDecomposePrompt(theorem, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
   return `You are DECOMPOSING a Lean 4 theorem you could not close directly, using the interactive proof assistant (Pantograph) to find the RIGHT sub-lemmas.
-
+${extra ? `\n${extra}\n` : ""}
 ${toolSection}
 
-METHOD — explore with Pantograph (Leak II) first:
+METHOD — BRIEF Pantograph recon, then scaffold FAST:
 - init_proof { proposition } (CLOSED, ∀-quantified, ∈ not "in"), then apply_tactic step by step. Push the proof as far as strong automation takes you; the goals you CANNOT close are exactly the helper lemmas you need. Read them off the live state — don't guess.
 - NEVER use \`sorry\` inside a Pantograph tactic (it errors). Just stop stepping when you reach the hard goal and record its statement.
+- HARD LIMIT on recon: spend at most the FIRST HALF of your turns stepping in Pantograph. This exploration is only to discover helper statements — the moment you have candidate helpers (or you are halfway through your turns), STOP stepping and submit the scaffold.
+
+MANDATORY — a master-containing scaffold MUST reach verify_full_script well before your turns run out. As soon as recon gives you candidate helpers, submit a COMPLETE scaffold (original theorem verbatim by name + helper lemmas bodied \`:= by sorry\` + best-attempt assembly) via verify_full_script — it need not compile first try — then use remaining turns to fix ONLY its compile errors until the sole diagnostics are the helper \`sorry\`s. A run that ends with no master-containing scaffold compiled is a total failure, no matter how much Pantograph progress you made.
 
 Then emit a single self-contained Lean scaffold:
   1. HELPER LEMMAS — each a real, well-typed statement (the goals you couldn't close), body exactly \`:= by sorry\`, descriptive unique names. Prefer helpers closable by automation.
@@ -1220,37 +1225,37 @@ const STRATEGIES = {
   hacker: {
     label: "Hacker — compiler-driven, verify_full_script as the main loop",
     node: (t, m, x) => provePrompt(t, m, x),
-    decompose: (t, m) => decomposePrompt(t, m),
+    decompose: (t, m, x) => decomposePrompt(t, m, x),
     search: GOV_INITIAL,
   },
   pantograph: {
     label: "Pantograph — interactive Leak II as the workspace, Leak IV only as guardrail",
     node: (t, m, x) => pantographProvePrompt(t, m, x),
-    decompose: (t, m) => pantographDecomposePrompt(t, m),
+    decompose: (t, m, x) => pantographDecomposePrompt(t, m, x),
     search: GOV_INITIAL,
   },
   librarian: {
     label: "Librarian — search-first control; find & cite Mathlib lemmas",
     node: (t, m, x) => librarianProvePrompt(t, m, x),
-    decompose: (t, m) => decomposePrompt(t, m),
+    decompose: (t, m, x) => decomposePrompt(t, m, x),
     search: 30, // generous, so it's a fair opposite of hack-first
   },
   sketch: {
     label: "Sketch — plan the argument in words, then formalize step by step",
     node: (t, m, x) => sketchProvePrompt(t, m, x),
-    decompose: (t, m) => decomposePrompt(t, m),
+    decompose: (t, m, x) => decomposePrompt(t, m, x),
     search: GOV_INITIAL,
   },
   brute: {
     label: "Brute — automation only (aesop/decide/omega/simp_all/nlinarith)",
     node: (t, m, x) => bruteProvePrompt(t, m, x),
-    decompose: (t, m) => decomposePrompt(t, m),
+    decompose: (t, m, x) => decomposePrompt(t, m, x),
     search: 0, // brute mode does not search
   },
 }
 const pickStrategy = (name) => STRATEGIES[name] || STRATEGIES.hacker
 const nodePromptFor = (name, t, m, x) => pickStrategy(name).node(t, m, x)
-const decomposePromptFor = (name, t, m) => pickStrategy(name).decompose(t, m)
+const decomposePromptFor = (name, t, m, x) => pickStrategy(name).decompose(t, m, x)
 const searchBudgetFor = (name) => {
   const b = pickStrategy(name).search
   return Number.isFinite(b) ? b : GOV_INITIAL
@@ -1827,6 +1832,12 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
 async function runNodeProver(node, ctx) {
   const gate = makeProofGate(node.statement)
   let decomposeRequested = false
+  // #2: the node prover's stream already SEES every compile error and tactic
+  // state; capture the most recent ones so a forced decomposition can be told
+  // exactly where the direct attempt got stuck instead of rediscovering it.
+  const verifyIds = new Set()
+  let lastVerifyError = ""
+  let lastGoalState = ""
   const extra =
     "EARLY DECOMPOSE (optional): if partway through you judge this goal is too large to close directly and would be better split into sub-lemmas, output a line that is exactly `DECOMPOSE: <one-line reason>` and stop — a dedicated decomposition run will then take over. Only do this when genuinely stuck; prefer to finish the proof if you can."
   const prompt = nodePromptFor(ctx.strategy, node.statement, ctx.mcpServers, extra)
@@ -1835,9 +1846,26 @@ async function runNodeProver(node, ctx) {
     if (ev?.verified) return true
     if (o.type === "assistant" && o.message?.content) {
       for (const c of o.message.content) {
+        if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script"))
+          verifyIds.add(c.id)
         if (c.type === "text" && /(^|\n)\s*DECOMPOSE\s*:/i.test(c.text || "")) {
           decomposeRequested = true
           return true
+        }
+      }
+    } else if (o.type === "user" && o.message?.content) {
+      for (const c of o.message.content) {
+        if (c.type !== "tool_result") continue
+        const t = Array.isArray(c.content)
+          ? c.content.map((x) => x?.text || "").join("\n")
+          : String(c.content ?? "")
+        if (!t) continue
+        if (verifyIds.has(c.tool_use_id)) {
+          // Keep the latest compile that actually FAILED (not a success line).
+          if (!/Compilation Successful|100% verified/i.test(t) && /error|Error|Line \d+|sorry/.test(t))
+            lastVerifyError = t
+        } else if (/⊢|no goals|goals? \(|state_id|unsolved/i.test(t)) {
+          lastGoalState = t // an interactive (Pantograph) tactic state
         }
       }
     }
@@ -1858,7 +1886,24 @@ async function runNodeProver(node, ctx) {
     { onObject, emit: ctx.emit },
   )
   const proof = gate.verifiedScript
-  return { verified: !!proof, proof: proof || "", decomposeRequested }
+  return { verified: !!proof, proof: proof || "", decomposeRequested, lastVerifyError, lastGoalState }
+}
+
+// #2: turn the node prover's captured failure into a decomposer briefing, so it
+// targets the exact wall instead of re-deriving it. Empty when nothing useful
+// was seen (e.g. the agent never compiled anything).
+function nodeFailureContext(res) {
+  const clip = (s, n) => {
+    const x = String(s || "").trim()
+    return x.length > n ? x.slice(0, n) + "\n…(truncated)" : x
+  }
+  if (res?.lastVerifyError) {
+    return `PREVIOUS DIRECT ATTEMPT (do NOT rediscover this — build on it). The last compile of this goal FAILED with:\n${clip(res.lastVerifyError, 1400)}\n\nExtract the SPECIFIC point that failed above into a helper lemma; do not re-split parts that already compiled.`
+  }
+  if (res?.lastGoalState) {
+    return `PREVIOUS DIRECT ATTEMPT (do NOT rediscover this — build on it). The proof advanced but got stuck at this goal state:\n${clip(res.lastGoalState, 1200)}\n\nMake THIS stuck goal your primary helper lemma.`
+  }
+  return ""
 }
 
 // Run the Decomposer subagent on a node, then GATE its output ourselves: take
@@ -1866,7 +1911,7 @@ async function runNodeProver(node, ctx) {
 // first, and verify each on the daemon. Accept the first that is either a full
 // (sorry-free) proof or a structurally-valid reduction. Returns
 // { ok, fullyProved?, scaffold, children, reason }.
-async function runDecomposer(node, ctx) {
+async function runDecomposer(node, ctx, extraContext = "") {
   const masterName = declaredName(node.statement)
   const verifyCalls = {}
   const candidates = []
@@ -1906,7 +1951,7 @@ async function runDecomposer(node, ctx) {
   }
   const r = await spawnProverStream(
     {
-      prompt: decomposePromptFor(ctx.strategy, node.statement, ctx.mcpServers),
+      prompt: decomposePromptFor(ctx.strategy, node.statement, ctx.mcpServers, extraContext),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
       maxTurns: ctx.decomposeTurnBudget,
@@ -2017,86 +2062,114 @@ async function proveNode(node, ctx) {
     return false
   }
 
-  // 2. Decompose (forced after the turn budget, or voluntarily requested).
-  ctx.emit({
-    type: "message-annotation",
-    subtype: "status",
-    thought: res.decomposeRequested
-      ? `🪓 Agent requested decomposition of ${declName(node.signature)}.`
-      : `🪓 Not closed in ${ctx.turnBudget} turns — forcing decomposition of ${declName(node.signature)}.`,
-  })
-  const dec = await runDecomposer(node, ctx)
-  if (!dec.ok) {
-    node.status = "failed"
-    ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Decomposition failed: ${dec.reason}` })
-    return false
-  }
-  if (dec.fullyProved) {
-    node.proof = dec.scaffold
-    node.status = "proved-direct"
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Decomposer fully proved ${declName(node.signature)}.` })
-    return true
-  }
-  node.scaffold = dec.scaffold
-  node.children = dec.children.map((h, i) => ({
-    id: `${node.id}.${i + 1}`,
-    signature: h.signature,
-    statement: h.text,
-    status: "open",
-    children: [],
-    depth: node.depth + 1,
-  }))
-  node.status = "decomposed"
-  ctx.emit({
-    type: "message-annotation",
-    subtype: "status",
-    thought: `➗ Split ${declName(node.signature)} into ${node.children.length} lemma(s): ${node.children.map((c) => declName(c.signature)).join(", ")}`,
-  })
-
-  // 3. Recurse into every child; a single unproved child fails the node.
-  for (const child of node.children) {
-    const ok = await proveNode(child, ctx)
-    if (!ok) {
+  // 2-4. Decompose → prove children → assemble, wrapped in a bounded
+  // RE-DECOMPOSITION retry (#5): if a child lemma turns out unprovable, or the
+  // assembly won't verify, the split was probably flawed — try a DIFFERENT
+  // decomposition instead of instantly killing the whole branch. The node
+  // prover's failure context (#2) seeds the first decompose; each retry also
+  // states why the last split failed so the decomposer doesn't repeat it.
+  const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
+  const baseContext = nodeFailureContext(res)
+  let extraContext = baseContext
+  for (let attempt = 0; ; attempt++) {
+    if (ctx.signal?.aborted) return false
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought:
+        attempt > 0
+          ? `♻️ Re-decomposing ${declName(node.signature)} (attempt ${attempt + 1}) — the previous split didn't pan out.`
+          : res.decomposeRequested
+            ? `🪓 Agent requested decomposition of ${declName(node.signature)}.`
+            : `🪓 Not closed in ${ctx.turnBudget} turns — forcing decomposition of ${declName(node.signature)}.`,
+    })
+    const dec = await runDecomposer(node, ctx, extraContext)
+    if (!dec.ok) {
+      if (attempt < maxRetry && ctx.nodeCount < ctx.maxNodes && !ctx.signal?.aborted) {
+        extraContext = `${baseContext}\n\nA previous decomposition attempt did not yield a usable split (${dec.reason}). Produce a DIFFERENT decomposition.`
+        continue
+      }
       node.status = "failed"
-      ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Sub-lemma ${declName(child.signature)} could not be proved — ${declName(node.signature)} fails.` })
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Decomposition failed: ${dec.reason}` })
       return false
     }
-  }
-
-  // 4. Assemble the whole subtree, then GATE it by re-proving the node's exact
-  // statement from the assembly ("verifying agent didn't drift the goal"). The
-  // guarded script, when hole-free, is itself a proof of the VERBATIM master —
-  // benign warnings (deprecations/linters) are tolerated, only errors/sorry are
-  // holes. Falls back to a plain hole-free + canonical-signature check.
-  if (ctx.signal?.aborted) return false
-  const assembled = assembleScript(node)
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Assembling ${declName(node.signature)} from ${node.children.length} proved lemma(s) — 🛡️ verifying no goal drift…` })
-  const guarded = buildDriftGuardScript(assembled, node.statement)
-  if (guarded) {
-    const gv = await verifyViaDaemon(guarded, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
-    if (gv.ok && isHoleFreeProof(parseVerifyOutput(gv.text))) {
-      node.proof = guarded
-      node.status = "proved-assembled"
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled; goal preserved and verified hole-free.` })
+    if (dec.fullyProved) {
+      node.proof = dec.scaffold
+      node.status = "proved-direct"
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Decomposer fully proved ${declName(node.signature)}.` })
       return true
     }
+    node.scaffold = dec.scaffold
+    node.children = dec.children.map((h, i) => ({
+      id: `${node.id}.${i + 1}`,
+      signature: h.signature,
+      statement: h.text,
+      status: "open",
+      children: [],
+      depth: node.depth + 1,
+    }))
+    node.status = "decomposed"
+    const childNames = node.children.map((c) => declName(c.signature)).join(", ")
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `➗ Split ${declName(node.signature)} into ${node.children.length} lemma(s): ${childNames}`,
+    })
+
+    // 3. Recurse into every child; a single unproved child dooms THIS split.
+    let failReason = ""
+    for (const child of node.children) {
+      const ok = await proveNode(child, ctx)
+      if (!ok) {
+        failReason = `sub-lemma "${declName(child.signature)}" could not be proved`
+        break
+      }
+    }
+
+    // 4. If every child proved, assemble the subtree and GATE it by re-proving
+    // the node's exact statement from the assembly ("verifying agent didn't
+    // drift the goal"). The guarded script, when hole-free, is itself a proof of
+    // the VERBATIM master — benign warnings tolerated, only errors/sorry are
+    // holes. Falls back to a plain hole-free + canonical-signature check.
+    if (!failReason) {
+      if (ctx.signal?.aborted) return false
+      const assembled = assembleScript(node)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Assembling ${declName(node.signature)} from ${node.children.length} proved lemma(s) — 🛡️ verifying no goal drift…` })
+      const guarded = buildDriftGuardScript(assembled, node.statement)
+      if (guarded) {
+        const gv = await verifyViaDaemon(guarded, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+        if (gv.ok && isHoleFreeProof(parseVerifyOutput(gv.text))) {
+          node.proof = guarded
+          node.status = "proved-assembled"
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled; goal preserved and verified hole-free.` })
+          return true
+        }
+      }
+      const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+      const parsed = parseVerifyOutput(v.text)
+      if (v.ok && isHoleFreeProof(parsed) && scriptProvesTarget(assembled, node.signature)) {
+        node.proof = assembled
+        node.status = "proved-assembled"
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled and verified sorry-free.` })
+        return true
+      }
+      failReason = `assembly did not verify (${oneLine(v.text || v.error || "unknown")})`
+    }
+
+    // A child or the assembly failed. Re-decompose with a DIFFERENT split if we
+    // still have retry budget AND node budget; else the node fails for real.
+    if (attempt < maxRetry && ctx.nodeCount < ctx.maxNodes && !ctx.signal?.aborted) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `♻️ ${declName(node.signature)}: ${failReason} — re-decomposing with a different split.` })
+      extraContext = `${baseContext}\n\nA PREVIOUS decomposition of THIS goal FAILED: it split into [${childNames}] but ${failReason}. Produce a DIFFERENT decomposition — change the lemma boundaries or the mathematical approach; do NOT repeat that same split.`
+      node.children = []
+      node.scaffold = undefined
+      node.status = "open"
+      continue
+    }
+    node.status = "failed"
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ ${declName(node.signature)}: ${failReason}.` })
+    return false
   }
-  // Fallback: the plain assembly, hole-free and containing the exact signature.
-  const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
-  const parsed = parseVerifyOutput(v.text)
-  if (v.ok && isHoleFreeProof(parsed) && scriptProvesTarget(assembled, node.signature)) {
-    node.proof = assembled
-    node.status = "proved-assembled"
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 ${declName(node.signature)} assembled and verified sorry-free.` })
-    return true
-  }
-  node.status = "failed"
-  ctx.emit({
-    type: "message-annotation",
-    subtype: "error",
-    thought: `❌ Assembly of ${declName(node.signature)} did not verify: ${oneLine(v.text || v.error || "unknown")}`,
-  })
-  return false
 }
 
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
@@ -2162,6 +2235,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     decomposeTurnBudget: clampNum(opts.decomposeTurnBudget, 1, 40, 12),
     maxDepth: clampNum(opts.maxDepth, 1, 6, 3),
     maxNodes: clampNum(opts.maxNodes, 1, 64, 24),
+    // #5: how many times a node may re-decompose (with a DIFFERENT split) after
+    // a child lemma or the assembly fails, before the node itself fails.
+    maxRedecompose: clampNum(opts.maxRedecompose, 0, 5, 1),
     // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
     nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
