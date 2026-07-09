@@ -38,6 +38,26 @@ const GEN_RUN_OPTIONS = {
   maxOutputTokens: 64000,
 };
 
+// Reverse mode builds problems from exact arithmetic (products, modular
+// exponentiation, witness evaluation) that a tool-less model would otherwise
+// grind out by hand — slow (10-20 min of thinking) AND error-prone, so the
+// certificate often ends up wrong. Give ONLY reverse mode a python tool so it
+// computes and self-verifies the certificate exactly, in seconds. The other
+// modes stay tool-free (lean context = less rate-limit pressure when looping).
+function genRunOptionsFor(mode: GenMode) {
+  if (mode !== 'reverse') return GEN_RUN_OPTIONS;
+  return {
+    ...GEN_RUN_OPTIONS,
+    // Drop Bash from the denylist; keep everything else blocked.
+    disallowedTools:
+      'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
+    allowedTools: 'Bash',
+    // Headless run on the user's own local bridge — auto-approve the tool so it
+    // can actually execute python without an interactive prompt.
+    permissionMode: 'bypassPermissions',
+  };
+}
+
 // The model's context window, for a rough "% of context used" readout.
 const CONTEXT_WINDOW = 200000;
 
@@ -140,21 +160,26 @@ const MODE_BLOCKS: Record<GenMode, string> = {
 - NESTED INSIGHTS MODE. The solution must require chaining 2-3 DISTINCT, non-obvious insights, each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. A strong solver needs a genuine multi-step derivation to reach the integer answer.
 - The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
   reverse: `
-- REVERSE-CONSTRUCTION MODE, tuned for the IDEAL class: EASY TO VERIFY, HARD TO SOLVE. Build the problem BACKWARD from a secret you choose, so the answer is known for free, the Lean check is a cheap one-step CERTIFICATE, yet a solver must do real search or inversion.
-  THE TARGET ASYMMETRY: checking the answer is ONE short computation (a multiplication, a modular exponentiation, evaluating a witness). Finding it needs search that a naive brute-force loop cannot do in reasonable time — but a clever insight or algorithm can. This is the NP / one-way-function shape.
+- REVERSE-CONSTRUCTION MODE. The ONE invariant: EASY TO VERIFY, HARD TO SOLVE. Build the problem BACKWARD — start from hidden structure you choose so the answer is known to you for free, apply a process that is cheap to check but hard to run in reverse, then reveal only the result and ask for an integer function of what you hid. The Lean check must be a cheap one-step CERTIFICATE the answer satisfies; the solver, lacking your secret, must do real work to recover it.
 
-  1. SECRET: choose hidden data you know — e.g. two primes p,q; a discrete-log exponent x; a subset S; a satisfying assignment; a permutation. This secret IS (or determines) your integer answer.
-  2. ONE-WAY FORWARD MAP: apply a map that is cheap forward but hard to invert — multiply p*q = N; exponentiate g^x mod p; sum/combine over S; a hidden bijection over a huge domain. Hand the solver only the OUTPUT and ask for a function of the secret (a specific INTEGER, e.g. "the sum of the prime factors of N", "the exponent x", "the size of the hidden subset").
-  3. Present it as a clean, self-contained competition problem; do not reveal the secret.
+  DO NOT restrict yourself to any one niche. This asymmetry appears EVERYWHERE in math — roam the whole space and pick whatever is freshest. A NON-exhaustive palette (do not just cycle these — invent your own):
+  - Number theory: factoring, but ALSO Diophantine witnesses, digit/base representations, continued fractions, hidden divisor structure, modular seeds.
+  - Combinatorics: a hidden colouring / tiling / graph / lattice path / matching / permutation whose count or a single witness is asked; a hidden subset with a target sum or property.
+  - Algebra: a polynomial built from chosen roots (ask a coefficient / a value); a hidden matrix or linear system; a group/word construction.
+  - Sequences & recurrences: a hidden seed or rule producing a term far downstream that is cheap to check forward, hard to invert.
+  - Geometry: hidden lattice configurations, chosen points forcing an area/count, constructions with a cheap-to-verify invariant.
+  - Games / processes / invariants: a chosen play sequence or state whose outcome is a cheap check but whose optimal value needs insight.
+  Whatever you pick, the shape is: (1) SECRET you know → (2) a forward map cheap to verify but hard to invert → (3) hand the solver only the output, ask for a specific INTEGER function of the secret. Do not reveal the secret.
 
   LEAN 4 THEOREM = a CERTIFICATE the ANSWER satisfies, verifiable by ONE computation, NOT a search:
-  - GOOD: p * q = N ∧ Nat.Prime p ∧ Nat.Prime q ; (g ^ x : ZMod p) = h ; ((S : Finset ℕ).sum f = T ∧ <cheap predicate on S>). Use ZMod for modular facts so the check stays fast (never compute giant powers before taking the mod). Prefer decide/native_decide on that single certificate.
-  - FORBIDDEN: a statement whose ONLY way to check is to enumerate a bounded domain — if Lean brute-forces it, so can the solver. Reference the answer/witness DIRECTLY so verification is polynomial, not a search.
-  - Also FORBIDDEN (co-NP, not cheap to verify): "the maximum/minimum is V", "the number of solutions is K", or any nonexistence claim.
+  - Reference the answer/witness DIRECTLY so verification is polynomial. Examples of the FORM (not a menu to copy): \`p * q = N ∧ Nat.Prime p ∧ Nat.Prime q\`; \`(g ^ x : ZMod p) = h\`; \`(S : Finset ℕ).sum f = T ∧ <cheap predicate on S>\`; \`poly.eval r = 0\`; \`f^[k] seed = target\`. Use ZMod for modular facts so the check stays fast (never form giant powers before reducing).
+  - FORBIDDEN: a statement whose ONLY check is to enumerate a bounded domain — if Lean brute-forces it, so can the solver.
+  - Also FORBIDDEN (co-NP, not cheap to verify): "the maximum/minimum is V", "the number of solutions is K", or any nonexistence claim — UNLESS you also give a directly-checkable witness that pins it.
+  - Prefer decide/native_decide, an equational check, or a direct predicate on that single certificate.
 
-  SCALE so brute force fails but insight wins: make the search space large enough that "just loop over everything" is impractical (e.g. N a ~30-40 bit semiprime; x over a large modulus; S over 2^40 subsets), yet small enough that a smart method (Pollard rho, meet-in-the-middle, CRT, exploiting the hidden structure) cracks it. Do NOT make it cryptographically unbreakable.
+  SCALE so brute force fails but insight wins: large enough that "loop over everything" is impractical, small enough that a smart method cracks it. Sizes are yours to choose per construction — do NOT default to crypto-grade magnitudes.
 
-  You built it from the secret, so state the exact integer answer directly; do NOT re-derive it.`,
+  COMPUTE, DON'T HAND-DERIVE: you have a Bash tool — run \`python3\` to build your secret, apply the forward map, and COMPUTE the exact integer answer and every number in the certificate (products, modular exponentials, sums, witness evaluations). VERIFY the certificate numerically in python before you emit it. NEVER do large arithmetic in your head — it is slow and it is wrong. State the exact values python gave you.`,
 };
 
 const RESPONSE_FORMAT = `
@@ -852,7 +877,10 @@ export function AdminPipeline() {
       try {
         genRes = await callBridge(true, '/run', {
           method: 'POST',
-          body: JSON.stringify({ prompt, options: GEN_RUN_OPTIONS }),
+          body: JSON.stringify({
+            prompt,
+            options: genRunOptionsFor(modeRef.current),
+          }),
           signal: ctrl.signal,
         });
       } catch {
