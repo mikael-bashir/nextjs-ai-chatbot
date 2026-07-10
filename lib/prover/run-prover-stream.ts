@@ -91,11 +91,17 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
     res = await fetch(`${base}/${endpoint}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bridge-token': token },
+      // NOTE: the bridge reads model + strategy from `options` (body.options),
+      // so they MUST go there — a top-level `model` is ignored by the prove
+      // paths. (Kept top-level too for the debug log / backwards-compat.)
       body: JSON.stringify({
         theorem: problem,
         mcpServers,
         model,
-        options: opts.strategy ? { strategy: opts.strategy } : undefined,
+        options: {
+          ...(opts.strategy ? { strategy: opts.strategy } : {}),
+          ...(model ? { model } : {}),
+        },
       }),
       signal,
     });

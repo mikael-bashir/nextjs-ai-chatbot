@@ -24,6 +24,8 @@ export function ProverPlayground() {
   const [decompose, setDecompose] = useState(false);
   // Strategy mode for A/B testing proof approaches (tree path only).
   const [strategy, setStrategy] = useState('hacker');
+  // Model the prover runs on ('' = the bridge/CLI default).
+  const [model, setModel] = useState('');
 
   const run = useCallback(async () => {
     if (!problem.trim()) return;
@@ -36,6 +38,7 @@ export function ProverPlayground() {
       const out = await runProverStream({
         problem,
         mcpServers,
+        model: model || undefined,
         onEvent: append,
         source: decompose ? `playground-tree:${strategy}` : 'playground',
         endpoint: decompose ? 'prove-tree' : 'prove-stream',
@@ -47,7 +50,7 @@ export function ProverPlayground() {
     } finally {
       setRunning(false);
     }
-  }, [problem, decompose, strategy]);
+  }, [problem, decompose, strategy, model]);
 
   return (
     <div className="space-y-4">
@@ -81,6 +84,21 @@ export function ProverPlayground() {
           <GitBranch className="size-3.5" />
           Decompose mode {decompose ? 'on' : 'off'}
         </button>
+        <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+          Model
+          <select
+            value={model}
+            onChange={(e) => setModel(e.target.value)}
+            disabled={running}
+            className="rounded-md border bg-background px-2 py-1.5 text-sm"
+          >
+            <option value="">Default</option>
+            <option value="claude-opus-4-8">Opus 4.8</option>
+            <option value="claude-sonnet-5">Sonnet 5</option>
+            <option value="claude-fable-5">Fable 5</option>
+            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+          </select>
+        </label>
         {decompose && (
           <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
             Strategy

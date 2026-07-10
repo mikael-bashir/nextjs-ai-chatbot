@@ -500,6 +500,13 @@ export function AdminPipeline() {
   useEffect(() => {
     verifyStrategyRef.current = verifyStrategy;
   }, [verifyStrategy]);
+  // Model the prover runs on ('' = the bridge/CLI default). Held in a ref so the
+  // async verify loop reads the latest value. Passed through to `claude --model`.
+  const [verifyModel, setVerifyModel] = useState('');
+  const verifyModelRef = useRef(verifyModel);
+  useEffect(() => {
+    verifyModelRef.current = verifyModel;
+  }, [verifyModel]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -611,9 +618,11 @@ export function AdminPipeline() {
       try {
         const decompose = verifyDecomposeRef.current;
         const strategy = verifyStrategyRef.current;
+        const model = verifyModelRef.current;
         const outcome = await runProverStream({
           problem: lean,
           mcpServers,
+          model: model || undefined,
           bridgeUrl: conn.bridgeUrl,
           token: conn.token,
           signal,
@@ -1482,6 +1491,21 @@ export function AdminPipeline() {
               <span aria-hidden>⑂</span>
               Decompose {verifyDecompose ? 'on' : 'off'}
             </button>
+            <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+              Model
+              <select
+                value={verifyModel}
+                onChange={(e) => setVerifyModel(e.target.value)}
+                className="rounded-md border bg-background px-1.5 py-1 text-xs"
+                title="Which model the prover runs on (passed to claude --model). Default uses the bridge/CLI default."
+              >
+                <option value="">Default</option>
+                <option value="claude-opus-4-8">Opus 4.8</option>
+                <option value="claude-sonnet-5">Sonnet 5</option>
+                <option value="claude-fable-5">Fable 5</option>
+                <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+              </select>
+            </label>
             {verifyDecompose && (
               <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                 Strategy
