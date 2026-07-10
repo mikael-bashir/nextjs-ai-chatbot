@@ -867,13 +867,32 @@ function parseRefuteWitnesses(text) {
 // refuted iff a harness compiles hole-free (a certified ¬T). On a hit it pins
 // down the SMALLEST witness and returns a MINIMAL single-witness certificate
 // (not the full sweep), so the stored/displayed disproof stays readable.
+// The disproof probe is a fast OPTIMIZATION (catch an obviously-false theorem in
+// seconds), so it gets a SHORT leash — not the full verify timeout. Some bodies
+// are poison for `native_decide` (e.g. a sum over `Equiv.Perm (Fin n)` with `n`
+// still symbolic): the daemon would grind toward the 180s wall for nothing. If
+// the probe exceeds this, we bail and just let the prover run. Env-overridable.
+const REFUTE_TIMEOUT_MS_DEFAULT = Number(process.env.REFUTE_TIMEOUT_MS || 25000)
+const refuteTimeoutOf = (ctx) => ctx.refuteTimeoutMs || REFUTE_TIMEOUT_MS_DEFAULT
+
 async function refutePreCheck(rawStmt, ctx, extraWitnesses = []) {
   if (ctx.signal?.aborted) return { refuted: false }
   const witnesses = [...new Set([...extraWitnesses, ...REFUTE_WITNESSES])]
   const script = buildRefuteScript(rawStmt, witnesses)
   if (!script) return { refuted: false }
-  const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
-  if (!(v.ok && isHoleFreeProof(parseVerifyOutput(v.text)))) return { refuted: false }
+  const timeoutMs = refuteTimeoutOf(ctx)
+  const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs })
+  if (!(v.ok && isHoleFreeProof(parseVerifyOutput(v.text)))) {
+    // Bail out loudly on a timeout so the run visibly moves on to proving.
+    if (/timed out/i.test(v.error || "")) {
+      ctx.emit?.({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `⏭️ Disproof pre-check exceeded ${Math.round(timeoutMs / 1000)}s (undecidable/heavy body) — skipping it and proceeding to prove.`,
+      })
+    }
+    return { refuted: false }
+  }
   const w = await findRefuteWitness(rawStmt, ctx, witnesses).catch(() => null)
   const minimal = w != null ? buildRefuteScript(rawStmt, [w]) : script
   return { refuted: true, script: minimal, witness: w }
@@ -881,11 +900,12 @@ async function refutePreCheck(rawStmt, ctx, extraWitnesses = []) {
 
 // On a confirmed refute, find the SMALLEST witness (for a human-readable message).
 async function findRefuteWitness(rawStmt, ctx, witnesses = REFUTE_WITNESSES) {
+  const timeoutMs = refuteTimeoutOf(ctx)
   for (const w of witnesses) {
     if (ctx.signal?.aborted) break
     const s = buildRefuteScript(rawStmt, [w])
     if (!s) return null
-    const v = await verifyViaDaemon(s, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    const v = await verifyViaDaemon(s, ctx.verifyUrl, { timeoutMs })
     if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text))) return w
   }
   return null
@@ -1585,7 +1605,7 @@ async function proveStream(res, theorem, mcpServers, opts = {}) {
   theorem = normalizeProblemSyntax(theorem)
   if (opts.refuteCheck !== false) {
     const verifyUrl = resolveVerifyUrl(mcpServers)
-    const rctx = { verifyUrl, verifyTimeoutMs: 180000, signal: undefined }
+    const rctx = { verifyUrl, verifyTimeoutMs: 180000, refuteTimeoutMs: REFUTE_TIMEOUT_MS_DEFAULT, signal: undefined }
     if (verifyUrl) {
       const pre = await refutePreCheck(theorem, rctx)
       if (pre.refuted) {
@@ -2832,6 +2852,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
     nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
     verifyTimeoutMs: 180000,
+    // Short leash for the disproof pre-check so a heavy/undecidable body can't
+    // stall the whole run at the daemon (env REFUTE_TIMEOUT_MS or opts).
+    refuteTimeoutMs: clampNum(opts.refuteTimeoutMs, 3000, 120000, REFUTE_TIMEOUT_MS_DEFAULT),
     nodeCount: 0,
     stage: "",
   }
