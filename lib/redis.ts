@@ -256,6 +256,25 @@ export function normTitle(s?: string | null): string {
   return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// Return a display title guaranteed not to collide (by normTitle) with any in
+// `taken`. If `desired` is free it's returned as-is; otherwise a " (2)", " (3)",
+// … suffix is appended until it's unique. This is how a newly generated problem
+// is kept unique against the current roster so the title-keyed dedupe guards can
+// never mis-fire.
+export function disambiguateTitle(
+  desired: string | null | undefined,
+  taken: Set<string>,
+): string {
+  const base = (desired || 'Generated Problem').trim() || 'Generated Problem';
+  if (!taken.has(normTitle(base))) return base;
+  for (let i = 2; i < 1000; i++) {
+    const candidate = `${base} (${i})`;
+    if (!taken.has(normTitle(candidate))) return candidate;
+  }
+  // Pathological fallback — a timestamp suffix is effectively always unique.
+  return `${base} (${Date.now().toString(36)})`;
+}
+
 // True iff a problem with this (normalized) title is already in the staging /
 // prod queue. Empty/absent titles never match, so an untitled manual push is
 // never blocked. These back the server-side guards that stop a problem being

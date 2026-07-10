@@ -4,12 +4,52 @@ import { isAdminEmail } from '@/lib/admin';
 import {
   GENERATED_CAP,
   deleteGenerated,
+  disambiguateTitle,
   listGenerated,
+  listProblems,
+  listProdProblems,
+  normTitle,
   pushProblem,
   queueLength,
   saveGenerated,
   updateGenerated,
 } from '@/lib/redis';
+
+// Titles already on the roster — generated history + both Redis queues + the
+// live CompeteMath set — so a new problem's title can be made unique against
+// all of them. Live is best-effort: a CompeteMath outage never blocks a save.
+async function rosterTitles(): Promise<Set<string>> {
+  const set = new Set<string>();
+  const add = (t?: string | null) => {
+    const n = normTitle(t);
+    if (n) set.add(n);
+  };
+  const [gen, staging, prod] = await Promise.all([
+    listGenerated().catch(() => []),
+    listProblems().catch(() => []),
+    listProdProblems().catch(() => []),
+  ]);
+  gen.forEach((g) => add(g.questionTitle));
+  staging.forEach((s) => add(s.questionTitle));
+  prod.forEach((p) => add(p.questionTitle));
+  try {
+    const base = (
+      process.env.COMPETEMATH_BASE_URL || 'https://www.competemath.com'
+    ).replace(/\/$/, '');
+    const r = await fetch(`${base}/api/problems`, {
+      next: { revalidate: 3600 },
+    });
+    if (r.ok) {
+      const rows = await r.json();
+      if (Array.isArray(rows)) {
+        for (const x of rows) add((x as { title?: string })?.title);
+      }
+    }
+  } catch {
+    /* live set unavailable — dedupe against the queues only */
+  }
+  return set;
+}
 
 // The full generation history: every problem Claude produces is stored here,
 // verified or not, so nothing is ever silently discarded. Capped at
@@ -45,8 +85,16 @@ export async function POST(request: NextRequest) {
       });
     }
     const verified = !!body.verified;
+    // Guarantee the title can't collide with anything already on the roster —
+    // append " (2)", " (3)", … if needed. Since a verified record is also pushed
+    // to staging below with this same title, the uniqueness propagates all the
+    // way to prod, so the title-keyed dedupe guards can never mis-fire.
+    const questionTitle = disambiguateTitle(
+      body.questionTitle,
+      await rosterTitles(),
+    );
     const record = {
-      questionTitle: body.questionTitle ?? null,
+      questionTitle,
       subtitle: body.subtitle ?? null,
       problem: body.problem ?? null,
       answer: body.answer ?? null,
