@@ -40,6 +40,8 @@ export async function POST(request: NextRequest) {
       proof: body.proof ?? null,
       finalText: body.finalText ?? null,
       metrics: body.metrics ?? null,
+      // The full activity flow (ProverEvent[]); only accept an array.
+      events: Array.isArray(body.events) ? body.events : null,
     });
     return Response.json({ id: row.id });
   } catch (error) {

@@ -411,6 +411,12 @@ export const agentRunLog = pgTable('AgentRunLog', {
   proof: text('proof'),
   finalText: text('finalText'),
   metrics: json('metrics'),
+  // Full normalized activity flow (ProverEvent[]) — every step the console
+  // showed (tool calls, results, status annotations, planner/minion flow), so a
+  // finished attempt can be reviewed/shared after the fact. Long fields are
+  // truncated client-side to bound the row; the table is trimmed to the newest
+  // rows on insert (see createAgentRunLog).
+  events: json('events'),
   createdAt: timestamp('createdAt').notNull().defaultNow(),
 });
 

@@ -25,6 +25,28 @@ const db = drizzle(vercelSql, { schema: { apiKey, problemJob, agentRunLog } });
 // ---------------------------------------------------------------------------
 // Admin debug log — full agent context + outcome per prover run (admin only).
 // ---------------------------------------------------------------------------
+// Newest N attempts to retain — the debug log is a rolling window, not an
+// archive, so it never grows unbounded.
+const AGENT_RUN_LOG_KEEP = 100;
+
+// The AgentRunLog table was created via raw DDL and the Drizzle migrate step is
+// currently wedged (unrelated Chat.title drift), so bring the `events` column
+// into being idempotently on first write. Memoized: runs at most once/process.
+let ensureAgentRunLogSchemaPromise: Promise<void> | null = null;
+function ensureAgentRunLogSchema(): Promise<void> {
+  if (!ensureAgentRunLogSchemaPromise) {
+    ensureAgentRunLogSchemaPromise = (async () => {
+      try {
+        await vercelSql`ALTER TABLE "AgentRunLog" ADD COLUMN IF NOT EXISTS "events" json`;
+      } catch (e) {
+        // Never let schema upkeep break the (fire-and-forget) logging path.
+        console.error('ensureAgentRunLogSchema failed:', e);
+      }
+    })();
+  }
+  return ensureAgentRunLogSchemaPromise;
+}
+
 export async function createAgentRunLog(input: {
   userId?: string | null;
   source: string;
@@ -36,7 +58,9 @@ export async function createAgentRunLog(input: {
   proof?: string | null;
   finalText?: string | null;
   metrics?: unknown;
+  events?: unknown;
 }): Promise<AgentRunLog> {
+  await ensureAgentRunLogSchema();
   const [row] = await db
     .insert(agentRunLog)
     .values({
@@ -50,12 +74,28 @@ export async function createAgentRunLog(input: {
       proof: input.proof ?? null,
       finalText: input.finalText ?? null,
       metrics: input.metrics ?? null,
+      events: input.events ?? null,
     })
     .returning();
+  // Trim to the newest AGENT_RUN_LOG_KEEP rows (rolling window). Best-effort.
+  try {
+    await vercelSql`
+      DELETE FROM "AgentRunLog"
+      WHERE "id" NOT IN (
+        SELECT "id" FROM "AgentRunLog"
+        ORDER BY "createdAt" DESC
+        LIMIT ${AGENT_RUN_LOG_KEEP}
+      )`;
+  } catch (e) {
+    console.error('AgentRunLog trim failed:', e);
+  }
   return row;
 }
 
 export async function listAgentRunLogs(limit = 50): Promise<AgentRunLog[]> {
+  // Guarantee the `events` column exists before selecting it (the table predates
+  // the column and the migrate step is wedged — see ensureAgentRunLogSchema).
+  await ensureAgentRunLogSchema();
   return db
     .select()
     .from(agentRunLog)

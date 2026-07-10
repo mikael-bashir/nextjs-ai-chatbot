@@ -71,11 +71,42 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
   const token = opts.token ?? conn.token ?? '';
 
   let seq = 0;
+  // Accumulate the full activity flow for the admin debug log so a finished run
+  // can be reviewed after the fact — the same events the console renders. Long
+  // fields are truncated and the array is capped so a persisted row stays sane.
+  const MAX_LOG_EVENTS = 1500;
+  const FIELD_CAP = 4000;
+  const cap = (s?: string) =>
+    typeof s === 'string' && s.length > FIELD_CAP
+      ? `${s.slice(0, FIELD_CAP)}\n…[truncated ${s.length - FIELD_CAP} chars]`
+      : s;
+  const activityLog: ProverEvent[] = [];
   const emit = (
     kind: ProverEventKind,
     label: string,
     extra: Partial<ProverEvent> = {},
-  ) => onEvent({ id: ++seq, ts: Date.now(), kind, label, ...extra });
+  ) => {
+    const ev: ProverEvent = { id: ++seq, ts: Date.now(), kind, label, ...extra };
+    onEvent(ev);
+    if (activityLog.length < MAX_LOG_EVENTS) {
+      // Store without the per-event `metrics` (kept once, separately) and with
+      // long text fields truncated.
+      activityLog.push({
+        id: ev.id,
+        ts: ev.ts,
+        kind: ev.kind,
+        label: ev.label,
+        tool: ev.tool,
+        input: cap(ev.input),
+        detail: cap(ev.detail),
+        proof: cap(ev.proof),
+        disproof: cap(ev.disproof),
+        verified: ev.verified,
+        refuted: ev.refuted,
+        counterexample: ev.counterexample,
+      });
+    }
+  };
 
   // Immediate client-side feedback before the stream opens.
   emit('received', `Problem received by prover`, { detail: problem });
@@ -141,6 +172,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
       proof: outcome?.proof ?? '',
       finalText,
       metrics: lastMetrics,
+      events: activityLog,
     });
   };
 
