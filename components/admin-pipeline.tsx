@@ -1129,11 +1129,16 @@ export function AdminPipeline() {
             j.staged,
             ...it.filter((x) => x.id !== j.staged.id),
           ]);
+      } else if (res.status === 409) {
+        // Server refused a duplicate — surface it and refresh so the chip shows.
+        const j = await res.json().catch(() => null);
+        pushLog('warn', j?.error || 'Already in staging — not added again.');
+        loadQueue();
       }
     } finally {
       setBusy(null);
     }
-  }, []);
+  }, [pushLog, loadQueue]);
 
   const removeGenerated = useCallback(async (id: string) => {
     setBusy(`del:${id}`);
@@ -1178,6 +1183,13 @@ export function AdminPipeline() {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ id }),
       });
+      // Duplicate refusal is not a prod outage — just report it and refresh so
+      // the "In prod" state shows; don't mark prod unhealthy.
+      if (r.status === 409) {
+        pushLog('warn', (await r.text()) || 'Already in prod — not pushed.');
+        loadQueue();
+        return;
+      }
       if (!r.ok) throw new Error((await r.text()) || `failed (${r.status})`);
       dropStaged(id);
     } catch (e) {
@@ -1189,7 +1201,7 @@ export function AdminPipeline() {
     } finally {
       setBusy(null);
     }
-  }, []);
+  }, [pushLog, loadQueue]);
 
   // ---- derived ----------------------------------------------------------
 
@@ -1807,11 +1819,19 @@ export function AdminPipeline() {
                     size="sm"
                     variant="secondary"
                     className="h-7 px-2 text-xs"
-                    disabled={busy === `stage:${g.id}`}
+                    disabled={busy === `stage:${g.id}` || pl.staging}
                     onClick={() => addToStaging(g)}
-                    title="Add this problem to the staging review queue"
+                    title={
+                      pl.staging
+                        ? 'Already in the staging queue'
+                        : 'Add this problem to the staging review queue'
+                    }
                   >
-                    {busy === `stage:${g.id}` ? 'Adding…' : 'Add to staging'}
+                    {busy === `stage:${g.id}`
+                      ? 'Adding…'
+                      : pl.staging
+                        ? 'In staging'
+                        : 'Add to staging'}
                   </Button>
                   <Button
                     size="sm"
@@ -1913,7 +1933,9 @@ export function AdminPipeline() {
                 : 'Queue is empty.'}
             </p>
           )}
-          {items.map((it) => (
+          {items.map((it) => {
+            const inProd = prodTitleSet.has(normTitle(it.questionTitle));
+            return (
             <div key={it.id} className="rounded-lg border p-3">
               <div className="flex items-start justify-between gap-2">
                 <div className="min-w-0 flex-1">
@@ -1929,15 +1951,23 @@ export function AdminPipeline() {
                     size="sm"
                     variant="secondary"
                     className="h-7 px-2 text-xs"
-                    disabled={busy === `promote:${it.id}` || !health?.prod.ok}
+                    disabled={
+                      busy === `promote:${it.id}` || !health?.prod.ok || inProd
+                    }
                     onClick={() => promoteItem(it.id)}
                     title={
-                      health?.prod.ok
-                        ? 'Publish to the production weekly-problems queue'
-                        : 'Prod Redis unreachable'
+                      inProd
+                        ? 'Already in the prod queue'
+                        : health?.prod.ok
+                          ? 'Publish to the production weekly-problems queue'
+                          : 'Prod Redis unreachable'
                     }
                   >
-                    {busy === `promote:${it.id}` ? '…' : 'Push to prod'}
+                    {busy === `promote:${it.id}`
+                      ? '…'
+                      : inProd
+                        ? 'In prod'
+                        : 'Push to prod'}
                   </Button>
                   <Button
                     size="sm"
@@ -1951,7 +1981,8 @@ export function AdminPipeline() {
                 </div>
               </div>
             </div>
-          ))}
+            );
+          })}
         </div>
       </div>
 

@@ -1,7 +1,12 @@
 import type { NextRequest } from 'next/server';
 import { auth } from '@/app/(auth)/auth';
 import { isAdminEmail } from '@/lib/admin';
-import { deleteProblem, listProblems, pushToProd } from '@/lib/redis';
+import {
+  deleteProblem,
+  listProblems,
+  prodHasTitle,
+  pushToProd,
+} from '@/lib/redis';
 import { saveGeneratedProblem } from '@/lib/db/generated-problem-queries';
 
 // Promote a staged problem to the production CompeteMath queue. The main app's
@@ -28,6 +33,16 @@ export async function POST(request: NextRequest) {
     const rec = (await listProblems()).find((p) => p.id === id);
     if (!rec) {
       return new Response('Not found', { status: 404 });
+    }
+
+    // Robustness guard: never double-publish. If a problem with this title is
+    // already sitting in the prod queue, refuse (409) and leave staging intact —
+    // don't push a duplicate or archive metadata twice.
+    if (await prodHasTitle(rec.questionTitle)) {
+      return new Response(
+        'A problem with this title is already in the prod queue.',
+        { status: 409 },
+      );
     }
 
     // Prerequisite-knowledge level (1-5) → CompeteMath's `knowledge` column as

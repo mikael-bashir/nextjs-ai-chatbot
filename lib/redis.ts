@@ -250,6 +250,29 @@ export async function listProdProblems(): Promise<
     .filter((x): x is { questionTitle?: string } => !!x);
 }
 
+// Canonical title key for de-duping a problem across the queues (case- and
+// whitespace-insensitive). Mirrors the client's normTitle in admin-pipeline.
+export function normTitle(s?: string | null): string {
+  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// True iff a problem with this (normalized) title is already in the staging /
+// prod queue. Empty/absent titles never match, so an untitled manual push is
+// never blocked. These back the server-side guards that stop a problem being
+// double-queued even if the UI is stale.
+export async function stagingHasTitle(title?: string | null): Promise<boolean> {
+  const t = normTitle(title);
+  if (!t) return false;
+  return (await listProblems()).some((p) => normTitle(p.questionTitle) === t);
+}
+export async function prodHasTitle(title?: string | null): Promise<boolean> {
+  const t = normTitle(title);
+  if (!t) return false;
+  return (await listProdProblems()).some(
+    (p) => normTitle(p.questionTitle) === t,
+  );
+}
+
 // Health probe for both instances: reports reachability + queue length so the
 // admin UI can surface Redis issues immediately.
 export async function redisHealth(): Promise<{

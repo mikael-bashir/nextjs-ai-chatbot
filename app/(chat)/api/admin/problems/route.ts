@@ -8,6 +8,7 @@ import {
   pushProblem,
   queueLength,
   redisHealth,
+  stagingHasTitle,
 } from '@/lib/redis';
 
 // Admin-only queue management. GET returns health + the staged items; POST
@@ -64,6 +65,18 @@ export async function POST(request: NextRequest) {
       return new Response('problem must include at least { lean }', {
         status: 400,
       });
+    }
+    // Robustness guard: never double-stage the same problem. If one with this
+    // title is already in staging, refuse (409) instead of pushing a duplicate.
+    if (await stagingHasTitle(body.questionTitle)) {
+      return Response.json(
+        {
+          ok: false,
+          duplicate: true,
+          error: 'A problem with this title is already in staging.',
+        },
+        { status: 409 },
+      );
     }
     const record = {
       questionTitle: body.questionTitle ?? null,
