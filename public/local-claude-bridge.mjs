@@ -650,8 +650,33 @@ function makeProofGate(theorem) {
 // followed by "Line N (Error|Warning): message" lines (a `sorry`/`admit`
 // surfaces as a Warning "declaration uses `sorry`").
 const SORRY_RE = /uses\s*[`'"]?\s*(sorry|admit)/i
+// Verify results frequently arrive as the daemon's JSON envelope
+// {"result":"…\n…"} where the newlines are ESCAPED. The per-line diagnostic
+// regex below is line-anchored (^Line …), so on escaped `\n` it silently finds
+// NOTHING — which made the have-tree gate reject its own valid skeletons (an
+// escaped "Line 3 (Warning): … sorry" parsed as zero sorry-warnings). Un-escape
+// first — extract the JSON `result`, else turn literal \n/\r/\t escapes into real
+// whitespace — so EVERY caller (structural gate, hole-free check, syntax-error
+// check) sees the real diagnostic lines.
+function normalizeVerifyText(text) {
+  const s = String(text == null ? "" : text)
+  const t = s.trim()
+  if (t.startsWith("{") && /"result"\s*:/.test(t)) {
+    try {
+      const obj = JSON.parse(t)
+      if (obj && typeof obj.result === "string") return obj.result
+    } catch {
+      /* not clean JSON — fall through to escape-unwrapping */
+    }
+  }
+  if (!/\n/.test(s) && /\\n|\\r|\\t/.test(s)) {
+    return s.replace(/\\r\\n|\\n|\\r/g, "\n").replace(/\\t/g, "\t")
+  }
+  return s
+}
+
 function parseVerifyOutput(text) {
-  const raw = String(text == null ? "" : text)
+  const raw = normalizeVerifyText(text)
   const success =
     /compilation successful|100% verified/i.test(raw) && !/compilation failed|❌/i.test(raw)
   const diagnostics = []
