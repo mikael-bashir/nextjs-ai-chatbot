@@ -44,10 +44,11 @@ const GEN_RUN_OPTIONS = {
 // certificate often ends up wrong. Give ONLY reverse mode a python tool so it
 // computes and self-verifies the certificate exactly, in seconds. The other
 // modes stay tool-free (lean context = less rate-limit pressure when looping).
-function genRunOptionsFor(mode: GenMode) {
-  if (mode !== 'reverse') return GEN_RUN_OPTIONS;
+function genRunOptionsFor(mode: GenMode, model?: string) {
+  const withModel = model ? { ...GEN_RUN_OPTIONS, model } : GEN_RUN_OPTIONS;
+  if (mode !== 'reverse') return withModel;
   return {
-    ...GEN_RUN_OPTIONS,
+    ...withModel,
     // Drop Bash from the denylist; keep everything else blocked.
     disallowedTools:
       'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
@@ -57,6 +58,17 @@ function genRunOptionsFor(mode: GenMode) {
     permissionMode: 'bypassPermissions',
   };
 }
+
+// Models selectable for the local `claude` runs (available on the Claude Max
+// plan). '' = the CLI/bridge default. Generation and verification pick one each,
+// independently.
+const PROVER_MODELS: { value: string; label: string }[] = [
+  { value: '', label: 'Default' },
+  { value: 'claude-opus-4-8', label: 'Opus 4.8' },
+  { value: 'claude-sonnet-5', label: 'Sonnet 5' },
+  { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+  { value: 'claude-fable-5', label: 'Fable 5' },
+];
 
 // The model's context window, for a rough "% of context used" readout.
 const CONTEXT_WINDOW = 200000;
@@ -472,6 +484,12 @@ export function AdminPipeline() {
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [previewIds, setPreviewIds] = useState<string[]>([]);
   const [mode, setMode] = useState<GenMode>('standard');
+  // Generation model — independent from the verification model. '' = default.
+  const [genModel, setGenModel] = useState('');
+  const genModelRef = useRef(genModel);
+  useEffect(() => {
+    genModelRef.current = genModel;
+  }, [genModel]);
   const [liveProblems, setLiveProblems] = useState<LiveProblem[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [workBridgeUrl, setWorkBridgeUrl] = useState('');
@@ -901,7 +919,10 @@ export function AdminPipeline() {
           method: 'POST',
           body: JSON.stringify({
             prompt,
-            options: genRunOptionsFor(modeRef.current),
+            options: genRunOptionsFor(
+              modeRef.current,
+              genModelRef.current || undefined,
+            ),
           }),
           signal: ctrl.signal,
         });
@@ -1271,6 +1292,21 @@ export function AdminPipeline() {
               ),
             )}
           </div>
+          <label className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
+            Generation model
+            <select
+              value={genModel}
+              onChange={(e) => setGenModel(e.target.value)}
+              className="rounded-md border bg-background px-1.5 py-1 text-xs"
+              title="Which model generates problems (independent of the verification model). Default = the bridge/CLI default."
+            >
+              {PROVER_MODELS.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
             {mode === 'standard' &&
               'Elegant, hand-solvable; Lean proof usually machine-checkable (decide).'}
@@ -1497,13 +1533,13 @@ export function AdminPipeline() {
                 value={verifyModel}
                 onChange={(e) => setVerifyModel(e.target.value)}
                 className="rounded-md border bg-background px-1.5 py-1 text-xs"
-                title="Which model the prover runs on (passed to claude --model). Default uses the bridge/CLI default."
+                title="Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default."
               >
-                <option value="">Default</option>
-                <option value="claude-opus-4-8">Opus 4.8</option>
-                <option value="claude-sonnet-5">Sonnet 5</option>
-                <option value="claude-fable-5">Fable 5</option>
-                <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+                {PROVER_MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
               </select>
             </label>
             {verifyDecompose && (
