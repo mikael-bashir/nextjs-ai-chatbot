@@ -1597,6 +1597,7 @@ export function AdminPipeline() {
                   <option value="sketch">Sketch (plan then formalize)</option>
                   <option value="brute">Brute (automation only)</option>
                   <option value="have">Have (in-context, no top-level lemmas)</option>
+                  <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
                 </select>
               </label>
             )}

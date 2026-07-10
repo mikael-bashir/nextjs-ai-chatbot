@@ -1432,6 +1432,16 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have",
   },
+  // Phase-1 linear context: planner writes a `have`-skeleton, isolated minions
+  // fill each hole, an assembler stitches + re-verifies. Bounded context per
+  // agent; falls back to `have` on any failure. See proveHaveTree.
+  "have-tree": {
+    label: "Have-tree — planner + isolated per-hole minions (linear context)",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => haveHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "have-tree",
+  },
 }
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
 // prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
@@ -2493,6 +2503,253 @@ async function proveHaveFlat(theorem, ctx) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// HAVE-TREE — Phase-1 linear-context orchestrator.
+// The single-agent `have` mode (proveHaveFlat) holds the WHOLE proof in ONE
+// context, so context grows ~O(N²) with proof length and the model degrades. The
+// have-tree keeps every agent's context BOUNDED: a PLANNER writes a compiled
+// `have`-skeleton (each hard step a hole `:= by sorry --⟪hN⟫`), then each hole is
+// filled by a FRESH, ISOLATED MINION that sees only the skeleton — i.e. the
+// sibling SIGNATURES, never their proofs — and the ASSEMBLER splices the fills
+// and re-checks the whole thing hole-free on the daemon. Cost scales with the
+// number of holes, not proof length.
+//   Q1 (per-hole goal state): the minion is handed the skeleton — the have's TYPE
+//     is its goal and the earlier `have`s are its hypotheses; it can init_proof
+//     that goal to see the exact state on demand.
+//   Q2 (relevant context): the whole (small) skeleton, which carries Lean's real
+//     scoping — no lossy pruning that could drop a needed hypothesis.
+//   Q3 (teardown): each minion is a separate process; when it returns its fill,
+//     the process exits and its context evaporates — only the fill (a few
+//     tactics) survives, spliced into the file.
+// SAFETY: anything that goes wrong (no skeleton, an unfillable hole, a stitched
+// proof that doesn't verify) FALLS BACK to proveHaveFlat, so have-tree is never
+// weaker than the known-good single-context path.
+// ---------------------------------------------------------------------------
+const HOLE_TAG_RE = /--\s*⟪\s*(\w+)\s*⟫/g
+const HAS_HOLE_TAG = /--\s*⟪\s*\w+\s*⟫/ // non-global, for safe boolean tests
+
+function parseHoleIds(skeleton) {
+  const ids = []
+  const seen = new Set()
+  const src = String(skeleton || "")
+  HOLE_TAG_RE.lastIndex = 0
+  let m
+  while ((m = HOLE_TAG_RE.exec(src)) !== null) {
+    if (!seen.has(m[1])) {
+      seen.add(m[1])
+      ids.push(m[1])
+    }
+  }
+  return ids
+}
+
+// Extract the tactic block a minion emitted for hole `id`: the ```lean fence that
+// follows its `FILL ⟪id⟫` marker. Strict on purpose — a malformed reply yields
+// null → the hole fails → we fall back, rather than splicing garbage.
+function parseFillBlock(text, id) {
+  const s = String(text || "")
+  const re = new RegExp("FILL\\s*⟪\\s*" + id + "\\s*⟫[\\s\\S]*?```lean\\s*\\n([\\s\\S]*?)```", "i")
+  const m = s.match(re)
+  if (!m) return null
+  const body = m[1].replace(/\s+$/, "")
+  return body.trim() ? body : null
+}
+
+// Replace hole `id`'s `:= by sorry --⟪id⟫` with the minion's tactics, re-indented
+// under the `have`. Returns the skeleton unchanged if the hole's shape is
+// unexpected (the final assembly verify then catches the leftover sorry).
+function spliceHole(skeleton, id, tactics) {
+  const lines = String(skeleton || "").split("\n")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return skeleton
+  const line = lines[idx]
+  const bodyRe = new RegExp(":=\\s*by\\s+sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫\\s*$")
+  if (!bodyRe.test(line)) return skeleton
+  const ind = (line.match(/^\s*/) || [""])[0].length
+  const pad = " ".repeat(ind + 2)
+  const body = String(tactics)
+    .split("\n")
+    .map((t) => (t.trim() === "" ? "" : pad + t))
+    .join("\n")
+  lines[idx] = line.replace(bodyRe, ":= by\n" + body)
+  return lines.join("\n")
+}
+
+function haveTreePlannerPrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are the PLANNER for a Lean 4 + Mathlib proof. Your job is to produce a STRUCTURALLY VALID SKELETON that another agent will fill — NOT to finish the proof.
+
+${toolSection}
+
+TWO OUTCOMES — pick the cheaper one:
+A) If you can close the whole theorem OUTRIGHT in roughly ≤ 40 lines, just do it: write the proof, verify_full_script it to success (no \`sorry\`), and output it as one \`\`\`lean block. Done.
+B) Otherwise, DECOMPOSE into a skeleton and STOP (do NOT fill the holes):
+   1. Reproduce the ORIGINAL theorem VERBATIM (same name + signature), open with \`by\`.
+   2. Lay the argument out as local steps, each a HOLE written EXACTLY like this, on ONE line:
+        have hN : <the proposition for this step> := by sorry --⟪hN⟫
+      Use a DISTINCT tag per hole: --⟪h1⟫, --⟪h2⟫, …. The \`have\` inherits the ambient hypotheses automatically — do NOT re-quantify. Each hole must be a genuinely SMALLER step, ideally closable on its own in ≤ ~40 lines.
+   3. Close the main goal FROM those \`have\`s. This ASSEMBLY must be \`sorry\`-FREE — the ONLY holes in the whole script are the tagged \`have … := by sorry --⟪hN⟫\` lines.
+   4. verify_full_script the skeleton: it MUST compile with the ONLY diagnostics being \`sorry\` warnings (no errors). That proves the decomposition type-checks. Deprecation/linter warnings are fine.
+   5. STOP. Output the verified skeleton as one \`\`\`lean block. Do NOT fill any hole.
+
+RULES:
+- Every hole tag must be unique and match \`--⟪hN⟫\` EXACTLY (double angle brackets). Hole bodies are a single \`:= by sorry --⟪hN⟫\`.
+- No top-level \`theorem\`/\`lemma\` other than the master; all structure is \`have\`s.
+- A skeleton whose assembly still has a bare \`sorry\`, or whose holes aren't tagged, is INVALID — fix it before stopping.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}
+Theorem (its signature is immutable):
+${theorem}`
+}
+
+function haveHoleFillPrompt(skeleton, id, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are a MINION filling ONE hole in an already-verified Lean 4 proof skeleton. Do NOT touch any other hole.
+
+${toolSection}
+
+THE SKELETON (already compiles with every \`have\` stubbed as \`sorry\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`. Its declared type is your GOAL; the hypotheses in scope are the theorem's binders plus the EARLIER \`have\`s (they're available by name). To see the EXACT goal state, \`init_proof\` your hole's proposition (closed: ∀-quantify any free variable) and step it with \`apply_tactic\` — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`).
+
+METHOD:
+1. Work out the tactics that close ONLY hole \`--⟪${id}⟫\`.
+2. CHECK them in context: take the skeleton above, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other \`sorry --⟪…⟫\` untouched), and verify_full_script. Success = it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Iterate until that holds.
+3. Call cleanup_memory to free any proof state you opened.
+
+OUTPUT (exactly this shape, nothing else after it):
+FILL ⟪${id}⟫
+\`\`\`lean
+<only the tactics that replace \`sorry\`, one per line, starting at the LEFT margin — no \`have\`, no leading \`by\`, no theorem>
+\`\`\`
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// Fill one hole in an isolated minion (fresh process → bounded context). Returns
+// the tactic text, or null if the minion couldn't produce a usable fill.
+async function fillHole(skeleton, id, ctx) {
+  if (ctx.signal?.aborted) return null
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Minion filling hole ⟪${id}⟫ in an isolated context…` })
+  const res = await spawnProverStream(
+    {
+      prompt: haveHoleFillPrompt(skeleton, id, ctx.mcpServers, ""),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: ctx.turnBudget,
+      timeoutMs: ctx.nodeTimeoutMs,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: () => false, emit: ctx.emit },
+  )
+  const fill = parseFillBlock(res.finalText, id)
+  if (!fill) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL block.` })
+    return null
+  }
+  return fill
+}
+
+// Phase-1 orchestrator. Planner → isolated per-hole minions → assembler, with a
+// hard fall-through to proveHaveFlat so it can never be weaker than today.
+async function proveHaveTree(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "🌿"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: "🌿 Have-tree: planning a decomposition skeleton (isolated per-hole minions)." })
+
+  // ---- 1) PLANNER: a hole-free proof (small case) OR a tagged skeleton --------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true // planner closed it outright — stop
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+            skeleton = script // keep the latest valid, tagged skeleton
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: ctx.decomposeTurnBudget,
+      timeoutMs: ctx.nodeTimeoutMs,
+      stage: "🌿",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  // Small-proof fast path: the planner closed it directly.
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+  const holeIds = parseHoleIds(skeleton)
+  if (!holeIds.length) return proveHaveFlat(theorem, ctx)
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Skeleton verified — ${holeIds.length} hole(s): ${holeIds.map((h) => `⟪${h}⟫`).join(" ")}. Filling each in its own minion.` })
+
+  // ---- 2) MINIONS: fill each hole in isolation (parallel) ----------------------
+  const fills = await Promise.all(holeIds.map((id) => fillHole(skeleton, id, ctx)))
+  if (fills.some((f) => f == null) || ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ A hole couldn't be filled in isolation — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+
+  // ---- 3) ASSEMBLER: splice + verify the whole thing hole-free -----------------
+  let assembled = skeleton
+  holeIds.forEach((id, i) => {
+    assembled = spliceHole(assembled, id, fills[i])
+  })
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ Assembling the filled holes and re-verifying the whole proof on the daemon…" })
+  const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(assembled, sig)) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${holeIds.length} isolated holes.` })
+    return { verified: true, proof: assembled }
+  }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — falling back to single-context have mode.` })
+  return proveHaveFlat(theorem, ctx)
+}
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -2522,10 +2779,15 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
       style === "have"
         ? `[DECOMPOSITION MODE — have-based (flat, single agent) · strategy: ${strategy}]\n\n=== PROVER PROMPT ===\n` +
           haveProvePrompt(theorem, mcpServers)
-        : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
-          nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
-          "\n\n=== DECOMPOSER PROMPT ===\n" +
-          decomposePromptFor(strategy, theorem, mcpServers),
+        : style === "have-tree"
+          ? `[DECOMPOSITION MODE — have-tree (planner + isolated per-hole minions) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers) +
+            "\n\n=== HOLE-FILL (MINION) PROMPT ===\n" +
+            haveHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
+          : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
+            nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
+            "\n\n=== DECOMPOSER PROMPT ===\n" +
+            decomposePromptFor(strategy, theorem, mcpServers),
     model: opts.model || null,
     strategy,
     theorem,
@@ -2605,9 +2867,10 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
       }
       let ok = false
       let proof = ""
-      if (style === "have") {
-        // Flat, in-context `have` decomposition — one agent, no tree.
-        const r = await proveHaveFlat(theorem, ctx)
+      if (style === "have" || style === "have-tree") {
+        // `have`: one agent, whole proof in one context. `have-tree`: planner +
+        // isolated per-hole minions (linear context), falling back to `have`.
+        const r = style === "have-tree" ? await proveHaveTree(theorem, ctx) : await proveHaveFlat(theorem, ctx)
         ok = r.verified
         proof = r.proof
         if (r.refuted) {
