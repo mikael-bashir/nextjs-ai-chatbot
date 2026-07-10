@@ -41,9 +41,15 @@ export interface ProverEvent {
   /** Present on `done`/`verified`. */
   verified?: boolean;
   proof?: string;
+  /** Present on `done` when the theorem was machine-disproved (a false master). */
+  refuted?: boolean;
+  counterexample?: string;
 }
 
 export interface ProverOutcome {
   verified: boolean;
   proof: string;
+  /** The master was proven FALSE (counterexample verified by Lean). */
+  refuted?: boolean;
+  counterexample?: string;
 }

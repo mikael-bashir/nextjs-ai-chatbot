@@ -670,6 +670,8 @@ export function AdminPipeline() {
 
         let verified = false;
         let proof = '';
+        let refuted = false;
+        let counterexample = '';
         try {
           const mcpServers = await fetchMcp();
           const out = await proveStream(
@@ -679,6 +681,8 @@ export function AdminPipeline() {
           );
           verified = out.verified;
           proof = out.proof;
+          refuted = !!out.refuted;
+          counterexample = out.counterexample || '';
         } catch (e) {
           const title =
             item.questionTitle || item.problem?.slice(0, 60) || item.id;
@@ -709,21 +713,28 @@ export function AdminPipeline() {
           break;
         }
 
-        // Genuine outcome: persist it and clear the queued flag.
+        // Genuine outcome: persist it and clear the queued flag. A `refuted`
+        // result (the theorem is machine-disproved false) is stored with a
+        // distinct marker so it reads as a BAD problem, not a hard one.
         await patchGenerated(item.id, {
           verified,
           proof,
-          error: verified ? null : 'Lean proof did not verify',
+          error: verified
+            ? null
+            : refuted
+              ? `↯ REFUTED — ${counterexample || 'counterexample verified by Lean'}`
+              : 'Lean proof did not verify',
           queued: false,
         });
         setStats((s) => ({
           ...s,
           verified: s.verified + (verified ? 1 : 0),
-          failed: s.failed + (verified ? 0 : 1),
+          // A refuted problem is resolved-as-bad, not a prover failure.
+          failed: s.failed + (verified || refuted ? 0 : 1),
         }));
         pushLog(
-          verified ? 'info' : 'warn',
-          `${verified ? 'Proved' : 'Did not verify'}: ${
+          verified ? 'info' : refuted ? 'warn' : 'warn',
+          `${verified ? 'Proved' : refuted ? `↯ Refuted (false theorem — ${counterexample})` : 'Did not verify'}: ${
             item.questionTitle || item.problem?.slice(0, 60) || item.id
           }`,
         );
@@ -1148,6 +1159,7 @@ export function AdminPipeline() {
     if (verifyingId === g.id) return 'verifying';
     if (verifyQueue.some((x) => x.id === g.id)) return 'queued';
     if (g.verified) return 'proved';
+    if (g.error?.startsWith('↯ REFUTED')) return 'refuted';
     if (g.error) return 'failed';
     return 'unverified';
   };
@@ -1156,6 +1168,9 @@ export function AdminPipeline() {
     verifying: 'bg-amber-500/15 text-amber-600 animate-pulse',
     queued: 'bg-blue-500/15 text-blue-600',
     proved: 'bg-emerald-500/15 text-emerald-600',
+    // Refuted = the theorem is provably false (a bad problem, distinct from a
+    // hard one the prover merely couldn't close).
+    refuted: 'bg-fuchsia-500/15 text-fuchsia-600',
     failed: 'bg-red-500/15 text-red-500',
     unverified: 'bg-muted text-muted-foreground',
   };

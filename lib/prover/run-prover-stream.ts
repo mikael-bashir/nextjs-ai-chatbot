@@ -222,12 +222,19 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
           break;
         }
         case 'done':
-          outcome = { verified: !!d.verified, proof: d.proof || '' };
+          outcome = {
+            verified: !!d.verified,
+            proof: d.proof || '',
+            refuted: !!d.refuted,
+            counterexample: d.counterexample,
+          };
           emit(
             d.verified ? 'verified' : 'rejected',
             d.verified
               ? 'Proof verified by the guardrail'
-              : 'No verified proof produced',
+              : d.refuted
+                ? `Refuted — theorem is false (${d.counterexample || 'counterexample verified'})`
+                : 'No verified proof produced',
             { verified: !!d.verified, proof: d.proof || '', metrics },
           );
           break;
