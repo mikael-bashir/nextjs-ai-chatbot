@@ -482,7 +482,6 @@ export function AdminPipeline() {
     [pushLog],
   );
 
-  const [queued, setQueued] = useState<number | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
   const [items, setItems] = useState<StagedItem[]>([]);
   const [generated, setGenerated] = useState<GeneratedItem[]>([]);
@@ -853,7 +852,6 @@ export function AdminPipeline() {
       setHealth(j.health ?? null);
       setItems(Array.isArray(j.items) ? j.items : []);
       setProdTitles(Array.isArray(j.prodItems) ? j.prodItems : []);
-      setQueued(j.queued ?? null);
     } catch {
       /* ignore */
     }
@@ -1131,7 +1129,6 @@ export function AdminPipeline() {
             j.staged,
             ...it.filter((x) => x.id !== j.staged.id),
           ]);
-        if (typeof j.queued === 'number') setQueued(j.queued);
       }
     } finally {
       setBusy(null);
@@ -1158,7 +1155,6 @@ export function AdminPipeline() {
 
   const dropStaged = (id: string) => {
     setItems((it) => it.filter((x) => x.id !== id));
-    setQueued((q) => (typeof q === 'number' ? Math.max(0, q - 1) : q));
   };
 
   const removeItem = useCallback(async (id: string) => {
@@ -1238,6 +1234,12 @@ export function AdminPipeline() {
       prod: prodTitleSet.has(t),
     };
   };
+
+  // Problems waiting for proof: the verification queue minus the one currently
+  // being worked on (verifyQueue holds the in-flight item at its front until it
+  // finishes). This is what the "Queued" stat means next to Generated/Verified/
+  // Failed — NOT the staging-Redis length.
+  const queuedForVerify = verifyQueue.filter((x) => x.id !== verifyingId).length;
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
@@ -1374,7 +1376,7 @@ export function AdminPipeline() {
             tone="text-emerald-600"
           />
           <Stat label="Failed" value={stats.failed} />
-          <Stat label="Queued" value={queued ?? '—'} />
+          <Stat label="Queued" value={queuedForVerify} />
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
