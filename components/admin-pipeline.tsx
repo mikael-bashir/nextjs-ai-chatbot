@@ -390,6 +390,12 @@ function extractJson(text: string): GenProblem | null {
   return null;
 }
 
+// Canonical title key for matching a problem across the generated / staging /
+// prod / live stores (case- and whitespace-insensitive).
+function normTitle(s?: string | null): string {
+  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
 function metaLine(p: GeneratedItem | StagedItem, withDate = false): string {
   return [
     p.difficulty,
@@ -491,6 +497,9 @@ export function AdminPipeline() {
     genModelRef.current = genModel;
   }, [genModel]);
   const [liveProblems, setLiveProblems] = useState<LiveProblem[]>([]);
+  // Titles currently in the prod queue (awaiting the CompeteMath cron). Used to
+  // flag generated items that are already staged for publication.
+  const [prodTitles, setProdTitles] = useState<string[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [workBridgeUrl, setWorkBridgeUrl] = useState('');
   const [generatingOne, setGeneratingOne] = useState(false);
@@ -843,6 +852,7 @@ export function AdminPipeline() {
       const j = await r.json();
       setHealth(j.health ?? null);
       setItems(Array.isArray(j.items) ? j.items : []);
+      setProdTitles(Array.isArray(j.prodItems) ? j.prodItems : []);
       setQueued(j.queued ?? null);
     } catch {
       /* ignore */
@@ -1212,6 +1222,22 @@ export function AdminPipeline() {
       genFilter === 'all' ||
       (genFilter === 'verified' ? g.verified : !g.verified),
   );
+
+  // Publication-state highlighting. A problem is identified across the three
+  // stores by its (normalized) title — the only field the prod payload shares
+  // with staging + the live CompeteMath set (the Lean statement isn't promoted).
+  const liveTitleSet = new Set(liveProblems.map((p) => normTitle(p.title)));
+  const stagingTitleSet = new Set(items.map((s) => normTitle(s.questionTitle)));
+  const prodTitleSet = new Set(prodTitles.map(normTitle));
+  const placementOf = (g: GeneratedItem) => {
+    const t = normTitle(g.questionTitle);
+    if (!t) return { live: false, staging: false, prod: false };
+    return {
+      live: liveTitleSet.has(t),
+      staging: stagingTitleSet.has(t),
+      prod: prodTitleSet.has(t),
+    };
+  };
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-8">
@@ -1693,8 +1719,15 @@ export function AdminPipeline() {
           )}
           {filtered.map((g) => {
             const status = statusOf(g);
+            const pl = placementOf(g);
             return (
-              <div key={g.id} className="rounded-lg border p-3">
+              <div
+                key={g.id}
+                className={cn(
+                  'rounded-lg border p-3',
+                  pl.live && 'border-rose-500/40 bg-rose-500/[0.03]',
+                )}
+              >
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
@@ -1706,6 +1739,30 @@ export function AdminPipeline() {
                       >
                         {status}
                       </span>
+                      {pl.live && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-rose-500/15 text-rose-600"
+                          title="Already published on CompeteMath practice — remove if this is a duplicate"
+                        >
+                          Live
+                        </span>
+                      )}
+                      {pl.staging && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-blue-500/15 text-blue-600"
+                          title="Sitting in the staging review queue"
+                        >
+                          Staging
+                        </span>
+                      )}
+                      {pl.prod && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-violet-500/15 text-violet-600"
+                          title="In the prod queue, awaiting the CompeteMath publish cron"
+                        >
+                          Prod
+                        </span>
+                      )}
                       <span className="truncate font-medium">
                         {g.questionTitle || g.problem || 'Untitled problem'}
                       </span>

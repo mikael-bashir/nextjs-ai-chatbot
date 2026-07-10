@@ -226,6 +226,30 @@ export async function prodQueueLength(): Promise<number> {
   return getCompetemathRedis().llen(PROD_QUEUE_KEY);
 }
 
+// Peek the production weekly-problems queue (items awaiting the CompeteMath cron
+// that drains them into the live `questions` table). Read-only; used so the
+// admin pipeline can flag which generated problems are already sitting in prod.
+// The prod payload shape (see the promote route) carries questionTitle but not
+// the Lean statement, so title is the only cross-store key.
+export async function listProdProblems(): Promise<
+  Array<{ questionTitle?: string }>
+> {
+  const raws: string[] = await getCompetemathRedis().lrange(
+    PROD_QUEUE_KEY,
+    0,
+    -1,
+  );
+  return raws
+    .map((r) => {
+      try {
+        return JSON.parse(r) as { questionTitle?: string };
+      } catch {
+        return null;
+      }
+    })
+    .filter((x): x is { questionTitle?: string } => !!x);
+}
+
 // Health probe for both instances: reports reachability + queue length so the
 // admin UI can surface Redis issues immediately.
 export async function redisHealth(): Promise<{

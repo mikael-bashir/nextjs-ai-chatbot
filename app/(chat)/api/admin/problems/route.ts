@@ -4,6 +4,7 @@ import { isAdminEmail } from '@/lib/admin';
 import {
   deleteProblem,
   listProblems,
+  listProdProblems,
   pushProblem,
   queueLength,
   redisHealth,
@@ -29,11 +30,25 @@ export async function GET() {
       console.error('Error listing staged problems:', error);
     }
   }
+  // Titles of problems currently sitting in the prod queue, so the pipeline can
+  // flag generated items that are already awaiting publication. Best-effort:
+  // empty if prod Redis is unreachable.
+  let prodItems: string[] = [];
+  if (health.prod.ok) {
+    try {
+      prodItems = (await listProdProblems())
+        .map((p) => p.questionTitle)
+        .filter((t): t is string => !!t);
+    } catch (error) {
+      console.error('Error listing prod problems:', error);
+    }
+  }
   return Response.json({
     health,
     // Back-compat: the loop reads `queued` after enqueueing.
     queued: health.staging.length ?? items.length,
     items,
+    prodItems,
   });
 }
 
