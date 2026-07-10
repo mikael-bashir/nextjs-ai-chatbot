@@ -1557,7 +1557,7 @@ async function proveStream(res, theorem, mcpServers, opts = {}) {
         send({ type: "prompt", prompt: "[REFUTED before proving — the theorem is false]", theorem, model: opts.model || null, mcpServers: (mcpServers || []).map((s) => ({ name: s?.name, url: s?.url })) })
         send({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${cex}. Machine-checked disproof; skipping the prover.`, metrics })
         send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${cex}), verified by Lean:\n\n\`\`\`lean\n${pre.script}\n\`\`\`` })
-        send({ type: "done", metrics, verified: false, refuted: true, counterexample: cex, proof: "" })
+        send({ type: "done", metrics, verified: false, refuted: true, counterexample: cex, proof: "", disproof: pre.script })
         res.end()
         return
       }
@@ -2444,7 +2444,7 @@ async function proveHaveFlat(theorem, ctx) {
     if (refuteText && !ctx.signal?.aborted) {
       ctx.emit({ type: "message-annotation", subtype: "status", thought: "🔎 Agent flagged the theorem as FALSE — verifying the disproof on the daemon…" })
       const dis = await confirmAgentRefute(theorem, ctx, refuteText)
-      if (dis.refuted) return { verified: false, refuted: true, counterexample: dis.counterexample }
+      if (dis.refuted) return { verified: false, refuted: true, counterexample: dis.counterexample, disproof: dis.script }
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "The claimed counterexample did not verify — continuing to prove." })
     }
     if (attempt >= maxRetry || ctx.signal?.aborted) return { verified: false, proof: "" }
@@ -2559,7 +2559,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           const cex = w != null ? `counterexample at the first argument = ${w}` : "a small counterexample"
           emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${cex}. Machine-checked disproof; skipping the prover.` })
           send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${cex}), verified by Lean:\n\n\`\`\`lean\n${pre.script}\n\`\`\`` })
-          send({ type: "done", metrics, verified: false, refuted: true, counterexample: cex, proof: "" })
+          send({ type: "done", metrics, verified: false, refuted: true, counterexample: cex, proof: "", disproof: pre.script })
           res.end()
           return
         }
@@ -2574,7 +2574,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         if (r.refuted) {
           emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${r.counterexample}. Machine-checked disproof.` })
           send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${r.counterexample}), verified by Lean.` })
-          send({ type: "done", metrics, verified: false, refuted: true, counterexample: r.counterexample, proof: "" })
+          send({ type: "done", metrics, verified: false, refuted: true, counterexample: r.counterexample, proof: "", disproof: r.disproof })
           res.end()
           return
         }
@@ -2593,7 +2593,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         if (!ok && ctx.refuted) {
           emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${ctx.refuted.counterexample}. Machine-checked disproof.` })
           send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${ctx.refuted.counterexample}), verified by Lean.` })
-          send({ type: "done", metrics, verified: false, refuted: true, counterexample: ctx.refuted.counterexample, proof: "" })
+          send({ type: "done", metrics, verified: false, refuted: true, counterexample: ctx.refuted.counterexample, proof: "", disproof: ctx.refuted.script })
           res.end()
           return
         }

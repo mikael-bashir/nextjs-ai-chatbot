@@ -227,6 +227,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
             proof: d.proof || '',
             refuted: !!d.refuted,
             counterexample: d.counterexample,
+            disproof: d.disproof,
           };
           emit(
             d.verified ? 'verified' : 'rejected',

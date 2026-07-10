@@ -680,7 +680,9 @@ export function AdminPipeline() {
             ctrl.signal,
           );
           verified = out.verified;
-          proof = out.proof;
+          // For a refuted theorem there is no proof — store the machine-checked
+          // `¬theorem` disproof instead so the card can show the counterexample.
+          proof = out.refuted ? out.disproof || '' : out.proof;
           refuted = !!out.refuted;
           counterexample = out.counterexample || '';
         } catch (e) {
@@ -1722,6 +1724,14 @@ export function AdminPipeline() {
                     )}
                     {g.verified && g.proof && (
                       <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-emerald-500/10 p-2 text-[11px]">
+                        {g.proof}
+                      </pre>
+                    )}
+                    {statusOf(g) === 'refuted' && g.proof && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-fuchsia-500/10 p-2 text-[11px]">
+                        <span className="mb-1 block font-medium text-fuchsia-600">
+                          Machine-checked disproof (¬theorem, compiled by Lean):
+                        </span>
                         {g.proof}
                       </pre>
                     )}

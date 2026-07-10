@@ -44,6 +44,8 @@ export interface ProverEvent {
   /** Present on `done` when the theorem was machine-disproved (a false master). */
   refuted?: boolean;
   counterexample?: string;
+  /** The Lean `¬theorem` script the daemon compiled to certify the disproof. */
+  disproof?: string;
 }
 
 export interface ProverOutcome {
@@ -52,4 +54,6 @@ export interface ProverOutcome {
   /** The master was proven FALSE (counterexample verified by Lean). */
   refuted?: boolean;
   counterexample?: string;
+  /** The machine-checked `¬theorem` disproof script. */
+  disproof?: string;
 }
