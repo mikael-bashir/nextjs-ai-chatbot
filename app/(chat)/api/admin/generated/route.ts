@@ -85,10 +85,11 @@ export async function POST(request: NextRequest) {
       });
     }
     const verified = !!body.verified;
-    // Guarantee the title can't collide with anything already on the roster —
-    // append " (2)", " (3)", … if needed. Since a verified record is also pushed
-    // to staging below with this same title, the uniqueness propagates all the
-    // way to prod, so the title-keyed dedupe guards can never mis-fire.
+    // Guarantee the title can't collide with anything already on the roster: if
+    // it does, disambiguateTitle swaps in a fresh code-name (not a number).
+    // Since a verified record is also pushed to staging below with this same
+    // title, the uniqueness propagates all the way to prod, so the title-keyed
+    // dedupe guards can never mis-fire.
     const questionTitle = disambiguateTitle(
       body.questionTitle,
       await rosterTitles(),

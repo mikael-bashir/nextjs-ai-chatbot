@@ -256,23 +256,61 @@ export function normTitle(s?: string | null): string {
   return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
+// A pool of evocative code-name titles in the house style (abstract, ominous,
+// vaguely mathematical — the titles are NOT descriptions of the problem). On a
+// collision we draw a FRESH name from here rather than tacking on a number, so a
+// renamed problem is indistinguishable from a first-class generated one.
+export const FALLBACK_TITLES = [
+  'The Vanishing Point', 'Silent Cardinal', 'The Hollow Proof', 'Recursive Dawn',
+  'False Vacuum', 'Infinite Descent', 'Terminal Value', 'Strange Attractor',
+  'Zero Kelvin', 'The Heavy Tail', 'Dark Forest', 'Unstable Equilibrium',
+  'The Omega Point', 'Irrational Roots', 'Violent Symmetry', 'The Killing Vector',
+  'The Empty Set', 'Broken Ladder', 'Prime Suspect', 'The Last Residue',
+  'Modular Ghost', 'The Golden Cut', "Fermat's Shadow", 'The Twisted Torus',
+  "Cauchy's Veil", 'The Frozen Sum', 'Spectral Gap', 'The Lonely Runner',
+  'Hidden Lattice', 'The Collatz Mirror', "Euler's Whisper", 'Broken Symmetry',
+  "Cantor's Dust", 'The Final Digit', 'Parity Wall', 'The Sunken Curve',
+  "Gauss's Silence", 'The Perfect Shroud', 'Vanishing Moment', 'The Iron Bound',
+  'Convex Ruin', 'The Divided Kingdom', 'Root of Ruin', 'The Missing Angle',
+  "Hilbert's Echo", 'The Endless Staircase', 'The Narrow Margin', 'Countable Chaos',
+  'The Frozen Orbit', "Riemann's Ghost", 'The Silent Sieve', 'Null Horizon',
+  'The Crooked Line', "Abel's Regret", 'The Tangent Line', 'Forbidden Minor',
+  'The Empty Product', 'The Third Root', 'Pigeonhole Paradox', 'The Sealed Urn',
+  'Chromatic Storm', 'The Bounded Infinite', 'Pale Constant', 'The Vanishing Gap',
+  'Orthogonal Fate', 'The Last Partition', 'Weighted Silence', 'Nine Point Circle',
+  'The Hidden Symmetry', 'Cold Equation', 'The Recursive Tomb', 'Fractal Verdict',
+  'The Sparse Matrix', "Euclid's Nightmare", "The Architect's Flaw", 'A Quiet Variable',
+  'The Third Body', 'Proof by Exhaustion', 'The Heavy Sphere', 'Boundary Condition',
+  'The Prime Gap', 'Twin Paradox', 'The Weighted Coin', "Markov's Curse",
+  'The Empty Interval', 'Diverging Series', 'The Fixed Point', "Brouwer's Ghost",
+  'The Knotted Path', 'Genus Zero', 'The Sealed Envelope', 'Non-Trivial Zero',
+  'The Perfect Cover', "Ramsey's Threshold", 'The Isolated Vertex', 'Spanning Ruin',
+  'The Broken Graph', 'Degrees of Freedom', 'The Silent Automaton', 'Undecidable',
+  'The Frozen Fraction', 'Continued Silence', 'Rational Storm', 'Singular Matrix',
+  'The Hollow Cylinder', 'Torus Knot', 'The Golden Angle', "Fibonacci's Curse",
+  'The Broken Spiral', 'Logarithmic Fall', 'The Steep Descent', 'Saddle Point',
+  'The Narrow Path', 'Convergent Doom', 'The Empty Lattice', "Zeta's Shadow",
+  'The Critical Line', 'Analytic Ruin', "Galois Silence", 'Radical Extension',
+  'The Broken Ring', 'Ideal Boundary', 'The Prime Ideal', "Noether's Ghost",
+  'The Vanishing Ideal', 'Spectral Ruin',
+]
+
 // Return a display title guaranteed not to collide (by normTitle) with any in
-// `taken`. If `desired` is free it's returned as-is; otherwise a " (2)", " (3)",
-// … suffix is appended until it's unique. This is how a newly generated problem
-// is kept unique against the current roster so the title-keyed dedupe guards can
-// never mis-fire.
+// `taken`. If `desired` is free it's kept as-is; otherwise (or if it's empty) we
+// draw a fresh, unused code-name from FALLBACK_TITLES rather than numbering it,
+// so a renamed problem reads like any other. Only if the entire pool is taken do
+// we fall back to a timestamp suffix. This keeps a newly generated problem unique
+// against the current roster so the title-keyed dedupe guards can never mis-fire.
 export function disambiguateTitle(
   desired: string | null | undefined,
   taken: Set<string>,
 ): string {
-  const base = (desired || 'Generated Problem').trim() || 'Generated Problem';
-  if (!taken.has(normTitle(base))) return base;
-  for (let i = 2; i < 1000; i++) {
-    const candidate = `${base} (${i})`;
-    if (!taken.has(normTitle(candidate))) return candidate;
-  }
-  // Pathological fallback — a timestamp suffix is effectively always unique.
-  return `${base} (${Date.now().toString(36)})`;
+  const base = (desired || '').trim();
+  if (base && !taken.has(normTitle(base))) return base;
+  const free = FALLBACK_TITLES.filter((n) => !taken.has(normTitle(n)));
+  if (free.length) return free[Math.floor(Math.random() * free.length)];
+  // Pathological fallback (whole pool exhausted) — a timestamp is ~always unique.
+  return `${base || 'Generated Problem'} (${Date.now().toString(36)})`;
 }
 
 // True iff a problem with this (normalized) title is already in the staging /
