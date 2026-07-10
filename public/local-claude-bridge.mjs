@@ -303,8 +303,24 @@ const isSearchToolName = (n) => SEARCH_TOOL_RE.test(String(n || ""))
 const SYNTAX_ERR_RE =
   /unknown (identifier|constant|package|namespace|tactic)|unexpected token|unexpected end|unterminated|unexpected identifier|expected |has not been declared|invalid field notation/i
 function verifyTextIsSyntaxError(text) {
-  const p = parseVerifyOutput(text)
-  return p.errors.some((e) => SYNTAX_ERR_RE.test(e.message))
+  const raw = String(text == null ? "" : text)
+  if (!/failed|❌|error/i.test(raw)) return false
+  const p = parseVerifyOutput(raw)
+  if (p.errors.some((e) => SYNTAX_ERR_RE.test(e.message))) return true
+  // Leak IV results arrive as a JSON string whose diagnostics are on escaped
+  // "\n"s, so the per-line parse above can miss them; fall back to the raw text
+  // (the regex has no line anchors). Without this the refill NEVER fired.
+  return SYNTAX_ERR_RE.test(raw)
+}
+// A "probe" verify is one whose entire body is name/existence checks
+// (#check / #print / #eval / #find, or `example : T := @name`) with no real
+// proof. Probing is how the agent brute-forces lemma NAMES in the unmetered
+// compiler channel — it must NOT earn a search refill, or we'd be paying it to
+// guess. A script with a theorem/lemma/have or a `by` tactic block is a genuine
+// attempt and DOES earn a refill when it hits a truly unknown name.
+function isRealProofScript(script) {
+  const s = String(script || "")
+  return /\b(theorem|lemma|have|show|suffices)\b/.test(s) || /:=\s*by\b/.test(s)
 }
 
 const GOV_INITIAL = Number(process.env.SEARCH_BUDGET_INITIAL || 3)
@@ -379,7 +395,7 @@ async function governedSearchCall(g, toolName, args) {
   if (g.budget <= 0) {
     g.blockedCount++
     console.log(`[gov ${g.id}] search BLOCKED (budget 0) tool=${toolName}`)
-    return `🛑 Search budget spent — stop searching and PROVE. You already know Lean 4; write a candidate proof (lead with decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. The compiler's errors teach you far more than a lemma lookup. Your search allowance refills (+${GOV_GRANT}) only when verify_full_script reports an UNKNOWN identifier/name — the one case a lookup helps. If the goal is genuinely too big, decompose it.`
+    return `🛑 Search budget spent — stop searching and PROVE. You already know Lean 4; lead with strong automation (decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. To resolve a specific lemma NAME, do NOT guess it with \`#check @name\` — put the goal in \`example : <goal> := by exact?\` (or apply?/rw?/simp?); unification finds the name for free. A search allowance is earned only when a REAL proof attempt hits an unknown name. If the goal is genuinely too big, decompose it.`
   }
   g.budget--
   const srv = g.searchServer
@@ -387,7 +403,7 @@ async function governedSearchCall(g, toolName, args) {
   console.log(`[gov ${g.id}] search forwarded tool=${toolName} (${g.budget} left)`)
   const r = await callRemoteMcpTool(srv.url, toolName, args, { timeoutMs: 60000 })
   const body = r.ok ? r.text : `Search error: ${r.error || "unknown"} — don't retry; prove with the compiler instead.`
-  return `${body}\n\n[search budget: ${g.budget} left. Refills +${GOV_GRANT} only on a verify_full_script UNKNOWN-name error. Prefer compiling.]`
+  return `${body}\n\n[search budget: ${g.budget} left — spend it on TYPE-PATTERN loogle queries (e.g. loogle "(f _)^[_] _ = _") or moogle concepts, never on a bare lemma name. To resolve a name for free, use \`exact?\`/\`apply?\` in a script. Prefer compiling.]`
 }
 
 // ---- MCP-over-SSE SERVER for the governor (the inverse of callRemoteMcpTool) --
@@ -1116,6 +1132,19 @@ Only the ids that actually exist will load; use those. Never invent a server nam
   return 'Load your Lean MCP tools first with ToolSearch "select:mcp__<server>__<tool>" (they are deferred), then use a whole-script compiler (verify_full_script) and library search.'
 }
 
+// Shared guidance that dissolves the two pathologies we keep seeing burn whole
+// runs on HARD theorems: (1) the agent brute-forces a lemma NAME with
+// `#check @guess` / `example : Nat := @guess` in the unmetered compiler (the
+// "soft override" of the search budget), and (2) it FINDS the right lemma but
+// never applies it. This does NOT relax the "go PROVE" pressure — it redirects
+// name-discovery to the tools that actually resolve names, for free.
+const SEARCH_USAGE_NOTE = `FINDING & USING LEMMAS — do this instead of guessing names:
+- Do NOT hunt a lemma NAME with \`#check @guessedName\` or \`example : Nat := @guessedName\`. Guessing names in the compiler wastes the run and earns you nothing.
+- To get the exact name of a lemma that closes a goal, let unification find it: \`example : <goal> := by exact?\` (or \`apply?\`, \`rw?\`, \`simp?\`). THAT is the name search, and it costs no search budget.
+- loogle takes a TYPE PATTERN or a list of constants, never a lemma name: e.g. \`loogle "(fwdDiff _)^[_] _ _ = _"\` or \`loogle Nat.choose, Finset.sum, (_ ^ _)\`. A bare name like \`loogle "fwdDiff_iter_eq_shift"\` always errors.
+- The MOMENT you have a plausible lemma — from search, from \`exact?\`, or from memory — USE it in a real script: \`simpa using <lemma> …\`, \`rw [<lemma>]\`, \`exact <lemma> …\`. If the name is slightly off, the compiler's "unknown identifier — did you mean …?" corrects it in one step. Never collect lemmas you don't apply.
+- Stay in ONE workspace: drive the proof through verify_full_script. Use init_proof/apply_tactic only to LOOK at a stuck goal, ONE tactic per call (no \`;\`-chains, no \`rename'\` — Pantograph rejects them).`
+
 // The goal is to let Claude use the tools logically on its own — but a bare
 // "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
 // on hard theorems and never actually build or check a proof. So we hand it an
@@ -1151,6 +1180,8 @@ WORKFLOW:
 5. Done ONLY when verify_full_script reports success on a script containing the ORIGINAL theorem below (same name and signature) with no \`sorry\`. Output that final verified proof as a single \`\`\`lean code block.
 
 Bias: attempt → compile → read error → fix → compile. Spend your turns COMPILING, not searching or theorising. If after a few honest compile-and-fix rounds the goal is clearly too big for one script, say so and decompose rather than grinding.
+
+${SEARCH_USAGE_NOTE}
 ${extra ? `\n${extra}\n` : ""}
 Theorem:
 ${theorem}`
@@ -1350,6 +1381,8 @@ RULES:
 - NEVER introduce a top-level \`theorem\`/\`lemma\` other than the master itself — ALL structure lives in \`have\`s inside the one proof.
 - Think like a Lean hacker: reason from your own knowledge + the compiler's errors; search is a last resort.
 - Done ONLY when verify_full_script succeeds on the master with NO \`sorry\` and NO errors. Output the final proof as one \`\`\`lean block.
+
+${SEARCH_USAGE_NOTE}
 ${extra ? `\n${extra}\n` : ""}
 Theorem (prove this EXACT statement; its signature is immutable):
 ${theorem}`
@@ -1879,9 +1912,10 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
       resolve({ ok: false, finalText: "", exitCode: null, timedOut: false, stderr: `mcp config: ${e.message}` })
       return
     }
-    // Track which tool_use ids are verify calls so we can refill the search
-    // budget when the compiler reports an unknown NAME (a syntax error).
-    const verifyCallIds = new Set()
+    // Track verify calls (id -> the script submitted) so we can refill the
+    // search budget when a REAL proof attempt reports an unknown NAME — and
+    // withhold the refill from bare name-probing scripts.
+    const verifyCalls = new Map()
     const args = [
       "-p", prompt,
       "--output-format", "stream-json", "--verbose",
@@ -1954,16 +1988,18 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
           if (o.type === "assistant" && o.message?.content) {
             for (const c of o.message.content) {
               if (c.type === "tool_use" && String(c.name || "").endsWith("verify_full_script") && c.id) {
-                verifyCallIds.add(c.id)
+                verifyCalls.set(c.id, c.input?.script ?? "")
               }
             }
           } else if (o.type === "user" && o.message?.content) {
             for (const c of o.message.content) {
-              if (c.type === "tool_result" && verifyCallIds.has(c.tool_use_id)) {
+              if (c.type === "tool_result" && verifyCalls.has(c.tool_use_id)) {
                 const t = Array.isArray(c.content)
                   ? c.content.map((x) => x.text || "").join("\n")
                   : String(c.content ?? "")
-                if (verifyTextIsSyntaxError(t)) {
+                // Refill ONLY when a genuine proof attempt hit an unknown name —
+                // never for a `#check @guess` probe (that would reward guessing).
+                if (verifyTextIsSyntaxError(t) && isRealProofScript(verifyCalls.get(c.tool_use_id))) {
                   grantSearch(governor, "verify syntax error")
                   if (emit)
                     emit({

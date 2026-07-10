@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   Inbox,
   Cpu,
@@ -15,6 +15,8 @@ import {
   XCircle,
   Flag,
   Loader2,
+  Copy,
+  Check,
 } from 'lucide-react';
 
 import type { ProverEvent, ProverEventKind } from '@/lib/prover/types';
@@ -46,6 +48,64 @@ function timeStr(ts: number): string {
     minute: '2-digit',
     second: '2-digit',
   });
+}
+
+// Serialize the WHOLE run — every entry fully expanded (no truncation, no
+// collapsing) — into a plain-text block for pasting into a debug session.
+function fullLogText(events: ProverEvent[], title: string): string {
+  const indent = (s: string) =>
+    s
+      .split('\n')
+      .map((l) => `    ${l}`)
+      .join('\n');
+  const out: string[] = [`=== ${title} — ${events.length} entries ===`];
+  const last = [...events].reverse().find((e) => e.metrics)?.metrics;
+  if (last) {
+    const bits = [
+      typeof last.llm_invocations === 'number' && `${last.llm_invocations} llm`,
+      typeof last.tools_invoked === 'number' && `${last.tools_invoked} tools`,
+      typeof last.time_elapsed === 'number' && `${last.time_elapsed}s`,
+    ].filter(Boolean);
+    if (bits.length) out.push(bits.join(' · '));
+  }
+  for (const e of events) {
+    out.push('');
+    out.push(`[${timeStr(e.ts)}] ${e.kind.toUpperCase()} — ${e.label}`);
+    if (e.input?.trim()) out.push(indent(e.input));
+    if (e.detail?.trim()) out.push(indent(e.detail));
+    if (e.proof?.trim()) out.push(indent(`PROOF:\n${e.proof}`));
+    if (e.disproof?.trim()) out.push(indent(`DISPROOF:\n${e.disproof}`));
+  }
+  return out.join('\n');
+}
+
+function CopyLogButton({
+  events,
+  title,
+}: {
+  events: ProverEvent[];
+  title: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(fullLogText(events, title));
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          /* clipboard unavailable (insecure context) — nothing to do */
+        }
+      }}
+      title="Copy the full run log (every entry expanded) to the clipboard"
+      className="flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+    >
+      {copied ? <Check className="size-3" /> : <Copy className="size-3" />}
+      {copied ? 'Copied' : 'Copy log'}
+    </button>
+  );
 }
 
 function Row({ e }: { e: ProverEvent }) {
@@ -122,19 +182,22 @@ export function ProverConsole({
           <Cpu className="size-3.5 text-muted-foreground" />
         )}
         <span className="text-xs font-semibold">{title}</span>
-        {lastMetrics && (
-          <span className="ml-auto flex items-center gap-3 font-mono text-[10px] text-muted-foreground">
-            {typeof lastMetrics.llm_invocations === 'number' && (
-              <span>{lastMetrics.llm_invocations} llm</span>
-            )}
-            {typeof lastMetrics.tools_invoked === 'number' && (
-              <span>{lastMetrics.tools_invoked} tools</span>
-            )}
-            {typeof lastMetrics.time_elapsed === 'number' && (
-              <span>{lastMetrics.time_elapsed}s</span>
-            )}
-          </span>
-        )}
+        <div className="ml-auto flex items-center gap-3">
+          {lastMetrics && (
+            <span className="flex items-center gap-3 font-mono text-[10px] text-muted-foreground">
+              {typeof lastMetrics.llm_invocations === 'number' && (
+                <span>{lastMetrics.llm_invocations} llm</span>
+              )}
+              {typeof lastMetrics.tools_invoked === 'number' && (
+                <span>{lastMetrics.tools_invoked} tools</span>
+              )}
+              {typeof lastMetrics.time_elapsed === 'number' && (
+                <span>{lastMetrics.time_elapsed}s</span>
+              )}
+            </span>
+          )}
+          {events.length > 0 && <CopyLogButton events={events} title={title} />}
+        </div>
       </div>
       <div ref={scrollRef} className="max-h-96 overflow-y-auto divide-y divide-border/40">
         {events.length === 0 ? (
