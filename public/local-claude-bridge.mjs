@@ -847,16 +847,20 @@ function parseRefuteWitnesses(text) {
   return [...new Set(nums)].slice(0, 12)
 }
 
-// Try to refute rawStmt on the daemon. Returns { refuted, script } — refuted iff
-// the harness compiles hole-free (a certified ¬T).
+// Try to refute rawStmt on the daemon. Returns { refuted, script, witness } —
+// refuted iff a harness compiles hole-free (a certified ¬T). On a hit it pins
+// down the SMALLEST witness and returns a MINIMAL single-witness certificate
+// (not the full sweep), so the stored/displayed disproof stays readable.
 async function refutePreCheck(rawStmt, ctx, extraWitnesses = []) {
   if (ctx.signal?.aborted) return { refuted: false }
   const witnesses = [...new Set([...extraWitnesses, ...REFUTE_WITNESSES])]
   const script = buildRefuteScript(rawStmt, witnesses)
   if (!script) return { refuted: false }
   const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
-  if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text))) return { refuted: true, script }
-  return { refuted: false }
+  if (!(v.ok && isHoleFreeProof(parseVerifyOutput(v.text)))) return { refuted: false }
+  const w = await findRefuteWitness(rawStmt, ctx, witnesses).catch(() => null)
+  const minimal = w != null ? buildRefuteScript(rawStmt, [w]) : script
+  return { refuted: true, script: minimal, witness: w }
 }
 
 // On a confirmed refute, find the SMALLEST witness (for a human-readable message).
@@ -884,8 +888,7 @@ async function confirmAgentRefute(rawStmt, ctx, refuteText) {
   const witnesses = parseRefuteWitnesses(refuteText)
   const pre = await refutePreCheck(rawStmt, ctx, witnesses)
   if (!pre.refuted) return { refuted: false }
-  const w = await findRefuteWitness(rawStmt, ctx, [...new Set([...witnesses, ...REFUTE_WITNESSES])]).catch(() => null)
-  const cex = w != null ? `counterexample at the first argument = ${w}` : "a counterexample"
+  const cex = pre.witness != null ? `counterexample at the first argument = ${pre.witness}` : "a counterexample"
   return { refuted: true, counterexample: cex, script: pre.script }
 }
 
@@ -1552,7 +1555,7 @@ async function proveStream(res, theorem, mcpServers, opts = {}) {
           }
         }
         const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
-        const w = await findRefuteWitness(theorem, rctx).catch(() => null)
+        const w = pre.witness
         const cex = w != null ? `counterexample at the first argument = ${w}` : "a small counterexample"
         send({ type: "prompt", prompt: "[REFUTED before proving — the theorem is false]", theorem, model: opts.model || null, mcpServers: (mcpServers || []).map((s) => ({ name: s?.name, url: s?.url })) })
         send({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${cex}. Machine-checked disproof; skipping the prover.`, metrics })
@@ -2555,7 +2558,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         emit({ type: "message-annotation", subtype: "status", thought: "🔎 Disproof pre-check — probing small counterexamples…" })
         const pre = await refutePreCheck(theorem, ctx)
         if (pre.refuted) {
-          const w = await findRefuteWitness(theorem, ctx).catch(() => null)
+          const w = pre.witness
           const cex = w != null ? `counterexample at the first argument = ${w}` : "a small counterexample"
           emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${cex}. Machine-checked disproof; skipping the prover.` })
           send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${cex}), verified by Lean:\n\n\`\`\`lean\n${pre.script}\n\`\`\`` })
