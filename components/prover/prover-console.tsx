@@ -17,6 +17,8 @@ import {
   Loader2,
   Copy,
   Check,
+  Timer,
+  Plus,
 } from 'lucide-react';
 
 import type { ProverEvent, ProverEventKind } from '@/lib/prover/types';
@@ -108,6 +110,64 @@ function CopyLogButton({
   );
 }
 
+// Compact "2m" / "1h05m" / "45s" for a duration in ms.
+function fmtDur(ms: number): string {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h${String(m % 60).padStart(2, '0')}m`;
+}
+
+// The computation time-limit indicator + "+5 min" extend button. Shows the total
+// budget and, while a run is live, a ticking "N left". Clicking pushes the
+// bridge deadline out (see extendProverRun) — it rescues even the running stage.
+function ComputeLimit({
+  limit,
+  running,
+  onExtend,
+  extending,
+}: {
+  limit: { deadlineMs: number; budgetMs: number };
+  running: boolean;
+  onExtend?: () => void;
+  extending?: boolean;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!running) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [running]);
+  const left = limit.deadlineMs - now;
+  const low = running && left <= 60_000; // <1 min left — warn
+  return (
+    <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
+      <Timer className="size-3" />
+      <span title="Total computation time budget for this run">
+        {fmtDur(limit.budgetMs)}
+      </span>
+      {running && (
+        <span className={low ? 'text-amber-500' : 'text-muted-foreground/70'}>
+          · {fmtDur(Math.max(0, left))} left
+        </span>
+      )}
+      {onExtend && (
+        <button
+          type="button"
+          onClick={onExtend}
+          disabled={extending}
+          title="Add 5 minutes to the computation time limit"
+          className="ml-0.5 inline-flex items-center gap-0.5 rounded border px-1 py-0.5 font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+        >
+          <Plus className="size-3" />5 min
+        </button>
+      )}
+    </span>
+  );
+}
+
 function Row({ e }: { e: ProverEvent }) {
   const { icon: Icon, color } = STYLE[e.kind] ?? STYLE.text;
   const body = e.input ?? e.detail;
@@ -154,12 +214,20 @@ export function ProverConsole({
   title = 'Prover activity',
   emptyHint = 'No activity yet — send a problem to the prover.',
   className = '',
+  computeLimit = null,
+  onExtend,
+  extending = false,
 }: {
   events: ProverEvent[];
   running?: boolean;
   title?: string;
   emptyHint?: string;
   className?: string;
+  // Live wall-clock budget for this run (from runProverStream's onRunId). When
+  // present, the header shows a limit indicator + "+5 min" button (onExtend).
+  computeLimit?: { deadlineMs: number; budgetMs: number } | null;
+  onExtend?: () => void;
+  extending?: boolean;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // Auto-scroll to the newest line unless the user has scrolled up.
@@ -183,6 +251,14 @@ export function ProverConsole({
         )}
         <span className="text-xs font-semibold">{title}</span>
         <div className="ml-auto flex items-center gap-3">
+          {computeLimit && (
+            <ComputeLimit
+              limit={computeLimit}
+              running={running}
+              onExtend={onExtend}
+              extending={extending}
+            />
+          )}
           {lastMetrics && (
             <span className="flex items-center gap-3 font-mono text-[10px] text-muted-foreground">
               {typeof lastMetrics.llm_invocations === 'number' && (

@@ -12,7 +12,10 @@ import {
   fetchProverMcpServers,
   type ProverMcpServer,
 } from '@/lib/mcp/fetch-prover-servers';
-import { runProverStream } from '@/lib/prover/run-prover-stream';
+import {
+  runProverStream,
+  extendProverRun,
+} from '@/lib/prover/run-prover-stream';
 import { ProverConsole } from '@/components/prover/prover-console';
 import type { ProverEvent } from '@/lib/prover/types';
 import { MathMarkdown } from '@/components/math-markdown';
@@ -423,6 +426,11 @@ function connFor(useWork: boolean) {
   }
 }
 
+// Default wall-clock budget a tree-path verification runs under before it needs
+// a manual "+5 min" nudge. Generous — deep proofs (e.g. lucas_nresidue_prime)
+// legitimately take a while — and always extendable live.
+const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
+
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
   const [genStage, setGenStage] = useState<'idle' | 'generating' | 'saving'>(
@@ -539,6 +547,14 @@ export function AdminPipeline() {
   const [genStartedAt, setGenStartedAt] = useState<number | null>(null);
   const [verifyStartedAt, setVerifyStartedAt] = useState<number | null>(null);
   const [, setNowTick] = useState(0);
+  // Wall-clock compute budget for a verification run (tree path). The bridge
+  // reports the runId + deadline via onRunId; the "+5 min" button pushes it out.
+  const [computeLimit, setComputeLimit] = useState<{
+    deadlineMs: number;
+    budgetMs: number;
+  } | null>(null);
+  const [extending, setExtending] = useState(false);
+  const runIdRef = useRef<string | null>(null);
   const [usage, setUsage] = useState({
     calls: 0,
     tokens: 0,
@@ -656,6 +672,13 @@ export function AdminPipeline() {
           source: decompose ? `acg-tree:${strategy}` : 'acg',
           endpoint: decompose ? 'prove-tree' : 'prove-stream',
           strategy: decompose ? strategy : undefined,
+          // Tree path runs under an extendable wall-clock budget; the single-agent
+          // path ignores it (and never fires onRunId), so the indicator stays off.
+          computeBudgetMs: decompose ? VERIFY_COMPUTE_BUDGET_MS : undefined,
+          onRunId: ({ runId, deadlineMs, budgetMs }) => {
+            runIdRef.current = runId;
+            setComputeLimit({ deadlineMs, budgetMs });
+          },
         });
         const lim = detectSessionLimit(content);
         if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
@@ -699,6 +722,8 @@ export function AdminPipeline() {
         verifyingIdRef.current = item.id;
         setVerifyingId(item.id);
         setVerifyEvents([]);
+        runIdRef.current = null;
+        setComputeLimit(null);
         const ctrl = new AbortController();
         verifyAbortRef.current = ctrl;
         setVerifyStartedAt(Date.now());
@@ -788,6 +813,26 @@ export function AdminPipeline() {
   }, [proveStream, pushLog, pauseForLimit]);
 
   const terminateVerification = () => verifyAbortRef.current?.abort();
+
+  // "+5 min": push the running verification's wall-clock deadline out. Best-effort
+  // — the bridge mutates the live deadline so it rescues even the current stage.
+  const extendVerification = useCallback(async () => {
+    const runId = runIdRef.current;
+    if (!runId || extending) return;
+    setExtending(true);
+    try {
+      const conn = connFor(false); // shared (verification) bridge
+      const r = await extendProverRun({
+        runId,
+        addMs: 5 * 60_000,
+        bridgeUrl: conn.bridgeUrl,
+        token: conn.token,
+      });
+      if (r) setComputeLimit(r);
+    } finally {
+      setExtending(false);
+    }
+  }, [extending]);
 
   const resumeNow = useCallback(() => {
     limitPausedRef.current = false;
@@ -1646,6 +1691,9 @@ export function AdminPipeline() {
             running={!!verifyingId}
             title="Verification activity"
             className="mb-2"
+            computeLimit={computeLimit}
+            onExtend={extendVerification}
+            extending={extending}
           />
         )}
         <div className="space-y-1.5">

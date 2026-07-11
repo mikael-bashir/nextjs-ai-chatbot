@@ -19,7 +19,7 @@
 
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
-import { randomBytes, timingSafeEqual } from "node:crypto"
+import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto"
 import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -1918,6 +1918,29 @@ const clampNum = (v, lo, hi, dflt) => {
   const n = Number(v)
   return Number.isFinite(n) ? Math.min(Math.max(n, lo), hi) : dflt
 }
+// ── Live compute-budget registry ─────────────────────────────────────────────
+// A streaming prove run may carry a WALL-CLOCK budget (options.computeBudgetMs).
+// We register it here under a runId with a MUTABLE deadline; the subprocess
+// killers read the deadline LIVE (not a fixed timer), so the UI's "+5 min" button
+// (POST /extend) rescues even the stage that's currently running. No budget (0)
+// means uncapped — deadline Infinity — preserving the old "let it run" behavior.
+const ACTIVE_RUNS = new Map() // runId -> { deadlineMs, budgetMs }
+function registerRun(budgetMs) {
+  const runId = randomUUID()
+  const st = {
+    deadlineMs: budgetMs > 0 ? Date.now() + budgetMs : Infinity,
+    budgetMs: budgetMs > 0 ? budgetMs : 0,
+  }
+  ACTIVE_RUNS.set(runId, st)
+  return { runId, st }
+}
+// True once a governed run's wall-clock budget is spent (used to stop retrying).
+function deadlinePassed(ctx) {
+  if (typeof ctx?.getDeadline !== "function") return false
+  const dl = ctx.getDeadline()
+  return Number.isFinite(dl) && Date.now() >= dl
+}
+
 const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim().slice(0, 120)
 const declName = (sig) => {
   const m = String(sig || "").match(/\b(?:theorem|lemma)\s+([^\s({\[:]+)/)
@@ -1966,7 +1989,7 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, stage, metrics, signal, searchBudget }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
@@ -2015,13 +2038,30 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
         /* gone */
       }
     }
-    const timer =
-      cap > 0
-        ? setTimeout(() => {
-            timedOut = true
-            kill()
-          }, cap)
-        : null
+    // Two ways to bound a stage. A live `getDeadline()` (extendable wall-clock
+    // budget) is POLLED so the UI's "+5 min" push takes effect on the RUNNING
+    // subprocess; a plain `cap` is the legacy fixed one-shot timer. Deadline wins
+    // when both are present.
+    let timer = null
+    let deadlineTimer = null
+    if (typeof getDeadline === "function") {
+      deadlineTimer = setInterval(() => {
+        const dl = getDeadline()
+        if (Number.isFinite(dl) && Date.now() >= dl) {
+          timedOut = true
+          kill()
+        }
+      }, 3000)
+    } else if (cap > 0) {
+      timer = setTimeout(() => {
+        timedOut = true
+        kill()
+      }, cap)
+    }
+    const clearTimers = () => {
+      if (timer) clearTimeout(timer)
+      if (deadlineTimer) clearInterval(deadlineTimer)
+    }
     const onAbort = () => {
       stopped = true
       kill()
@@ -2097,13 +2137,13 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, sta
       stderr += c.toString("utf8")
     })
     child.on("error", (e) => {
-      clearTimeout(timer)
+      clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
       destroyGovernor(governor)
       resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message })
     })
     child.on("close", (code) => {
-      clearTimeout(timer)
+      clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
       if (governor.searchCount)
         emit?.({
@@ -2176,6 +2216,7 @@ async function runNodeProver(node, ctx) {
       model: ctx.model,
       maxTurns: ctx.turnBudget,
       timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
       stage: ctx.stage,
       metrics: ctx.metrics,
       signal: ctx.signal,
@@ -2254,6 +2295,7 @@ async function runDecomposer(node, ctx, extraContext = "") {
       model: ctx.model,
       maxTurns: ctx.decomposeTurnBudget,
       timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
       stage: `${ctx.stage}✂️`,
       metrics: ctx.metrics,
       signal: ctx.signal,
@@ -2543,8 +2585,12 @@ async function proveHaveFlat(theorem, ctx, { seed } = {}) {
         prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${extra}\n${REFUTE_NOTE}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
-        maxTurns: budget,
+        // Under a wall-clock budget, TIME governs — lift the turn cap high so the
+        // finisher isn't cut off mid-proof by turns (which is what stranded the
+        // near-complete lucas_nresidue_prime run one line from done).
+        maxTurns: ctx.computeGoverned ? Math.max(budget, 600) : budget,
         timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
         stage: ctx.stage,
         metrics: ctx.metrics,
         signal: ctx.signal,
@@ -2567,7 +2613,7 @@ async function proveHaveFlat(theorem, ctx, { seed } = {}) {
       if (dis.refuted) return { verified: false, refuted: true, counterexample: dis.counterexample, disproof: dis.script }
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "The claimed counterexample did not verify — continuing to prove." })
     }
-    if (attempt >= maxRetry || ctx.signal?.aborted) return { verified: false, proof: "" }
+    if (attempt >= maxRetry || ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
     extra = lastVerifyError
       ? `YOUR PREVIOUS ATTEMPT FAILED. The last verify_full_script reported:\n${lastVerifyError.slice(0, 1400)}\n\nFix the SPECIFIC error above — adjust the failing \`have\` or the final assembly, and keep the parts that already compiled.`
       : "YOUR PREVIOUS ATTEMPT did not produce a verified proof. Start from the skeleton-first approach: lay out the `have`s, compile the skeleton, then fill them."
@@ -2715,6 +2761,7 @@ async function fillHole(skeleton, id, ctx) {
       model: ctx.model,
       maxTurns: ctx.turnBudget,
       timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
       stage: `⟪${id}⟫`,
       metrics: ctx.metrics,
       signal: ctx.signal,
@@ -2773,6 +2820,7 @@ async function proveHaveTree(theorem, ctx) {
       model: ctx.model,
       maxTurns: ctx.decomposeTurnBudget,
       timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
       stage: "🌿",
       metrics: ctx.metrics,
       signal: ctx.signal,
@@ -2902,6 +2950,19 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     return
   }
 
+  // Optional WALL-CLOCK budget for the whole run (minutes the operator allots).
+  // 0 / absent ⇒ uncapped (deadline Infinity), preserving the old behavior. When
+  // set, the deadline is mutable and the UI can push it out live via /extend.
+  const rawBudget = Number(opts.computeBudgetMs)
+  const budgetMs =
+    Number.isFinite(rawBudget) && rawBudget > 0
+      ? Math.min(Math.max(rawBudget, 60000), 21600000)
+      : 0
+  const { runId, st: runState } = registerRun(budgetMs)
+  // Tell the client its runId + current deadline so it can render the limit
+  // indicator and target /extend. Only meaningful when a budget was requested.
+  if (budgetMs > 0) send({ type: "run", runId, deadlineMs: runState.deadlineMs, budgetMs: runState.budgetMs })
+
   const abort = new AbortController()
   const ctx = {
     mcpServers,
@@ -2912,6 +2973,10 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     emit,
     metrics,
     signal: abort.signal,
+    // Live wall-clock budget: subprocess killers poll this, so /extend rescues
+    // even the running stage. computeGoverned lifts turn caps so TIME governs.
+    getDeadline: () => runState.deadlineMs,
+    computeGoverned: budgetMs > 0,
     turnBudget: clampNum(opts.turnBudget, 1, 40, 10),
     decomposeTurnBudget: clampNum(opts.decomposeTurnBudget, 1, 40, 12),
     maxDepth: clampNum(opts.maxDepth, 1, 6, 3),
@@ -2933,6 +2998,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     stage: "",
   }
   res.on("close", () => {
+    ACTIVE_RUNS.delete(runId)
     if (!res.writableEnded) abort.abort()
   })
 
@@ -3009,6 +3075,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
       emit({ type: "error", message: `tree error: ${String(e?.message || e)}` })
       send({ type: "done", metrics, verified: false, proof: "" })
     } finally {
+      ACTIVE_RUNS.delete(runId)
       res.end()
     }
   })()
@@ -3097,6 +3164,22 @@ const server = createServer(async (req, res) => {
       }
       proveStream(res, theorem, body.mcpServers || [], body.options || {})
       return
+    }
+
+    // Push out a running prove's wall-clock budget (the UI's "+5 min" button).
+    // Mutates the live deadline the subprocess killers poll, so it rescues even
+    // the stage currently executing. Behind the same token + CORS gate above.
+    if (req.method === "POST" && url.pathname === "/extend") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const runId = String(body.runId || "")
+      const addMs = clampNum(body.addMs, 60000, 3600000, 300000) // +5 min default, 1–60 min
+      const st = ACTIVE_RUNS.get(runId)
+      if (!st) return json(res, 404, { error: "run_not_found" })
+      // If the run was uncapped, base the fresh deadline on now.
+      const base = Number.isFinite(st.deadlineMs) ? st.deadlineMs : Date.now()
+      st.deadlineMs = base + addMs
+      st.budgetMs = (Number.isFinite(st.budgetMs) ? st.budgetMs : 0) + addMs
+      return json(res, 200, { ok: true, runId, deadlineMs: st.deadlineMs, budgetMs: st.budgetMs, addedMs: addMs })
     }
 
     // Decomposition orchestrator: prove-or-split proof tree. Same SSE shape as

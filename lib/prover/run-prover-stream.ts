@@ -41,6 +41,44 @@ interface RunOpts {
   // 'hacker' (compiler-driven) or 'pantograph' (interactive Leak II). Ignored by
   // the single-agent path.
   strategy?: string;
+  // Optional WALL-CLOCK budget (ms) for the whole run — the tree path governs by
+  // TIME when set (turn caps lifted) and reports a runId + deadline so the UI can
+  // show a limit indicator and push it out via extendProverRun. Omit for uncapped.
+  computeBudgetMs?: number;
+  // Fires once the bridge assigns this run its id + initial deadline (tree path
+  // only, and only when computeBudgetMs was set). Capture the runId to /extend.
+  onRunId?: (info: {
+    runId: string;
+    deadlineMs: number;
+    budgetMs: number;
+  }) => void;
+}
+
+// Push out a running prove's wall-clock budget (the "+5 min" button). Returns the
+// new deadline/budget, or null on any failure (extension is best-effort — never
+// let it break the run). Requires the runId from onRunId above.
+export async function extendProverRun(args: {
+  runId: string;
+  addMs?: number;
+  bridgeUrl?: string;
+  token?: string;
+}): Promise<{ deadlineMs: number; budgetMs: number } | null> {
+  const conn = bridgeConnection();
+  const base = normalizeBase(args.bridgeUrl ?? conn.bridgeUrl);
+  const token = args.token ?? conn.token ?? '';
+  try {
+    const res = await fetch(`${base}/extend`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-bridge-token': token },
+      body: JSON.stringify({ runId: args.runId, addMs: args.addMs ?? 300000 }),
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    if (typeof j?.deadlineMs !== 'number') return null;
+    return { deadlineMs: j.deadlineMs, budgetMs: j.budgetMs ?? 0 };
+  } catch {
+    return null;
+  }
 }
 
 // Fire-and-forget: persist a run to the admin debug log. Admin-gated server-side.
@@ -132,6 +170,9 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
         options: {
           ...(opts.strategy ? { strategy: opts.strategy } : {}),
           ...(model ? { model } : {}),
+          ...(opts.computeBudgetMs && opts.computeBudgetMs > 0
+            ? { computeBudgetMs: opts.computeBudgetMs }
+            : {}),
         },
       }),
       signal,
@@ -196,6 +237,16 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
       switch (d.type) {
         case 'received':
           emit('received', 'Problem received by prover', { detail: d.problem });
+          break;
+        case 'run':
+          // The bridge assigned this run its id + initial wall-clock deadline —
+          // hand it up so the UI can show the limit and target /extend.
+          if (typeof d.runId === 'string')
+            opts.onRunId?.({
+              runId: d.runId,
+              deadlineMs: Number(d.deadlineMs) || 0,
+              budgetMs: Number(d.budgetMs) || 0,
+            });
           break;
         case 'prompt':
           // The exact context the bridge built for the agent (admin debug log).
