@@ -204,50 +204,47 @@ Respond with ONLY this JSON object, nothing else:
 {"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
 // CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
-// difficulty of a generated problem — so we can make genuinely easy problems
-// too, not only olympiad-caliber ones. Level 0 = "Any" (the model assigns it).
-const LEVELS: { value: number; label: string; need: string; aim: string }[] = [
+// prerequisite KNOWLEDGE of a generated problem. This is ORTHOGONAL to how hard
+// the problem is to solve — a Level-1 problem (primary-school knowledge) can
+// still be fiendishly hard. Difficulty/ingenuity is set by the mode, not here.
+// Level 0 = "Any" (the model assigns the level).
+const LEVELS: { value: number; label: string; need: string }[] = [
   {
     value: 1,
     label: 'Foundational',
-    need: 'only knowledge a first-year primary-school student would have — basic arithmetic, counting, simple patterns. Use NOTHING beyond that.',
-    aim: 'ACCESSIBLE above all: a clear, self-contained problem such a student could reasonably attempt. It need NOT be a fiendish puzzle or hinge on a deep trick — approachability beats non-obviousness here. Keep the numbers small and the setup concrete.',
+    need: 'the base knowledge of a first-year primary-school student — basic arithmetic, counting, simple patterns',
   },
   {
     value: 2,
     label: 'Early secondary',
-    need: 'knowledge only up to early high / secondary school — fractions, basic algebra, simple geometry, elementary number facts.',
-    aim: 'A friendly problem a keen early-secondary student can crack with a neat but elementary idea. Still approachable; avoid advanced machinery.',
+    need: 'up to early high / secondary school — fractions, basic algebra, simple geometry, elementary number facts',
   },
   {
     value: 3,
     label: 'Sixth form / college',
-    need: 'knowledge up to the end of sixth form / college — algebra, functions, sequences, basic combinatorics/number theory, introductory calculus.',
-    aim: 'A solid puzzle at strong sixth-form / early-university level: a genuine insight, but nothing requiring specialist university topics.',
+    need: 'up to the end of sixth form / college — algebra, functions, sequences, basic combinatorics/number theory, introductory calculus',
   },
   {
     value: 4,
     label: 'One advanced concept',
-    need: 'a SINGLE advanced, university-level concept (e.g. group theory, linear algebra, real analysis, advanced number theory) — exactly one such tool.',
-    aim: 'Competition-caliber difficulty built around that one advanced idea. This is a hard problem.',
+    need: 'a single advanced, university-level concept (e.g. group theory, linear algebra, real analysis, advanced number theory)',
   },
   {
     value: 5,
     label: 'Multiple advanced concepts',
-    need: 'SEVERAL advanced, university-level concepts combined together.',
-    aim: 'Top-tier olympiad / research-flavoured difficulty combining multiple advanced ideas. Make it genuinely hard.',
+    need: 'several advanced, university-level concepts combined',
   },
 ];
 
-// Prompt block that pins the generator to a target CompeteMath tier. Empty for
-// level 0. Placed LAST (after the mode block) so it has final say on difficulty.
+// Prompt block that caps the PREREQUISITE KNOWLEDGE to a target tier. It must NOT
+// touch difficulty — that stays owned entirely by the mode block above.
 function levelBlock(level: number): string {
   const L = LEVELS.find((l) => l.value === level);
   if (!L) return '';
-  return `\n\nTARGET DIFFICULTY — CompeteMath Level ${level} (${L.label}). This takes PRECEDENCE over any pressure above to make the problem olympiad-hard or maximally non-standard:
-- Prerequisite knowledge: require ${L.need}
-- Aim: ${L.aim}
-- Set "level" in your output to exactly ${level}, and pick "difficulty"/"points" to match this tier (low levels ⇒ Easy/Medium; high levels ⇒ Hard/Extreme).
+  return `\n\nTARGET KNOWLEDGE LEVEL — CompeteMath Level ${level} (${L.label}). This constrains ONLY the prerequisite knowledge, NOT the difficulty:
+- A solver must be able to UNDERSTAND and attempt the problem with at most: ${L.need}. Do not require, in the statement or the intended human solution, any concept beyond this tier. (The Lean formalisation may still use whatever Mathlib needs — that is separate and does not count.)
+- This says NOTHING about how hard the problem is. Difficulty and ingenuity are governed entirely by the mode above and remain fully in force. A Level-${level} problem must be exactly as hard to SOLVE as the mode demands — e.g. a Level-1 HARD problem is a genuinely fiendish insight over elementary objects (arithmetic, counting, simple patterns), NOT an easy question.
+- Set "level" in your output to exactly ${level}. Set "difficulty"/"points" to reflect how hard the problem is to SOLVE (per the mode) — NEVER downgrade the difficulty just because the level is low.
 You must still produce a specific INTEGER answer and a machine-checkable Lean 4 theorem as specified below.`;
 }
 
