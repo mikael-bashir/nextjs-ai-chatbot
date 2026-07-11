@@ -203,6 +203,54 @@ Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
 {"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
+// CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
+// difficulty of a generated problem — so we can make genuinely easy problems
+// too, not only olympiad-caliber ones. Level 0 = "Any" (the model assigns it).
+const LEVELS: { value: number; label: string; need: string; aim: string }[] = [
+  {
+    value: 1,
+    label: 'Foundational',
+    need: 'only knowledge a first-year primary-school student would have — basic arithmetic, counting, simple patterns. Use NOTHING beyond that.',
+    aim: 'ACCESSIBLE above all: a clear, self-contained problem such a student could reasonably attempt. It need NOT be a fiendish puzzle or hinge on a deep trick — approachability beats non-obviousness here. Keep the numbers small and the setup concrete.',
+  },
+  {
+    value: 2,
+    label: 'Early secondary',
+    need: 'knowledge only up to early high / secondary school — fractions, basic algebra, simple geometry, elementary number facts.',
+    aim: 'A friendly problem a keen early-secondary student can crack with a neat but elementary idea. Still approachable; avoid advanced machinery.',
+  },
+  {
+    value: 3,
+    label: 'Sixth form / college',
+    need: 'knowledge up to the end of sixth form / college — algebra, functions, sequences, basic combinatorics/number theory, introductory calculus.',
+    aim: 'A solid puzzle at strong sixth-form / early-university level: a genuine insight, but nothing requiring specialist university topics.',
+  },
+  {
+    value: 4,
+    label: 'One advanced concept',
+    need: 'a SINGLE advanced, university-level concept (e.g. group theory, linear algebra, real analysis, advanced number theory) — exactly one such tool.',
+    aim: 'Competition-caliber difficulty built around that one advanced idea. This is a hard problem.',
+  },
+  {
+    value: 5,
+    label: 'Multiple advanced concepts',
+    need: 'SEVERAL advanced, university-level concepts combined together.',
+    aim: 'Top-tier olympiad / research-flavoured difficulty combining multiple advanced ideas. Make it genuinely hard.',
+  },
+];
+
+// Prompt block that pins the generator to a target CompeteMath tier. Empty for
+// level 0. Placed LAST (after the mode block) so it has final say on difficulty.
+function levelBlock(level: number): string {
+  const L = LEVELS.find((l) => l.value === level);
+  if (!L) return '';
+  return `\n\nTARGET DIFFICULTY — CompeteMath Level ${level} (${L.label}). This takes PRECEDENCE over any pressure above to make the problem olympiad-hard or maximally non-standard:
+- Prerequisite knowledge: require ${L.need}
+- Aim: ${L.aim}
+- Set "level" in your output to exactly ${level}, and pick "difficulty"/"points" to match this tier (low levels ⇒ Easy/Medium; high levels ⇒ Hard/Extreme).
+You must still produce a specific INTEGER answer and a machine-checkable Lean 4 theorem as specified below.`;
+}
+
 interface LiveProblem {
   title: string;
   subtitle?: string;
@@ -250,11 +298,11 @@ function buildAvoidContext(
   return parts.join('\n\n');
 }
 
-function buildPrompt(mode: GenMode, avoid: string): string {
+function buildPrompt(mode: GenMode, level: number, avoid: string): string {
   const avoidBlock = avoid
     ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
     : '';
-  return BASE_REQS + MODE_BLOCKS[mode] + avoidBlock + RESPONSE_FORMAT;
+  return BASE_REQS + MODE_BLOCKS[mode] + levelBlock(level) + avoidBlock + RESPONSE_FORMAT;
 }
 
 interface GenProblem {
@@ -497,6 +545,8 @@ export function AdminPipeline() {
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [previewIds, setPreviewIds] = useState<string[]>([]);
   const [mode, setMode] = useState<GenMode>('standard');
+  // Target CompeteMath knowledge tier for generation (0 = Any / model decides).
+  const [targetLevel, setTargetLevel] = useState(0);
   // Generation model — independent from the verification model. '' = default.
   const [genModel, setGenModel] = useState('');
   const genModelRef = useRef(genModel);
@@ -580,6 +630,7 @@ export function AdminPipeline() {
   // Refs so generateOne reads the latest mode + existing problems for the prompt
   // without depending on that state (which would restart the Work loop).
   const modeRef = useRef<GenMode>('standard');
+  const targetLevelRef = useRef(0);
   const generatedRef = useRef<GeneratedItem[]>([]);
   const liveRef = useRef<LiveProblem[]>([]);
 
@@ -588,6 +639,9 @@ export function AdminPipeline() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+  useEffect(() => {
+    targetLevelRef.current = targetLevel;
+  }, [targetLevel]);
   useEffect(() => {
     generatedRef.current = generated;
   }, [generated]);
@@ -926,6 +980,9 @@ export function AdminPipeline() {
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
     const savedMode = localStorage.getItem('lca.genMode') as GenMode | null;
     if (savedMode && savedMode in MODE_LABEL) setMode(savedMode);
+    const savedLevel = Number(localStorage.getItem('lca.targetLevel'));
+    if (Number.isInteger(savedLevel) && savedLevel >= 0 && savedLevel <= 5)
+      setTargetLevel(savedLevel);
     // Pull already-live CompeteMath problems so generation can avoid them.
     fetch('/api/admin/live-problems')
       .then((r) => (r.ok ? r.json() : { problems: [] }))
@@ -942,6 +999,11 @@ export function AdminPipeline() {
   const persistMode = (m: GenMode) => {
     setMode(m);
     localStorage.setItem('lca.genMode', m);
+  };
+
+  const persistLevel = (n: number) => {
+    setTargetLevel(n);
+    localStorage.setItem('lca.targetLevel', String(n));
   };
 
   const persistWorkBridgeUrl = (value: string) => {
@@ -964,6 +1026,7 @@ export function AdminPipeline() {
     try {
       const prompt = buildPrompt(
         modeRef.current,
+        targetLevelRef.current,
         buildAvoidContext(generatedRef.current, liveRef.current),
       );
       let genRes: Response;
@@ -1377,6 +1440,22 @@ export function AdminPipeline() {
               ),
             )}
           </div>
+          <label className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
+            Target level
+            <select
+              value={targetLevel}
+              onChange={(e) => persistLevel(Number(e.target.value))}
+              className="rounded-md border bg-background px-1.5 py-1 text-xs"
+              title="Target CompeteMath knowledge tier — drives how easy or hard the generated problem is. 'Any' lets the model decide."
+            >
+              <option value={0}>Any (model decides)</option>
+              {LEVELS.map((l) => (
+                <option key={l.value} value={l.value}>
+                  {l.value} · {l.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
             Generation model
             <select
