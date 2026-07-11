@@ -51,7 +51,10 @@ export async function POST(request: NextRequest) {
     const knowledge =
       Number.isInteger(lvl) && lvl >= 1 && lvl <= 5 ? `Level ${lvl}` : null;
 
-    // Exactly the fields the weekly-problems cron reads.
+    // Exactly the fields the weekly-problems cron reads. Includes the Lean proof
+    // + provenance so CompeteMath can render a verification CERTIFICATE for the
+    // problem: `proof` is the machine-checked script, `mintedAt` is when it was
+    // generated, `toolchain` is the Lean/Mathlib it was enforced against.
     const prodPayload = {
       questionTitle: rec.questionTitle ?? 'Generated Problem',
       questionProblem: rec.problem ?? '',
@@ -60,6 +63,9 @@ export async function POST(request: NextRequest) {
       points: rec.points ?? 100,
       answer: rec.answer ?? null,
       knowledge,
+      proof: rec.proof ?? null,
+      mintedAt: rec.createdAt ?? null,
+      toolchain: rec.toolchain ?? null,
     };
 
     // Order matters: publish to prod + persist metadata BEFORE removing from
