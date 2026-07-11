@@ -999,6 +999,22 @@ function resolveVerifyUrl(mcpServers) {
   return servers[0]?.url || null
 }
 
+// The interactive Pantograph server (Leak II) — the one exposing init_proof /
+// apply_tactic. Used to free proof state between sequential minions, since the
+// daemon's cleanup_memory is GLOBAL and can't be shared by concurrent callers.
+function resolvePantographUrl(mcpServers) {
+  for (const s of mcpServers || []) {
+    if (!s?.url) continue
+    const tools = Array.isArray(s.tools) ? s.tools : []
+    const has = tools.some((t) => {
+      const n = typeof t === "string" ? t : t && t.name
+      return n && /init_proof|apply_tactic/i.test(n)
+    })
+    if (has) return s.url
+  }
+  return null
+}
+
 // Call ANY tool on a remote MCP-SSE server, one-shot. `toolMatch` is a string
 // (exact tool name) or RegExp (matched against the server's tool names). Returns
 // { ok, text, error }. Used both to verify scaffolds on the daemon and to proxy
@@ -2473,9 +2489,17 @@ async function proveNode(node, ctx) {
 // tree: the agent's self-reported success is RE-VERIFIED independently on the
 // daemon before acceptance. Bounded outer retries feed the last compile failure
 // back in (like #2) so a stuck run gets a fresh, informed attempt.
-async function proveHaveFlat(theorem, ctx) {
+async function proveHaveFlat(theorem, ctx, { seed } = {}) {
   const budget = ctx.haveTurnBudget || 24
   const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
+  // When the have-tree banked some holes, it hands us the partially-filled
+  // skeleton here so that proven work is never thrown away — the agent only has
+  // to finish the remaining `sorry`s. This is a soft HINT (the agent may still
+  // restructure); the independent verify gate below is unchanged, so soundness
+  // is identical to a from-scratch run.
+  const seedNote = seed
+    ? `A PARTIAL PROOF is already on the board. In the skeleton below, every \`have\` step whose body is NOT \`sorry\` is ALREADY PROVEN and correct — reuse it verbatim, do NOT redo it. Your ONLY job is to fill the remaining \`sorry\` hole(s) and output the complete, sorry-free proof of the master:\n\`\`\`lean\n${seed}\n\`\`\`\n`
+    : ""
   let extra = ""
   for (let attempt = 0; ; attempt++) {
     if (ctx.signal?.aborted) return { verified: false, proof: "" }
@@ -2486,7 +2510,9 @@ async function proveHaveFlat(theorem, ctx) {
       thought:
         attempt > 0
           ? `♻️ Retrying have-based proof (attempt ${attempt + 1}) with the last compile error in hand.`
-          : `🧩 Proving in one context via local \`have\` decomposition (${budget} turns).`,
+          : seed
+            ? `🧩 Finishing the remaining hole(s) in one context — the already-proven steps are kept (${budget} turns).`
+            : `🧩 Proving in one context via local \`have\` decomposition (${budget} turns).`,
     })
     const gate = makeProofGate(theorem)
     const verifyIds = new Set()
@@ -2514,7 +2540,7 @@ async function proveHaveFlat(theorem, ctx) {
     }
     await spawnProverStream(
       {
-        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${extra}\n${REFUTE_NOTE}`),
+        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${extra}\n${REFUTE_NOTE}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         maxTurns: budget,
@@ -2665,7 +2691,7 @@ YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`. Its declared type is your GOAL
 METHOD:
 1. Work out the tactics that close ONLY hole \`--⟪${id}⟫\`.
 2. CHECK them in context: take the skeleton above, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other \`sorry --⟪…⟫\` untouched), and verify_full_script. Success = it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Iterate until that holds.
-3. Call cleanup_memory to free any proof state you opened.
+(You do NOT need to call cleanup_memory — the system frees proof state between holes for you. Spend your turns proving.)
 
 OUTPUT (exactly this shape, nothing else after it):
 FILL ⟪${id}⟫
@@ -2773,26 +2799,49 @@ async function proveHaveTree(theorem, ctx) {
   if (!holeIds.length) return proveHaveFlat(theorem, ctx)
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Skeleton verified — ${holeIds.length} hole(s): ${holeIds.map((h) => `⟪${h}⟫`).join(" ")}. Filling each in its own minion.` })
 
-  // ---- 2) MINIONS: fill each hole in isolation (parallel) ----------------------
-  const fills = await Promise.all(holeIds.map((id) => fillHole(skeleton, id, ctx)))
-  if (fills.some((f) => f == null) || ctx.signal?.aborted) {
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ A hole couldn't be filled in isolation — falling back to single-context have mode." })
-    return proveHaveFlat(theorem, ctx)
+  // ---- 2) MINIONS: fill each hole in its OWN isolated context, SEQUENTIALLY ----
+  // Sequential, not parallel: Leak II's cleanup_memory is GLOBAL, so concurrent
+  // minions clobber each other's proof states. The bridge frees state BETWEEN
+  // minions instead (the minion prompt no longer calls cleanup_memory), so each
+  // minion still gets a clean daemon without racing the others.
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  const fills = new Array(holeIds.length).fill(null)
+  for (let i = 0; i < holeIds.length; i++) {
+    if (ctx.signal?.aborted) break
+    fills[i] = await fillHole(skeleton, holeIds[i], ctx)
+    if (pantoUrl)
+      await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
   }
 
-  // ---- 3) ASSEMBLER: splice + verify the whole thing hole-free -----------------
-  let assembled = skeleton
+  // ---- 3) SPLICE the holes that DID fill — bank partial progress ---------------
+  // A failed hole no longer discards the successful ones: we splice every fill we
+  // got and hand the PARTIALLY-filled skeleton onward, so proven work is kept.
+  let partial = skeleton
+  const remaining = []
   holeIds.forEach((id, i) => {
-    assembled = spliceHole(assembled, id, fills[i])
+    if (fills[i] != null) partial = spliceHole(partial, id, fills[i])
+    else remaining.push(id)
   })
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ Assembling the filled holes and re-verifying the whole proof on the daemon…" })
-  const v = await verifyViaDaemon(assembled, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
-  if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(assembled, sig)) {
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${holeIds.length} isolated holes.` })
-    return { verified: true, proof: assembled }
+  const filled = holeIds.length - remaining.length
+
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    // Every hole filled — assemble + verify hole-free (the full win).
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${holeIds.length} isolated holes.` })
+      return { verified: true, proof: partial }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Banked ${filled}/${holeIds.length} hole(s) in isolation; finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
   }
-  ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — falling back to single-context have mode.` })
-  return proveHaveFlat(theorem, ctx)
+
+  // ---- 4) FINISH: hand the PARTIALLY-filled skeleton to flat mode as a seed, so
+  // the proven holes are never thrown away. Flat mode's gate still requires a
+  // full, independently-verified proof of the master, so soundness is unchanged.
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  return proveHaveFlat(theorem, ctx, { seed: partial })
 }
 
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
