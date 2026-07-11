@@ -136,12 +136,13 @@ function fmtCountdown(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
 }
 
-type GenMode = 'standard' | 'hard' | 'nested' | 'reverse';
+type GenMode = 'easy' | 'medium' | 'hard' | 'insane' | 'reverse';
 
 const MODE_LABEL: Record<GenMode, string> = {
-  standard: 'Standard',
+  easy: 'Easy',
+  medium: 'Medium',
   hard: 'Hard',
-  nested: 'Nested insights',
+  insane: 'Insane',
   reverse: 'Reverse-built',
 };
 
@@ -156,7 +157,7 @@ Keep your reasoning brief and get to the JSON.
 Core requirements:
 - Creative and NON-standard: not a textbook exercise, not a famous/known competition problem, not a classic named result. Fresh setup and phrasing.
 - The answer is a specific INTEGER.
-- Give presentation metadata: a short evocative title, a 1-3 word subtitle, a difficulty of exactly "Easy" | "Medium" | "Hard" | "Extreme", and points = 50 for Easy, 100 for Medium, 150 for Hard, 200 for Extreme.
+- Give presentation metadata: a short evocative title and a 1-3 word subtitle. The "difficulty" and "points" are DICTATED by the mode below — emit exactly the values it specifies (do not choose your own).
 - Also assign a "level" as an INTEGER 1-5 = the prerequisite mathematical KNOWLEDGE required to attempt it (this is about background needed, NOT how hard the puzzle is — a level-1 problem can still be a tough puzzle):
   1 = a first-year primary school student would technically have the base knowledge to attempt it;
   2 = knowledge content up to early high / secondary school;
@@ -165,15 +166,22 @@ Core requirements:
   5 = several advanced concepts combined together.`;
 
 const MODE_BLOCKS: Record<GenMode, string> = {
-  standard: `
-- Solvable BY HAND with at most a basic calculator via an elegant insight, NOT brute force.
-- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).`,
+  easy: `
+- EASY. A quick, approachable problem: a single clear elementary observation or a short direct computation solves it. No deep trick and no long chain of steps — it should feel like a warm-up.
+- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
+- Emit "difficulty":"Easy", "points":50.`,
+  medium: `
+- MEDIUM. A solid problem needing ONE genuine, non-obvious insight — not immediate, but not fiendish. A capable solver reaches the integer answer with some real thought.
+- Provide a Lean 4 theorem provable in Mathlib: a decide/native_decide over a small finite domain is acceptable, or a modest closed-form fact. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
+- Emit "difficulty":"Medium", "points":100.`,
   hard: `
-- HARD MODE. The problem must NOT be solvable by a short brute-force script: avoid small finite search spaces. Use large or unbounded domains, a general n, or structures where naive enumeration is infeasible. It must hinge on a genuine, non-obvious insight, yet still be solvable by hand to a specific integer.
-- The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
-  nested: `
-- NESTED INSIGHTS MODE. The solution must require chaining 2-3 DISTINCT, non-obvious insights, each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. A strong solver needs a genuine multi-step derivation to reach the integer answer.
-- The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.`,
+- HARD. The problem must NOT be solvable by a short brute-force script: avoid small finite search spaces. Use large or unbounded domains, a general n, or structures where naive enumeration is infeasible. It must hinge on a genuine, non-obvious insight, yet still be solvable by hand to a specific integer.
+- The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.
+- Emit "difficulty":"Hard", "points":150.`,
+  insane: `
+- INSANE. The hardest tier. The solution must chain MULTIPLE distinct, non-obvious insights (or one extraordinarily deep idea), each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. Olympiad-final / research-flavoured, yet it still resolves to a specific integer.
+- The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.
+- Emit "difficulty":"Insane", "points":200.`,
   reverse: `
 - REVERSE-CONSTRUCTION MODE. The ONE invariant: EASY TO VERIFY, HARD TO SOLVE. Build the problem BACKWARD — start from hidden structure you choose so the answer is known to you for free, apply a process that is cheap to check but hard to run in reverse, then reveal only the result and ask for an integer function of what you hid. The Lean check must be a cheap one-step CERTIFICATE the answer satisfies; the solver, lacking your secret, must do real work to recover it.
 
@@ -194,14 +202,15 @@ const MODE_BLOCKS: Record<GenMode, string> = {
 
   SCALE so brute force fails but insight wins: large enough that "loop over everything" is impractical, small enough that a smart method cracks it. Sizes are yours to choose per construction — do NOT default to crypto-grade magnitudes.
 
-  COMPUTE, DON'T HAND-DERIVE: you have a Bash tool — run \`python3\` to build your secret, apply the forward map, and COMPUTE the exact integer answer and every number in the certificate (products, modular exponentials, sums, witness evaluations). VERIFY the certificate numerically in python before you emit it. NEVER do large arithmetic in your head — it is slow and it is wrong. State the exact values python gave you.`,
+  COMPUTE, DON'T HAND-DERIVE: you have a Bash tool — run \`python3\` to build your secret, apply the forward map, and COMPUTE the exact integer answer and every number in the certificate (products, modular exponentials, sums, witness evaluations). VERIFY the certificate numerically in python before you emit it. NEVER do large arithmetic in your head — it is slow and it is wrong. State the exact values python gave you.
+- Emit "difficulty":"Insane", "points":200.`,
 };
 
 const RESPONSE_FORMAT = `
 
 Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
-{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Extreme","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
+{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
 // CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
 // prerequisite KNOWLEDGE of a generated problem. This is ORTHOGONAL to how hard
@@ -541,7 +550,7 @@ export function AdminPipeline() {
   const [genCap, setGenCap] = useState(200);
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [previewIds, setPreviewIds] = useState<string[]>([]);
-  const [mode, setMode] = useState<GenMode>('standard');
+  const [mode, setMode] = useState<GenMode>('medium');
   // Target CompeteMath knowledge tier for generation (0 = Any / model decides).
   const [targetLevel, setTargetLevel] = useState(0);
   // Generation model — independent from the verification model. '' = default.
@@ -626,7 +635,7 @@ export function AdminPipeline() {
   const runningRef = useRef(false);
   // Refs so generateOne reads the latest mode + existing problems for the prompt
   // without depending on that state (which would restart the Work loop).
-  const modeRef = useRef<GenMode>('standard');
+  const modeRef = useRef<GenMode>('medium');
   const targetLevelRef = useRef(0);
   const generatedRef = useRef<GeneratedItem[]>([]);
   const liveRef = useRef<LiveProblem[]>([]);
@@ -1419,7 +1428,7 @@ export function AdminPipeline() {
         <div className="mt-3">
           <Label className="text-xs">Difficulty mode</Label>
           <div className="mt-1 flex flex-wrap gap-1 text-xs">
-            {(['standard', 'hard', 'nested', 'reverse'] as GenMode[]).map(
+            {(['easy', 'medium', 'hard', 'insane', 'reverse'] as GenMode[]).map(
               (m) => (
                 <button
                   key={m}
@@ -1469,12 +1478,14 @@ export function AdminPipeline() {
             </select>
           </label>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            {mode === 'standard' &&
-              'Elegant, hand-solvable; Lean proof usually machine-checkable (decide).'}
+            {mode === 'easy' &&
+              'A quick warm-up: one elementary observation solves it. Lean proof usually machine-checkable (decide). Emits difficulty Easy.'}
+            {mode === 'medium' &&
+              'Needs one genuine, non-obvious insight. Small-domain decide or a modest closed form. Emits difficulty Medium.'}
             {mode === 'hard' &&
-              'No brute-force / small-search solution; Lean theorem is general (not decide) — harder to auto-prove, but the workflow still tries.'}
-            {mode === 'nested' &&
-              'Requires chaining 2-3 distinct insights; general (non-decide) Lean statement. Hardest to prove automatically.'}
+              'No brute-force / small-search solution; Lean theorem is general (not decide) — harder to auto-prove, but the workflow still tries. Emits difficulty Hard.'}
+            {mode === 'insane' &&
+              'Chains multiple distinct insights (or one very deep idea); general (non-decide) Lean statement. Hardest to prove automatically. Emits difficulty Insane.'}
             {mode === 'reverse' &&
               'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
           </p>
