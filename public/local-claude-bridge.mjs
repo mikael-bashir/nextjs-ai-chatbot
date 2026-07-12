@@ -1995,6 +1995,15 @@ function deadlinePassed(ctx) {
   const dl = ctx.getDeadline()
   return Number.isFinite(dl) && Date.now() >= dl
 }
+// Human label for the SHARED clock every agent (planner, minions, finisher) runs
+// against. Governance is purely TIME now — no turn caps — and the "+5 min" button
+// pushes this same deadline out for all of them at once.
+function remainingLabel(ctx) {
+  const dl = typeof ctx?.getDeadline === "function" ? ctx.getDeadline() : Infinity
+  if (!Number.isFinite(dl)) return "no time cap — runs until you Terminate"
+  const m = Math.max(0, Math.round((dl - Date.now()) / 60000))
+  return `~${m} min left on the shared clock`
+}
 
 const oneLine = (s) => String(s || "").replace(/\s+/g, " ").trim().slice(0, 120)
 const declName = (sig) => {
@@ -2587,7 +2596,6 @@ async function proveNode(node, ctx) {
 // daemon before acceptance. Bounded outer retries feed the last compile failure
 // back in (like #2) so a stuck run gets a fresh, informed attempt.
 async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
-  const budget = ctx.haveTurnBudget || 24
   const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
   // When the have-tree banked some holes, it hands us the partially-filled
   // skeleton here so that proven work is never thrown away — the agent only has
@@ -2624,8 +2632,8 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
         attempt > 0
           ? `♻️ Retrying have-based proof (attempt ${attempt + 1}) with the last compile error in hand.`
           : seed
-            ? `🧩 Finishing the remaining hole(s) in one context — the already-proven steps are kept (${budget} turns).`
-            : `🧩 Proving in one context via local \`have\` decomposition (${budget} turns).`,
+            ? `🧩 Finishing the remaining hole(s) in one context — the already-proven steps are kept (${remainingLabel(ctx)}).`
+            : `🧩 Proving in one context via local \`have\` decomposition (${remainingLabel(ctx)}).`,
     })
     const gate = makeProofGate(theorem)
     const verifyIds = new Set()
@@ -2656,10 +2664,10 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
         prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${extra}\n${REFUTE_NOTE}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
-        // Under a wall-clock budget, TIME governs — lift the turn cap high so the
-        // finisher isn't cut off mid-proof by turns (which is what stranded the
-        // near-complete lucas_nresidue_prime run one line from done).
-        maxTurns: ctx.computeGoverned ? Math.max(budget, 600) : budget,
+        // NO turn cap. The finisher runs until it proves the goal or the SHARED
+        // wall-clock deadline (ctx.getDeadline, extendable via the "+5 min" button)
+        // kills it — TIME is the only governor, exactly like the single-agent path.
+        maxTurns: 0,
         timeoutMs: ctx.nodeTimeoutMs,
         getDeadline: ctx.getDeadline,
         stage: ctx.stage,
@@ -2834,10 +2842,10 @@ async function fillHole(skeleton, id, ctx) {
       prompt: haveHoleFillPrompt(skeleton, id, ctx.mcpServers, ""),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
-      // A minion does a WHOLE hole in one context. Under a wall-clock budget TIME
-      // governs, so lift the turn cap high; otherwise give it the generous minion
-      // budget — NOT the tiny per-node turnBudget that used to cut it off mid-proof.
-      maxTurns: ctx.computeGoverned ? Math.max(ctx.minionTurnBudget, 600) : ctx.minionTurnBudget,
+      // NO turn cap. A minion runs until it fills its hole or the SAME shared
+      // wall-clock deadline the main thread uses (ctx.getDeadline, extendable via
+      // "+5 min") kills it. Minions and the main thread share ONE clock.
+      maxTurns: 0,
       timeoutMs: ctx.nodeTimeoutMs,
       getDeadline: ctx.getDeadline,
       stage: `⟪${id}⟫`,
@@ -2907,7 +2915,9 @@ async function proveHaveTree(theorem, ctx) {
       prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
-      maxTurns: ctx.decomposeTurnBudget,
+      // NO turn cap. The planner writes its skeleton and stops naturally; if it
+      // stalls, the shared wall-clock deadline (ctx.getDeadline) bounds it.
+      maxTurns: 0,
       timeoutMs: ctx.nodeTimeoutMs,
       getDeadline: ctx.getDeadline,
       stage: "🌿",
@@ -3065,15 +3075,16 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     emit,
     metrics,
     signal: abort.signal,
-    // Live wall-clock budget: subprocess killers poll this, so /extend rescues
-    // even the running stage. computeGoverned lifts turn caps so TIME governs.
+    // THE single governor for the have/have-tree paths: one live wall-clock
+    // deadline shared by the planner, every minion, and the finisher. Subprocess
+    // killers poll it, so the "+5 min" /extend rescues whichever stage is running.
+    // No turn caps anywhere on these paths — TIME alone bounds them.
     getDeadline: () => runState.deadlineMs,
     computeGoverned: budgetMs > 0,
+    // Turn budgets below are used ONLY by the lemma-style prove-or-split tree
+    // (proveNode), where the budget doubles as a "force a decomposition after N
+    // turns" trigger. The have-tree/have paths ignore them (time-governed).
     turnBudget: clampNum(opts.turnBudget, 1, 40, 10),
-    // A have-tree MINION proves a WHOLE hole in its own isolated context (like the
-    // flat agent proves the whole theorem), so it needs a far larger allowance
-    // than a tree node's turnBudget — the tiny node budget was cutting minions off
-    // mid-proof (a near-complete hole would fail with nothing banked).
     minionTurnBudget: clampNum(opts.minionTurnBudget, 5, 300, 40),
     decomposeTurnBudget: clampNum(opts.decomposeTurnBudget, 1, 40, 12),
     maxDepth: clampNum(opts.maxDepth, 1, 6, 3),
@@ -3081,8 +3092,6 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // #5: how many times a node may re-decompose (with a DIFFERENT split) after
     // a child lemma or the assembly fails, before the node itself fails.
     maxRedecompose: clampNum(opts.maxRedecompose, 0, 5, 1),
-    // `have` style only: turn budget for the single flat agent (it does the whole
-    // proof in one context, so it gets a larger allowance than a tree node).
     haveTurnBudget: clampNum(opts.haveTurnBudget, 5, 60, 24),
     // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
