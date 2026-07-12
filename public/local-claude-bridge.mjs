@@ -2586,7 +2586,7 @@ async function proveNode(node, ctx) {
 // tree: the agent's self-reported success is RE-VERIFIED independently on the
 // daemon before acceptance. Bounded outer retries feed the last compile failure
 // back in (like #2) so a stuck run gets a fresh, informed attempt.
-async function proveHaveFlat(theorem, ctx, { seed } = {}) {
+async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
   const budget = ctx.haveTurnBudget || 24
   const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
   // When the have-tree banked some holes, it hands us the partially-filled
@@ -2597,6 +2597,22 @@ async function proveHaveFlat(theorem, ctx, { seed } = {}) {
   const seedNote = seed
     ? `A PARTIAL PROOF is already on the board. In the skeleton below, every \`have\` step whose body is NOT \`sorry\` is ALREADY PROVEN and correct — reuse it verbatim, do NOT redo it. Your ONLY job is to fill the remaining \`sorry\` hole(s) and output the complete, sorry-free proof of the master:\n\`\`\`lean\n${seed}\n\`\`\`\n`
     : ""
+  // Unverified scratch work from isolated minions that didn't bank their hole:
+  // the tactics they applied in the interactive prover (since wiped). A pure
+  // HINT — the agent may reuse correct steps or ignore dead ends. Soundness is
+  // unchanged (the verify gate below still demands a full, independent proof).
+  const hintNote =
+    hints && Object.keys(hints).length
+      ? "\nUNVERIFIED SCRATCH WORK from isolated attempts on the remaining hole(s) — reuse any step that is correct, ignore dead ends:\n" +
+        Object.entries(hints)
+          .map(([id, n]) => {
+            const tac = (n?.tactics || [])
+              .map((t) => "    " + String(t).replace(/\s+/g, " ").slice(0, 160))
+              .join("\n")
+            return `  ⟪${id}⟫${tac ? " applied these tactics, in order:\n" + tac : ""}`
+          })
+          .join("\n") + "\n"
+      : ""
   let extra = ""
   for (let attempt = 0; ; attempt++) {
     if (ctx.signal?.aborted) return { verified: false, proof: "" }
@@ -2637,7 +2653,7 @@ async function proveHaveFlat(theorem, ctx, { seed } = {}) {
     }
     await spawnProverStream(
       {
-        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${extra}\n${REFUTE_NOTE}`),
+        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${extra}\n${REFUTE_NOTE}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         // Under a wall-clock budget, TIME governs — lift the turn cap high so the
@@ -2807,14 +2823,21 @@ ${extra ? `\n${extra}\n` : ""}`
 // Fill one hole in an isolated minion (fresh process → bounded context). Returns
 // the tactic text, or null if the minion couldn't produce a usable fill.
 async function fillHole(skeleton, id, ctx) {
-  if (ctx.signal?.aborted) return null
+  if (ctx.signal?.aborted) return { fill: null, notes: null }
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Minion filling hole ⟪${id}⟫ in an isolated context…` })
+  // Collect the tactics the minion actually applied, so a REJECTED minion's
+  // work can seed the combined finish rather than evaporating with its (soon
+  // wiped) Pantograph state.
+  const applied = []
   const res = await spawnProverStream(
     {
       prompt: haveHoleFillPrompt(skeleton, id, ctx.mcpServers, ""),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
-      maxTurns: ctx.turnBudget,
+      // A minion does a WHOLE hole in one context. Under a wall-clock budget TIME
+      // governs, so lift the turn cap high; otherwise give it the generous minion
+      // budget — NOT the tiny per-node turnBudget that used to cut it off mid-proof.
+      maxTurns: ctx.computeGoverned ? Math.max(ctx.minionTurnBudget, 600) : ctx.minionTurnBudget,
       timeoutMs: ctx.nodeTimeoutMs,
       getDeadline: ctx.getDeadline,
       stage: `⟪${id}⟫`,
@@ -2822,14 +2845,25 @@ async function fillHole(skeleton, id, ctx) {
       signal: ctx.signal,
       searchBudget: ctx.searchBudget,
     },
-    { onObject: () => false, emit: ctx.emit },
+    {
+      onObject: (o) => {
+        if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+          for (const c of o.message.content) {
+            if (c?.type === "tool_use" && String(c.name || "").endsWith("apply_tactic") && c.input?.tactic)
+              applied.push(String(c.input.tactic))
+          }
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
   )
   const fill = parseFillBlock(res.finalText, id)
   if (!fill) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL block.` })
-    return null
+    return { fill: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
   }
-  return fill
+  return { fill, notes: null }
 }
 
 // Phase-1 orchestrator. Planner → isolated per-hole minions → assembler, with a
@@ -2909,9 +2943,12 @@ async function proveHaveTree(theorem, ctx) {
   // minion still gets a clean daemon without racing the others.
   const pantoUrl = resolvePantographUrl(ctx.mcpServers)
   const fills = new Array(holeIds.length).fill(null)
+  const rejectedNotes = {} // hole id -> { text, tactics } for minions that didn't bank
   for (let i = 0; i < holeIds.length; i++) {
     if (ctx.signal?.aborted) break
-    fills[i] = await fillHole(skeleton, holeIds[i], ctx)
+    const r = await fillHole(skeleton, holeIds[i], ctx)
+    fills[i] = r.fill
+    if (!r.fill && r.notes) rejectedNotes[holeIds[i]] = r.notes
     if (pantoUrl)
       await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
   }
@@ -2944,7 +2981,7 @@ async function proveHaveTree(theorem, ctx) {
   // the proven holes are never thrown away. Flat mode's gate still requires a
   // full, independently-verified proof of the master, so soundness is unchanged.
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
-  return proveHaveFlat(theorem, ctx, { seed: partial })
+  return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
 }
 
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
@@ -3033,6 +3070,11 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     getDeadline: () => runState.deadlineMs,
     computeGoverned: budgetMs > 0,
     turnBudget: clampNum(opts.turnBudget, 1, 40, 10),
+    // A have-tree MINION proves a WHOLE hole in its own isolated context (like the
+    // flat agent proves the whole theorem), so it needs a far larger allowance
+    // than a tree node's turnBudget — the tiny node budget was cutting minions off
+    // mid-proof (a near-complete hole would fail with nothing banked).
+    minionTurnBudget: clampNum(opts.minionTurnBudget, 5, 300, 40),
     decomposeTurnBudget: clampNum(opts.decomposeTurnBudget, 1, 40, 12),
     maxDepth: clampNum(opts.maxDepth, 1, 6, 3),
     maxNodes: clampNum(opts.maxNodes, 1, 64, 24),
