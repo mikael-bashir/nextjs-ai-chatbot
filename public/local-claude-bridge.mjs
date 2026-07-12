@@ -1199,8 +1199,34 @@ function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {})
 // Compile a script against the verify daemon DIRECTLY over MCP-SSE. The
 // orchestrator does not trust the agent's own verify calls for scaffolds/
 // assemblies IT constructs — it checks them itself.
-function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000 } = {}) {
-  return callRemoteMcpTool(sseUrl, /verify.*full.*script|verify_full_script/i, { script }, { timeoutMs })
+// A verify result that reflects the DAEMON hiccupping — its Lean file worker
+// aborted (native stack overflow) and it self-healed, or a socket blip — NOT the
+// proof being wrong. The verdict is meaningless, so it's worth one retry: on a
+// shared daemon another client's monster script can leave the worker mid-respawn,
+// and the retried verify lands on the fresh worker. Kept deliberately tight so a
+// genuine "Compilation Failed: Line N (Error)" is NEVER mistaken for transient.
+function isTransientDaemonError(res) {
+  if (!res) return true // no result at all — treat as transient
+  const t = `${res.text || ""}\n${res.error || ""}`
+  if (/compilation failed/i.test(t) && /Line\s+\d+\s*\(Error/i.test(t)) return false
+  return (
+    /worker crashed|self-healed|native stack overflow|-329(0[02])\b|Server process for .*crash|mcp call timed out|terminated|socket|ECONNRESET|network/i.test(
+      t,
+    ) || res.ok === false
+  )
+}
+
+// Independent re-verification on the daemon, with a bounded retry when the daemon
+// (not the proof) is the problem — see isTransientDaemonError. The retried call
+// absorbs the fresh worker's ~Mathlib re-import, so no long fixed sleep is needed;
+// a short backoff just lets the daemon's didClose/respawn settle.
+async function verifyViaDaemon(script, sseUrl, { timeoutMs = 180000, retries = 1, backoffMs = 3000 } = {}) {
+  let res
+  for (let attempt = 0; ; attempt++) {
+    res = await callRemoteMcpTool(sseUrl, /verify.*full.*script|verify_full_script/i, { script }, { timeoutMs })
+    if (attempt >= retries || !isTransientDaemonError(res)) return res
+    await new Promise((r) => setTimeout(r, backoffMs))
+  }
 }
 
 // Build the "how to load your deferred MCP tools" section shared by the prover
