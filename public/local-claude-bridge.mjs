@@ -39,7 +39,13 @@ const isTransientNetErr = (e) => {
     s,
   )
 }
+// An AbortError is us tearing a connection down on purpose (timeout / completion)
+// — it is expected, not a fault, so stay silent.
+const isAbort = (e) =>
+  (e?.name || e?.cause?.name) === "AbortError" ||
+  (e?.code || e?.cause?.code) === "ABORT_ERR"
 process.on("unhandledRejection", (err) => {
+  if (isAbort(err)) return
   if (isTransientNetErr(err))
     return console.error(
       "[bridge] transient network error (continuing):",
@@ -48,6 +54,7 @@ process.on("unhandledRejection", (err) => {
   console.error("[bridge] unhandledRejection:", err)
 })
 process.on("uncaughtException", (err) => {
+  if (isAbort(err)) return
   if (isTransientNetErr(err))
     return console.error(
       "[bridge] transient network error (continuing):",
@@ -1080,13 +1087,14 @@ function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {})
       if (settled) return
       settled = true
       clearTimeout(timer)
+      // Abort the underlying request(s). This errors the SSE body stream, whose
+      // reader loop already swallows the resulting AbortError (.catch below), and
+      // aborts any in-flight POST (awaited inside the try/catch). Do NOT also call
+      // reader.cancel() here: cancelling an already-aborted stream returns a
+      // REJECTED promise (AbortError) that a synchronous try/catch cannot catch,
+      // which was leaking as an unhandledRejection.
       try {
         ac.abort()
-      } catch {
-        /* ignore */
-      }
-      try {
-        reader?.cancel()
       } catch {
         /* ignore */
       }
