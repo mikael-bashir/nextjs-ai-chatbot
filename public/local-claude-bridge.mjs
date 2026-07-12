@@ -1068,10 +1068,23 @@ function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {})
     const pending = new Map()
     let buf = ""
     let nextId = 1
+    // Own the connection lifecycle with an AbortController so WE tear the socket
+    // down cleanly on success/timeout. reader.cancel() alone is not enough: it is
+    // skipped if the reader hasn't been assigned yet (timeout before connect), and
+    // it doesn't reliably abort the underlying undici request. A leaked request
+    // gets reset later by the remote (e.g. a sleeping HF Space), and undici then
+    // raises an unhandled "terminated" rejection with nothing awaiting it — which
+    // crashes the whole bridge. Aborting routes that teardown into handled paths.
+    const ac = new AbortController()
     const done = (out) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      try {
+        ac.abort()
+      } catch {
+        /* ignore */
+      }
       try {
         reader?.cancel()
       } catch {
@@ -1118,13 +1131,14 @@ function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {})
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(body),
+        signal: ac.signal,
       })
       if (!res.ok && !notify) throw new Error(`POST ${method} -> ${res.status}`)
       return p
     }
     ;(async () => {
       try {
-        const res = await fetch(sseUrl, { headers: { Accept: "text/event-stream" } })
+        const res = await fetch(sseUrl, { headers: { Accept: "text/event-stream" }, signal: ac.signal })
         if (!res.ok || !res.body) throw new Error(`SSE open failed: ${res.status}`)
         reader = res.body.getReader()
         const dec = new TextDecoder()
