@@ -66,6 +66,9 @@ export async function POST(request: NextRequest) {
       proof: rec.proof ?? null,
       mintedAt: rec.createdAt ?? null,
       toolchain: rec.toolchain ?? null,
+      // Solver-facing key idea (1-3 sentences). CompeteMath reveals it alongside
+      // the answer once a problem is solved or given up.
+      insight: rec.insight ?? null,
     };
 
     // Order matters: publish to prod + persist metadata BEFORE removing from
