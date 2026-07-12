@@ -157,7 +157,13 @@ Keep your reasoning brief and get to the JSON.
 Core requirements:
 - Creative and NON-standard: not a textbook exercise, not a famous/known competition problem, not a classic named result. Fresh setup and phrasing.
 - The answer is a specific INTEGER.
-- Give presentation metadata: a short evocative title and a 1-3 word subtitle. The "difficulty" and "points" are DICTATED by the mode below — emit exactly the values it specifies (do not choose your own).
+- TITLE — make it genuinely curious and alluring, a hook that makes someone want to click. VARY THE SHAPE every single time; never settle into a template:
+  · an intriguing question — "Isn't this impossible?", "How is π hiding in here?", "Why won't it stop?"
+  · a vivid scenario or stakes — "Defending the Earth", "The last coin standing", "Escape the grid"
+  · a provocative teaser or claim — "Nothing adds up", "A number that shouldn't exist"
+  · playful, wry, or surprising is welcome.
+  HARD BAN: the formulaic "The <Adjective> <Noun>" pattern (e.g. "The Cubic Sentinel", "The Stubborn Remainder") — it is boring and overused; do not use it, and do not start most titles with "The". Keep it short (~2-6 words), specific to THIS problem's flavour, and never spoil the answer.
+- Also give a 1-3 word subtitle (a small tagline). The "difficulty" and "points" are DICTATED by the mode below — emit exactly the values it specifies (do not choose your own).
 - Also assign a "level" as an INTEGER 1-5 = the prerequisite mathematical KNOWLEDGE required to attempt it (this is about background needed, NOT how hard the puzzle is — a level-1 problem can still be a tough puzzle):
   1 = a first-year primary school student would technically have the base knowledge to attempt it;
   2 = knowledge content up to early high / secondary school;
@@ -210,7 +216,7 @@ const RESPONSE_FORMAT = `
 
 Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
-{"questionTitle":"<short evocative title>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
+{"questionTitle":"<curious, alluring hook — a question / scenario / teaser; NEVER 'The <Adjective> <Noun>'>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
 // CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
 // prerequisite KNOWLEDGE of a generated problem. This is ORTHOGONAL to how hard
