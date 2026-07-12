@@ -24,6 +24,39 @@ import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+// --- Resilience: never let a dropped socket take down the whole bridge. -------
+// The relay connection and remote MCP servers (HF Spaces sleep, tunnels reset)
+// routinely close sockets mid-stream; undici surfaces that as an async
+// "terminated" / UND_ERR_SOCKET rejection. With no handler, Node exits the
+// process — so the relay's own reconnect loop never gets to run. Swallow ONLY
+// these transient network errors and keep running; anything else still fails
+// fast so real bugs surface.
+const isTransientNetErr = (e) => {
+  const s = String(
+    e?.code || e?.cause?.code || e?.cause?.message || e?.message || e,
+  )
+  return /UND_ERR_SOCKET|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EPIPE|ENETUNREACH|EAI_AGAIN|terminated|other side closed|socket hang up|fetch failed/i.test(
+    s,
+  )
+}
+process.on("unhandledRejection", (err) => {
+  if (isTransientNetErr(err))
+    return console.error(
+      "[bridge] transient network error (continuing):",
+      err?.message || err,
+    )
+  console.error("[bridge] unhandledRejection:", err)
+})
+process.on("uncaughtException", (err) => {
+  if (isTransientNetErr(err))
+    return console.error(
+      "[bridge] transient network error (continuing):",
+      err?.message || err,
+    )
+  console.error("[bridge] uncaughtException:", err)
+  process.exit(1)
+})
+
 const PORT = Number(process.env.PORT || 4123)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"
 // Auto-generate a token if none supplied. Copy it into the app UI once.
