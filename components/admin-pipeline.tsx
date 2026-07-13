@@ -21,6 +21,7 @@ import type { ProverEvent } from '@/lib/prover/types';
 import {
   estimateCost,
   extractFeatures,
+  bridgeRunTransport,
   type EstimateResult,
 } from '@/lib/cost/estimator';
 
@@ -799,7 +800,12 @@ export function AdminPipeline() {
         features,
         theorem: item.lean || '',
         problem: item.problem || '',
-        callBridge: (path, init) => callBridge(false, path, init),
+        // Switch seam: today the estimate runs on your plan via the local
+        // bridge. Swap this transport for an API/Messages one to move to
+        // credits + a hosted service — nothing else changes.
+        transport: bridgeRunTransport((path, init) =>
+          callBridge(false, path, init),
+        ),
       })
         .then((est) => {
           if (est)
