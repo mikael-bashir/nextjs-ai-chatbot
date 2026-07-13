@@ -2745,7 +2745,14 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
       if (dis.refuted) return { verified: false, refuted: true, counterexample: dis.counterexample, disproof: dis.script }
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "The claimed counterexample did not verify — continuing to prove." })
     }
-    if (attempt >= maxRetry || ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
+    // When a compute budget is set the run is TIME-governed (like the single-agent
+    // path): keep retrying until the SHARED deadline or a Terminate — NOT a fixed
+    // attempt count — so extending the clock ("+5 min"/"+1h") actually buys more
+    // attempts instead of stopping early with budget to spare. Uncapped runs (no
+    // budget ⇒ Infinite deadline) keep the finite maxRetry so they can't loop
+    // forever. Every retry re-verifies independently, so soundness is unchanged.
+    const outOfAttempts = ctx.computeGoverned ? false : attempt >= maxRetry
+    if (outOfAttempts || ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
     extra = lastVerifyError
       ? `YOUR PREVIOUS ATTEMPT FAILED. The last verify_full_script reported:\n${lastVerifyError.slice(0, 1400)}\n\nFix the SPECIFIC error above — adjust the failing \`have\` or the final assembly, and keep the parts that already compiled.`
       : "YOUR PREVIOUS ATTEMPT did not produce a verified proof. Start from the skeleton-first approach: lay out the `have`s, compile the skeleton, then fill them."
