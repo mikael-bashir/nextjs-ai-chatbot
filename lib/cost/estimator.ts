@@ -15,6 +15,7 @@ import {
   DEFAULT_ESTIMATE_BUDGET_MS,
   buildEstimatePrompt,
   parseEstimate,
+  calibrateEstimate,
   extractFeatures,
   type EstimatorFeatures,
   type NeighborRow,
@@ -119,13 +120,26 @@ export async function estimateCost(opts: {
   const model = features.model || DEFAULT_ESTIMATOR_MODEL;
   const budgetMs = opts.budgetMs ?? DEFAULT_ESTIMATE_BUDGET_MS;
 
-  // 1) Retrieve nearest past proofs with actual costs (empirical anchor).
+  // 1) Retrieve nearest past proofs with actual costs (empirical anchor) and the
+  // estimator's own running accuracy (its measured bias, for self-calibration).
   let neighbors: NeighborRow[] = [];
   try {
     const r = await fetch(`/api/admin/cost-history?${neighborQuery(features)}`);
     if (r.ok) neighbors = (await r.json())?.neighbors ?? [];
   } catch {
     /* cold start / offline history — estimator falls back to goal difficulty */
+  }
+  let biasRel: number | null = null;
+  let statN = 0;
+  try {
+    const s = await fetch('/api/admin/cost-history?stats');
+    if (s.ok) {
+      const st = (await s.json())?.stats;
+      biasRel = typeof st?.biasRel === 'number' ? st.biasRel : null;
+      statN = Number(st?.n) || 0;
+    }
+  } catch {
+    /* no stats yet — calibration is a no-op until history accrues */
   }
 
   // 2) Assemble the shared prompt and run it through the transport.
@@ -144,10 +158,19 @@ export async function estimateCost(opts: {
   } catch {
     return null;
   }
-  const parsed = parseEstimate(text);
-  if (!parsed) return null;
+  const rawParsed = parseEstimate(text);
+  if (!rawParsed) return null;
+  // 3) Calibrate: divide out the estimator's measured bias and cap against the
+  // observed neighbour costs. This is what fixes the systematic over-estimation,
+  // and it self-stabilises because we persist the CALIBRATED number below.
+  const parsed = calibrateEstimate(rawParsed, {
+    biasRel,
+    n: statN,
+    neighborActuals: neighbors.map((nb) => Number(nb.actual_usd)),
+  });
 
-  // 3) Persist the estimate; the returned id lets us record the actual later.
+  // 4) Persist the (calibrated) estimate; the returned id lets us record the
+  // actual later so future bias is measured against what we actually predicted.
   let costHistoryId: string | undefined;
   try {
     const p = await fetch('/api/admin/cost-history', {

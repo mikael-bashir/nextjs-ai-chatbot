@@ -79,12 +79,14 @@ export function extractFeatures(
 
 export const ESTIMATOR_SYSTEM = `You are a cost estimator for an automated Lean 4 theorem-proving service that proves competition math problems with an agentic Claude prover. Given a problem, its Lean theorem, and a table of SIMILAR PAST proofs with their ACTUAL dollar costs, predict what it will cost to prove THIS problem.
 
-Reason about proof-search difficulty from the Lean goal itself: a decide/native_decide over a small finite domain is cheap; a general closed-form statement needing induction, algebra, or lemma search is far more expensive; deep multi-step or decomposable goals cost the most (they fan out into many sub-proofs). Longer/among-more-hypotheses goals trend costlier.
+CALIBRATION — READ FIRST. Your single most reliable prediction is the MEDIAN actual cost of the closest neighbors below. START THERE and stay close to it. The most common estimator failure is OVER-estimation — do not inflate. Move off the neighbor median only when the Lean goal is clearly structurally different, and move in PROPORTION to concrete evidence, never as a blanket safety margin.
 
-The SIMILAR PAST proofs are ground truth — ANCHOR your number to them, then adjust up or down for how this goal differs. If there is little/no history, estimate from the goal's intrinsic difficulty (typical proofs run about $0.05–$5, hard/decomposed ones can exceed $10).
+Most proofs are CHEAP: the agent closes the large majority with automation (decide / native_decide / simp / omega / nlinarith / ring) in one or two attempts. A "general" (non-decide) goal is the NORMAL case — do NOT add a premium just because a goal isn't a finite decide. Reserve materially higher numbers only for goals that are visibly LARGE, deeply multi-step, or explicitly decomposed (fanning into many sub-proofs).
+
+The SIMILAR PAST proofs are ground truth. If there is little/no history, be conservative and estimate LOW: assume a routine single problem costs well under $1 unless the Lean goal is visibly large or decomposed. Prefer under- to over-estimating when unsure.
 
 Output ONLY this strict JSON object, no prose and no code fences:
-{"estimateUsd": <number>, "low": <number>, "high": <number>, "rationale": "<1-3 sentences: the key drivers and which neighbors you anchored to>"}`;
+{"estimateUsd": <number>, "low": <number>, "high": <number>, "rationale": "<1-3 sentences: which neighbors you anchored to and why you moved off the median, if at all>"}`;
 
 export function buildEstimatePrompt(args: {
   theorem?: string;
@@ -110,6 +112,54 @@ export function buildEstimatePrompt(args: {
     `\nSIMILAR PAST PROOFS (actual costs — your empirical anchor):\n${table}`,
     `\nPredict the dollar cost to prove THIS problem. Output ONLY the JSON object.`,
   ].join('\n');
+}
+
+export function median(xs: number[]): number | null {
+  const a = xs.filter((x) => Number.isFinite(x) && x >= 0).sort((p, q) => p - q);
+  if (!a.length) return null;
+  const m = Math.floor(a.length / 2);
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
+
+// Deterministic post-hoc calibration — the learning loop the estimator was
+// missing. Two corrections, both aimed at the systematic OVER-estimation:
+//   1) Bias feedback: biasRel = mean (est-actual)/actual over history. If the
+//      estimator has been running high (biasRel > 0), divide it out so the
+//      predicted number tracks reality. Needs enough samples; the factor is
+//      bounded so a noisy small sample can't wildly swing a prediction. Because
+//      we persist the CALIBRATED number, biasRel self-stabilises toward 0.
+//   2) Reality rail: never let one estimate exceed a sane multiple of the worst
+//      observed neighbour cost (guards the "$40 for a $2 proof" blowups).
+export function calibrateEstimate(
+  raw: EstimateJson,
+  opts: { biasRel?: number | null; n?: number; neighborActuals?: number[] },
+): EstimateJson {
+  let factor = 1;
+  const n = opts.n ?? 0;
+  const b = opts.biasRel;
+  if (n >= 5 && typeof b === 'number' && Number.isFinite(b) && b > -0.99) {
+    // actual ≈ est / (1 + biasRel). Bound to [0.2, 2]: correct at most 5× down
+    // (chronic over-estimation) or 2× up, never more on a single call.
+    factor = Math.min(2, Math.max(0.2, 1 / (1 + b)));
+  }
+  let est = raw.estimateUsd * factor;
+  let low = raw.low * factor;
+  let high = raw.high * factor;
+  const acts = (opts.neighborActuals || [])
+    .filter((x) => Number.isFinite(x) && x > 0)
+    .sort((p, q) => p - q);
+  if (acts.length >= 3) {
+    const cap = acts[acts.length - 1] * 3; // ≤ 3× the worst neighbour
+    if (est > cap && est > 0) {
+      const s = cap / est;
+      est *= s;
+      low *= s;
+      high *= s;
+    }
+  }
+  const r = (x: number) => Math.max(0, Math.round(x * 1000) / 1000);
+  est = r(est);
+  return { estimateUsd: est, low: r(Math.min(low, est)), high: r(Math.max(high, est)), rationale: raw.rationale };
 }
 
 // Pull the estimator's JSON out of its reply (tolerating stray prose/fences).
