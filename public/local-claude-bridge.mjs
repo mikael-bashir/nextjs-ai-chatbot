@@ -141,6 +141,12 @@ function readBody(req) {
 
 // Build a safe, fixed set of CLI flags. Anything not modelled here is ignored —
 // the page cannot inject arbitrary flags or a different binary.
+// Tools the prover subagents (planner / minions / finisher / tree nodes) are NOT
+// allowed. WebSearch/WebFetch are literature-browsing escape hatches that let the
+// agent "discover" a goal is an open conjecture and stop proving — cut them so it
+// stays in the compiler. Tune here (e.g. add "Bash" to also cut numeric probing).
+const PROVER_DISALLOWED_TOOLS = ["WebSearch", "WebFetch"]
+
 function buildArgs(prompt, options = {}) {
   const args = ["-p", String(prompt), "--output-format", "json"]
   if (typeof options.model === "string" && options.model.trim())
@@ -2125,6 +2131,12 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       "-p", prompt,
       "--output-format", "stream-json", "--verbose",
       "--mcp-config", cfgPath, "--strict-mcp-config", "--dangerously-skip-permissions",
+      // The prover PROVES — it does not browse the literature. WebSearch/WebFetch
+      // were a surrender hatch: the agent would look up "is this open/hard", find
+      // it's an unsolved conjecture, and stop — burning the run on research instead
+      // of the compiler. Cut them. (Leak I loogle/moogle stay for LEAN lemma search,
+      // and Bash stays — numeric witness-finding is real proof work.)
+      "--disallowedTools", ...PROVER_DISALLOWED_TOOLS,
     ]
     if (model) args.push("--model", model)
     if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
