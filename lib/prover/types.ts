@@ -21,6 +21,11 @@ export interface ProverMetrics {
   tools_invoked?: number;
   llm_invocations?: number;
   time_elapsed?: number; // seconds
+  /** Running total dollar cost (sum of `total_cost_usd` across every claude
+   *  sub-run in this proof — planner + minions + finisher + node proves). */
+  cost_usd?: number;
+  /** Running total tokens across all sub-runs. */
+  tokens?: number;
 }
 
 export interface ProverEvent {
@@ -51,6 +56,8 @@ export interface ProverEvent {
 export interface ProverOutcome {
   verified: boolean;
   proof: string;
+  /** Actual dollar cost of the whole proof run (summed across sub-runs). */
+  costUsd?: number;
   /** The master was proven FALSE (counterexample verified by Lean). */
   refuted?: boolean;
   counterexample?: string;

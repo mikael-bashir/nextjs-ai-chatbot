@@ -310,13 +310,26 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
           }
           break;
         }
-        case 'done':
+        case 'done': {
+          // Actual dollar cost of the whole run, summed across sub-runs on the
+          // bridge and carried on the terminal metrics. `d.cost_usd` is accepted
+          // as a fallback in case a future bridge lifts it to the top level.
+          const doneMetrics = (metrics ?? d.metrics) as
+            | { cost_usd?: number }
+            | undefined;
+          const costUsd =
+            typeof d.cost_usd === 'number'
+              ? d.cost_usd
+              : typeof doneMetrics?.cost_usd === 'number'
+                ? doneMetrics.cost_usd
+                : undefined;
           outcome = {
             verified: !!d.verified,
             proof: d.proof || '',
             refuted: !!d.refuted,
             counterexample: d.counterexample,
             disproof: d.disproof,
+            costUsd,
           };
           emit(
             d.verified ? 'verified' : 'rejected',
@@ -328,6 +341,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
             { verified: !!d.verified, proof: d.proof || '', metrics },
           );
           break;
+        }
         case 'error':
           emit('error', d.message || 'Prover error', { metrics });
           break;

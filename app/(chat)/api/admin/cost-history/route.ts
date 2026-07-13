@@ -1,0 +1,110 @@
+import { auth } from '@/app/(auth)/auth';
+import { isAdminEmail } from '@/lib/admin';
+import {
+  insertEstimate,
+  recordActual,
+  nearestNeighbors,
+  accuracyStats,
+  type CostFeatures,
+  type EstimateInput,
+} from '@/lib/db/cost-history-queries';
+
+// Admin-only cost-estimator memory. Not part of the customer /v1 API.
+//   GET  ?stats            → estimator scoreboard (N / MAPE / bias, per-difficulty)
+//   GET  ?neighbors&<feat> → K nearest past problems with their actual costs
+//   POST { ...features, estimateUsd, estimateLow, estimateHigh, rationale } → { id }
+//   PATCH { id, actualUsd, verified } → records the actual once a proof finishes
+async function requireAdmin() {
+  const session = await auth();
+  return isAdminEmail(session?.user?.email) ? session : null;
+}
+
+function featuresFromParams(p: URLSearchParams): CostFeatures {
+  const num = (k: string) => {
+    const v = p.get(k);
+    return v == null || v === '' ? null : Number(v);
+  };
+  const bool = (k: string) => {
+    const v = p.get(k);
+    return v == null ? null : v === 'true' || v === '1';
+  };
+  return {
+    title: p.get('title'),
+    difficulty: p.get('difficulty'),
+    level: num('level'),
+    topic: p.get('topic'),
+    problemLen: num('problemLen'),
+    leanLen: num('leanLen'),
+    usesDecide: bool('usesDecide'),
+    isGeneral: bool('isGeneral'),
+    hypCount: num('hypCount'),
+    decompose: bool('decompose'),
+    model: p.get('model'),
+  };
+}
+
+export async function GET(request: Request) {
+  if (!(await requireAdmin())) {
+    return Response.json({ error: 'forbidden' }, { status: 403 });
+  }
+  const url = new URL(request.url);
+  const p = url.searchParams;
+  try {
+    if (p.has('stats')) {
+      return Response.json({ stats: await accuracyStats() });
+    }
+    if (p.has('neighbors')) {
+      const k = Number(p.get('k')) || 8;
+      const neighbors = await nearestNeighbors(
+        featuresFromParams(p),
+        Math.min(Math.max(k, 1), 30),
+      );
+      return Response.json({ neighbors });
+    }
+    return Response.json({ error: 'unknown_query' }, { status: 400 });
+  } catch (error) {
+    console.error('cost-history GET error:', error);
+    return Response.json({ error: 'internal' }, { status: 500 });
+  }
+}
+
+export async function POST(request: Request) {
+  if (!(await requireAdmin())) {
+    return Response.json({ error: 'forbidden' }, { status: 403 });
+  }
+  const body = (await request.json().catch(() => null)) as EstimateInput | null;
+  if (!body || !Number.isFinite(Number(body.estimateUsd))) {
+    return Response.json({ error: 'estimateUsd required' }, { status: 400 });
+  }
+  try {
+    const id = await insertEstimate({
+      ...body,
+      estimateUsd: Number(body.estimateUsd),
+      estimateLow: body.estimateLow == null ? null : Number(body.estimateLow),
+      estimateHigh: body.estimateHigh == null ? null : Number(body.estimateHigh),
+    });
+    return Response.json({ id });
+  } catch (error) {
+    console.error('cost-history POST error:', error);
+    return Response.json({ error: 'internal' }, { status: 500 });
+  }
+}
+
+export async function PATCH(request: Request) {
+  if (!(await requireAdmin())) {
+    return Response.json({ error: 'forbidden' }, { status: 403 });
+  }
+  const body = await request.json().catch(() => null);
+  const id = body?.id;
+  const actualUsd = Number(body?.actualUsd);
+  if (typeof id !== 'string' || !Number.isFinite(actualUsd)) {
+    return Response.json({ error: 'id + actualUsd required' }, { status: 400 });
+  }
+  try {
+    await recordActual(id, actualUsd, !!body?.verified);
+    return Response.json({ ok: true });
+  } catch (error) {
+    console.error('cost-history PATCH error:', error);
+    return Response.json({ error: 'internal' }, { status: 500 });
+  }
+}

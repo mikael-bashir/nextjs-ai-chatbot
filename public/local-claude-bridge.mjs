@@ -179,6 +179,18 @@ function extractText(stdout) {
   }
 }
 
+// Total tokens across all buckets of a claude usage object (input + both cache
+// tiers + output), used to accumulate a run-level token count alongside cost.
+function usageTokens(u) {
+  if (!u || typeof u !== "object") return 0
+  return (
+    (u.input_tokens || 0) +
+    (u.cache_creation_input_tokens || 0) +
+    (u.cache_read_input_tokens || 0) +
+    (u.output_tokens || 0)
+  )
+}
+
 // Pull token usage + cost out of claude's --output-format json result so the UI
 // can display per-call token counts and running totals.
 function extractMeta(stdout) {
@@ -1913,6 +1925,11 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
         }
       } else if (o.type === "result") {
         finalText = o.result || ""
+        // Actual cost: the CLI's final result frame carries total_cost_usd (a
+        // dollar-equivalent even on the Max plan; real spend on API credits) and
+        // usage. Accumulate onto the shared metrics so `done` reports it.
+        if (typeof o.total_cost_usd === "number") metrics.cost_usd = (metrics.cost_usd || 0) + o.total_cost_usd
+        if (o.usage) metrics.tokens = (metrics.tokens || 0) + usageTokens(o.usage)
       } else if (o.type === "system" && (o.subtype === "init" || o.model)) {
         // ONLY the init frame — it carries the run context (model, the MCP
         // servers it connected, how many tools it can drive). Claude Code also
@@ -2216,7 +2233,13 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           /* budget accounting must never crash the run */
         }
         if (emit) mapObjectToEvents(o, emit, stage, metrics)
-        if (o.type === "result") finalText = o.result || finalText
+        if (o.type === "result") {
+          finalText = o.result || finalText
+          // Sum this sub-run's cost into the shared tree metrics (ctx.metrics),
+          // so the tree's final `done` reports the whole item's actual cost.
+          if (metrics && typeof o.total_cost_usd === "number") metrics.cost_usd = (metrics.cost_usd || 0) + o.total_cost_usd
+          if (metrics && o.usage) metrics.tokens = (metrics.tokens || 0) + usageTokens(o.usage)
+        }
         if (stop && !stopped) {
           stopped = true
           kill()
@@ -3213,6 +3236,65 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   })()
 }
 
+// ===========================================================================
+// COST ESTIMATOR (a few-minute Opus call, retrieval-augmented)
+// ---------------------------------------------------------------------------
+// Predicts the dollar cost to PROVE a problem before we spend it, anchored to
+// the actual costs of similar past proofs. Tool-free + lean system prompt so the
+// estimate itself is cheap. The budget here caps the ESTIMATOR only — the prover
+// is never wall-clock-capped.
+const ESTIMATOR_SYSTEM = `You are a cost estimator for an automated Lean 4 theorem-proving service that proves competition math problems with an agentic Claude prover. Given a problem, its Lean theorem, and a table of SIMILAR PAST proofs with their ACTUAL dollar costs, predict what it will cost to prove THIS problem.
+
+Reason about proof-search difficulty from the Lean goal itself: a decide/native_decide over a small finite domain is cheap; a general closed-form statement needing induction, algebra, or lemma search is far more expensive; deep multi-step or decomposable goals cost the most (they fan out into many sub-proofs). Longer/among-more-hypotheses goals trend costlier.
+
+The SIMILAR PAST proofs are ground truth — ANCHOR your number to them, then adjust up or down for how this goal differs. If there is little/no history, estimate from the goal's intrinsic difficulty (typical proofs run about $0.05–$5, hard/decomposed ones can exceed $10).
+
+Output ONLY this strict JSON object, no prose and no code fences:
+{"estimateUsd": <number>, "low": <number>, "high": <number>, "rationale": "<1-3 sentences: the key drivers and which neighbors you anchored to>"}`;
+
+function buildEstimatePrompt({ theorem, problem, features, neighbors }) {
+  const f = features || {};
+  const rows = Array.isArray(neighbors) ? neighbors : [];
+  const table = rows.length
+    ? rows
+        .map(
+          (n) =>
+            `- ${n.difficulty || '?'}/L${n.level ?? '?'} decide=${!!n.uses_decide} general=${!!n.is_general} leanLen=${n.lean_len ?? '?'} hyps=${n.hyp_count ?? '?'} → $${Number(n.actual_usd).toFixed(3)} (${n.verified ? 'proved' : 'failed'})`,
+        )
+        .join('\n')
+    : '(no history yet — estimate from the Lean goal alone)';
+  return [
+    `PROBLEM:\n${String(problem || '(not provided)').slice(0, 4000)}`,
+    `\nLEAN THEOREM:\n${String(theorem || '(not provided)').slice(0, 4000)}`,
+    `\nFEATURES: difficulty=${f.difficulty ?? '?'}, level=${f.level ?? '?'}, topic=${f.topic ?? '?'}, leanLen=${f.leanLen ?? '?'}, usesDecide=${!!f.usesDecide}, general=${!!f.isGeneral}, hypotheses=${f.hypCount ?? '?'}, decompose=${!!f.decompose}`,
+    `\nSIMILAR PAST PROOFS (actual costs — your empirical anchor):\n${table}`,
+    `\nPredict the dollar cost to prove THIS problem. Output ONLY the JSON object.`,
+  ].join('\n');
+}
+
+// Pull the estimator's JSON out of its reply (tolerating stray prose/fences).
+function parseEstimate(text) {
+  const t = String(text || '');
+  const m = t.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  let o;
+  try {
+    o = JSON.parse(m[0]);
+  } catch {
+    return null;
+  }
+  const est = Number(o.estimateUsd);
+  if (!Number.isFinite(est) || est < 0) return null;
+  const low = Number.isFinite(Number(o.low)) ? Number(o.low) : est;
+  const high = Number.isFinite(Number(o.high)) ? Number(o.high) : est;
+  return {
+    estimateUsd: est,
+    low: Math.min(low, est),
+    high: Math.max(high, est),
+    rationale: typeof o.rationale === 'string' ? o.rationale.slice(0, 600) : '',
+  };
+}
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`)
 
@@ -3276,6 +3358,38 @@ const server = createServer(async (req, res) => {
         maxOutputTokens: Number(options.maxOutputTokens) || 0,
       })
       return json(res, 200, result)
+    }
+
+    // Cost estimate for one problem — a single tool-free Opus call, capped to a
+    // few minutes (the estimator ONLY; never the prover).
+    if (req.method === "POST" && url.pathname === "/estimate") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const theorem = typeof body.theorem === "string" ? body.theorem : ""
+      const problem = typeof body.problem === "string" ? body.problem : ""
+      if (!theorem.trim() && !problem.trim()) {
+        return json(res, 400, { error: "problem_or_theorem_required" })
+      }
+      const budgetMs = Math.min(Math.max(Number(body.budgetMs) || 180000, 30000), 300000)
+      const killer = new AbortController()
+      res.on("close", () => {
+        if (!res.writableEnded) killer.abort()
+      })
+      const prompt = buildEstimatePrompt({
+        theorem,
+        problem,
+        features: body.features || {},
+        neighbors: body.neighbors || [],
+      })
+      const model = typeof body.model === "string" && body.model.trim() ? body.model.trim() : "claude-opus-4-8"
+      const result = await runClaude(
+        buildArgs(prompt, { model, systemPrompt: ESTIMATOR_SYSTEM, excludeDynamicSections: true }),
+        { timeoutMs: budgetMs, killSignal: killer.signal, maxOutputTokens: 4000 },
+      )
+      const parsed = parseEstimate(result.text)
+      if (!parsed) {
+        return json(res, 200, { ok: false, error: "unparseable_estimate", raw: (result.text || "").slice(0, 500), model, estimatorCostUsd: result.costUsd ?? null })
+      }
+      return json(res, 200, { ok: true, ...parsed, model, estimatorCostUsd: result.costUsd ?? null })
     }
 
     if (req.method === "POST" && url.pathname === "/prove") {

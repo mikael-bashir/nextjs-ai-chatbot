@@ -18,6 +18,40 @@ import {
 } from '@/lib/prover/run-prover-stream';
 import { ProverConsole } from '@/components/prover/prover-console';
 import type { ProverEvent } from '@/lib/prover/types';
+import {
+  estimateCost,
+  extractFeatures,
+  type EstimateResult,
+} from '@/lib/cost/estimator';
+
+// Per-item cost state (session-scoped): the estimate made on enqueue and the
+// actual recorded once the proof finishes. Persisted rows live in
+// proof_cost_history; this map drives the live per-card display.
+interface ItemCost {
+  estimating?: boolean;
+  estFailed?: boolean;
+  estUsd?: number;
+  estLow?: number;
+  estHigh?: number;
+  estRationale?: string;
+  costHistoryId?: string;
+  actualUsd?: number;
+}
+
+// Estimator scoreboard shape (mirrors AccuracyStats in cost-history-queries; kept
+// local so this client module doesn't import the server-only DB layer).
+interface EstStats {
+  n: number;
+  mape: number | null;
+  biasRel: number | null;
+  biasAbs: number | null;
+  byDifficulty: { difficulty: string; n: number; mape: number | null }[];
+}
+
+const fmtUsd = (n: number | null | undefined) =>
+  n == null ? '—' : `$${n.toFixed(n < 1 ? 3 : 2)}`;
+const fmtPct = (n: number | null | undefined) =>
+  n == null ? '—' : `${(n * 100).toFixed(0)}%`;
 import { MathMarkdown } from '@/components/math-markdown';
 
 const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
@@ -637,6 +671,33 @@ export function AdminPipeline() {
     lastCostUsd: 0,
   });
 
+  // Cost estimator: per-item estimate/actual (session-scoped, keyed by item id)
+  // + the running accuracy scoreboard. `costsRef` mirrors `costs` so the async
+  // verify loop can read/patch without a stale closure. `estPromiseRef` holds the
+  // in-flight estimate so the loop can join it (for the history row id) when the
+  // proof — which runs concurrently — finishes.
+  const [costs, setCosts] = useState<Record<string, ItemCost>>({});
+  const costsRef = useRef<Record<string, ItemCost>>({});
+  const estPromiseRef = useRef<Record<string, Promise<EstimateResult | null>>>(
+    {},
+  );
+  const [estStats, setEstStats] = useState<EstStats | null>(null);
+  const setCost = useCallback((id: string, patch: Partial<ItemCost>) => {
+    costsRef.current = {
+      ...costsRef.current,
+      [id]: { ...costsRef.current[id], ...patch },
+    };
+    setCosts({ ...costsRef.current });
+  }, []);
+  const loadEstStats = useCallback(async () => {
+    try {
+      const r = await fetch('/api/admin/cost-history?stats');
+      if (r.ok) setEstStats((await r.json())?.stats ?? null);
+    } catch {
+      /* scoreboard is best-effort */
+    }
+  }, []);
+
   // Auto-pause when Claude's session/usage limit is hit; auto-resume at reset.
   const [limitPause, setLimitPause] = useState<{
     message: string;
@@ -714,6 +775,53 @@ export function AdminPipeline() {
   );
 
   const fetchMcp = (): Promise<ProverMcpServer[]> => fetchProverMcpServers();
+
+  // Kick off the cost estimate for an item (auto, on enqueue). Runs CONCURRENTLY
+  // with proving; the result lands on `costs[id]` and the promise on
+  // `estPromiseRef` so the verify loop can join it and record the actual against
+  // the same proof_cost_history row.
+  const runEstimate = useCallback(
+    (item: GeneratedItem) => {
+      if (!item.lean || item.id in estPromiseRef.current) return;
+      setCost(item.id, { estimating: true, estFailed: false });
+      const model = verifyModelRef.current || 'claude-opus-4-8';
+      const features = extractFeatures(
+        {
+          questionTitle: item.questionTitle,
+          problem: item.problem,
+          difficulty: item.difficulty,
+          level: item.level,
+          lean: item.lean,
+        },
+        { decompose: verifyDecomposeRef.current, model },
+      );
+      const p = estimateCost({
+        features,
+        theorem: item.lean || '',
+        problem: item.problem || '',
+        callBridge: (path, init) => callBridge(false, path, init),
+      })
+        .then((est) => {
+          if (est)
+            setCost(item.id, {
+              estimating: false,
+              estUsd: est.estimateUsd,
+              estLow: est.low,
+              estHigh: est.high,
+              estRationale: est.rationale,
+              costHistoryId: est.costHistoryId,
+            });
+          else setCost(item.id, { estimating: false, estFailed: true });
+          return est;
+        })
+        .catch(() => {
+          setCost(item.id, { estimating: false, estFailed: true });
+          return null;
+        });
+      estPromiseRef.current[item.id] = p;
+    },
+    [callBridge, setCost],
+  );
 
   // Prove via the SHARED bridge, streaming EVERY step into <ProverConsole> via
   // the same runProverStream the admin queue resolver + playground use. THROWS on
@@ -810,6 +918,7 @@ export function AdminPipeline() {
         let proof = '';
         let refuted = false;
         let counterexample = '';
+        let actualUsd: number | undefined;
         try {
           const mcpServers = await fetchMcp();
           const out = await proveStream(
@@ -818,6 +927,9 @@ export function AdminPipeline() {
             ctrl.signal,
           );
           verified = out.verified;
+          // Actual dollar cost of the whole run (summed across sub-runs on the
+          // bridge). Shown on the card and recorded against the estimate.
+          actualUsd = typeof out.costUsd === 'number' ? out.costUsd : undefined;
           // For a refuted theorem there is no proof — store the machine-checked
           // `¬theorem` disproof instead so the card can show the counterexample.
           proof = out.refuted ? out.disproof || '' : out.proof;
@@ -878,6 +990,30 @@ export function AdminPipeline() {
             item.questionTitle || item.problem?.slice(0, 60) || item.id
           }`,
         );
+        // Record the actual cost against this item's estimate. The estimate
+        // runs concurrently, so join its promise for the history row id, then
+        // PATCH the actual and refresh the scoreboard.
+        if (actualUsd != null) {
+          setCost(item.id, { actualUsd });
+          try {
+            const est = await estPromiseRef.current[item.id];
+            if (est?.costHistoryId) {
+              await fetch('/api/admin/cost-history', {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  id: est.costHistoryId,
+                  actualUsd,
+                  verified,
+                }),
+              });
+              loadEstStats();
+            }
+          } catch {
+            /* recording is best-effort; the actual still shows on the card */
+          }
+        }
+
         queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
         syncQueue();
       }
@@ -929,6 +1065,11 @@ export function AdminPipeline() {
     return () => clearTimeout(id);
   }, [limitPause, resumeNow]);
 
+  // Load the estimator scoreboard on mount (and it refreshes after each actual).
+  useEffect(() => {
+    loadEstStats();
+  }, [loadEstStats]);
+
   // Add to the verification queue — persists queued=true so it survives reloads.
   const enqueueVerify = useCallback(
     async (item: GeneratedItem) => {
@@ -940,10 +1081,14 @@ export function AdminPipeline() {
       }
       queueRef.current = [...queueRef.current, { ...item, queued: true }];
       syncQueue();
+      // Auto-estimate the cost the moment it enters the queue — every problem
+      // piped to the verifier gets a prediction, computed concurrently with the
+      // proof (its few-minute budget never touches the prover).
+      runEstimate(item);
       await patchGenerated(item.id, { queued: true });
       runVerifier();
     },
-    [runVerifier],
+    [runVerifier, runEstimate],
   );
 
   const removeFromVerifyQueue = async (id: string) => {
@@ -1595,6 +1740,48 @@ export function AdminPipeline() {
             {fmtTokens(CONTEXT_WINDOW)} context window.
           </p>
         )}
+
+        {/* Cost estimator scoreboard — how close estimates have tracked actuals.
+            The "test the estimator" surface: it should improve as more proofs
+            land (MAPE ↓). Bias > 0 means we over-estimate on average. */}
+        <div className="mt-3 rounded-md border p-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Cost estimator
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              {estStats?.n ? `${estStats.n} scored` : 'no scored proofs yet'}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center text-[11px]">
+            <div>
+              <div className="font-semibold">{fmtPct(estStats?.mape)}</div>
+              <div className="text-muted-foreground">MAPE</div>
+            </div>
+            <div>
+              <div className="font-semibold">
+                {estStats?.biasRel == null
+                  ? '—'
+                  : `${estStats.biasRel > 0 ? '+' : ''}${fmtPct(estStats.biasRel)}`}
+              </div>
+              <div className="text-muted-foreground">bias</div>
+            </div>
+            <div>
+              <div className="font-semibold">{fmtUsd(estStats?.biasAbs)}</div>
+              <div className="text-muted-foreground">avg $ error</div>
+            </div>
+          </div>
+          {estStats?.byDifficulty && estStats.byDifficulty.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+              {estStats.byDifficulty.map((d) => (
+                <span key={d.difficulty}>
+                  {d.difficulty}: {fmtPct(d.mape)}{' '}
+                  <span className="opacity-60">(n={d.n})</span>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {/* Activity / error log */}
@@ -1938,6 +2125,7 @@ export function AdminPipeline() {
                     <p className="mt-0.5 text-xs text-muted-foreground">
                       {metaLine(g, true)}
                     </p>
+                    <CostLine cost={costs[g.id]} />
                   </div>
                 </div>
 
@@ -2146,6 +2334,47 @@ export function AdminPipeline() {
         the main CompeteMath queue and archives the Lean proof to the database.
       </p>
     </div>
+  );
+}
+
+// Per-card cost line: the estimate (with band + rationale on hover) and, once
+// the proof lands, the actual and the signed delta.
+function CostLine({ cost }: { cost?: ItemCost }) {
+  if (!cost) return null;
+  const { estimating, estFailed, estUsd, estLow, estHigh, estRationale, actualUsd } =
+    cost;
+  if (!estimating && !estFailed && estUsd == null && actualUsd == null)
+    return null;
+  const delta = estUsd != null && actualUsd != null ? actualUsd - estUsd : null;
+  return (
+    <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+      {estimating ? (
+        <span className="text-amber-500">estimating cost…</span>
+      ) : estFailed ? (
+        <span className="text-muted-foreground">estimate unavailable</span>
+      ) : estUsd != null ? (
+        <span className="text-amber-600" title={estRationale || undefined}>
+          est {fmtUsd(estUsd)}
+          {estLow != null && estHigh != null && (
+            <span className="opacity-60">
+              {' '}
+              ({fmtUsd(estLow)}–{fmtUsd(estHigh)})
+            </span>
+          )}
+        </span>
+      ) : null}
+      {actualUsd != null && (
+        <span className="font-medium text-emerald-600">
+          actual {fmtUsd(actualUsd)}
+        </span>
+      )}
+      {delta != null && Math.abs(delta) > 1e-9 && (
+        <span className={delta > 0 ? 'text-rose-500' : 'text-emerald-500'}>
+          Δ {delta > 0 ? '+' : '−'}
+          {fmtUsd(Math.abs(delta))}
+        </span>
+      )}
+    </p>
   );
 }
 
