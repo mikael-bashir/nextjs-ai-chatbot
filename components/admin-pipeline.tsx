@@ -387,6 +387,14 @@ interface GeneratedItem extends StagedItem {
   verified: boolean;
   error?: string | null;
   queued?: boolean;
+  // Persisted cost-estimator state (hydrated into the `costs` map on load so the
+  // per-card estimate/actual survive a refresh).
+  estUsd?: number;
+  estLow?: number;
+  estHigh?: number;
+  estRationale?: string;
+  costHistoryId?: string;
+  actualUsd?: number;
 }
 
 interface Health {
@@ -808,7 +816,7 @@ export function AdminPipeline() {
         ),
       })
         .then((est) => {
-          if (est)
+          if (est) {
             setCost(item.id, {
               estimating: false,
               estUsd: est.estimateUsd,
@@ -817,7 +825,16 @@ export function AdminPipeline() {
               estRationale: est.rationale,
               costHistoryId: est.costHistoryId,
             });
-          else setCost(item.id, { estimating: false, estFailed: true });
+            // Persist onto the generated record so the estimate survives a
+            // refresh (the `costs` map is session-only). Best-effort.
+            patchGenerated(item.id, {
+              estUsd: est.estimateUsd,
+              estLow: est.low,
+              estHigh: est.high,
+              estRationale: est.rationale,
+              costHistoryId: est.costHistoryId,
+            });
+          } else setCost(item.id, { estimating: false, estFailed: true });
           return est;
         })
         .catch(() => {
@@ -1001,14 +1018,21 @@ export function AdminPipeline() {
         // PATCH the actual and refresh the scoreboard.
         if (actualUsd != null) {
           setCost(item.id, { actualUsd });
+          // Persist the actual onto the generated record so it survives a
+          // refresh, not just the session `costs` map. Best-effort.
+          patchGenerated(item.id, { actualUsd });
           try {
             const est = await estPromiseRef.current[item.id];
-            if (est?.costHistoryId) {
+            // After a refresh the in-flight estimate promise is gone; fall back
+            // to the costHistoryId persisted on the item / in the costs map.
+            const histId =
+              est?.costHistoryId ?? costsRef.current[item.id]?.costHistoryId;
+            if (histId) {
               await fetch('/api/admin/cost-history', {
                 method: 'PATCH',
                 headers: { 'content-type': 'application/json' },
                 body: JSON.stringify({
-                  id: est.costHistoryId,
+                  id: histId,
                   actualUsd,
                   verified,
                 }),
@@ -1139,6 +1163,24 @@ export function AdminPipeline() {
       const list: GeneratedItem[] = Array.isArray(j.items) ? j.items : [];
       setGenerated(list);
       if (typeof j.cap === 'number') setGenCap(j.cap);
+      // Rehydrate the per-card cost display from the persisted item fields so the
+      // estimate/actual survive a refresh (the `costs` map is session-only).
+      const seeded: Record<string, ItemCost> = { ...costsRef.current };
+      for (const it of list) {
+        if (it.estUsd != null || it.actualUsd != null || it.costHistoryId) {
+          seeded[it.id] = {
+            ...seeded[it.id],
+            estUsd: it.estUsd,
+            estLow: it.estLow,
+            estHigh: it.estHigh,
+            estRationale: it.estRationale,
+            costHistoryId: it.costHistoryId,
+            actualUsd: it.actualUsd,
+          };
+        }
+      }
+      costsRef.current = seeded;
+      setCosts(seeded);
       rebuildQueue(list);
     } catch {
       /* ignore */

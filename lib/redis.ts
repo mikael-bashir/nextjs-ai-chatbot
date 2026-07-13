@@ -141,6 +141,15 @@ export interface GeneratedRecord {
   // reloads and the verifier can resume it later.
   queued?: boolean;
   toolchain?: string;
+  // Cost-estimator display state, persisted so the estimate (made on enqueue)
+  // and the actual (recorded on verify) survive a page refresh. The learning
+  // history lives separately in proof_cost_history; these mirror it per-card.
+  estUsd?: number;
+  estLow?: number;
+  estHigh?: number;
+  estRationale?: string;
+  costHistoryId?: string;
+  actualUsd?: number;
   createdAt: string;
 }
 

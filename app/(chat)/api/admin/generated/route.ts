@@ -146,6 +146,18 @@ export async function PATCH(request: NextRequest) {
     if ('proof' in body) patch.proof = body.proof ?? '';
     if ('error' in body) patch.error = body.error ?? null;
     if ('queued' in body) patch.queued = !!body.queued;
+    // Cost-estimator display fields — persisted so the estimate/actual survive a
+    // refresh (they mirror the proof_cost_history row driving the scoreboard).
+    for (const k of [
+      'estUsd',
+      'estLow',
+      'estHigh',
+      'estRationale',
+      'costHistoryId',
+      'actualUsd',
+    ] as const) {
+      if (k in body) patch[k] = body[k];
+    }
     const updated = await updateGenerated(body.id, patch);
     return updated
       ? Response.json({ ok: true, item: updated })
