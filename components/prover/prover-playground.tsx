@@ -1,17 +1,34 @@
 'use client';
 
-import { useCallback, useState } from 'react';
-import { Loader2, Play, ShieldCheck, ShieldAlert, GitBranch } from 'lucide-react';
+import { useCallback, useRef, useState } from 'react';
+import {
+  Loader2,
+  Play,
+  ShieldCheck,
+  ShieldAlert,
+  GitBranch,
+  Square,
+} from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { fetchProverMcpServers } from '@/lib/mcp/fetch-prover-servers';
-import { runProverStream } from '@/lib/prover/run-prover-stream';
+import {
+  runProverStream,
+  extendProverRun,
+} from '@/lib/prover/run-prover-stream';
 import { ProverConsole } from '@/components/prover/prover-console';
 import type { ProverEvent, ProverOutcome } from '@/lib/prover/types';
 
+// Wall-clock budget for a decomposition (tree) run — matches the admin verifier
+// (VERIFY_COMPUTE_BUDGET_MS) so the playground behaves identically. The tree path
+// governs by TIME when this is set and reports a runId so "+5 min" can push it
+// out; the single-agent path ignores it. Never a cap on the prover otherwise.
+const PLAYGROUND_COMPUTE_BUDGET_MS = 30 * 60_000;
+
 // A minimal "message the prover" surface. It reuses the exact same runner +
-// console as the admin queue resolver — send a statement, watch every step.
+// console as the admin queue resolver — send a statement, watch every step,
+// extend the compute budget live, or terminate — full parity with the verifier.
 export function ProverPlayground() {
   const [problem, setProblem] = useState(
     'theorem sample : 1 + 1 = 2 := by sorry',
@@ -27,30 +44,88 @@ export function ProverPlayground() {
   // Model the prover runs on ('' = the bridge/CLI default).
   const [model, setModel] = useState('');
 
-  const run = useCallback(async () => {
-    if (!problem.trim()) return;
-    setRunning(true);
-    setEvents([]);
-    setOutcome(null);
-    const append = (e: ProverEvent) => setEvents((prev) => [...prev, e]);
+  // Live compute-budget state for the tree path: the bridge reports a runId +
+  // deadline via onRunId; the "+5 min" button (extend) pushes the deadline out.
+  const [computeLimit, setComputeLimit] = useState<{
+    deadlineMs: number;
+    budgetMs: number;
+  } | null>(null);
+  const [extending, setExtending] = useState(false);
+  const runIdRef = useRef<string | null>(null);
+  // Latest saved checkpoint (a partially-filled skeleton) from a decompose run.
+  // Persists in component state so you can Resume after a Terminate or a stop.
+  const [checkpoint, setCheckpoint] = useState<{
+    skeleton: string;
+    filled: number;
+    total: number;
+  } | null>(null);
+  // Lets the Terminate button abort a running prove; aborting the fetch trips the
+  // bridge's disconnect handler, which kills the claude run server-side.
+  const abortRef = useRef<AbortController | null>(null);
+
+  const run = useCallback(
+    async (seed?: string) => {
+      if (!problem.trim()) return;
+      // Resuming is always a tree run (the seed is a have-tree skeleton).
+      const asTree = decompose || !!seed;
+      setRunning(true);
+      setEvents([]);
+      setOutcome(null);
+      setComputeLimit(null);
+      runIdRef.current = null;
+      const ctrl = new AbortController();
+      abortRef.current = ctrl;
+      const append = (e: ProverEvent) => setEvents((prev) => [...prev, e]);
+      try {
+        const mcpServers = await fetchProverMcpServers();
+        const out = await runProverStream({
+          problem,
+          mcpServers,
+          model: model || undefined,
+          signal: ctrl.signal,
+          onEvent: append,
+          source: asTree ? `playground-tree:${strategy}` : 'playground',
+          endpoint: asTree ? 'prove-tree' : 'prove-stream',
+          strategy: asTree ? strategy : undefined,
+          seed,
+          // Tree path runs under an extendable wall-clock budget; the single-agent
+          // path ignores it (and never fires onRunId), so no indicator shows.
+          computeBudgetMs: asTree ? PLAYGROUND_COMPUTE_BUDGET_MS : undefined,
+          onRunId: ({ runId, deadlineMs, budgetMs }) => {
+            runIdRef.current = runId;
+            setComputeLimit({ deadlineMs, budgetMs });
+          },
+          // Auto-save the latest banked checkpoint so a stop/Terminate can Resume.
+          onCheckpoint: (cp) => setCheckpoint(cp),
+        });
+        setOutcome(out);
+      } catch {
+        /* the console already shows the error event (or the abort) */
+      } finally {
+        setRunning(false);
+        runIdRef.current = null;
+        abortRef.current = null;
+      }
+    },
+    [problem, decompose, strategy, model],
+  );
+
+  // "+5 min" — push the running prove's wall-clock budget out. Best-effort.
+  const extend = useCallback(async () => {
+    const runId = runIdRef.current;
+    if (!runId || extending) return;
+    setExtending(true);
     try {
-      const mcpServers = await fetchProverMcpServers();
-      const out = await runProverStream({
-        problem,
-        mcpServers,
-        model: model || undefined,
-        onEvent: append,
-        source: decompose ? `playground-tree:${strategy}` : 'playground',
-        endpoint: decompose ? 'prove-tree' : 'prove-stream',
-        strategy: decompose ? strategy : undefined,
-      });
-      setOutcome(out);
-    } catch {
-      /* the console already shows the error event */
+      const r = await extendProverRun({ runId, addMs: 5 * 60_000 });
+      if (r) setComputeLimit(r);
     } finally {
-      setRunning(false);
+      setExtending(false);
     }
-  }, [problem, decompose, strategy, model]);
+  }, [extending]);
+
+  const terminate = useCallback(() => {
+    abortRef.current?.abort();
+  }, []);
 
   return (
     <div className="space-y-4">
@@ -62,7 +137,7 @@ export function ProverPlayground() {
         placeholder="Enter a statement (Lean theorem, or a problem to prove)…"
       />
       <div className="flex flex-wrap items-center gap-3">
-        <Button onClick={run} disabled={running || !problem.trim()} className="gap-2">
+        <Button onClick={() => run()} disabled={running || !problem.trim()} className="gap-2">
           {running ? (
             <Loader2 className="size-4 animate-spin" />
           ) : (
@@ -70,6 +145,28 @@ export function ProverPlayground() {
           )}
           Send to prover
         </Button>
+        {!running && checkpoint && (
+          <button
+            type="button"
+            onClick={() => run(checkpoint.skeleton)}
+            className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/50 bg-violet-500/10 px-3 py-1.5 text-sm text-violet-600 transition-colors hover:bg-violet-500/20 dark:text-violet-400"
+            title="Continue from the saved checkpoint instead of restarting"
+          >
+            <GitBranch className="size-3.5" />
+            Resume ({checkpoint.filled}/{checkpoint.total})
+          </button>
+        )}
+        {running && (
+          <button
+            type="button"
+            onClick={terminate}
+            className="inline-flex items-center gap-1.5 rounded-md border border-rose-500/50 bg-rose-500/10 px-3 py-1.5 text-sm text-rose-600 transition-colors hover:bg-rose-500/20 dark:text-rose-400"
+            title="Stop this prove — kills the claude run server-side via the bridge"
+          >
+            <Square className="size-3.5" />
+            Terminate
+          </button>
+        )}
         <button
           type="button"
           onClick={() => setDecompose((v) => !v)}
@@ -127,11 +224,19 @@ export function ProverPlayground() {
           {strategy === 'pantograph'
             ? 'Pantograph mode builds proofs interactively in Leak II; Leak IV is used only as the final guardrail.'
             : 'Hacker mode leads with the compiler (verify_full_script) and strong automation.'}{' '}
-          Needs a verify_full_script MCP server connected.
+          Needs a verify_full_script MCP server connected. Runs under a{' '}
+          {Math.round(PLAYGROUND_COMPUTE_BUDGET_MS / 60_000)}-minute compute
+          budget you can extend live (+5 min).
         </p>
       )}
 
-      <ProverConsole events={events} running={running} />
+      <ProverConsole
+        events={events}
+        running={running}
+        computeLimit={computeLimit}
+        onExtend={extend}
+        extending={extending}
+      />
 
       {outcome && (
         <div

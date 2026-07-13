@@ -150,6 +150,12 @@ export interface GeneratedRecord {
   estRationale?: string;
   costHistoryId?: string;
   actualUsd?: number;
+  // Saved verification progress: the latest resumable checkpoint from a have-tree
+  // run (a partially-filled `have`-skeleton). Auto-persisted as holes bank, so a
+  // stopped run (limit / terminate / crash) can resume instead of restarting.
+  proofCheckpoint?: string;
+  proofCheckpointFilled?: number;
+  proofCheckpointTotal?: number;
   createdAt: string;
 }
 

@@ -155,6 +155,10 @@ export async function PATCH(request: NextRequest) {
       'estRationale',
       'costHistoryId',
       'actualUsd',
+      // Saved verification progress (resumable have-tree checkpoint).
+      'proofCheckpoint',
+      'proofCheckpointFilled',
+      'proofCheckpointTotal',
     ] as const) {
       if (k in body) patch[k] = body[k];
     }

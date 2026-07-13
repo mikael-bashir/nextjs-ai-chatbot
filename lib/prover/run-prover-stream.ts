@@ -52,6 +52,18 @@ interface RunOpts {
     deadlineMs: number;
     budgetMs: number;
   }) => void;
+  // Resume a saved run: a checkpoint (partially-filled `have`-skeleton) from a
+  // prior run. The tree path finishes the remaining holes straight from it
+  // instead of replanning. Tree path only; ignored by the single-agent path.
+  seed?: string;
+  // Fires whenever the tree run banks progress — the latest resumable checkpoint
+  // (skeleton with proven holes filled, rest still `sorry`). Persist the newest
+  // one so any stop (limit / terminate / crash) can resume from it.
+  onCheckpoint?: (info: {
+    skeleton: string;
+    filled: number;
+    total: number;
+  }) => void;
 }
 
 // Push out a running prove's wall-clock budget (the "+5 min" button). Returns the
@@ -173,6 +185,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
           ...(opts.computeBudgetMs && opts.computeBudgetMs > 0
             ? { computeBudgetMs: opts.computeBudgetMs }
             : {}),
+          ...(opts.seed && opts.seed.trim() ? { seed: opts.seed } : {}),
         },
       }),
       signal,
@@ -247,6 +260,20 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
               deadlineMs: Number(d.deadlineMs) || 0,
               budgetMs: Number(d.budgetMs) || 0,
             });
+          break;
+        case 'checkpoint':
+          // The tree run banked progress — a resumable partially-filled skeleton.
+          // Surface the latest so the client can persist it (auto-save).
+          if (typeof d.skeleton === 'string' && d.skeleton.trim()) {
+            opts.onCheckpoint?.({
+              skeleton: d.skeleton,
+              filled: Number(d.filled) || 0,
+              total: Number(d.total) || 0,
+            });
+            emit('system', `Progress saved (${Number(d.filled) || 0}/${Number(d.total) || 0} holes banked)`, {
+              detail: d.skeleton,
+            });
+          }
           break;
         case 'prompt':
           // The exact context the bridge built for the agent (admin debug log).

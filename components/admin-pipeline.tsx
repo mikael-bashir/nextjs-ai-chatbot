@@ -395,6 +395,10 @@ interface GeneratedItem extends StagedItem {
   estRationale?: string;
   costHistoryId?: string;
   actualUsd?: number;
+  // Saved verification progress (resumable have-tree checkpoint), auto-persisted.
+  proofCheckpoint?: string;
+  proofCheckpointFilled?: number;
+  proofCheckpointTotal?: number;
 }
 
 interface Health {
@@ -672,6 +676,9 @@ export function AdminPipeline() {
   } | null>(null);
   const [extending, setExtending] = useState(false);
   const runIdRef = useRef<string | null>(null);
+  // item.id -> saved checkpoint to resume from, set by "Resume from saved" and
+  // consumed once by the verify loop (so a plain re-verify still starts fresh).
+  const resumeSeedRef = useRef<Record<string, string>>({});
   const [usage, setUsage] = useState({
     calls: 0,
     tokens: 0,
@@ -858,6 +865,7 @@ export function AdminPipeline() {
       lean: string,
       mcpServers: ProverMcpServer[],
       signal?: AbortSignal,
+      opts?: { itemId?: string; seed?: string },
     ) => {
       const conn = connFor(false); // shared (verification) bridge
       let content = ''; // accumulate text to detect a session-limit message
@@ -867,7 +875,11 @@ export function AdminPipeline() {
         if (ev.label) content += ` ${ev.label}`;
       };
       try {
-        const decompose = verifyDecomposeRef.current;
+        // Resuming from a saved checkpoint is always a tree run (the seed is a
+        // have-tree skeleton), so force the tree path + budget regardless of the
+        // current decompose toggle.
+        const resuming = !!opts?.seed;
+        const decompose = verifyDecomposeRef.current || resuming;
         const strategy = verifyStrategyRef.current;
         const model = verifyModelRef.current;
         const outcome = await runProverStream({
@@ -881,12 +893,23 @@ export function AdminPipeline() {
           source: decompose ? `acg-tree:${strategy}` : 'acg',
           endpoint: decompose ? 'prove-tree' : 'prove-stream',
           strategy: decompose ? strategy : undefined,
+          seed: opts?.seed,
           // Tree path runs under an extendable wall-clock budget; the single-agent
           // path ignores it (and never fires onRunId), so the indicator stays off.
           computeBudgetMs: decompose ? VERIFY_COMPUTE_BUDGET_MS : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
             setComputeLimit({ deadlineMs, budgetMs });
+          },
+          // Auto-save: persist the newest banked checkpoint on the item so ANY
+          // stop (usage-limit / Terminate / crash) can resume from it later.
+          onCheckpoint: ({ skeleton, filled, total }) => {
+            if (!opts?.itemId) return;
+            patchGenerated(opts.itemId, {
+              proofCheckpoint: skeleton,
+              proofCheckpointFilled: filled,
+              proofCheckpointTotal: total,
+            });
           },
         });
         const lim = detectSessionLimit(content);
@@ -944,10 +967,16 @@ export function AdminPipeline() {
         let actualUsd: number | undefined;
         try {
           const mcpServers = await fetchMcp();
+          // If this item was enqueued via "Resume from saved", hand its checkpoint
+          // to the run so it finishes from banked progress. One-shot: consumed here
+          // so a later plain re-verify starts fresh.
+          const seed = resumeSeedRef.current[item.id];
+          delete resumeSeedRef.current[item.id];
           const out = await proveStream(
             item.lean as string,
             mcpServers,
             ctrl.signal,
+            { itemId: item.id, seed },
           );
           verified = out.verified;
           // Actual dollar cost of the whole run (summed across sub-runs on the
@@ -1000,6 +1029,15 @@ export function AdminPipeline() {
               ? `↯ REFUTED — ${counterexample || 'counterexample verified by Lean'}`
               : 'Lean proof did not verify',
           queued: false,
+          // A proven (or refuted) problem's checkpoint is stale — clear it so no
+          // stale "resume" is offered. An unproven item KEEPS its checkpoint.
+          ...(verified || refuted
+            ? {
+                proofCheckpoint: '',
+                proofCheckpointFilled: 0,
+                proofCheckpointTotal: 0,
+              }
+            : {}),
         });
         setStats((s) => ({
           ...s,
@@ -1119,6 +1157,18 @@ export function AdminPipeline() {
       runVerifier();
     },
     [runVerifier, runEstimate],
+  );
+
+  // Resume a run from its saved checkpoint: stash the seed (consumed once by the
+  // verify loop) and enqueue. The tree run finishes the remaining holes from the
+  // banked skeleton instead of replanning from scratch.
+  const resumeVerification = useCallback(
+    (item: GeneratedItem) => {
+      if (!item.proofCheckpoint) return;
+      resumeSeedRef.current[item.id] = item.proofCheckpoint;
+      enqueueVerify(item);
+    },
+    [enqueueVerify],
   );
 
   const removeFromVerifyQueue = async (id: string) => {
@@ -2205,6 +2255,21 @@ export function AdminPipeline() {
                         ? 'Verifying…'
                         : 'Verify again'}
                   </Button>
+                  {g.proofCheckpoint &&
+                    !g.verified &&
+                    status !== 'queued' &&
+                    status !== 'verifying' && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 border-violet-500/50 px-2 text-xs text-violet-600 hover:bg-violet-500/10 dark:text-violet-400"
+                        onClick={() => resumeVerification(g)}
+                        title={`Continue from the saved checkpoint (${g.proofCheckpointFilled ?? 0}/${g.proofCheckpointTotal ?? 0} holes banked) instead of restarting`}
+                      >
+                        ▶ Resume ({g.proofCheckpointFilled ?? 0}/
+                        {g.proofCheckpointTotal ?? 0})
+                      </Button>
+                    )}
                   <Button
                     size="sm"
                     variant="secondary"

@@ -2994,6 +2994,10 @@ async function proveHaveTree(theorem, ctx) {
   const holeIds = parseHoleIds(skeleton)
   if (!holeIds.length) return proveHaveFlat(theorem, ctx)
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Skeleton verified — ${holeIds.length} hole(s): ${holeIds.map((h) => `⟪${h}⟫`).join(" ")}. Filling each in its own minion.` })
+  // First resumable checkpoint: the verified skeleton itself. Even with 0 holes
+  // filled this is worth saving — a resume from here skips the whole planning
+  // phase. Client persists the latest checkpoint; any stop can restart here.
+  ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: holeIds.length })
 
   // ---- 2) MINIONS: fill each hole in its OWN isolated context, SEQUENTIALLY ----
   // Sequential, not parallel: Leak II's cleanup_memory is GLOBAL, so concurrent
@@ -3008,6 +3012,21 @@ async function proveHaveTree(theorem, ctx) {
     const r = await fillHole(skeleton, holeIds[i], ctx)
     fills[i] = r.fill
     if (!r.fill && r.notes) rejectedNotes[holeIds[i]] = r.notes
+    // Emit an updated checkpoint each time a hole banks: the skeleton with every
+    // hole proven SO FAR filled in, the rest still `sorry`. Persisted client-side
+    // so a usage-limit / Terminate / crash mid-loop resumes from banked progress
+    // instead of replanning. (spliceHole is the same splice used for `partial`.)
+    if (r.fill != null) {
+      let cp = skeleton
+      let done = 0
+      holeIds.forEach((hid, j) => {
+        if (fills[j] != null) {
+          cp = spliceHole(cp, hid, fills[j])
+          done++
+        }
+      })
+      ctx.emit({ type: "checkpoint", skeleton: cp, filled: done, total: holeIds.length })
+    }
     if (pantoUrl)
       await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
   }
@@ -3119,6 +3138,11 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     mcpServers,
     model: opts.model,
     strategy,
+    // Resume seed: a previously-saved checkpoint (a partially-filled skeleton —
+    // banked `have`s proven, the rest still `sorry`). When present, we skip
+    // planning + isolated minions and finish straight from it (proveHaveFlat's
+    // seed path), so saved progress is never re-derived. Empty ⇒ fresh run.
+    seed: typeof opts.seed === "string" && opts.seed.trim() ? opts.seed : null,
     searchBudget: searchBudgetFor(strategy),
     verifyUrl,
     emit,
@@ -3188,7 +3212,17 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
       if (style === "have" || style === "have-tree") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
-        const r = style === "have-tree" ? await proveHaveTree(theorem, ctx) : await proveHaveFlat(theorem, ctx)
+        // Resuming from a saved checkpoint short-circuits both: finish the
+        // remaining holes straight from the seed (proven work is handed in, not
+        // rediscovered). The independent verify gate is unchanged, so soundness
+        // is identical to a from-scratch run.
+        let r
+        if (ctx.seed) {
+          emit({ type: "message-annotation", subtype: "status", thought: "▶️ Resuming from a saved checkpoint — finishing the remaining hole(s) from banked progress." })
+          r = await proveHaveFlat(theorem, ctx, { seed: ctx.seed })
+        } else {
+          r = style === "have-tree" ? await proveHaveTree(theorem, ctx) : await proveHaveFlat(theorem, ctx)
+        }
         ok = r.verified
         proof = r.proof
         if (r.refuted) {
