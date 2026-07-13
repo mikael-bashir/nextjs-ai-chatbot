@@ -185,7 +185,19 @@ const MODE_BLOCKS: Record<GenMode, string> = {
 - The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.
 - Emit "difficulty":"Hard", "points":150.`,
   insane: `
-- INSANE. The hardest tier. The solution must chain MULTIPLE distinct, non-obvious insights (or one extraordinarily deep idea), each unlocking the next — no single trick suffices, and it is definitely not brute-forceable. Olympiad-final / research-flavoured, yet it still resolves to a specific integer.
+- INSANE. The hardest and rarest tier. The goal is a specific FEELING: a solver reads a SHORT, innocent-looking statement and is overwhelmed not by its length but by how LITTLE they have to go on — no foothold, no obvious first move, "wait… what can I even DO with this?". The path only appears after chaining MULTIPLE distinct, non-obvious insights (or seeing one extraordinarily deep idea), each unlocking the next. A long statement full of exotic vocabulary is the OPPOSITE of what you want — the difficulty must live in the ideas, not the reading.
+
+  HARD BANS — none of these make a problem Insane. If your idea leans on any of them, it is at most Hard: DISCARD it and design a genuinely harder one (do NOT emit a mislabelled problem — this mode must still output a real Insane).
+  · A big modulus / argument / bound that does NOT change the answer. If the result is the same for every prime p (or every large n), the giant number is pure decoration — e.g. "Σ_{i=1}^{p-1} (p-1)!/i mod p" is 0 for EVERY odd prime (one-line Wilson + inverses), so p = 10^9+7 is a costume, not difficulty.
+  · An answer that is degenerate or forced by symmetry — 0, 1, or a constant independent of the elaborate-looking setup.
+  · Dressing an elementary fact in a famous named object (Wilson, Stern/fusc diatomic, Pell, "the multiplicative group mod p", Fibonacci, Catalan…). A recognisable object hands the solver the very foothold you must deny them. Prefer an UNFAMILIAR, self-defined construction the solver has never seen named.
+  · A "big" input whose EFFECTIVE work is tiny — a recurrence evaluated at n ≈ 10^7, a Pell equation with a small fundamental solution, an order/count read straight off a factorisation. If a five-line Python script prints the answer in under a second, it is not Insane (it is barely Hard).
+
+  SELF-CHECK — in your brief reasoning you MUST clear ALL four; if any fails, the problem is not Insane, so redesign before emitting:
+  1. INSIGHT CHAIN: name the ≥2 distinct insights that must be chained (or justify one genuinely deep idea). "One clever observation, then compute" is HARD, not Insane.
+  2. NOT BRUTE-FORCEABLE: state the effective search space and why no short script cracks it — concretely (e.g. "even the smartest enumeration is ≳ 10^12 irreducible steps"), not merely "the number is large". If a small program wins, it fails.
+  3. LOAD-BEARING NUMBERS: confirm the specific numbers matter — change them and both the answer AND the required ideas change. If you could shrink them with nothing lost, it fails.
+  4. SPARSE STATEMENT: the statement is a couple of clean sentences with minimal given information. If it is long, or needs exotic named machinery to even state, rewrite it.
 - The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.
 - Emit "difficulty":"Insane", "points":200.`,
   reverse: `
