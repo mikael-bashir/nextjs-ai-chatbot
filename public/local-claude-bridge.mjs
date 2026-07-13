@@ -453,7 +453,11 @@ async function governedSearchCall(g, toolName, args) {
   const srv = g.searchServer
   if (!srv?.url) return "Search is unavailable right now — prove with the compiler and interactive tactics instead."
   console.log(`[gov ${g.id}] search forwarded tool=${toolName} (${g.budget} left)`)
-  const r = await callRemoteMcpTool(srv.url, toolName, args, { timeoutMs: 60000 })
+  // Every legitimate loogle/moogle query returns in well under this; loogle's own
+  // heartbeat guard errors a too-broad one in ~15-20s. So 25s covers all real
+  // cases and cuts losses fast on a stuck one — and since Leak-I no longer drops
+  // its warm index on a timeout, abandoning early here is now harmless.
+  const r = await callRemoteMcpTool(srv.url, toolName, args, { timeoutMs: 25000 })
   const body = r.ok ? r.text : `Search error: ${r.error || "unknown"} — don't retry; prove with the compiler instead.`
   return `${body}\n\n[search budget: ${g.budget} left — spend it on TYPE-PATTERN loogle queries (e.g. loogle "(f _)^[_] _ = _") or moogle concepts, never on a bare lemma name. To resolve a name for free, use \`exact?\`/\`apply?\` in a script. Prefer compiling.]`
 }
