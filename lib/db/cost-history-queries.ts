@@ -159,6 +159,36 @@ export async function nearestNeighbors(
   return rows as unknown as Neighbor[];
 }
 
+export interface GlobalCostStats {
+  n: number;
+  minActual: number | null;
+  median: number | null; // global p50 of actuals
+  q: number | null; // global p80 of actuals — cold-start prior for the estimator
+}
+
+// Global distribution of ACTUAL costs — the estimator's cold-start prior (used
+// before enough similar neighbours exist) and the observed floor. Only rows with
+// a recorded actual count.
+export async function globalCostStats(): Promise<GlobalCostStats> {
+  await ensureTable();
+  const { rows } = await sql`
+    SELECT count(*)::int AS n,
+           min(actual_usd) AS min_actual,
+           percentile_cont(0.5) WITHIN GROUP (ORDER BY actual_usd) AS median,
+           percentile_cont(0.8) WITHIN GROUP (ORDER BY actual_usd) AS q
+    FROM proof_cost_history
+    WHERE actual_usd IS NOT NULL;
+  `;
+  const o = rows[0] || {};
+  const num = (v: unknown): number | null => (v == null ? null : Number(v));
+  return {
+    n: Number(o.n ?? 0),
+    minActual: num(o.min_actual),
+    median: num(o.median),
+    q: num(o.q),
+  };
+}
+
 export interface AccuracyStats {
   n: number;
   mape: number | null; // mean absolute percentage error

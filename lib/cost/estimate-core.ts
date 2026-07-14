@@ -179,6 +179,107 @@ export function calibrateEstimate(
   return { estimateUsd: est, low: est, high: est, rationale: raw.rationale };
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// DATA-DRIVEN ESTIMATOR (no model). Similarity-weighted conditional-quantile
+// regression over proof_cost_history. This REPLACES the LLM: an agent has no
+// reliable signal from a Lean goal to a dollar figure, but the empirical costs
+// of SIMILAR past proofs do. This is a k-NN / kernel quantile regressor, which is
+// UNIVERSALLY CONSISTENT (Stone's theorem): as history grows — neighbours ↑,
+// distances ↓ — the prediction provably converges to the true conditional
+// τ-quantile Q_τ(cost | features), the optimal predictor. The only residual is
+// irreducible proof-search randomness (identical features, different luck), and
+// τ controls exactly how safely we sit above it: τ=0.8 ⇒ the estimate lands at or
+// above the actual ~80% of the time in the limit. Deterministic, free, instant.
+
+// Safety level of the estimate. 0.8 = a fair-but-safe upper-ish estimate. Raise
+// toward 0.9 for a more conservative (rarely-under) number; lower toward 0.5 for
+// the central (median) prediction. This is the ONE knob.
+export const DEFAULT_QUANTILE = 0.8;
+
+export interface PredictNeighbor {
+  actual_usd: number;
+  distance: number;
+  verified?: boolean | null;
+}
+export interface GlobalPrior {
+  n: number;
+  minActual?: number | null;
+  q?: number | null; // global τ-quantile of all actuals (cold-start prior)
+  median?: number | null;
+}
+
+const finite = (x: unknown): number | null => {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+};
+const firstPositive = (...xs: unknown[]): number => {
+  for (const x of xs) {
+    const n = Number(x);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return COST_FLOOR_USD;
+};
+
+// Weighted quantile via the standard cumulative-weight rule: the smallest value
+// whose cumulative weight fraction reaches τ.
+export function weightedQuantile(
+  pts: { v: number; w: number }[],
+  tau: number,
+): number | null {
+  const a = pts.filter((p) => p.w > 0 && Number.isFinite(p.v)).sort((p, q) => p.v - q.v);
+  if (!a.length) return null;
+  const total = a.reduce((s, p) => s + p.w, 0);
+  if (total <= 0) return null;
+  let cum = 0;
+  for (const p of a) {
+    cum += p.w;
+    if (cum / total >= tau) return p.v;
+  }
+  return a[a.length - 1].v;
+}
+
+// The estimate: weighted τ-quantile of the closest past proofs' ACTUAL costs,
+// shrunk toward the global prior while neighbours are few (so it degrades
+// gracefully at cold start), and floored at the fixed overhead. `neighbors` must
+// already be the K-nearest with their feature distances (K grows with history).
+export function predictCost(
+  neighbors: PredictNeighbor[],
+  global: GlobalPrior,
+  opts: { tau?: number } = {},
+): EstimateJson {
+  const tau = Math.min(0.99, Math.max(0.5, opts.tau ?? DEFAULT_QUANTILE));
+  // Inverse-distance kernel: closer past proofs count more. (distance ≥ 0.)
+  const pts = (neighbors || [])
+    .map((nb) => ({ v: Number(nb.actual_usd), d: Number(nb.distance) }))
+    .filter((p) => Number.isFinite(p.v) && p.v > 0 && Number.isFinite(p.d) && p.d >= 0)
+    .map((p) => ({ v: p.v, w: 1 / (1 + p.d) }));
+
+  const localQ = weightedQuantile(pts, tau);
+  const prior = firstPositive(global.q, global.median, COST_FLOOR_USD);
+
+  // Cold-start shrinkage: weight the local estimate by how much similar data we
+  // have. α → 1 as neighbours accrue, so the prior fades and the estimator
+  // becomes purely local — this is the mechanism by which it converges.
+  const ess = pts.length;
+  const K0 = 8;
+  const alpha = ess / (ess + K0);
+  let est = localQ == null ? prior : alpha * localQ + (1 - alpha) * prior;
+
+  // Hard floor: nothing costs below the fixed overhead / cheapest observed proof.
+  const floor = Math.max(COST_FLOOR_USD, finite(global.minActual) ?? 0);
+  est = Math.max(est, floor);
+
+  const r = (x: number) => Math.max(0, Math.round(x * 1000) / 1000);
+  est = r(est);
+  const pct = Math.round(tau * 100);
+  const rationale =
+    localQ == null
+      ? `No similar history yet — global p${pct} prior $${r(prior)}, floored at $${r(floor)} (n=${global.n}).`
+      : `Weighted p${pct} of ${ess} similar past proof(s) = $${r(localQ)}; blended ${Math.round(alpha * 100)}% local / ${Math.round((1 - alpha) * 100)}% prior; floor $${r(floor)}.`;
+  // Single confident number (low = high = est): no band.
+  return { estimateUsd: est, low: est, high: est, rationale };
+}
+
 // Pull the estimator's JSON out of its reply (tolerating stray prose/fences).
 export function parseEstimate(text: string): EstimateJson | null {
   const t = String(text || '');

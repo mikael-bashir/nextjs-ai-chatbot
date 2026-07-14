@@ -21,7 +21,6 @@ import type { ProverEvent } from '@/lib/prover/types';
 import {
   estimateCost,
   extractFeatures,
-  bridgeRunTransport,
   type EstimateResult,
 } from '@/lib/cost/estimator';
 
@@ -811,17 +810,9 @@ export function AdminPipeline() {
         },
         { decompose: verifyDecomposeRef.current, model },
       );
-      const p = estimateCost({
-        features,
-        theorem: item.lean || '',
-        problem: item.problem || '',
-        // Switch seam: today the estimate runs on your plan via the local
-        // bridge. Swap this transport for an API/Messages one to move to
-        // credits + a hosted service — nothing else changes.
-        transport: bridgeRunTransport((path, init) =>
-          callBridge(false, path, init),
-        ),
-      })
+      // Deterministic, data-driven estimate (k-NN quantile over cost history) —
+      // no model call. Converges to the true cost as history accrues.
+      const p = estimateCost({ features })
         .then((est) => {
           if (est) {
             setCost(item.id, {

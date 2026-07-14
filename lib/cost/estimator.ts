@@ -10,14 +10,12 @@
 // plan the moment ANTHROPIC_API_KEY is set on the bridge host — no code change.)
 
 import {
-  ESTIMATOR_SYSTEM,
   DEFAULT_ESTIMATOR_MODEL,
-  DEFAULT_ESTIMATE_BUDGET_MS,
-  buildEstimatePrompt,
-  parseEstimate,
-  calibrateEstimate,
+  DEFAULT_QUANTILE,
+  predictCost,
   extractFeatures,
   type EstimatorFeatures,
+  type GlobalPrior,
   type NeighborRow,
 } from './estimate-core';
 
@@ -38,56 +36,6 @@ export interface EstimateResult {
   estimatorCostUsd?: number | null;
 }
 
-/**
- * The one seam to swap when changing where/how the estimate runs. Given a fully
- * assembled prompt + system + model + budget, return the model's raw text and
- * (if known) what the call cost.
- */
-export type EstimatorTransport = (args: {
-  prompt: string;
-  system: string;
-  model: string;
-  budgetMs: number;
-}) => Promise<{ text: string; costUsd: number | null }>;
-
-/**
- * Default transport — the local bridge's generic `/run` (your Claude plan).
- * Tool-free + lean flags keep the call cheap. Set ANTHROPIC_API_KEY on the bridge
- * host to bill API credits through this exact path with no code change.
- *
- * The future credit/hosted transport is a sibling of this ~10-line function, e.g.
- *   const apiTransport: EstimatorTransport = async ({prompt, system, model, budgetMs}) => {
- *     const m = await anthropic.messages.create({ model, max_tokens: 4000,
- *       system, messages: [{ role: 'user', content: prompt }] });   // ANTHROPIC_API_KEY
- *     return { text: m.content.find(b => b.type==='text')?.text ?? '', costUsd: null };
- *   };
- */
-export function bridgeRunTransport(
-  callBridge: (path: string, init?: RequestInit) => Promise<Response>,
-): EstimatorTransport {
-  return async ({ prompt, system, model, budgetMs }) => {
-    const res = await callBridge('/run', {
-      method: 'POST',
-      body: JSON.stringify({
-        prompt,
-        options: {
-          model,
-          systemPrompt: system,
-          excludeDynamicSections: true,
-          timeoutMs: budgetMs,
-          maxOutputTokens: 4000,
-        },
-      }),
-    });
-    if (!res.ok) throw new Error(`bridge /run ${res.status}`);
-    const j = await res.json();
-    return {
-      text: String(j?.text || ''),
-      costUsd: typeof j?.costUsd === 'number' ? j.costUsd : null,
-    };
-  };
-}
-
 function neighborQuery(f: EstimatorFeatures): string {
   const p = new URLSearchParams();
   p.set('neighbors', '1');
@@ -105,72 +53,53 @@ function neighborQuery(f: EstimatorFeatures): string {
 }
 
 /**
- * Full estimate flow: retrieve neighbors → run through `transport` → parse →
- * persist. `transport` is the only backend-specific dependency. Returns null if
- * the estimator produced no usable number.
+ * Full estimate flow: retrieve the K nearest past proofs (with actual costs) +
+ * the global prior → run the deterministic k-NN quantile regressor → persist.
+ * No model, no API/plan cost, instant. Returns null only if persistence and
+ * retrieval both fail (nothing to predict from AND cannot record).
+ *
+ * `transport`/`budgetMs` are accepted but ignored — kept so existing callers
+ * compile unchanged while the LLM path is retired.
  */
 export async function estimateCost(opts: {
   features: EstimatorFeatures;
-  theorem: string;
-  problem: string;
-  transport: EstimatorTransport;
+  theorem?: string;
+  problem?: string;
+  tau?: number;
+  transport?: unknown;
   budgetMs?: number;
 }): Promise<EstimateResult | null> {
-  const { features, theorem, problem, transport } = opts;
+  const { features } = opts;
   const model = features.model || DEFAULT_ESTIMATOR_MODEL;
-  const budgetMs = opts.budgetMs ?? DEFAULT_ESTIMATE_BUDGET_MS;
 
-  // 1) Retrieve nearest past proofs with actual costs (empirical anchor) and the
-  // estimator's own running accuracy (its measured bias, for self-calibration).
+  // 1) Retrieve the K nearest past proofs (with their ACTUAL costs + feature
+  // distances) and the global cost prior. K grows with history server-side.
   let neighbors: NeighborRow[] = [];
+  let global: GlobalPrior = { n: 0 };
   try {
     const r = await fetch(`/api/admin/cost-history?${neighborQuery(features)}`);
-    if (r.ok) neighbors = (await r.json())?.neighbors ?? [];
-  } catch {
-    /* cold start / offline history — estimator falls back to goal difficulty */
-  }
-  let biasRel: number | null = null;
-  let statN = 0;
-  try {
-    const s = await fetch('/api/admin/cost-history?stats');
-    if (s.ok) {
-      const st = (await s.json())?.stats;
-      biasRel = typeof st?.biasRel === 'number' ? st.biasRel : null;
-      statN = Number(st?.n) || 0;
+    if (r.ok) {
+      const j = await r.json();
+      neighbors = Array.isArray(j?.neighbors) ? j.neighbors : [];
+      if (j?.global) global = j.global as GlobalPrior;
     }
   } catch {
-    /* no stats yet — calibration is a no-op until history accrues */
+    /* cold start / offline — predictCost falls back to the floor prior */
   }
 
-  // 2) Assemble the shared prompt and run it through the transport.
-  const prompt = buildEstimatePrompt({ theorem, problem, features, neighbors });
-  let text = '';
-  let estimatorCostUsd: number | null = null;
-  try {
-    const out = await transport({
-      prompt,
-      system: ESTIMATOR_SYSTEM,
-      model,
-      budgetMs,
-    });
-    text = out.text;
-    estimatorCostUsd = out.costUsd;
-  } catch {
-    return null;
-  }
-  const rawParsed = parseEstimate(text);
-  if (!rawParsed) return null;
-  // 3) Calibrate: divide out the estimator's measured bias and cap against the
-  // observed neighbour costs. This is what fixes the systematic over-estimation,
-  // and it self-stabilises because we persist the CALIBRATED number below.
-  const parsed = calibrateEstimate(rawParsed, {
-    biasRel,
-    n: statN,
-    neighborActuals: neighbors.map((nb) => Number(nb.actual_usd)),
-  });
+  // 2) Predict: similarity-weighted τ-quantile of neighbour actuals, shrunk to
+  // the prior while data is thin, floored at the fixed overhead. Deterministic.
+  const parsed = predictCost(
+    neighbors.map((nb) => ({
+      actual_usd: Number((nb as { actual_usd?: number }).actual_usd),
+      distance: Number((nb as { distance?: number }).distance),
+    })),
+    global,
+    { tau: opts.tau ?? DEFAULT_QUANTILE },
+  );
 
-  // 4) Persist the (calibrated) estimate; the returned id lets us record the
-  // actual later so future bias is measured against what we actually predicted.
+  // 3) Persist the estimate; the returned id lets us record the actual later so
+  // this very prediction becomes a training point for future estimates.
   let costHistoryId: string | undefined;
   try {
     const p = await fetch('/api/admin/cost-history', {
@@ -193,6 +122,6 @@ export async function estimateCost(opts: {
     ...parsed,
     model,
     costHistoryId,
-    estimatorCostUsd,
+    estimatorCostUsd: 0, // the estimator itself is free now
   };
 }

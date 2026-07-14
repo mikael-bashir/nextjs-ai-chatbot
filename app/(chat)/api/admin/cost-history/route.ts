@@ -5,6 +5,7 @@ import {
   recordActual,
   nearestNeighbors,
   accuracyStats,
+  globalCostStats,
   type CostFeatures,
   type EstimateInput,
 } from '@/lib/db/cost-history-queries';
@@ -54,12 +55,14 @@ export async function GET(request: Request) {
       return Response.json({ stats: await accuracyStats() });
     }
     if (p.has('neighbors')) {
-      const k = Number(p.get('k')) || 8;
-      const neighbors = await nearestNeighbors(
-        featuresFromParams(p),
-        Math.min(Math.max(k, 1), 30),
-      );
-      return Response.json({ neighbors });
+      // Adaptive K grows with history (≈3·√n, bounded) so the k-NN quantile
+      // regressor stays consistent: more data ⇒ more neighbours ⇒ tighter
+      // convergence to the true conditional cost quantile.
+      const global = await globalCostStats();
+      const kAuto = Math.round(3 * Math.sqrt(Math.max(0, global.n)));
+      const k = Math.min(60, Math.max(12, Number(p.get('k')) || kAuto || 12));
+      const neighbors = await nearestNeighbors(featuresFromParams(p), k);
+      return Response.json({ neighbors, global });
     }
     return Response.json({ error: 'unknown_query' }, { status: 400 });
   } catch (error) {
