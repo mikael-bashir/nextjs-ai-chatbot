@@ -60,6 +60,32 @@ async function requireAdmin() {
   return isAdminEmail(session?.user?.email) ? session : null;
 }
 
+// Cost-estimator ingest (self-hosted service, internal network). No-op unless
+// ESTIMATOR_URL is set. Best-effort: swallow every error so telemetry can never
+// affect the admin flow.
+const ESTIMATOR_URL = (process.env.ESTIMATOR_URL || '').replace(/\/$/, '');
+async function ingestCostExample(rec: Record<string, unknown>): Promise<void> {
+  if (!ESTIMATOR_URL) return;
+  const signature = rec.lean;
+  const cost = rec.actualUsd;
+  if (typeof signature !== 'string' || !signature || typeof cost !== 'number') return;
+  try {
+    await fetch(`${ESTIMATOR_URL}/ingest`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        signature,
+        proved: !!rec.verified,
+        actualCostUsd: cost,
+        model: typeof rec.model === 'string' ? rec.model : null,
+        source: 'verifier',
+      }),
+    });
+  } catch {
+    /* estimator down/absent — ignore */
+  }
+}
+
 export async function GET() {
   if (!(await requireAdmin())) {
     return new Response('Forbidden', { status: 403 });
@@ -163,6 +189,12 @@ export async function PATCH(request: NextRequest) {
       if (k in body) patch[k] = body[k];
     }
     const updated = await updateGenerated(body.id, patch);
+    // When actual cost lands, stream the labelled example to the cost-estimator
+    // service (it learns cost from the Lean signature alone). Fire-and-forget,
+    // server-side over the internal network — never blocks or fails the PATCH.
+    if (updated && 'actualUsd' in patch) {
+      void ingestCostExample(updated as unknown as Record<string, unknown>);
+    }
     return updated
       ? Response.json({ ok: true, item: updated })
       : new Response('Not found', { status: 404 });
