@@ -810,9 +810,10 @@ export function AdminPipeline() {
         },
         { decompose: verifyDecomposeRef.current, model },
       );
-      // Deterministic, data-driven estimate (k-NN quantile over cost history) —
-      // no model call. Converges to the true cost as history accrues.
-      const p = estimateCost({ features })
+      // Estimate: the trained ML service (signature→cost) when available, else
+      // the deterministic k-NN quantile over cost history. Pass the Lean goal so
+      // the service can predict from the signature alone.
+      const p = estimateCost({ features, theorem: item.lean || '' })
         .then((est) => {
           if (est) {
             setCost(item.id, {

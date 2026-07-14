@@ -72,8 +72,64 @@ export async function estimateCost(opts: {
   const { features } = opts;
   const model = features.model || DEFAULT_ESTIMATOR_MODEL;
 
-  // 1) Retrieve the K nearest past proofs (with their ACTUAL costs + feature
-  // distances) and the global cost prior. K grows with history server-side.
+  // Persist an estimate to proof_cost_history so the actual can be recorded
+  // against it later (and it becomes a training point). Returns the row id.
+  const persist = async (p: {
+    estimateUsd: number;
+    low: number;
+    high: number;
+    rationale: string;
+  }): Promise<string | undefined> => {
+    try {
+      const res = await fetch('/api/admin/cost-history', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...features,
+          estimateUsd: p.estimateUsd,
+          estimateLow: p.low,
+          estimateHigh: p.high,
+          rationale: p.rationale,
+        }),
+      });
+      if (res.ok) return (await res.json())?.id;
+    } catch {
+      /* estimate still usable in-session even if persistence fails */
+    }
+    return undefined;
+  };
+
+  // 1) Try the trained ML estimator SERVICE first (server proxy → internal
+  // signature→cost model). It predicts from the Lean goal alone. Falls through
+  // to the k-NN retrieval estimate below if it's unconfigured/down.
+  if (opts.theorem) {
+    try {
+      const r = await fetch('/api/admin/estimator', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ signature: opts.theorem }),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        if (j?.available && typeof j.est_cost_usd === 'number') {
+          const est = Number(j.est_cost_usd);
+          const safe = Number(j.safe_cost_usd);
+          const rationale =
+            `ML est $${est.toFixed(3)} · safe $${safe.toFixed(3)} · ` +
+            `P(prove)=${Number(j.prove_prob).toFixed(2)}` +
+            (j.reject ? ` · REJECT (${(j.reasons || []).join('; ')})` : '');
+          const parsedMl = { estimateUsd: est, low: est, high: est, rationale };
+          const costHistoryId = await persist(parsedMl);
+          return { ...parsedMl, model, costHistoryId, estimatorCostUsd: 0 };
+        }
+      }
+    } catch {
+      /* service unreachable — fall through to k-NN */
+    }
+  }
+
+  // 2) Fallback: retrieve the K nearest past proofs + global prior and compute
+  // the similarity-weighted quantile estimate client-side.
   let neighbors: NeighborRow[] = [];
   let global: GlobalPrior = { n: 0 };
   try {
@@ -86,9 +142,6 @@ export async function estimateCost(opts: {
   } catch {
     /* cold start / offline — predictCost falls back to the floor prior */
   }
-
-  // 2) Predict: similarity-weighted τ-quantile of neighbour actuals, shrunk to
-  // the prior while data is thin, floored at the fixed overhead. Deterministic.
   const parsed = predictCost(
     neighbors.map((nb) => ({
       actual_usd: Number((nb as { actual_usd?: number }).actual_usd),
@@ -97,31 +150,6 @@ export async function estimateCost(opts: {
     global,
     { tau: opts.tau ?? DEFAULT_QUANTILE },
   );
-
-  // 3) Persist the estimate; the returned id lets us record the actual later so
-  // this very prediction becomes a training point for future estimates.
-  let costHistoryId: string | undefined;
-  try {
-    const p = await fetch('/api/admin/cost-history', {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        ...features,
-        estimateUsd: parsed.estimateUsd,
-        estimateLow: parsed.low,
-        estimateHigh: parsed.high,
-        rationale: parsed.rationale,
-      }),
-    });
-    if (p.ok) costHistoryId = (await p.json())?.id;
-  } catch {
-    /* estimate still usable in-session even if persistence fails */
-  }
-
-  return {
-    ...parsed,
-    model,
-    costHistoryId,
-    estimatorCostUsd: 0, // the estimator itself is free now
-  };
+  const costHistoryId = await persist(parsed);
+  return { ...parsed, model, costHistoryId, estimatorCostUsd: 0 };
 }
