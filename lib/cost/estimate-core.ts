@@ -191,10 +191,15 @@ export function calibrateEstimate(
 // τ controls exactly how safely we sit above it: τ=0.8 ⇒ the estimate lands at or
 // above the actual ~80% of the time in the limit. Deterministic, free, instant.
 
-// Safety level of the estimate. 0.8 = a fair-but-safe upper-ish estimate. Raise
-// toward 0.9 for a more conservative (rarely-under) number; lower toward 0.5 for
-// the central (median) prediction. This is the ONE knob.
-export const DEFAULT_QUANTILE = 0.8;
+// Central level of the estimate. Backtesting the real cost history showed proof
+// cost is ~constant near the floor for the large majority, with a rare, roughly
+// UNPREDICTABLE fat tail (a few proofs 20-60× the median). A high quantile there
+// is a trap: it drags the tail into every estimate (τ=0.8 backtested at ~900%
+// MAPE vs ~25% for a flat floor). So we predict the MEDIAN (τ=0.5) — the robust
+// central cost — and bound it (see predictCost) rather than chase the tail.
+// Raise cautiously only once features actually separate cost (e.g. real
+// Hard/Insane problems that consistently cost more). This is the ONE knob.
+export const DEFAULT_QUANTILE = 0.5;
 
 export interface PredictNeighbor {
   actual_usd: number;
@@ -255,7 +260,9 @@ export function predictCost(
     .map((p) => ({ v: p.v, w: 1 / (1 + p.d) }));
 
   const localQ = weightedQuantile(pts, tau);
-  const prior = firstPositive(global.q, global.median, COST_FLOOR_USD);
+  // Prior = the global MEDIAN actual (robust to the fat tail), not a high
+  // percentile — a high prior makes cold-start estimates explode.
+  const gMedian = firstPositive(global.median, global.q, COST_FLOOR_USD);
 
   // Cold-start shrinkage: weight the local estimate by how much similar data we
   // have. α → 1 as neighbours accrue, so the prior fades and the estimator
@@ -263,19 +270,25 @@ export function predictCost(
   const ess = pts.length;
   const K0 = 8;
   const alpha = ess / (ess + K0);
-  let est = localQ == null ? prior : alpha * localQ + (1 - alpha) * prior;
+  let est = localQ == null ? gMedian : alpha * localQ + (1 - alpha) * gMedian;
 
   // Hard floor: nothing costs below the fixed overhead / cheapest observed proof.
   const floor = Math.max(COST_FLOOR_USD, finite(global.minActual) ?? 0);
-  est = Math.max(est, floor);
+  // Robust upper rail: a routine estimate can't exceed a small multiple of the
+  // robust central cost. This is what stops a few tail outliers (or a noisy tiny
+  // early sample) from inflating a prediction — the median is already robust, and
+  // the cap bounds the blend/cold-start. It scales with the data: when a whole
+  // difficulty tier genuinely costs more, its median rises and the cap rises too.
+  const cap = Math.max(3 * COST_FLOOR_USD, 3 * gMedian);
+  est = Math.min(Math.max(est, floor), cap);
 
   const r = (x: number) => Math.max(0, Math.round(x * 1000) / 1000);
   est = r(est);
   const pct = Math.round(tau * 100);
   const rationale =
     localQ == null
-      ? `No similar history yet — global p${pct} prior $${r(prior)}, floored at $${r(floor)} (n=${global.n}).`
-      : `Weighted p${pct} of ${ess} similar past proof(s) = $${r(localQ)}; blended ${Math.round(alpha * 100)}% local / ${Math.round((1 - alpha) * 100)}% prior; floor $${r(floor)}.`;
+      ? `No similar history yet — global median prior $${r(gMedian)}, floored at $${r(floor)} (n=${global.n}).`
+      : `Weighted p${pct} of ${ess} similar past proof(s) = $${r(localQ)}; blended ${Math.round(alpha * 100)}% local / ${Math.round((1 - alpha) * 100)}% median-prior; floor $${r(floor)}, cap $${r(cap)}.`;
   // Single confident number (low = high = est): no band.
   return { estimateUsd: est, low: est, high: est, rationale };
 }
