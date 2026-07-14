@@ -2203,7 +2203,7 @@ export function AdminPipeline() {
                       {pl.prod && (
                         <span
                           className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-violet-500/15 text-violet-600"
-                          title="In the prod queue, awaiting the CompeteMath publish cron"
+                          title="Promoted to prod — awaiting the CompeteMath publish cron, or already published"
                         >
                           Prod
                         </span>

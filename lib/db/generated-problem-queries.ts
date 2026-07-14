@@ -57,6 +57,36 @@ export interface GeneratedProblemInput {
   promotedAt?: Date | null;
 }
 
+// Case/whitespace-insensitive title key — matches normTitle() in redis.ts and
+// admin-pipeline.tsx so promotion state joins consistently across stores.
+function normTitle(s?: string | null): string {
+  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// The DURABLE record of "promoted to prod": every promoted problem is archived
+// here with a `promotedAt`, so this survives the CompeteMath cron draining the
+// transient `weekly-problems` queue. This is the source of truth for the prod
+// badge and the re-staging guard (the queue is NOT — it empties on publish).
+export async function promotedTitles(): Promise<string[]> {
+  await ensureTable();
+  const { rows } = await sql`
+    SELECT "questionTitle" FROM "GeneratedProblem"
+    WHERE "promotedAt" IS NOT NULL AND "questionTitle" IS NOT NULL
+  `;
+  return rows
+    .map((r) => (r as { questionTitle?: string }).questionTitle)
+    .filter((t): t is string => !!t);
+}
+
+export async function hasPromotedTitle(
+  title?: string | null,
+): Promise<boolean> {
+  const t = normTitle(title);
+  if (!t) return false;
+  const titles = await promotedTitles();
+  return titles.some((x) => normTitle(x) === t);
+}
+
 export async function saveGeneratedProblem(
   input: GeneratedProblemInput,
 ): Promise<GeneratedProblem> {

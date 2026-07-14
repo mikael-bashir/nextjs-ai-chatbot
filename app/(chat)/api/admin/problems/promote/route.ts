@@ -7,7 +7,10 @@ import {
   prodHasTitle,
   pushToProd,
 } from '@/lib/redis';
-import { saveGeneratedProblem } from '@/lib/db/generated-problem-queries';
+import {
+  hasPromotedTitle,
+  saveGeneratedProblem,
+} from '@/lib/db/generated-problem-queries';
 
 // Promote a staged problem to the production CompeteMath queue. The main app's
 // weekly-problems cron LPOPs `weekly-problems` and inserts exactly these fields
@@ -35,12 +38,16 @@ export async function POST(request: NextRequest) {
       return new Response('Not found', { status: 404 });
     }
 
-    // Robustness guard: never double-publish. If a problem with this title is
-    // already sitting in the prod queue, refuse (409) and leave staging intact —
-    // don't push a duplicate or archive metadata twice.
-    if (await prodHasTitle(rec.questionTitle)) {
+    // Robustness guard: never double-publish. Check BOTH the transient prod
+    // queue (still awaiting the cron) AND the durable GeneratedProblem archive
+    // (already promoted, possibly already drained to live) — so a problem can't
+    // be re-promoted after the cron empties the queue.
+    if (
+      (await prodHasTitle(rec.questionTitle)) ||
+      (await hasPromotedTitle(rec.questionTitle))
+    ) {
       return new Response(
-        'A problem with this title is already in the prod queue.',
+        'A problem with this title has already been promoted to prod.',
         { status: 409 },
       );
     }

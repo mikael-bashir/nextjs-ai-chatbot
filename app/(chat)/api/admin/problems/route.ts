@@ -10,6 +10,10 @@ import {
   redisHealth,
   stagingHasTitle,
 } from '@/lib/redis';
+import {
+  hasPromotedTitle,
+  promotedTitles,
+} from '@/lib/db/generated-problem-queries';
 
 // Admin-only queue management. GET returns health + the staged items; POST
 // enqueues a verified problem; DELETE removes one by id.
@@ -31,19 +35,27 @@ export async function GET() {
       console.error('Error listing staged problems:', error);
     }
   }
-  // Titles of problems currently sitting in the prod queue, so the pipeline can
-  // flag generated items that are already awaiting publication. Best-effort:
-  // empty if prod Redis is unreachable.
-  let prodItems: string[] = [];
+  // Titles that have been promoted to prod, so the pipeline can flag them. Union
+  // of (a) the transient `weekly-problems` queue — items still AWAITING the
+  // CompeteMath cron, and (b) the DURABLE GeneratedProblem archive — everything
+  // ever promoted. (b) is what keeps the prod badge from vanishing once the cron
+  // drains the queue. Best-effort: each source is optional.
+  const prodTitleSet = new Set<string>();
   if (health.prod.ok) {
     try {
-      prodItems = (await listProdProblems())
-        .map((p) => p.questionTitle)
-        .filter((t): t is string => !!t);
+      for (const p of await listProdProblems()) {
+        if (p.questionTitle) prodTitleSet.add(p.questionTitle);
+      }
     } catch (error) {
       console.error('Error listing prod problems:', error);
     }
   }
+  try {
+    for (const t of await promotedTitles()) prodTitleSet.add(t);
+  } catch (error) {
+    console.error('Error listing promoted problems:', error);
+  }
+  const prodItems = Array.from(prodTitleSet);
   return Response.json({
     health,
     // Back-compat: the loop reads `queued` after enqueueing.
@@ -74,6 +86,20 @@ export async function POST(request: NextRequest) {
           ok: false,
           duplicate: true,
           error: 'A problem with this title is already in staging.',
+        },
+        { status: 409 },
+      );
+    }
+    // Also refuse re-staging something already PROMOTED to prod. This checks the
+    // durable GeneratedProblem archive, not the transient prod queue — so it
+    // still fires after the CompeteMath cron has drained the queue (the bug this
+    // fixes: a promoted problem could be re-staged once the queue emptied).
+    if (await hasPromotedTitle(body.questionTitle)) {
+      return Response.json(
+        {
+          ok: false,
+          duplicate: true,
+          error: 'A problem with this title was already promoted to prod.',
         },
         { status: 409 },
       );
