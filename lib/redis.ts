@@ -209,25 +209,46 @@ export async function deleteGenerated(id: string): Promise<boolean> {
 }
 
 // Merge a patch into the stored generated record in place (used by re-verify).
+// The generated store is a Redis LIST of JSON blobs, and updateGenerated is a
+// read-modify-write (lrange → merge → lset) which is NOT atomic. Two concurrent
+// PATCHes for the same item — e.g. the (now instant) cost-estimate write racing
+// the actual-cost write — would both read the same record and the last lset would
+// clobber the other's field (symptom: an item shows only `actual`, no `estimate`,
+// or vice-versa). The store has a single writer process per environment, so an
+// in-process async lock that serialises every read-modify-write fully prevents
+// the lost update. Cheap: these writes are human-paced, not high-QPS.
+let generatedWriteChain: Promise<unknown> = Promise.resolve();
+function serializeGeneratedWrite<T>(fn: () => Promise<T>): Promise<T> {
+  const next = generatedWriteChain.then(fn, fn);
+  // Keep the chain alive regardless of this write's outcome.
+  generatedWriteChain = next.then(
+    () => undefined,
+    () => undefined,
+  );
+  return next;
+}
+
 export async function updateGenerated(
   id: string,
   patch: Partial<GeneratedRecord>,
 ): Promise<GeneratedRecord | null> {
-  const redis = getRedis();
-  const raws: string[] = await redis.lrange(GENERATED_STORE_KEY, 0, -1);
-  for (let i = 0; i < raws.length; i++) {
-    try {
-      const rec = JSON.parse(raws[i]) as GeneratedRecord;
-      if (rec.id === id) {
-        const updated = { ...rec, ...patch, id: rec.id };
-        await redis.lset(GENERATED_STORE_KEY, i, JSON.stringify(updated));
-        return updated;
+  return serializeGeneratedWrite(async () => {
+    const redis = getRedis();
+    const raws: string[] = await redis.lrange(GENERATED_STORE_KEY, 0, -1);
+    for (let i = 0; i < raws.length; i++) {
+      try {
+        const rec = JSON.parse(raws[i]) as GeneratedRecord;
+        if (rec.id === id) {
+          const updated = { ...rec, ...patch, id: rec.id };
+          await redis.lset(GENERATED_STORE_KEY, i, JSON.stringify(updated));
+          return updated;
+        }
+      } catch {
+        /* skip malformed */
       }
-    } catch {
-      /* skip malformed */
     }
-  }
-  return null;
+    return null;
+  });
 }
 
 // Push a payload onto the production weekly-problems queue (separate instance).
