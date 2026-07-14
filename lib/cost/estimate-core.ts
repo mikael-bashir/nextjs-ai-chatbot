@@ -77,16 +77,29 @@ export function extractFeatures(
   };
 }
 
-export const ESTIMATOR_SYSTEM = `You are a cost estimator for an automated Lean 4 theorem-proving service that proves competition math problems with an agentic Claude prover. Given a problem, its Lean theorem, and a table of SIMILAR PAST proofs with their ACTUAL dollar costs, predict what it will cost to prove THIS problem.
+// The fixed-overhead floor: EVERY proof pays for the system prompt, the cached
+// MCP tool schemas, and a minimum number of agent turns, so no proof — however
+// trivial — comes in below roughly this. Empirically the cheap cluster sits at
+// ~$0.082–0.10. The estimator is floored to this in code (calibrateEstimate) and
+// told about it in the prompt, because a model left to "estimate low" will
+// happily predict $0.03 for a problem that physically cannot cost less than the
+// floor. Tune if the base model / prompt size / tool set changes materially.
+export const COST_FLOOR_USD = 0.08;
 
-CALIBRATION — READ FIRST. Your single most reliable prediction is the MEDIAN actual cost of the closest neighbors below. START THERE and stay close to it. The most common estimator failure is OVER-estimation — do not inflate. Move off the neighbor median only when the Lean goal is clearly structurally different, and move in PROPORTION to concrete evidence, never as a blanket safety margin.
+export const ESTIMATOR_SYSTEM = `You are a cost estimator for an automated Lean 4 theorem-proving service that proves competition math problems with an agentic Claude prover. Given a problem, its Lean theorem, and a table of SIMILAR PAST proofs with their ACTUAL dollar costs, predict ONE dollar figure: what it will cost to prove THIS problem.
 
-Most proofs are CHEAP: the agent closes the large majority with automation (decide / native_decide / simp / omega / nlinarith / ring) in one or two attempts. A "general" (non-decide) goal is the NORMAL case — do NOT add a premium just because a goal isn't a finite decide. Reserve materially higher numbers only for goals that are visibly LARGE, deeply multi-step, or explicitly decomposed (fanning into many sub-proofs).
+RETURN A SINGLE, SAFE, CONFIDENT NUMBER — not a range. The number is used for budgeting, so it must be one you'd stand behind: it is far worse to UNDER-estimate than to be a little high. When unsure, round toward the safe (higher) side.
 
-The SIMILAR PAST proofs are ground truth. If there is little/no history, be conservative and estimate LOW: assume a routine single problem costs well under $1 unless the Lean goal is visibly large or decomposed. Prefer under- to over-estimating when unsure.
+THE FLOOR — READ FIRST. Every proof pays a fixed overhead (system prompt, cached tool schemas, a few minimum agent turns), so no proof — however trivial — costs less than about $${COST_FLOOR_USD.toFixed(
+    2,
+  )}. NEVER predict below the floor, and never below the cheapest neighbor. The classic mistake is estimating $0.02–0.04 for an "easy" goal; that is impossible — such goals land AT the floor, not below it.
+
+ANCHOR ON THE SAFE SIDE. The SIMILAR PAST proofs are ground truth. Anchor near the UPPER end of the closest neighbors' actual costs (about their 75th percentile), NOT the median — this keeps you fair for routine problems while rarely under-shooting. Most routine proofs land near the floor; the agent closes them with automation (decide / native_decide / simp / omega / nlinarith / ring) in one or two attempts. A "general" (non-decide) goal is the NORMAL case — no premium for that alone.
+
+GO HIGH WHEN THE GOAL IS HARD. Do move materially above the neighbor band — into dollars, not cents — when the Lean goal is visibly LARGE, deeply multi-step, or explicitly decomposed (fanning into many sub-proofs). Under-costing a genuinely hard proof is the expensive error; don't suppress it.
 
 Output ONLY this strict JSON object, no prose and no code fences:
-{"estimateUsd": <number>, "low": <number>, "high": <number>, "rationale": "<1-3 sentences: which neighbors you anchored to and why you moved off the median, if at all>"}`;
+{"estimateUsd": <number>, "rationale": "<1-3 sentences: which neighbors you anchored to, and why you went above the band if you did>"}`;
 
 export function buildEstimatePrompt(args: {
   theorem?: string;
@@ -143,23 +156,27 @@ export function calibrateEstimate(
     factor = Math.min(2, Math.max(0.2, 1 / (1 + b)));
   }
   let est = raw.estimateUsd * factor;
-  let low = raw.low * factor;
-  let high = raw.high * factor;
   const acts = (opts.neighborActuals || [])
     .filter((x) => Number.isFinite(x) && x > 0)
     .sort((p, q) => p - q);
+  // Reality rail (top): never let one estimate exceed a sane multiple of the
+  // worst observed neighbour — guards the "$40 for a $2 proof" blowups.
   if (acts.length >= 3) {
-    const cap = acts[acts.length - 1] * 3; // ≤ 3× the worst neighbour
-    if (est > cap && est > 0) {
-      const s = cap / est;
-      est *= s;
-      low *= s;
-      high *= s;
-    }
+    const cap = acts[acts.length - 1] * 3;
+    if (est > cap && est > 0) est = cap;
   }
+  // Hard floor (bottom): no proof costs less than the fixed overhead. Use the
+  // larger of the constant floor and the cheapest observed neighbour, so the
+  // floor tracks reality if overhead drifts. This is what kills the systematic
+  // under-estimation on routine problems (predicting $0.03 for a $0.085 proof).
+  const neighborFloor = acts.length ? acts[Math.floor(acts.length * 0.1)] : 0;
+  const floor = Math.max(COST_FLOOR_USD, neighborFloor);
+  est = Math.max(est, floor);
   const r = (x: number) => Math.max(0, Math.round(x * 1000) / 1000);
   est = r(est);
-  return { estimateUsd: est, low: r(Math.min(low, est)), high: r(Math.max(high, est)), rationale: raw.rationale };
+  // Single confident number: no band. low/high are kept equal to the estimate
+  // for backward compatibility with the stored/rendered shape.
+  return { estimateUsd: est, low: est, high: est, rationale: raw.rationale };
 }
 
 // Pull the estimator's JSON out of its reply (tolerating stray prose/fences).

@@ -2454,8 +2454,7 @@ export function AdminPipeline() {
 // the proof lands, the actual and the signed delta.
 function CostLine({ cost }: { cost?: ItemCost }) {
   if (!cost) return null;
-  const { estimating, estFailed, estUsd, estLow, estHigh, estRationale, actualUsd } =
-    cost;
+  const { estimating, estFailed, estUsd, estRationale, actualUsd } = cost;
   if (!estimating && !estFailed && estUsd == null && actualUsd == null)
     return null;
   const delta = estUsd != null && actualUsd != null ? actualUsd - estUsd : null;
@@ -2468,12 +2467,6 @@ function CostLine({ cost }: { cost?: ItemCost }) {
       ) : estUsd != null ? (
         <span className="text-amber-600" title={estRationale || undefined}>
           est {fmtUsd(estUsd)}
-          {estLow != null && estHigh != null && (
-            <span className="opacity-60">
-              {' '}
-              ({fmtUsd(estLow)}–{fmtUsd(estHigh)})
-            </span>
-          )}
         </span>
       ) : null}
       {actualUsd != null && (
