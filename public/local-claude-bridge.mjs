@@ -1539,7 +1539,7 @@ ${theorem}`
 const RESEARCH_MODE_NOTE = `RESEARCH MODE — you attack goals that may be UNSOLVED. Rules of engagement:
 - NEVER assess whether the goal is "open", "famous", "hard", a "known conjecture", or "beyond current tools". You cannot know that and it is irrelevant — just work the goal in front of you.
 - Do NOT stop to REPORT difficulty, summarize the literature, or explain why something can't be done. Those are not outputs.
-- Your ONLY valid outputs are: (a) a verified proof, (b) a further DECOMPOSITION of the goal into smaller sub-goals, or (c) a machine-checked disproof you actually confirm on the daemon.
+- Your ONLY valid outputs are: (a) a verified proof, or (b) a further DECOMPOSITION of the goal into smaller sub-goals.
 - "I couldn't prove it" / "this is an open problem" is NOT a stopping state. If a step resists, BREAK IT SMALLER and hand the pieces on. Progress = shrinking the unproved part, not closing it in one shot.
 - Never return empty-handed: always emit your best partial \`have\` steps or tactics so the next agent builds on them, never nothing.`
 
@@ -1763,37 +1763,14 @@ function runProve(theorem, mcpServers, opts = {}) {
 // Streaming variant of /prove: runs Claude with stream-json and translates each
 // event into the app's SSE shape (message-annotation for tool activity,
 // text-delta for the final proof) so the main chat's activity panel renders it.
-// Single-agent SSE entrypoint. Wrapper runs the disproof pre-check FIRST (a
-// false master is refuted in seconds instead of spawning the prover), then hands
-// off to proveStreamRun for the actual proof attempt.
+// Single-agent SSE entrypoint. Goes straight to the prover.
+//
+// NOTE: the disproof/counterexample pre-check was removed — it ran a Lean daemon
+// disproof sweep before EVERY prove (pure overhead on the ~all-true problems) and
+// false-positive detection is being replaced by a separate system. See buildRefute*
+// helpers below, kept dead for that future system.
 async function proveStream(res, theorem, mcpServers, opts = {}) {
   theorem = normalizeProblemSyntax(theorem)
-  if (opts.refuteCheck !== false) {
-    const verifyUrl = resolveVerifyUrl(mcpServers)
-    const rctx = { verifyUrl, verifyTimeoutMs: 180000, refuteTimeoutMs: REFUTE_TIMEOUT_MS_DEFAULT, signal: undefined }
-    if (verifyUrl) {
-      const pre = await refutePreCheck(theorem, rctx)
-      if (pre.refuted) {
-        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform" })
-        const send = (o) => {
-          try {
-            res.write(`data: ${JSON.stringify(o)}\n\n`)
-          } catch {
-            /* client gone */
-          }
-        }
-        const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
-        const w = pre.witness
-        const cex = w != null ? `counterexample at the first argument = ${w}` : "a small counterexample"
-        send({ type: "prompt", prompt: "[REFUTED before proving — the theorem is false]", theorem, model: opts.model || null, mcpServers: (mcpServers || []).map((s) => ({ name: s?.name, url: s?.url })) })
-        send({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${cex}. Machine-checked disproof; skipping the prover.`, metrics })
-        send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${cex}), verified by Lean:\n\n\`\`\`lean\n${pre.script}\n\`\`\`` })
-        send({ type: "done", metrics, verified: false, refuted: true, counterexample: cex, proof: "", disproof: pre.script })
-        res.end()
-        return
-      }
-    }
-  }
   proveStreamRun(res, theorem, mcpServers, opts)
 }
 
@@ -1811,7 +1788,7 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
     return
   }
 
-  const systemPrompt = provePrompt(theorem, mcpServers, REFUTE_NOTE)
+  const systemPrompt = provePrompt(theorem, mcpServers)
   const args = [
     "-p", systemPrompt,
     "--output-format", "stream-json", "--verbose",
@@ -2342,7 +2319,6 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
 async function runNodeProver(node, ctx) {
   const gate = makeProofGate(node.statement)
   let decomposeRequested = false
-  let refuteText = ""
   // #2: the node prover's stream already SEES every compile error and tactic
   // state; capture the most recent ones so a forced decomposition can be told
   // exactly where the direct attempt got stuck instead of rediscovering it.
@@ -2350,8 +2326,7 @@ async function runNodeProver(node, ctx) {
   let lastVerifyError = ""
   let lastGoalState = ""
   const extra =
-    "EARLY DECOMPOSE (optional): if partway through you judge this goal is too large to close directly and would be better split into sub-lemmas, output a line that is exactly `DECOMPOSE: <one-line reason>` and stop — a dedicated decomposition run will then take over. Only do this when genuinely stuck; prefer to finish the proof if you can.\n" +
-    REFUTE_NOTE
+    "EARLY DECOMPOSE (optional): if partway through you judge this goal is too large to close directly and would be better split into sub-lemmas, output a line that is exactly `DECOMPOSE: <one-line reason>` and stop — a dedicated decomposition run will then take over. Only do this when genuinely stuck; prefer to finish the proof if you can."
   const prompt = nodePromptFor(ctx.strategy, node.statement, ctx.mcpServers, extra)
   const onObject = (o) => {
     const ev = gate.observe(o)
@@ -2360,10 +2335,6 @@ async function runNodeProver(node, ctx) {
       for (const c of o.message.content) {
         if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script"))
           verifyIds.add(c.id)
-        if (c.type === "text" && /(^|\n)\s*REFUTE\s*:/i.test(c.text || "")) {
-          refuteText = c.text
-          return true
-        }
         if (c.type === "text" && /(^|\n)\s*DECOMPOSE\s*:/i.test(c.text || "")) {
           decomposeRequested = true
           return true
@@ -2403,7 +2374,7 @@ async function runNodeProver(node, ctx) {
     { onObject, emit: ctx.emit },
   )
   const proof = gate.verifiedScript
-  return { verified: !!proof, proof: proof || "", decomposeRequested, refuteText, lastVerifyError, lastGoalState }
+  return { verified: !!proof, proof: proof || "", decomposeRequested, lastVerifyError, lastGoalState }
 }
 
 // #2: turn the node prover's captured failure into a decomposer briefing, so it
@@ -2574,19 +2545,6 @@ async function proveNode(node, ctx) {
     return true
   }
   if (ctx.signal?.aborted) return false
-  // Agent-driven disproof of the MASTER (depth 0 only): if the prover flagged the
-  // target as false, verify the disproof independently rather than wasting a
-  // decomposition on it. A confirmed ¬T sets ctx.refuted for the caller.
-  if (res.refuteText && node.depth === 0 && !ctx.signal?.aborted) {
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🔎 Prover flagged the master as FALSE — verifying the disproof on the daemon…" })
-    const dis = await confirmAgentRefute(node.statement, ctx, res.refuteText)
-    if (dis.refuted) {
-      ctx.refuted = dis
-      node.status = "failed"
-      return false
-    }
-    ctx.emit({ type: "message-annotation", subtype: "error", thought: "The claimed counterexample did not verify — continuing." })
-  }
   if (node.depth >= ctx.maxDepth) {
     node.status = "failed"
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Max depth (${ctx.maxDepth}) reached; cannot decompose ${declName(node.signature)} further.` })
@@ -2752,17 +2710,12 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
     const gate = makeProofGate(theorem)
     const verifyIds = new Set()
     let lastVerifyError = ""
-    let refuteText = ""
     const onObject = (o) => {
       const ev = gate.observe(o)
       if (ev?.verified) return true
       if (o.type === "assistant" && o.message?.content) {
         for (const c of o.message.content) {
           if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyIds.add(c.id)
-          if (c.type === "text" && /(^|\n)\s*REFUTE\s*:/i.test(c.text || "")) {
-            refuteText = c.text
-            return true // the agent believes it's false — stop and verify the disproof
-          }
         }
       } else if (o.type === "user" && o.message?.content) {
         for (const c of o.message.content) {
@@ -2775,7 +2728,7 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
     }
     await spawnProverStream(
       {
-        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${extra}\n${REFUTE_NOTE}`),
+        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${extra}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         // NO turn cap. The finisher runs until it proves the goal or the SHARED
@@ -2798,13 +2751,6 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
       if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(candidate, theoremSignature(theorem)))
         return { verified: true, proof: candidate }
       ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Agent reported success but the independent re-verify did not confirm it: ${oneLine(v.text || v.error || "unknown")}` })
-    }
-    // Agent-driven disproof: it flagged the theorem as false. Verify independently.
-    if (refuteText && !ctx.signal?.aborted) {
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: "🔎 Agent flagged the theorem as FALSE — verifying the disproof on the daemon…" })
-      const dis = await confirmAgentRefute(theorem, ctx, refuteText)
-      if (dis.refuted) return { verified: false, refuted: true, counterexample: dis.counterexample, disproof: dis.script }
-      ctx.emit({ type: "message-annotation", subtype: "error", thought: "The claimed counterexample did not verify — continuing to prove." })
     }
     // When a compute budget is set the run is TIME-governed (like the single-agent
     // path): keep retrying until the SHARED deadline or a Terminate — NOT a fixed
@@ -3331,21 +3277,6 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
 
   ;(async () => {
     try {
-      // Fast disproof pre-check: a FALSE master is dead on arrival — refute it in
-      // seconds (machine-checked ¬T) instead of grinding the prover for minutes.
-      if (opts.refuteCheck !== false) {
-        emit({ type: "message-annotation", subtype: "status", thought: "🔎 Disproof pre-check — probing small counterexamples…" })
-        const pre = await refutePreCheck(theorem, ctx)
-        if (pre.refuted) {
-          const w = pre.witness
-          const cex = w != null ? `counterexample at the first argument = ${w}` : "a small counterexample"
-          emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${cex}. Machine-checked disproof; skipping the prover.` })
-          send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${cex}), verified by Lean:\n\n\`\`\`lean\n${pre.script}\n\`\`\`` })
-          send({ type: "done", metrics, verified: false, refuted: true, counterexample: cex, proof: "", disproof: pre.script })
-          res.end()
-          return
-        }
-      }
       let ok = false
       let proof = ""
       if (style === "have" || style === "have-tree") {
@@ -3364,13 +3295,6 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         }
         ok = r.verified
         proof = r.proof
-        if (r.refuted) {
-          emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${r.counterexample}. Machine-checked disproof.` })
-          send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${r.counterexample}), verified by Lean.` })
-          send({ type: "done", metrics, verified: false, refuted: true, counterexample: r.counterexample, proof: "", disproof: r.disproof })
-          res.end()
-          return
-        }
         if (ok && proof) {
           emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — have-based proof verified sorry-free." })
           send({ type: "text-delta", content: `✅ **Verified proof** (in-context \`have\` decomposition, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
@@ -3383,13 +3307,6 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         emit({ type: "message-annotation", subtype: "status", thought: `🌲 Decomposition mode [${strategy}]: prove-or-split, ${ctx.turnBudget} turns/node, depth ≤ ${ctx.maxDepth}.` })
         ok = await proveNode(root, ctx)
         proof = ok ? root.proof : ""
-        if (!ok && ctx.refuted) {
-          emit({ type: "message-annotation", subtype: "error", thought: `↯ Master theorem is FALSE — ${ctx.refuted.counterexample}. Machine-checked disproof.` })
-          send({ type: "text-delta", content: `↯ **Refuted** — the theorem is false (${ctx.refuted.counterexample}), verified by Lean.` })
-          send({ type: "done", metrics, verified: false, refuted: true, counterexample: ctx.refuted.counterexample, proof: "", disproof: ctx.refuted.script })
-          res.end()
-          return
-        }
         if (ok && proof) {
           emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — full tree assembled and verified sorry-free." })
           send({ type: "text-delta", content: `✅ **Verified proof** (decomposition tree, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
