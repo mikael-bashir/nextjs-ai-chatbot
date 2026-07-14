@@ -66,6 +66,10 @@ process.on("uncaughtException", (err) => {
 
 const PORT = Number(process.env.PORT || 4123)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"
+// When the proof gate confirms mid-stream we interrupt the CLI (SIGINT) so it
+// flushes its final `result` frame — the sole carrier of total_cost_usd. This is
+// the grace window before we hard-kill a CLI that didn't exit after flushing.
+const PROOF_STOP_GRACE_MS = Number(process.env.PROOF_STOP_GRACE_MS) || 8000
 // Auto-generate a token if none supplied. Copy it into the app UI once.
 const TOKEN = process.env.BRIDGE_TOKEN || randomBytes(24).toString("base64url")
 const MAX_OUTPUT_BYTES = 5 * 1024 * 1024
@@ -1880,6 +1884,10 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
   let buf = ""
   let stderr = ""
   let finalText = ""
+  // Set once the proof gate confirms — so the interrupt-to-flush-cost logic
+  // fires exactly once (later frames, incl. the flushed `result`, must not
+  // re-signal).
+  let proofFoundStop = false
 
   child.stdout.on("data", (chunk) => {
     buf += chunk.toString("utf8")
@@ -1900,12 +1908,26 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
       // verify_full_script calls and records a daemon-verified, gate-passing
       // script. Then emit the display events below.
       const ev = gate.observe(o)
-      if (ev?.verified) {
+      if (ev?.verified && !proofFoundStop) {
+        proofFoundStop = true
         // Target theorem proved. Claude won't self-terminate on a tool success,
         // so stop it now instead of letting it wander until the timeout; the
         // close handler emits the verified proof.
+        //
+        // SIGINT (not SIGKILL): the CLI flushes its final `result` frame on an
+        // interrupt, and that frame is the ONLY carrier of total_cost_usd. A hard
+        // SIGKILL here races the result frame and drops the cost — which is why
+        // daemon-verified proofs showed no actual cost. Hard-kill only as a grace
+        // fallback if the CLI doesn't exit promptly after flushing.
         try {
-          child.kill("SIGKILL")
+          child.kill("SIGINT")
+          setTimeout(() => {
+            try {
+              child.kill("SIGKILL")
+            } catch {
+              /* already gone */
+            }
+          }, PROOF_STOP_GRACE_MS).unref?.()
         } catch {
           /* already gone */
         }
@@ -2275,7 +2297,17 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         }
         if (stop && !stopped) {
           stopped = true
-          kill()
+          // Interrupt (SIGINT), don't hard-kill: the CLI flushes its final
+          // `result` frame on an interrupt, and that frame is the only carrier of
+          // total_cost_usd (accumulated into the tree metrics just above). A hard
+          // SIGKILL here races that frame and drops the sub-run's cost — the tree
+          // equivalent of the flat-path bug. Hard-kill only if it lingers.
+          try {
+            child.kill("SIGINT")
+            setTimeout(kill, PROOF_STOP_GRACE_MS).unref?.()
+          } catch {
+            /* gone */
+          }
         }
       }
     })
