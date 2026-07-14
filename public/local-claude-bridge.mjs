@@ -1529,11 +1529,28 @@ ${theorem}`
 // breaks hard steps into local `have <name> : <prop> := by sorry`, which inherit
 // the local context natively, then fills them bottom-up. Single agent, one
 // context — the deliberate A/B control against the top-level-lemma tree.
+// Research-mode directive shared by every prover agent (planner / minion /
+// finisher). Kills the "this looks like an open/hard conjecture, I'll stop and
+// report" failure mode: the agent may not judge provability, only work the goal.
+const RESEARCH_MODE_NOTE = `RESEARCH MODE — you attack goals that may be UNSOLVED. Rules of engagement:
+- NEVER assess whether the goal is "open", "famous", "hard", a "known conjecture", or "beyond current tools". You cannot know that and it is irrelevant — just work the goal in front of you.
+- Do NOT stop to REPORT difficulty, summarize the literature, or explain why something can't be done. Those are not outputs.
+- Your ONLY valid outputs are: (a) a verified proof, (b) a further DECOMPOSITION of the goal into smaller sub-goals, or (c) a machine-checked disproof you actually confirm on the daemon.
+- "I couldn't prove it" / "this is an open problem" is NOT a stopping state. If a step resists, BREAK IT SMALLER and hand the pieces on. Progress = shrinking the unproved part, not closing it in one shot.
+- Never return empty-handed: always emit your best partial \`have\` steps or tactics so the next agent builds on them, never nothing.`
+
+// How deep the have-tree may recursively re-decompose a resisting hole before the
+// residual is handed to the single-context finisher. Bounds proof nesting (not
+// wall-clock — time is governed separately).
+const MAX_DECOMP_DEPTH = 4
+
 function haveProvePrompt(theorem, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
   return `You are proving a Lean 4 + Mathlib theorem by IN-CONTEXT DECOMPOSITION. You write ONE self-contained proof of the theorem and break every hard step into a LOCAL \`have\`, NEVER a top-level helper lemma.
 
 ${toolSection}
+
+${RESEARCH_MODE_NOTE}
 
 METHOD — scaffold with \`have\`, then fill:
 1. Reproduce the ORIGINAL theorem below VERBATIM (same name and signature) and open its proof with \`by\`.
@@ -2823,6 +2840,41 @@ function parseFillBlock(text, id) {
   return body.trim() ? body : null
 }
 
+// A minion's DECOMPOSE reply: a nested `have`-block (with its own tagged holes)
+// that reduces hole `id`. Returns the lean body, or null if absent / has no new
+// holes (a decomposition with no sub-holes is just a fill — reject it here so it
+// isn't spliced as a dead sub-tree).
+function parseDecomposeBlock(text, id) {
+  const s = String(text || "")
+  const re = new RegExp("DECOMPOSE\\s*⟪\\s*" + id + "\\s*⟫[\\s\\S]*?```lean\\s*\\n([\\s\\S]*?)```", "i")
+  const m = s.match(re)
+  if (!m) return null
+  const body = m[1].replace(/\s+$/, "")
+  if (!body.trim() || !HAS_HOLE_TAG.test(body)) return null
+  return body
+}
+
+// Rewrite every `--⟪x⟫` tag in a sub-decomposition to a globally-unique id (not
+// already present in `existing`), so nested holes can never collide with holes
+// elsewhere in the tree. Returns { body, tags }.
+let TAG_SEQ = 0
+function freshenTags(body, existing) {
+  const seen = new Set(existing)
+  const map = new Map()
+  const out = String(body).replace(/⟪\s*(\w+)\s*⟫/g, (_, t) => {
+    if (!map.has(t)) {
+      let nt
+      do {
+        nt = `d${++TAG_SEQ}`
+      } while (seen.has(nt))
+      seen.add(nt)
+      map.set(t, nt)
+    }
+    return `⟪${map.get(t)}⟫`
+  })
+  return { body: out, tags: [...map.values()] }
+}
+
 // Replace hole `id`'s `:= by sorry --⟪id⟫` with the minion's tactics, re-indented
 // under the `have`. Returns the skeleton unchanged if the hole's shape is
 // unexpected (the final assembly verify then catches the leftover sorry).
@@ -2850,7 +2902,9 @@ function haveTreePlannerPrompt(theorem, mcpServers = [], extra = "") {
 
 ${toolSection}
 
-TWO OUTCOMES — pick the cheaper one:
+${RESEARCH_MODE_NOTE}
+
+TWO OUTCOMES — pick the cheaper one (there is NO third "too hard" option — if you can't close it outright, you DECOMPOSE):
 A) If you can close the whole theorem OUTRIGHT in roughly ≤ 40 lines, just do it: write the proof, verify_full_script it to success (no \`sorry\`), and output it as one \`\`\`lean block. Done.
 B) Otherwise, DECOMPOSE into a skeleton and STOP (do NOT fill the holes):
    1. Reproduce the ORIGINAL theorem VERBATIM (same name + signature), open with \`by\`.
@@ -2874,9 +2928,11 @@ ${theorem}`
 
 function haveHoleFillPrompt(skeleton, id, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
-  return `You are a MINION filling ONE hole in an already-verified Lean 4 proof skeleton. Do NOT touch any other hole.
+  return `You are a MINION working ONE hole in a Lean 4 proof skeleton. Do NOT touch any other hole.
 
 ${toolSection}
+
+${RESEARCH_MODE_NOTE}
 
 THE SKELETON (already compiles with every \`have\` stubbed as \`sorry\`):
 \`\`\`lean
@@ -2885,26 +2941,34 @@ ${skeleton}
 
 YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`. Its declared type is your GOAL; the hypotheses in scope are the theorem's binders plus the EARLIER \`have\`s (they're available by name). To see the EXACT goal state, \`init_proof\` your hole's proposition (closed: ∀-quantify any free variable) and step it with \`apply_tactic\` — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`).
 
-METHOD:
-1. Work out the tactics that close ONLY hole \`--⟪${id}⟫\`.
-2. CHECK them in context: take the skeleton above, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other \`sorry --⟪…⟫\` untouched), and verify_full_script. Success = it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Iterate until that holds.
-(You do NOT need to call cleanup_memory — the system frees proof state between holes for you. Spend your turns proving.)
+You have TWO ways to make progress — you must ALWAYS produce one of them, never nothing:
 
-OUTPUT (exactly this shape, nothing else after it):
+CLOSE — if you can finish the hole, work out the tactics and CHECK them: take the skeleton, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other \`sorry --⟪…⟫\` untouched), verify_full_script until it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Then output:
 FILL ⟪${id}⟫
 \`\`\`lean
-<only the tactics that replace \`sorry\`, one per line, starting at the LEFT margin — no \`have\`, no leading \`by\`, no theorem>
+<only the tactics that replace \`sorry\`, one per line, from the LEFT margin — no \`have\`, no leading \`by\`, no theorem>
 \`\`\`
+
+DECOMPOSE — if the hole resists a direct close, do NOT give up: break its goal into SMALLER sub-steps that another minion will fill. Write local \`have\`s (they inherit this hole's context automatically — do NOT re-quantify), each a NEW tagged hole, then close THIS hole's goal from them. CHECK it by splicing in place of \`sorry --⟪${id}⟫\` and verify_full_script — it MUST compile with only \`sorry\` warnings (the new ones plus the untouched others), NO errors. Then output:
+DECOMPOSE ⟪${id}⟫
+\`\`\`lean
+have s1 : <smaller subgoal> := by sorry --⟪s1⟫
+have s2 : <smaller subgoal> := by sorry --⟪s2⟫
+<tactics that close THIS hole's goal from s1, s2, …>
+\`\`\`
+Each sub-step must be a GENUINELY smaller/easier goal. Use fresh tags (s1, s2, …); the system renames them to stay unique. Prefer CLOSE; DECOMPOSE only when you can't close directly — but ALWAYS pick one, never report that it's impossible.
+(You do NOT need to call cleanup_memory — the system frees proof state between holes for you. Spend your turns proving.)
 
 ${SEARCH_USAGE_NOTE}
 ${extra ? `\n${extra}\n` : ""}`
 }
 
-// Fill one hole in an isolated minion (fresh process → bounded context). Returns
-// the tactic text, or null if the minion couldn't produce a usable fill.
+// Work one hole in an isolated minion (fresh process → bounded context). Returns
+// EITHER a tactic fill (closes the hole), a decomposition (nested sub-skeleton
+// that reduces it to smaller holes), or a fail with scratch notes.
 async function fillHole(skeleton, id, ctx) {
-  if (ctx.signal?.aborted) return { fill: null, notes: null }
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Minion filling hole ⟪${id}⟫ in an isolated context…` })
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Minion working hole ⟪${id}⟫ in an isolated context…` })
   // Collect the tactics the minion actually applied, so a REJECTED minion's
   // work can seed the combined finish rather than evaporating with its (soon
   // wiped) Pantograph state.
@@ -2939,11 +3003,11 @@ async function fillHole(skeleton, id, ctx) {
     },
   )
   const fill = parseFillBlock(res.finalText, id)
-  if (!fill) {
-    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL block.` })
-    return { fill: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
-  }
-  return { fill, notes: null }
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
 }
 
 // Phase-1 orchestrator. Planner → isolated per-hole minions → assembler, with a
@@ -3028,54 +3092,74 @@ async function proveHaveTree(theorem, ctx) {
   // minions instead (the minion prompt no longer calls cleanup_memory), so each
   // minion still gets a clean daemon without racing the others.
   const pantoUrl = resolvePantographUrl(ctx.mcpServers)
-  const fills = new Array(holeIds.length).fill(null)
-  const rejectedNotes = {} // hole id -> { text, tactics } for minions that didn't bank
-  for (let i = 0; i < holeIds.length; i++) {
-    if (ctx.signal?.aborted) break
-    const r = await fillHole(skeleton, holeIds[i], ctx)
-    fills[i] = r.fill
-    if (!r.fill && r.notes) rejectedNotes[holeIds[i]] = r.notes
-    // Emit an updated checkpoint each time a hole banks: the skeleton with every
-    // hole proven SO FAR filled in, the rest still `sorry`. Persisted client-side
-    // so a usage-limit / Terminate / crash mid-loop resumes from banked progress
-    // instead of replanning. (spliceHole is the same splice used for `partial`.)
-    if (r.fill != null) {
-      let cp = skeleton
-      let done = 0
-      holeIds.forEach((hid, j) => {
-        if (fills[j] != null) {
-          cp = spliceHole(cp, hid, fills[j])
-          done++
+  // ---- 2) RECURSIVE DECOMPOSITION over ONE evolving skeleton --------------------
+  // Iterative deepening: each round walks the OPEN holes; a minion either CLOSES a
+  // hole (splice tactics), SPLITS it (splice a verified nested sub-skeleton → new
+  // smaller holes for the next round), or fails (leave it for the finisher). This
+  // is the recursion — a resisting hole becomes smaller holes instead of a dead
+  // end. Bounded by MAX_DECOMP_DEPTH and the shared wall-clock; every splice
+  // re-emits a resumable checkpoint so banked progress survives any stop.
+  let partial = skeleton
+  const rejectedNotes = {} // hole id -> scratch notes handed to the finisher
+  const stuck = new Set() // holes we tried and could not advance (skip on re-walk)
+  let banked = 0
+  for (let depth = 0; depth < MAX_DECOMP_DEPTH; depth++) {
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+    const open = parseHoleIds(partial).filter((h) => !stuck.has(h))
+    if (!open.length) break
+    let progressed = false
+    for (const id of open) {
+      if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+      const r = await fillHole(partial, id, ctx)
+      if (r.fill != null) {
+        partial = spliceHole(partial, id, r.fill)
+        banked++
+        progressed = true
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫.` })
+      } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
+        // Rename sub-holes to globally-unique tags, splice the nested block in
+        // place of this hole, and ACCEPT only if the whole script still compiles
+        // with only `sorry` warnings and still proves the master. Else leave it.
+        const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
+        const trial = spliceHole(partial, id, freshBody)
+        const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+        if (v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig)) {
+          partial = trial
+          progressed = true
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Split hole ⟪${id}⟫ into ${tags.length} smaller hole(s): ${tags.map((t) => `⟪${t}⟫`).join(" ")}.` })
+        } else {
+          stuck.add(id)
+          if (r.notes) rejectedNotes[id] = r.notes
+          ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ split didn't type-check — leaving it for the finisher.` })
         }
-      })
-      ctx.emit({ type: "checkpoint", skeleton: cp, filled: done, total: holeIds.length })
+      } else {
+        stuck.add(id)
+        if (r.notes) rejectedNotes[id] = r.notes
+      }
+      const openNow = parseHoleIds(partial)
+      ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow.length })
+      if (pantoUrl)
+        await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
     }
-    if (pantoUrl)
-      await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
+    if (!progressed) break // a full round advanced nothing → hand the residual on
   }
 
-  // ---- 3) SPLICE the holes that DID fill — bank partial progress ---------------
-  // A failed hole no longer discards the successful ones: we splice every fill we
-  // got and hand the PARTIALLY-filled skeleton onward, so proven work is kept.
-  let partial = skeleton
-  const remaining = []
-  holeIds.forEach((id, i) => {
-    if (fills[i] != null) partial = spliceHole(partial, id, fills[i])
-    else remaining.push(id)
-  })
-  const filled = holeIds.length - remaining.length
+  // ---- 3) The evolving skeleton IS the banked partial. Any still-open holes go to
+  // the finisher; a fully-closed one is the outright win.
+  const remaining = parseHoleIds(partial)
+  const filled = banked
 
   if (remaining.length === 0 && !ctx.signal?.aborted) {
     // Every hole filled — assemble + verify hole-free (the full win).
     ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
     const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${holeIds.length} isolated holes.` })
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${filled} banked hole(s) (recursive decomposition).` })
       return { verified: true, proof: partial }
     }
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
   } else if (!ctx.signal?.aborted) {
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Banked ${filled}/${holeIds.length} hole(s) in isolation; finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🌿 Banked ${filled}/${filled + remaining.length} hole(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
   }
 
   // ---- 4) FINISH: hand the PARTIALLY-filled skeleton to flat mode as a seed, so
