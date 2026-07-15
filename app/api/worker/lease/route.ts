@@ -3,6 +3,10 @@ import type { NextRequest } from 'next/server';
 import { authenticateWorker } from '@/lib/leak/worker-auth';
 import { leaseNextJob } from '@/lib/db/leak-queries';
 import { getProverMcpServers } from '@/lib/leak/prover-servers';
+import { getOrCreateCreditBalance } from '@/lib/db/queries';
+import { getUsdToGbpRate } from '@/lib/pricing';
+
+const COST_MARKUP = 1.2; // keep in sync with /api/worker/complete
 
 
 // Default lease window. The worker must heartbeat within this or the job is
@@ -36,7 +40,19 @@ export async function POST(request: NextRequest) {
   // to its own WORKER_MCP_CONFIG).
   const mcpServers = await getProverMcpServers().catch(() => []);
 
-  // Worker-facing view: problem text, identifiers, and the prover servers.
+  // The mid-run spend ceiling. The customer is billed COST_MARKUP × cost_usd (in
+  // £ credits), so the run must abort once cost_usd would exhaust the balance:
+  //   maxCostUsd = balance / (markup × usd→gbp).
+  // Mock jobs (or a missing rate) → no ceiling (Infinity) — nothing to bill.
+  const balanceCredits = await getOrCreateCreditBalance({
+    userId: job.userId,
+  }).catch(() => 0);
+  const rate = (await getUsdToGbpRate().catch(() => 0)) || 0;
+  const maxCostUsd =
+    rate > 0 ? balanceCredits / (COST_MARKUP * rate) : Number.POSITIVE_INFINITY;
+
+  // Worker-facing view: problem text, identifiers, prover servers, and the hard
+  // cost ceiling for this run.
   return Response.json({
     job: {
       id: job.id,
@@ -45,6 +61,7 @@ export async function POST(request: NextRequest) {
       attempts: job.attempts,
       leaseExpiresAt: job.leaseExpiresAt,
       mcpServers,
+      maxCostUsd,
     },
   });
 }

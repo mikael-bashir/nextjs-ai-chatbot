@@ -7,11 +7,14 @@ import {
   getJobById,
 } from '@/lib/db/leak-queries';
 import { getOrCreateCreditBalance } from '@/lib/db/queries';
-import { quoteProblem, MOCK_PROOF } from '@/lib/leak/pricing';
+import { MOCK_PROOF } from '@/lib/leak/pricing';
 import { publicJobView } from '@/lib/leak/serialize';
 
 
 const MAX_PROBLEM_CHARS = 20_000;
+// Pay-for-compute: no up-front quote, just a floor to start a run. The actual
+// bill (1.2× LLM cost) is metered during the run and settled on completion.
+const MIN_SUBMIT_CREDITS = 1;
 
 function err(code: string, message: string, status: number) {
   return Response.json({ error: { code, message } }, { status });
@@ -61,14 +64,15 @@ export async function POST(request: NextRequest) {
     return Response.json(publicJobView(proved), { status: 201 });
   }
 
-  // Real job: quote it and make sure the account can cover the quote before we
-  // accept work. Capture happens on success; a failed proof is never charged.
-  const quote = quoteProblem(problem);
+  // Real job: pay-for-compute. We don't quote up front — the run is billed at
+  // 1.2× its actual LLM cost on completion, and the worker aborts mid-run if the
+  // cost would exceed the balance (so a thin balance can't fund a huge search).
+  // The only gate here is a minimum balance to start.
   const balance = await getOrCreateCreditBalance({ userId: principal.userId });
-  if (balance < quote.quotedCredits) {
+  if (balance < MIN_SUBMIT_CREDITS) {
     return err(
       'insufficient_credits',
-      `This problem is quoted at ${quote.quotedCredits} credits but your balance is ${balance}. Top up to submit.`,
+      `A minimum balance of ${MIN_SUBMIT_CREDITS} credit is required to submit; your balance is ${balance}. Top up to continue.`,
       402,
     );
   }
@@ -78,8 +82,8 @@ export async function POST(request: NextRequest) {
     apiKeyId: principal.apiKeyId,
     problem,
     isMock: false,
-    pricingClass: quote.pricingClass,
-    quotedCredits: quote.quotedCredits,
+    pricingClass: 'metered', // billed at 1.2× actual cost, not a fixed quote
+    quotedCredits: null,
   });
 
   // Re-read to return a consistent serialized view.

@@ -1646,6 +1646,41 @@ const searchBudgetFor = (name) => {
 // result is only "verified" when the daemon confirmed a target-matching, sorry-
 // free script. `verified`/`proof` reflect that gate; `finalText` is the model's
 // closing message, kept only for diagnostics. The worker charges on `verified`.
+// Rough per-model USD pricing for the MID-RUN spend guard ONLY. The customer's
+// actual bill uses the CLI's authoritative total_cost_usd; this just lets the
+// worker abort a run before it blows past the balance, since the CLI reports
+// cost only on its final frame. $/1M in/out from the model table; cache read =
+// 0.1× input, 5-min write = 1.25×, 1-hour write = 2×.
+const MODEL_PRICE = [
+  [/opus/i, { i: 5, o: 25 }],
+  [/sonnet/i, { i: 3, o: 15 }],
+  [/haiku/i, { i: 1, o: 5 }],
+  [/fable|mythos/i, { i: 10, o: 50 }],
+]
+function modelPrice(model) {
+  for (const [re, p] of MODEL_PRICE) if (re.test(String(model || ""))) return p
+  return { i: 5, o: 25 } // default to opus-tier
+}
+function priceUsageUsd(usage, model) {
+  if (!usage) return 0
+  const p = modelPrice(model)
+  const inTok = Number(usage.input_tokens) || 0
+  const outTok = Number(usage.output_tokens) || 0
+  const readTok = Number(usage.cache_read_input_tokens) || 0
+  const cc = usage.cache_creation || {}
+  const w5 = Number(cc.ephemeral_5m_input_tokens) || 0
+  const w1h = Number(cc.ephemeral_1h_input_tokens) || 0
+  const wFlat = w5 || w1h ? 0 : Number(usage.cache_creation_input_tokens) || 0
+  return (
+    (inTok * p.i +
+      outTok * p.o +
+      readTok * 0.1 * p.i +
+      (w5 + wFlat) * 1.25 * p.i +
+      w1h * 2 * p.i) /
+    1e6
+  )
+}
+
 function runProve(theorem, mcpServers, opts = {}) {
   theorem = normalizeProblemSyntax(theorem)
   return new Promise((resolve) => {
@@ -1706,6 +1741,28 @@ function runProve(theorem, mcpServers, opts = {}) {
     let buf = ""
     let stderr = ""
     let finalText = ""
+    let costUsd = 0 // authoritative, summed from CLI `result` frames
+    let runningCostUsd = 0 // per-turn estimate for the mid-run spend guard
+    let budgetExceeded = false
+    let stopping = false
+    // Hard USD ceiling for this run (balance / (markup × fx)); ∞ ⇒ no cap.
+    const maxCostUsd = Number(opts.maxCostUsd)
+    const hasBudget = Number.isFinite(maxCostUsd) && maxCostUsd > 0
+    const stopChild = (signal) => {
+      if (stopping) return
+      stopping = true
+      try {
+        child.kill(signal)
+        // hard-kill fallback if it doesn't exit after flushing its result frame
+        setTimeout(() => {
+          try {
+            child.kill("SIGKILL")
+          } catch {}
+        }, PROOF_STOP_GRACE_MS).unref?.()
+      } catch {
+        /* already gone */
+      }
+    }
 
     child.stdout.on("data", (chunk) => {
       buf += chunk.toString("utf8")
@@ -1720,15 +1777,25 @@ function runProve(theorem, mcpServers, opts = {}) {
         } catch {
           continue
         }
+        // Cost: sum authoritative totals off result frames; estimate per-turn
+        // from assistant usage so the guard can act before the final frame.
+        if (o.type === "result" && typeof o.total_cost_usd === "number") {
+          costUsd += o.total_cost_usd
+        }
+        if (o.type === "assistant" && o.message?.usage) {
+          runningCostUsd += priceUsageUsd(o.message.usage, o.message.model)
+        }
+        // Mid-run spend guard: abort the instant the metered charge would exhaust
+        // the balance. SIGINT (not SIGKILL) so the CLI flushes its cost frame.
+        if (hasBudget && !budgetExceeded && Math.max(costUsd, runningCostUsd) >= maxCostUsd) {
+          budgetExceeded = true
+          stopChild("SIGINT")
+        }
         const ev = gate.observe(o)
         if (ev?.verified) {
-          // Target proved and daemon-confirmed — stop now instead of letting the
-          // agent wander to the timeout; the close handler resolves the result.
-          try {
-            child.kill("SIGKILL")
-          } catch {
-            /* already gone */
-          }
+          // Target proved + daemon-confirmed — stop now (SIGINT so the final
+          // cost frame flushes) instead of wandering to the timeout.
+          stopChild("SIGINT")
         }
         if (o.type === "result") finalText = o.result || ""
       }
@@ -1754,7 +1821,11 @@ function runProve(theorem, mcpServers, opts = {}) {
         exitCode: code,
         durationMs: Date.now() - start,
         timedOut,
-        stderr,
+        budgetExceeded,
+        costUsd, // authoritative total_cost_usd for billing
+        stderr: budgetExceeded
+          ? "aborted: run cost would exceed remaining balance"
+          : stderr,
       })
     })
   })
@@ -3735,25 +3806,31 @@ async function proveLeasedJob(job) {
   try {
     const out = await runProve(job.problem, mcp, {
       model: WORKER_MODEL || undefined,
+      // Abort mid-run if the metered charge would exhaust the balance. The app
+      // hands us the ceiling on lease (balance / (markup × fx)).
+      maxCostUsd:
+        typeof job.maxCostUsd === "number" ? job.maxCostUsd : Number.POSITIVE_INFINITY,
     })
     clearInterval(beat)
-    // GUARDRAIL: complete (and charge) ONLY on a daemon-verified proof. runProve
-    // now runs the SAME makeProofGate as /prove-stream — out.verified is true
-    // only when verify_full_script confirmed a target-matching, sorry-free
-    // script. A model that merely claims success (out.finalText) does NOT count.
+    const modelId = WORKER_MODEL || "claude"
+    const costUsd = typeof out.costUsd === "number" ? out.costUsd : 0
+    // Pay-for-compute: report costUsd either way so the app bills 1.2× actual on
+    // success OR failure. Complete (proof) only on a daemon-verified script.
     if (out.verified && out.proof && out.proof.trim()) {
-      await workerComplete(job.id, { proof: out.proof, modelId: WORKER_MODEL || "claude" })
-      console.log(`[worker] proved ${job.id} in ${out.durationMs}ms`)
+      await workerComplete(job.id, { proof: out.proof, costUsd, modelId })
+      console.log(`[worker] proved ${job.id} in ${out.durationMs}ms ($${costUsd.toFixed(4)})`)
     } else {
-      const error = out.timedOut
-        ? "prover timed out"
-        : out.stderr || "no verified proof produced"
-      await workerComplete(job.id, { error, modelId: WORKER_MODEL || "claude" })
-      console.log(`[worker] failed ${job.id}: ${error.slice(0, 120)}`)
+      const error = out.budgetExceeded
+        ? "aborted: run cost would exceed remaining balance"
+        : out.timedOut
+          ? "prover timed out"
+          : out.stderr || "no verified proof produced"
+      await workerComplete(job.id, { error, costUsd, modelId })
+      console.log(`[worker] failed ${job.id} ($${costUsd.toFixed(4)}): ${error.slice(0, 120)}`)
     }
   } catch (e) {
     clearInterval(beat)
-    await workerComplete(job.id, { error: e.message })
+    await workerComplete(job.id, { error: e.message, costUsd: 0 })
   }
 }
 

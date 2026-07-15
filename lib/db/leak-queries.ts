@@ -436,11 +436,14 @@ export async function adminResolveFailed({
   return row ?? null;
 }
 
-/** Mark a job failed (money-back: chargedCredits stays 0). */
+/** Mark a job failed. Pay-for-compute: a failed run is still billed for the
+ *  compute it consumed, so `chargedCredits` is whatever the metered charge was
+ *  (0 only when nothing was spent / could be charged). */
 export async function failJob({
   id,
   workerId,
   error,
+  chargedCredits,
   tokensInput,
   tokensOutput,
   modelId,
@@ -448,6 +451,7 @@ export async function failJob({
   id: string;
   workerId: string;
   error: string;
+  chargedCredits?: number | null;
   tokensInput?: number | null;
   tokensOutput?: number | null;
   modelId?: string | null;
@@ -457,7 +461,7 @@ export async function failJob({
     .set({
       status: 'failed',
       resultError: error,
-      chargedCredits: 0,
+      chargedCredits: chargedCredits ?? 0,
       tokensInput: tokensInput ?? null,
       tokensOutput: tokensOutput ?? null,
       modelId: modelId ?? null,
