@@ -380,6 +380,9 @@ interface StagedItem extends GenProblem {
   proof?: string;
   toolchain?: string;
   createdAt?: string;
+  // ISO time the Lean kernel confirmed the proof (set by the verify loop),
+  // threaded to the prod payload so the certificate's "verified" time is real.
+  verifiedAt?: string | null;
 }
 
 interface GeneratedItem extends StagedItem {
@@ -1018,6 +1021,10 @@ export function AdminPipeline() {
         await patchGenerated(item.id, {
           verified,
           proof,
+          // The exact moment the Lean kernel confirmed this proof. Carried
+          // through staging → prod so CompeteMath can sign the certificate with a
+          // real "Enforced/verified" timestamp (independent of when it's minted).
+          ...(verified ? { verifiedAt: new Date().toISOString() } : {}),
           error: verified
             ? null
             : refuted
@@ -1495,6 +1502,7 @@ export function AdminPipeline() {
           lean: item.lean,
           proof: item.proof ?? '',
           toolchain: item.toolchain ?? TOOLCHAIN,
+          verifiedAt: item.verifiedAt ?? null,
         }),
       });
       if (res.ok) {

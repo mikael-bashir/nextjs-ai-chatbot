@@ -116,6 +116,7 @@ export async function POST(request: NextRequest) {
       lean: body.lean,
       proof: body.proof ?? '',
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+      verifiedAt: body.verifiedAt ?? null,
       createdAt: new Date().toISOString(),
     };
     const staged = await pushProblem(record);
