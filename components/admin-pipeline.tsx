@@ -797,7 +797,10 @@ export function AdminPipeline() {
   // the same proof_cost_history row.
   const runEstimate = useCallback(
     (item: GeneratedItem) => {
-      if (!item.lean || item.id in estPromiseRef.current) return;
+      // Recompute on every (re-)verify — the only caller, enqueueVerify, already
+      // dedupes queued items, so this fires once per verify and a repeat verify
+      // gets a fresh estimate instead of being silently skipped.
+      if (!item.lean) return;
       setCost(item.id, { estimating: true, estFailed: false });
       const model = verifyModelRef.current || 'claude-opus-4-8';
       const features = extractFeatures(
@@ -1210,14 +1213,19 @@ export function AdminPipeline() {
       const seeded: Record<string, ItemCost> = { ...costsRef.current };
       for (const it of list) {
         if (it.estUsd != null || it.actualUsd != null || it.costHistoryId) {
+          const prev = seeded[it.id];
+          // MERGE, never null-clobber: a persisted field only overrides when it
+          // has a value. Otherwise a record whose estUsd hasn't been written yet
+          // (estimate still in flight, or lost to an old race) would wipe the
+          // estimate we just computed in memory — the "only actual, no est" bug.
           seeded[it.id] = {
-            ...seeded[it.id],
-            estUsd: it.estUsd,
-            estLow: it.estLow,
-            estHigh: it.estHigh,
-            estRationale: it.estRationale,
-            costHistoryId: it.costHistoryId,
-            actualUsd: it.actualUsd,
+            ...prev,
+            estUsd: it.estUsd ?? prev?.estUsd,
+            estLow: it.estLow ?? prev?.estLow,
+            estHigh: it.estHigh ?? prev?.estHigh,
+            estRationale: it.estRationale ?? prev?.estRationale,
+            costHistoryId: it.costHistoryId ?? prev?.costHistoryId,
+            actualUsd: it.actualUsd ?? prev?.actualUsd,
           };
         }
       }
