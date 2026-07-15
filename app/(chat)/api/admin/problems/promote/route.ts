@@ -72,10 +72,15 @@ export async function POST(request: NextRequest) {
       knowledge,
       proof: rec.proof ?? null,
       mintedAt: rec.createdAt ?? null,
-      // The real Lean-kernel verification time (set by the verifier), so the
-      // certificate's "Enforced/verified" timestamp is authentic — independent
-      // of when CompeteMath mints (signs) it at ingestion.
+      // The real Lean-kernel verification time (set by the verifier) + the
+      // certificate signature minted right after it. CompeteMath stores these
+      // verbatim (no re-signing), so the published signature is the one made
+      // seconds after the kernel verified.
       verifiedAt: (rec as { verifiedAt?: string | null }).verifiedAt ?? null,
+      signature: (rec as { signature?: string | null }).signature ?? null,
+      signatureKeyId:
+        (rec as { signatureKeyId?: string | null }).signatureKeyId ?? null,
+      certMintedAt: (rec as { certMintedAt?: string | null }).certMintedAt ?? null,
       toolchain: rec.toolchain ?? null,
       // Solver-facing key idea (1-3 sentences). CompeteMath reveals it alongside
       // the answer once a problem is solved or given up.

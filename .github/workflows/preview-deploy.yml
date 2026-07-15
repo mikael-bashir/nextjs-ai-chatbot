@@ -182,6 +182,7 @@ jobs:
           COMPETEMATH_REDIS_URL: ${{ secrets.COMPETEMATH_REDIS_URL }}
           STRIPE_SECRET:       ${{ secrets.STRIPE_SECRET_TEST }}
           RESEND_API_KEY:      ${{ secrets.RESEND_API_KEY }}
+          CERT_SIGN_PRIVATE_KEY: ${{ secrets.CERT_SIGN_PRIVATE_KEY }}
 
         with:
           host:     ${{ secrets.SERVER_IP }}
@@ -191,7 +192,8 @@ jobs:
             SUBDOMAIN,PORT,OPEN_PRS,COMPOSE_B64,CADDY_B64,GHCR_TOKEN,GITHUB_ACTOR,
             POSTGRES_URL,AUTH_SECRET,AUTH_URL,NEXT_PUBLIC_APP_URL,XAI_MASTER,
             XAI_FREE_KEY_1,XAI_FREE_KEY_2,XAI_FREE_KEY_3,
-            MEM0_API_KEY,REDIS_URL,COMPETEMATH_REDIS_URL,STRIPE_SECRET,RESEND_API_KEY
+            MEM0_API_KEY,REDIS_URL,COMPETEMATH_REDIS_URL,STRIPE_SECRET,RESEND_API_KEY,
+            CERT_SIGN_PRIVATE_KEY
           script: |
             set -euo pipefail
 
@@ -256,6 +258,7 @@ jobs:
               echo "STRIPE_SECRET=${STRIPE_SECRET}"
               echo "STRIPE_WEBHOOK_SECRET=${CLI_WEBHOOK_SECRET}"
               echo "RESEND_API_KEY=${RESEND_API_KEY}"
+              echo "CERT_SIGN_PRIVATE_KEY=${CERT_SIGN_PRIVATE_KEY}"
             } > "$PREVIEW_DIR/.env"
 
             # ── Self-heal: reap previews whose PR is no longer open ──────────

@@ -383,6 +383,11 @@ interface StagedItem extends GenProblem {
   // ISO time the Lean kernel confirmed the proof (set by the verify loop),
   // threaded to the prod payload so the certificate's "verified" time is real.
   verifiedAt?: string | null;
+  // Certificate signed at verify time (see the verify loop). Threaded through so
+  // CompeteMath stores this exact signature rather than re-signing at ingestion.
+  signature?: string | null;
+  signatureKeyId?: string | null;
+  certMintedAt?: string | null;
 }
 
 interface GeneratedItem extends StagedItem {
@@ -1018,13 +1023,44 @@ export function AdminPipeline() {
         // Genuine outcome: persist it and clear the queued flag. A `refuted`
         // result (the theorem is machine-disproved false) is stored with a
         // distinct marker so it reads as a BAD problem, not a hard one.
+        // The exact moment the Lean kernel confirmed this proof.
+        const verifiedAt = verified ? new Date().toISOString() : undefined;
+        // Mint the SIGNED certificate right now — as close to kernel verification
+        // as possible, so the signed bytes are provably what the kernel saw. The
+        // private key never leaves the server (this hits /api/admin/certificate/
+        // sign). Best-effort: an unsigned cert still publishes if signing is off.
+        let cert:
+          | { signature?: string | null; keyId?: string | null; certMintedAt?: string | null }
+          | null = null;
+        if (verified && proof) {
+          try {
+            const r = await fetch('/api/admin/certificate/sign', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                title: item.questionTitle,
+                proof,
+                verifiedAt,
+              }),
+            });
+            if (r.ok) cert = await r.json();
+          } catch {
+            /* signing best-effort — the proof is still recorded either way */
+          }
+        }
         await patchGenerated(item.id, {
           verified,
           proof,
-          // The exact moment the Lean kernel confirmed this proof. Carried
-          // through staging → prod so CompeteMath can sign the certificate with a
-          // real "Enforced/verified" timestamp (independent of when it's minted).
-          ...(verified ? { verifiedAt: new Date().toISOString() } : {}),
+          ...(verified ? { verifiedAt } : {}),
+          // Signature + the moment it was minted, carried through staging → prod
+          // so CompeteMath stores this exact signature instead of re-signing.
+          ...(cert?.signature
+            ? {
+                signature: cert.signature,
+                signatureKeyId: cert.keyId,
+                certMintedAt: cert.certMintedAt,
+              }
+            : {}),
           error: verified
             ? null
             : refuted
@@ -1503,6 +1539,9 @@ export function AdminPipeline() {
           proof: item.proof ?? '',
           toolchain: item.toolchain ?? TOOLCHAIN,
           verifiedAt: item.verifiedAt ?? null,
+          signature: item.signature ?? null,
+          signatureKeyId: item.signatureKeyId ?? null,
+          certMintedAt: item.certMintedAt ?? null,
         }),
       });
       if (res.ok) {

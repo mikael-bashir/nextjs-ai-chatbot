@@ -95,6 +95,7 @@ jobs:
             STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
             RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
             ESTIMATOR_URL=http://cost-estimator:8900
+            CERT_SIGN_PRIVATE_KEY=${{ secrets.CERT_SIGN_PRIVATE_KEY }}
             NODE_ENV=production
             EOF
 
