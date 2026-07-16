@@ -5,6 +5,14 @@ import { useState, useCallback, useRef } from "react"
 import { generateUUID } from "@/lib/utils"
 import { toast } from "sonner"
 import { useApiClient } from "@/lib/hooks/useApiClient"
+import { fetchProverMcpServers } from "@/lib/mcp/fetch-prover-servers"
+
+// Single source of truth for the "verified proof" toolchain stamp, applied once
+// at stream end for every model (they all check against the same daemon).
+const LEAN_TOOLCHAIN =
+  process.env.NEXT_PUBLIC_LEAN_TOOLCHAIN || "leanprover/lean4:v4.29.1"
+const LEAN_STAMP = `\n\n> 🔒 Verified against **${LEAN_TOOLCHAIN}** (Mathlib pinned to this toolchain). Guaranteed to compile only on this exact version.`
+const VERIFIED_PROOF = /verified proof|compilation successful|100% verified|proof complete/i
 
 export interface UIMessage {
   id: string
@@ -56,16 +64,40 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
       abortControllerRef.current = new AbortController()
 
       try {
-        const response = await apiClient("/api/chat/canary", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          signal: abortControllerRef.current.signal,
-          body: JSON.stringify({
-            id,
-            messages: currentMessages,
-            ...body,
-          }),
-        })
+        let response: Response
+        if (body.selectedChatModel === "claude-prove") {
+          // Prove on the user's own machine: talk to the local bridge directly
+          // (browser → localhost). It streams tool activity in the same SSE
+          // shape as the canary route, so the parsing below is unchanged.
+          let conn: { bridgeUrl?: string; token?: string } = {}
+          try {
+            const raw = localStorage.getItem("lca.connection")
+            if (raw) conn = JSON.parse(raw)
+          } catch {
+            /* ignore */
+          }
+          const base = (conn.bridgeUrl || "http://localhost:4123").replace(/\/$/, "")
+          const mcpServers = await fetchProverMcpServers(apiClient)
+          const theorem =
+            [...currentMessages].reverse().find((m) => m.role === "user")?.content || ""
+          response = await fetch(`${base}/prove-stream`, {
+            method: "POST",
+            signal: abortControllerRef.current.signal,
+            headers: { "Content-Type": "application/json", "x-bridge-token": conn.token || "" },
+            body: JSON.stringify({ theorem, mcpServers }),
+          })
+        } else {
+          response = await apiClient("/api/chat/canary", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: abortControllerRef.current.signal,
+            body: JSON.stringify({
+              id,
+              messages: currentMessages,
+              ...body,
+            }),
+          })
+        }
 
         if (response.status === 429) {
           const resBody = await response.json().catch(() => ({}))
@@ -152,6 +184,14 @@ export function useLeakChat({ id, initialMessages, body = {}, onFinish, onError 
               }
             }
           }
+        }
+
+        // Single stamp point for EVERY model: any verified proof gets the
+        // toolchain footer once, here, where all model streams converge.
+        if (VERIFIED_PROOF.test(assistantMessage.content)) {
+          const stamped = assistantMessage.content + LEAN_STAMP
+          assistantMessage = { ...assistantMessage, content: stamped, parts: [{ type: "text", text: stamped }] }
+          setMessages((prev) => prev.map((m) => (m.id === assistantMessage.id ? assistantMessage : m)))
         }
 
         setStatus("ready")

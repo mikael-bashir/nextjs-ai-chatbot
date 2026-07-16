@@ -1,0 +1,2586 @@
+'use client';
+
+import Link from 'next/link';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Button } from '@/components/ui/button';
+import { Switch } from '@/components/ui/switch';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Separator } from '@/components/ui/separator';
+import { cn } from '@/lib/utils';
+import {
+  fetchProverMcpServers,
+  type ProverMcpServer,
+} from '@/lib/mcp/fetch-prover-servers';
+import {
+  runProverStream,
+  extendProverRun,
+} from '@/lib/prover/run-prover-stream';
+import { ProverConsole } from '@/components/prover/prover-console';
+import type { ProverEvent } from '@/lib/prover/types';
+import {
+  estimateCost,
+  extractFeatures,
+  type EstimateResult,
+} from '@/lib/cost/estimator';
+
+// Per-item cost state (session-scoped): the estimate made on enqueue and the
+// actual recorded once the proof finishes. Persisted rows live in
+// proof_cost_history; this map drives the live per-card display.
+interface ItemCost {
+  estimating?: boolean;
+  estFailed?: boolean;
+  estUsd?: number;
+  estLow?: number;
+  estHigh?: number;
+  estRationale?: string;
+  costHistoryId?: string;
+  actualUsd?: number;
+}
+
+// Estimator scoreboard shape (mirrors AccuracyStats in cost-history-queries; kept
+// local so this client module doesn't import the server-only DB layer).
+interface EstStats {
+  n: number;
+  mape: number | null;
+  biasRel: number | null;
+  biasAbs: number | null;
+  byDifficulty: { difficulty: string; n: number; mape: number | null }[];
+}
+
+const fmtUsd = (n: number | null | undefined) =>
+  n == null ? '—' : `$${n.toFixed(n < 1 ? 3 : 2)}`;
+const fmtPct = (n: number | null | undefined) =>
+  n == null ? '—' : `${(n * 100).toFixed(0)}%`;
+import { MathMarkdown } from '@/components/math-markdown';
+
+const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
+
+// Generation needs no tools/MCP — run claude lean so each call carries ~4k
+// tokens of context instead of ~17k (default system prompt + tool schemas),
+// which drastically cuts subscription rate-limit pressure when looping.
+const GEN_RUN_OPTIONS = {
+  // No cap (0): hard/nested problems can take a long time to reason through, and
+  // the "Terminate" button now controls it (which kills claude server-side via
+  // the bridge's disconnect handler, so an uncapped run can't run away).
+  timeoutMs: 0,
+  systemPrompt:
+    'You are a creative competition-math problem setter. Follow the user instructions exactly and respond with ONLY the requested JSON object.',
+  disallowedTools:
+    'Bash Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
+  strictMcpConfig: true,
+  excludeDynamicSections: true,
+  // Hard/nested reasoning can blow past Claude Code's default 32k output-token
+  // cap (which counts thinking) and error out. Raise it to the model max.
+  maxOutputTokens: 64000,
+};
+
+// Reverse mode builds problems from exact arithmetic (products, modular
+// exponentiation, witness evaluation) that a tool-less model would otherwise
+// grind out by hand — slow (10-20 min of thinking) AND error-prone, so the
+// certificate often ends up wrong. Give ONLY reverse mode a python tool so it
+// computes and self-verifies the certificate exactly, in seconds. The other
+// modes stay tool-free (lean context = less rate-limit pressure when looping).
+function genRunOptionsFor(mode: GenMode, model?: string) {
+  const withModel = model ? { ...GEN_RUN_OPTIONS, model } : GEN_RUN_OPTIONS;
+  if (mode !== 'reverse') return withModel;
+  return {
+    ...withModel,
+    // Drop Bash from the denylist; keep everything else blocked.
+    disallowedTools:
+      'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
+    allowedTools: 'Bash',
+    // Headless run on the user's own local bridge — auto-approve the tool so it
+    // can actually execute python without an interactive prompt.
+    permissionMode: 'bypassPermissions',
+  };
+}
+
+// Models selectable for the local `claude` runs (available on the Claude Max
+// plan). '' = the CLI/bridge default. Generation and verification pick one each,
+// independently.
+const PROVER_MODELS: { value: string; label: string }[] = [
+  { value: '', label: 'Default' },
+  { value: 'claude-opus-4-8', label: 'Opus 4.8' },
+  { value: 'claude-sonnet-5', label: 'Sonnet 5' },
+  { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+  { value: 'claude-fable-5', label: 'Fable 5' },
+];
+
+// The model's context window, for a rough "% of context used" readout.
+const CONTEXT_WINDOW = 200000;
+
+function fmtElapsed(startMs: number | null): string {
+  if (startMs == null) return '';
+  const s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n);
+}
+
+// Compute the next timestamp for a wall-clock time like "8:30pm" in the viewer's
+// local timezone (best effort — assumes the browser tz matches the reset tz).
+function nextTimeToday(hour12: number, minute: number, ampm?: string): number {
+  let hour = hour12;
+  if (ampm) {
+    const pm = /p/i.test(ampm);
+    if (pm && hour < 12) hour += 12;
+    if (!pm && hour === 12) hour = 0;
+  }
+  const now = new Date();
+  const d = new Date(now);
+  d.setHours(hour, minute, 0, 0);
+  if (d.getTime() <= now.getTime()) d.setDate(d.getDate() + 1);
+  return d.getTime();
+}
+
+// Detect Claude's usage/session-limit message (e.g. "You've hit your session
+// limit · resets 8:30pm (Europe/London)") in stdout/stderr, and parse the reset
+// time so the worker can pause and auto-resume.
+function detectSessionLimit(text: string): {
+  hit: boolean;
+  message?: string;
+  resetText?: string;
+  resetAt?: number;
+} {
+  const t = (text || '').trim();
+  if (!/limit/i.test(t)) return { hit: false };
+  if (
+    !/(session|usage|rate)\s*limit|hit your|limit (reached|exceeded)/i.test(t)
+  )
+    return { hit: false };
+  const m = t.match(/reset[s]?\b[^0-9]*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
+  const resetAt = m
+    ? nextTimeToday(Number(m[1]), m[2] ? Number(m[2]) : 0, m[3])
+    : undefined;
+  return {
+    hit: true,
+    message: t.slice(0, 200),
+    resetText: m?.[0]?.trim(),
+    resetAt,
+  };
+}
+
+function fmtCountdown(ms: number): string {
+  const s = Math.max(0, Math.floor(ms / 1000));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
+}
+
+type GenMode = 'easy' | 'medium' | 'hard' | 'insane' | 'reverse';
+
+const MODE_LABEL: Record<GenMode, string> = {
+  easy: 'Easy',
+  medium: 'Medium',
+  hard: 'Hard',
+  insane: 'Insane',
+  reverse: 'Reverse-built',
+};
+
+const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
+
+Work EFFICIENTLY. Commit to ONE idea and derive its answer directly — do not
+explore many candidates or exhaustively re-verify in your head. Your Lean theorem
+will be MACHINE-CHECKED by a Lean prover afterward, so you do NOT need to prove it
+yourself; a best-effort answer that turns out wrong is caught cheaply downstream.
+Keep your reasoning brief and get to the JSON.
+
+Core requirements:
+- Creative and NON-standard: not a textbook exercise, not a famous/known competition problem, not a classic named result. Fresh setup and phrasing.
+- The answer is a specific INTEGER.
+- TITLE — make it genuinely curious and alluring, a hook that makes someone want to click. VARY THE SHAPE every single time; never settle into a template:
+  · an intriguing question — "Isn't this impossible?", "How is π hiding in here?", "Why won't it stop?"
+  · a vivid scenario or stakes — "Defending the Earth", "The last coin standing", "Escape the grid"
+  · a provocative teaser or claim — "Nothing adds up", "A number that shouldn't exist"
+  · playful, wry, or surprising is welcome.
+  HARD BAN: the formulaic "The <Adjective> <Noun>" pattern (e.g. "The Cubic Sentinel", "The Stubborn Remainder") — it is boring and overused; do not use it, and do not start most titles with "The". Keep it short (~2-6 words), specific to THIS problem's flavour, and never spoil the answer.
+- Also give a 1-3 word subtitle (a small tagline). The "difficulty" and "points" are DICTATED by the mode below — emit exactly the values it specifies (do not choose your own).
+- Also assign a "level" as an INTEGER 1-5 = the prerequisite mathematical KNOWLEDGE required to attempt it (this is about background needed, NOT how hard the puzzle is — a level-1 problem can still be a tough puzzle):
+  1 = a first-year primary school student would technically have the base knowledge to attempt it;
+  2 = knowledge content up to early high / secondary school;
+  3 = knowledge up to the end of sixth form / college;
+  4 = built around a single advanced, university-level concept;
+  5 = several advanced concepts combined together.`;
+
+const MODE_BLOCKS: Record<GenMode, string> = {
+  easy: `
+- EASY. A quick, approachable problem: a single clear elementary observation or a short direct computation solves it. No deep trick and no long chain of steps — it should feel like a warm-up.
+- Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
+- Emit "difficulty":"Easy", "points":50.`,
+  medium: `
+- MEDIUM. A solid problem needing ONE genuine, non-obvious insight — not immediate, but not fiendish. A capable solver reaches the integer answer with some real thought.
+- Provide a Lean 4 theorem provable in Mathlib: a decide/native_decide over a small finite domain is acceptable, or a modest closed-form fact. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
+- Emit "difficulty":"Medium", "points":100.`,
+  hard: `
+- HARD. The problem must NOT be solvable by a short brute-force script: avoid small finite search spaces. Use large or unbounded domains, a general n, or structures where naive enumeration is infeasible. It must hinge on a genuine, non-obvious insight, yet still be solvable by hand to a specific integer.
+- The Lean 4 theorem must NOT be provable by decide/native_decide over an enumerable domain. State a GENERAL or closed-form fact (a formula in n, an identity, a divisibility/inequality, a characterization) that requires real Mathlib tactics — induction, algebra, known lemmas — to prove. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.
+- Emit "difficulty":"Hard", "points":150.`,
+  insane: `
+- INSANE. The hardest and rarest tier. The goal is a specific FEELING: a solver reads a SHORT, innocent-looking statement and is overwhelmed not by its length but by how LITTLE they have to go on — no foothold, no obvious first move, "wait… what can I even DO with this?". The path only appears after chaining MULTIPLE distinct, non-obvious insights (or seeing one extraordinarily deep idea), each unlocking the next. A long statement full of exotic vocabulary is the OPPOSITE of what you want — the difficulty must live in the ideas, not the reading.
+
+  HARD BANS — none of these make a problem Insane. If your idea leans on any of them, it is at most Hard: DISCARD it and design a genuinely harder one (do NOT emit a mislabelled problem — this mode must still output a real Insane).
+  · A big modulus / argument / bound that does NOT change the answer. If the result is the same for every prime p (or every large n), the giant number is pure decoration — e.g. "Σ_{i=1}^{p-1} (p-1)!/i mod p" is 0 for EVERY odd prime (one-line Wilson + inverses), so p = 10^9+7 is a costume, not difficulty.
+  · An answer that is degenerate or forced by symmetry — 0, 1, or a constant independent of the elaborate-looking setup.
+  · Dressing an elementary fact in a famous named object (Wilson, Stern/fusc diatomic, Pell, "the multiplicative group mod p", Fibonacci, Catalan…). A recognisable object hands the solver the very foothold you must deny them. Prefer an UNFAMILIAR, self-defined construction the solver has never seen named.
+  · A "big" input whose EFFECTIVE work is tiny — a recurrence evaluated at n ≈ 10^7, a Pell equation with a small fundamental solution, an order/count read straight off a factorisation. If a five-line Python script prints the answer in under a second, it is not Insane (it is barely Hard).
+
+  SELF-CHECK — in your brief reasoning you MUST clear ALL four; if any fails, the problem is not Insane, so redesign before emitting:
+  1. INSIGHT CHAIN: name the ≥2 distinct insights that must be chained (or justify one genuinely deep idea). "One clever observation, then compute" is HARD, not Insane.
+  2. NOT BRUTE-FORCEABLE: state the effective search space and why no short script cracks it — concretely (e.g. "even the smartest enumeration is ≳ 10^12 irreducible steps"), not merely "the number is large". If a small program wins, it fails.
+  3. LOAD-BEARING NUMBERS: confirm the specific numbers matter — change them and both the answer AND the required ideas change. If you could shrink them with nothing lost, it fails.
+  4. SPARSE STATEMENT: the statement is a couple of clean sentences with minimal given information. If it is long, or needs exotic named machinery to even state, rewrite it.
+- The Lean 4 theorem must be a GENERAL / closed-form statement (NOT decide/native_decide over a finite domain), provable in Mathlib only with substantive, multi-step reasoning. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head). Still attempt to make it provable in Mathlib.
+- Emit "difficulty":"Insane", "points":200.`,
+  reverse: `
+- REVERSE-CONSTRUCTION MODE. The ONE invariant: EASY TO VERIFY, HARD TO SOLVE. Build the problem BACKWARD — start from hidden structure you choose so the answer is known to you for free, apply a process that is cheap to check but hard to run in reverse, then reveal only the result and ask for an integer function of what you hid. The Lean check must be a cheap one-step CERTIFICATE the answer satisfies; the solver, lacking your secret, must do real work to recover it.
+
+  DO NOT restrict yourself to any one niche. This asymmetry appears EVERYWHERE in math — roam the whole space and pick whatever is freshest. A NON-exhaustive palette (do not just cycle these — invent your own):
+  - Number theory: factoring, but ALSO Diophantine witnesses, digit/base representations, continued fractions, hidden divisor structure, modular seeds.
+  - Combinatorics: a hidden colouring / tiling / graph / lattice path / matching / permutation whose count or a single witness is asked; a hidden subset with a target sum or property.
+  - Algebra: a polynomial built from chosen roots (ask a coefficient / a value); a hidden matrix or linear system; a group/word construction.
+  - Sequences & recurrences: a hidden seed or rule producing a term far downstream that is cheap to check forward, hard to invert.
+  - Geometry: hidden lattice configurations, chosen points forcing an area/count, constructions with a cheap-to-verify invariant.
+  - Games / processes / invariants: a chosen play sequence or state whose outcome is a cheap check but whose optimal value needs insight.
+  Whatever you pick, the shape is: (1) SECRET you know → (2) a forward map cheap to verify but hard to invert → (3) hand the solver only the output, ask for a specific INTEGER function of the secret. Do not reveal the secret.
+
+  LEAN 4 THEOREM = a CERTIFICATE the ANSWER satisfies, verifiable by ONE computation, NOT a search:
+  - Reference the answer/witness DIRECTLY so verification is polynomial. Examples of the FORM (not a menu to copy): \`p * q = N ∧ Nat.Prime p ∧ Nat.Prime q\`; \`(g ^ x : ZMod p) = h\`; \`(S : Finset ℕ).sum f = T ∧ <cheap predicate on S>\`; \`poly.eval r = 0\`; \`f^[k] seed = target\`. Use ZMod for modular facts so the check stays fast (never form giant powers before reducing).
+  - FORBIDDEN: a statement whose ONLY check is to enumerate a bounded domain — if Lean brute-forces it, so can the solver.
+  - Also FORBIDDEN (co-NP, not cheap to verify): "the maximum/minimum is V", "the number of solutions is K", or any nonexistence claim — UNLESS you also give a directly-checkable witness that pins it.
+  - Prefer decide/native_decide, an equational check, or a direct predicate on that single certificate.
+
+  SCALE so brute force fails but insight wins: large enough that "loop over everything" is impractical, small enough that a smart method cracks it. Sizes are yours to choose per construction — do NOT default to crypto-grade magnitudes.
+
+  COMPUTE, DON'T HAND-DERIVE: you have a Bash tool — run \`python3\` to build your secret, apply the forward map, and COMPUTE the exact integer answer and every number in the certificate (products, modular exponentials, sums, witness evaluations). VERIFY the certificate numerically in python before you emit it. NEVER do large arithmetic in your head — it is slow and it is wrong. State the exact values python gave you.
+- Emit "difficulty":"Insane", "points":200.`,
+};
+
+const RESPONSE_FORMAT = `
+
+Assume "import Mathlib" is present; do NOT include imports.
+Respond with ONLY this JSON object, nothing else:
+{"questionTitle":"<curious, alluring hook — a question / scenario / teaser; NEVER 'The <Adjective> <Noun>'>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
+
+// CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
+// prerequisite KNOWLEDGE of a generated problem. This is ORTHOGONAL to how hard
+// the problem is to solve — a Level-1 problem (primary-school knowledge) can
+// still be fiendishly hard. Difficulty/ingenuity is set by the mode, not here.
+// Level 0 = "Any" (the model assigns the level).
+const LEVELS: { value: number; label: string; need: string }[] = [
+  {
+    value: 1,
+    label: 'Foundational',
+    need: 'the base knowledge of a first-year primary-school student — basic arithmetic, counting, simple patterns',
+  },
+  {
+    value: 2,
+    label: 'Early secondary',
+    need: 'up to early high / secondary school — fractions, basic algebra, simple geometry, elementary number facts',
+  },
+  {
+    value: 3,
+    label: 'Sixth form / college',
+    need: 'up to the end of sixth form / college — algebra, functions, sequences, basic combinatorics/number theory, introductory calculus',
+  },
+  {
+    value: 4,
+    label: 'One advanced concept',
+    need: 'a single advanced, university-level concept (e.g. group theory, linear algebra, real analysis, advanced number theory)',
+  },
+  {
+    value: 5,
+    label: 'Multiple advanced concepts',
+    need: 'several advanced, university-level concepts combined',
+  },
+];
+
+// Prompt block that caps the PREREQUISITE KNOWLEDGE to a target tier. It must NOT
+// touch difficulty — that stays owned entirely by the mode block above.
+function levelBlock(level: number): string {
+  const L = LEVELS.find((l) => l.value === level);
+  if (!L) return '';
+  return `\n\nTARGET KNOWLEDGE LEVEL — CompeteMath Level ${level} (${L.label}). This constrains ONLY the prerequisite knowledge, NOT the difficulty:
+- A solver must be able to UNDERSTAND and attempt the problem with at most: ${L.need}. Do not require, in the statement or the intended human solution, any concept beyond this tier. (The Lean formalisation may still use whatever Mathlib needs — that is separate and does not count.)
+- This says NOTHING about how hard the problem is. Difficulty and ingenuity are governed entirely by the mode above and remain fully in force. A Level-${level} problem must be exactly as hard to SOLVE as the mode demands — e.g. a Level-1 HARD problem is a genuinely fiendish insight over elementary objects (arithmetic, counting, simple patterns), NOT an easy question.
+- Set "level" in your output to exactly ${level}. Set "difficulty"/"points" to reflect how hard the problem is to SOLVE (per the mode) — NEVER downgrade the difficulty just because the level is low.
+You must still produce a specific INTEGER answer and a machine-checkable Lean 4 theorem as specified below.`;
+}
+
+interface LiveProblem {
+  title: string;
+  subtitle?: string;
+  difficulty?: string;
+}
+
+interface LogEntry {
+  id: number;
+  ts: number;
+  level: 'error' | 'warn' | 'info';
+  message: string;
+  // Optional payload, e.g. the raw generation output that failed to parse.
+  detail?: string;
+}
+
+// Serialize a log entry to a self-contained, copy-pasteable block (includes the
+// full raw output) so it can be dropped straight into a bug report.
+function formatLogEntry(e: LogEntry): string {
+  const head = `[${new Date(e.ts).toISOString()}] ${e.level.toUpperCase()}: ${e.message}`;
+  return e.detail
+    ? `${head}\n----- raw output -----\n${e.detail}\n----------------------`
+    : head;
+}
+
+// Summarise problems that already exist (here + live on CompeteMath) so the
+// model can deliberately avoid repeating topics/structures.
+function buildAvoidContext(
+  gen: { questionTitle?: string; problem?: string }[],
+  live: LiveProblem[],
+): string {
+  const genLines = gen
+    .slice(0, 60)
+    .map(
+      (g) =>
+        `- "${g.questionTitle ?? 'untitled'}"${g.problem ? `: ${g.problem.replace(/\s+/g, ' ').slice(0, 110)}` : ''}`,
+    );
+  const liveLines = live
+    .slice(0, 120)
+    .map((p) => `- "${p.title}"${p.subtitle ? ` — ${p.subtitle}` : ''}`);
+  const parts: string[] = [];
+  if (genLines.length)
+    parts.push(`Already generated here:\n${genLines.join('\n')}`);
+  if (liveLines.length)
+    parts.push(`Already live on CompeteMath:\n${liveLines.join('\n')}`);
+  return parts.join('\n\n');
+}
+
+function buildPrompt(mode: GenMode, level: number, avoid: string): string {
+  const avoidBlock = avoid
+    ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
+    : '';
+  return BASE_REQS + MODE_BLOCKS[mode] + levelBlock(level) + avoidBlock + RESPONSE_FORMAT;
+}
+
+interface GenProblem {
+  questionTitle?: string;
+  subtitle?: string;
+  problem?: string;
+  answer?: number;
+  difficulty?: string;
+  points?: number;
+  level?: number;
+  insight?: string;
+  lean?: string;
+}
+
+interface StagedItem extends GenProblem {
+  id: string;
+  proof?: string;
+  toolchain?: string;
+  createdAt?: string;
+  // ISO time the Lean kernel confirmed the proof (set by the verify loop),
+  // threaded to the prod payload so the certificate's "verified" time is real.
+  verifiedAt?: string | null;
+  // Certificate signed at verify time (see the verify loop). Threaded through so
+  // CompeteMath stores this exact signature rather than re-signing at ingestion.
+  signature?: string | null;
+  signatureKeyId?: string | null;
+  certMintedAt?: string | null;
+}
+
+interface GeneratedItem extends StagedItem {
+  verified: boolean;
+  error?: string | null;
+  queued?: boolean;
+  // Persisted cost-estimator state (hydrated into the `costs` map on load so the
+  // per-card estimate/actual survive a refresh).
+  estUsd?: number;
+  estLow?: number;
+  estHigh?: number;
+  estRationale?: string;
+  costHistoryId?: string;
+  actualUsd?: number;
+  // Saved verification progress (resumable have-tree checkpoint), auto-persisted.
+  proofCheckpoint?: string;
+  proofCheckpointFilled?: number;
+  proofCheckpointTotal?: number;
+}
+
+interface Health {
+  staging: { ok: boolean; length?: number; error?: string };
+  prod: { ok: boolean; length?: number; error?: string };
+}
+
+type GenFilter = 'all' | 'verified' | 'failed';
+
+// LLMs emit JSON whose string values contain raw LaTeX backslashes (\sum,
+// \lfloor, …) and sometimes literal newlines/tabs — both invalid inside a JSON
+// string, so JSON.parse throws. Walk the candidate string-aware and escape those
+// so the (otherwise well-formed) object parses. Only applied as a fallback.
+function repairJsonStrings(s: string): string {
+  let out = '';
+  let inStr = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (!inStr) {
+      out += c;
+      if (c === '"') inStr = true;
+      continue;
+    }
+    // Inside a string value.
+    if (c === '\\') {
+      const next = s[i + 1];
+      if (next && '"\\/bfnrtu'.includes(next)) {
+        out += c + next; // keep a valid escape intact
+        i++;
+      } else {
+        out += '\\\\'; // lone backslash (LaTeX) → escape it
+      }
+    } else if (c === '"') {
+      // A `"` really closes the string only if the next non-space char is a
+      // JSON delimiter (, } ] :) or the end. Otherwise it's an unescaped quote
+      // inside the value (e.g. a "friendly" pair) — escape it.
+      let j = i + 1;
+      while (j < s.length && /\s/.test(s[j])) j++;
+      const nxt = s[j];
+      if (
+        nxt === undefined ||
+        nxt === ',' ||
+        nxt === '}' ||
+        nxt === ']' ||
+        nxt === ':'
+      ) {
+        out += c;
+        inStr = false;
+      } else {
+        out += '\\"';
+      }
+    } else if (c === '\n') out += '\\n';
+    else if (c === '\r') out += '\\r';
+    else if (c === '\t') out += '\\t';
+    else out += c;
+  }
+  return out;
+}
+
+// Return the first BALANCED {...} object starting at `start`, respecting strings
+// (so braces inside the Lean code or problem text don't end it early). Handles
+// prose that trails the object and contains stray braces.
+function firstJsonObject(s: string, start: number): string | null {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i++) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c === '\\') esc = true;
+      else if (c === '"') inStr = false;
+    } else if (c === '"') inStr = true;
+    else if (c === '{') depth++;
+    else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+function extractJson(text: string): GenProblem | null {
+  if (!text) return null;
+  let s = text.trim();
+  // Unwrap a ```json … ``` fence if present.
+  const fence = s.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fence) s = fence[1].trim();
+  const start = s.indexOf('{');
+  if (start === -1) return null;
+  // Two candidate slices: the first balanced object (best for trailing prose),
+  // and first-{ to last-} (best when unescaped quotes confuse brace matching).
+  const balanced = firstJsonObject(s, start);
+  const lastEnd = s.lastIndexOf('}');
+  const greedy = lastEnd > start ? s.slice(start, lastEnd + 1) : null;
+  const candidates: string[] = [];
+  for (const c of [balanced, greedy]) {
+    if (c && !candidates.includes(c)) candidates.push(c);
+  }
+  // For each candidate try strict, then a repaired version (raw LaTeX
+  // backslashes, literal newlines, unescaped inner quotes).
+  for (const cand of candidates) {
+    for (const attempt of [cand, repairJsonStrings(cand)]) {
+      try {
+        return JSON.parse(attempt) as GenProblem;
+      } catch {
+        /* try the next candidate */
+      }
+    }
+  }
+  return null;
+}
+
+// Canonical title key for matching a problem across the generated / staging /
+// prod / live stores (case- and whitespace-insensitive).
+function normTitle(s?: string | null): string {
+  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+function metaLine(p: GeneratedItem | StagedItem, withDate = false): string {
+  return [
+    p.difficulty,
+    p.level ? `Level ${p.level}` : null,
+    p.points ? `${p.points}pts` : null,
+    p.answer != null ? `ans ${p.answer}` : null,
+    withDate && (p as GeneratedItem).createdAt
+      ? new Date((p as GeneratedItem).createdAt as string).toLocaleString()
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+// Read a bridge connection from localStorage. `useWork` prefers the dedicated
+// Work-loop bridge (lca.workBridgeUrl); verification uses the shared bridge so
+// generation and proving can run in parallel on two bridges.
+function connFor(useWork: boolean) {
+  try {
+    const base = JSON.parse(localStorage.getItem('lca.connection') || '{}');
+    const workUrl = localStorage.getItem('lca.workBridgeUrl') || '';
+    return useWork && workUrl ? { ...base, bridgeUrl: workUrl } : base;
+  } catch {
+    return {} as { bridgeUrl?: string; token?: string };
+  }
+}
+
+// Default wall-clock budget a tree-path verification runs under before it needs
+// a manual "+5 min" nudge. Generous — deep proofs (e.g. lucas_nresidue_prime)
+// legitimately take a while — and always extendable live.
+const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
+
+export function AdminPipeline() {
+  const [work, setWork] = useState(false);
+  const [genStage, setGenStage] = useState<'idle' | 'generating' | 'saving'>(
+    'idle',
+  );
+  const [stats, setStats] = useState({
+    generated: 0,
+    verified: 0,
+    failed: 0,
+    errors: 0,
+  });
+  const [log, setLog] = useState<LogEntry[]>([]);
+  const [logOpen, setLogOpen] = useState<Set<number>>(new Set());
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const copy = useCallback(async (key: string, text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(key);
+      setTimeout(() => setCopied((c) => (c === key ? null : c)), 1500);
+    } catch {
+      /* clipboard blocked — ignore */
+    }
+  }, []);
+
+  const pushLog = useCallback(
+    (level: LogEntry['level'], message: string, detail?: string) => {
+      setLog((l) =>
+        [
+          {
+            id: Date.now() + Math.random(),
+            ts: Date.now(),
+            level,
+            message,
+            detail,
+          },
+          ...l,
+        ].slice(0, 100),
+      );
+    },
+    [],
+  );
+
+  const pauseForLimit = useCallback(
+    (lim: { message: string; resetText?: string; resetAt?: number }) => {
+      if (limitPausedRef.current) return;
+      limitPausedRef.current = true;
+      setLimitPause(lim);
+      pushLog(
+        'warn',
+        `Paused — Claude session/usage limit reached${
+          lim.resetText ? ` (${lim.resetText})` : ''
+        }. Work auto-resumes at reset.`,
+        lim.message,
+      );
+    },
+    [pushLog],
+  );
+
+  const [health, setHealth] = useState<Health | null>(null);
+  const [items, setItems] = useState<StagedItem[]>([]);
+  const [generated, setGenerated] = useState<GeneratedItem[]>([]);
+  const [genCap, setGenCap] = useState(200);
+  const [genFilter, setGenFilter] = useState<GenFilter>('all');
+  const [previewIds, setPreviewIds] = useState<string[]>([]);
+  const [mode, setMode] = useState<GenMode>('medium');
+  // Target CompeteMath knowledge tier for generation (0 = Any / model decides).
+  const [targetLevel, setTargetLevel] = useState(0);
+  // Generation model — independent from the verification model. '' = default.
+  const [genModel, setGenModel] = useState('');
+  const genModelRef = useRef(genModel);
+  useEffect(() => {
+    genModelRef.current = genModel;
+  }, [genModel]);
+  const [liveProblems, setLiveProblems] = useState<LiveProblem[]>([]);
+  // Titles currently in the prod queue (awaiting the CompeteMath cron). Used to
+  // flag generated items that are already staged for publication.
+  const [prodTitles, setProdTitles] = useState<string[]>([]);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [workBridgeUrl, setWorkBridgeUrl] = useState('');
+  const [generatingOne, setGeneratingOne] = useState(false);
+
+  // Verification queue (client-side): problems awaiting proof, processed serially
+  // by a single verifier so generation and proving stay decoupled.
+  const [verifyQueue, setVerifyQueue] = useState<GeneratedItem[]>([]);
+  const [verifyingId, setVerifyingId] = useState<string | null>(null);
+  const [verifyPaused, setVerifyPaused] = useState<string | null>(null);
+  // Full, normalized prover activity for the shared <ProverConsole> (thinking,
+  // tool calls, tool results/errors, verify attempts, metrics) — not just names.
+  const [verifyEvents, setVerifyEvents] = useState<ProverEvent[]>([]);
+  // Decompose mode: when on, ACG verification drives the /prove-tree orchestrator
+  // (prove-or-split) instead of the single-agent /prove-stream. Held in a ref so
+  // proveStream can read the latest value without re-creating the verify loop.
+  const [verifyDecompose, setVerifyDecompose] = useState(false);
+  const verifyDecomposeRef = useRef(verifyDecompose);
+  useEffect(() => {
+    verifyDecomposeRef.current = verifyDecompose;
+  }, [verifyDecompose]);
+  // Strategy mode (A/B testing proof approaches) for the decompose path. Held in
+  // a ref for the same reason as verifyDecompose.
+  const [verifyStrategy, setVerifyStrategy] = useState('hacker');
+  const verifyStrategyRef = useRef(verifyStrategy);
+  useEffect(() => {
+    verifyStrategyRef.current = verifyStrategy;
+  }, [verifyStrategy]);
+  // Model the prover runs on ('' = the bridge/CLI default). Held in a ref so the
+  // async verify loop reads the latest value. Passed through to `claude --model`.
+  const [verifyModel, setVerifyModel] = useState('');
+  const verifyModelRef = useRef(verifyModel);
+  useEffect(() => {
+    verifyModelRef.current = verifyModel;
+  }, [verifyModel]);
+
+  // Live monitoring: start timestamps drive elapsed timers; usage accumulates
+  // token/cost metadata reported by the bridge.
+  const [genStartedAt, setGenStartedAt] = useState<number | null>(null);
+  const [verifyStartedAt, setVerifyStartedAt] = useState<number | null>(null);
+  const [, setNowTick] = useState(0);
+  // Wall-clock compute budget for a verification run (tree path). The bridge
+  // reports the runId + deadline via onRunId; the "+5 min" button pushes it out.
+  const [computeLimit, setComputeLimit] = useState<{
+    deadlineMs: number;
+    budgetMs: number;
+  } | null>(null);
+  const [extending, setExtending] = useState(false);
+  const runIdRef = useRef<string | null>(null);
+  // item.id -> saved checkpoint to resume from, set by "Resume from saved" and
+  // consumed once by the verify loop (so a plain re-verify still starts fresh).
+  const resumeSeedRef = useRef<Record<string, string>>({});
+  const [usage, setUsage] = useState({
+    calls: 0,
+    tokens: 0,
+    costUsd: 0,
+    lastTokens: 0,
+    lastCostUsd: 0,
+  });
+
+  // Cost estimator: per-item estimate/actual (session-scoped, keyed by item id)
+  // + the running accuracy scoreboard. `costsRef` mirrors `costs` so the async
+  // verify loop can read/patch without a stale closure. `estPromiseRef` holds the
+  // in-flight estimate so the loop can join it (for the history row id) when the
+  // proof — which runs concurrently — finishes.
+  const [costs, setCosts] = useState<Record<string, ItemCost>>({});
+  const costsRef = useRef<Record<string, ItemCost>>({});
+  const estPromiseRef = useRef<Record<string, Promise<EstimateResult | null>>>(
+    {},
+  );
+  const [estStats, setEstStats] = useState<EstStats | null>(null);
+  const setCost = useCallback((id: string, patch: Partial<ItemCost>) => {
+    costsRef.current = {
+      ...costsRef.current,
+      [id]: { ...costsRef.current[id], ...patch },
+    };
+    setCosts({ ...costsRef.current });
+  }, []);
+  const loadEstStats = useCallback(async () => {
+    try {
+      const r = await fetch('/api/admin/cost-history?stats');
+      if (r.ok) setEstStats((await r.json())?.stats ?? null);
+    } catch {
+      /* scoreboard is best-effort */
+    }
+  }, []);
+
+  // Auto-pause when Claude's session/usage limit is hit; auto-resume at reset.
+  const [limitPause, setLimitPause] = useState<{
+    message: string;
+    resetText?: string;
+    resetAt?: number;
+  } | null>(null);
+
+  const workRef = useRef(false);
+  const genAbortRef = useRef<AbortController | null>(null);
+  const verifyAbortRef = useRef<AbortController | null>(null);
+  const limitPausedRef = useRef(false);
+  const queueRef = useRef<GeneratedItem[]>([]);
+  const verifyingIdRef = useRef<string | null>(null);
+  const runningRef = useRef(false);
+  // Refs so generateOne reads the latest mode + existing problems for the prompt
+  // without depending on that state (which would restart the Work loop).
+  const modeRef = useRef<GenMode>('medium');
+  const targetLevelRef = useRef(0);
+  const generatedRef = useRef<GeneratedItem[]>([]);
+  const liveRef = useRef<LiveProblem[]>([]);
+
+  const syncQueue = () => setVerifyQueue([...queueRef.current]);
+
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
+  useEffect(() => {
+    targetLevelRef.current = targetLevel;
+  }, [targetLevel]);
+  useEffect(() => {
+    generatedRef.current = generated;
+  }, [generated]);
+
+  // Tick once a second while something is running (or paused), so elapsed timers
+  // and the limit countdown update live.
+  useEffect(() => {
+    if (genStartedAt == null && verifyStartedAt == null && !limitPause) return;
+    const id = setInterval(() => setNowTick((n) => n + 1), 1000);
+    return () => clearInterval(id);
+  }, [genStartedAt, verifyStartedAt, limitPause]);
+
+  const recordUsage = useCallback((u: any, costUsd: number | null) => {
+    const t =
+      (u?.input_tokens ?? 0) +
+      (u?.cache_creation_input_tokens ?? 0) +
+      (u?.cache_read_input_tokens ?? 0) +
+      (u?.output_tokens ?? 0);
+    if (!t && !costUsd) return;
+    const cost = costUsd ?? 0;
+    setUsage((s) => ({
+      calls: s.calls + 1,
+      tokens: s.tokens + t,
+      costUsd: s.costUsd + cost,
+      lastTokens: t,
+      lastCostUsd: cost,
+    }));
+  }, []);
+
+  const callBridge = useCallback(
+    (useWork: boolean, path: string, init?: RequestInit) => {
+      const conn = connFor(useWork);
+      let base = (conn.bridgeUrl || 'http://localhost:4123').replace(/\/$/, '');
+      // Tolerate a bare host:port (e.g. "localhost:4123") — fetch needs a scheme.
+      if (!/^https?:\/\//i.test(base)) base = `http://${base}`;
+      return fetch(`${base}${path}`, {
+        ...init,
+        headers: {
+          'content-type': 'application/json',
+          'x-bridge-token': conn.token || '',
+          ...(init?.headers || {}),
+        },
+      });
+    },
+    [],
+  );
+
+  const fetchMcp = (): Promise<ProverMcpServer[]> => fetchProverMcpServers();
+
+  // Kick off the cost estimate for an item (auto, on enqueue). Runs CONCURRENTLY
+  // with proving; the result lands on `costs[id]` and the promise on
+  // `estPromiseRef` so the verify loop can join it and record the actual against
+  // the same proof_cost_history row.
+  const runEstimate = useCallback(
+    (item: GeneratedItem) => {
+      // Recompute on every (re-)verify — the only caller, enqueueVerify, already
+      // dedupes queued items, so this fires once per verify and a repeat verify
+      // gets a fresh estimate instead of being silently skipped.
+      if (!item.lean) return;
+      setCost(item.id, { estimating: true, estFailed: false });
+      const model = verifyModelRef.current || 'claude-opus-4-8';
+      const features = extractFeatures(
+        {
+          questionTitle: item.questionTitle,
+          problem: item.problem,
+          difficulty: item.difficulty,
+          level: item.level,
+          lean: item.lean,
+        },
+        { decompose: verifyDecomposeRef.current, model },
+      );
+      // Estimate: the trained ML service (signature→cost) when available, else
+      // the deterministic k-NN quantile over cost history. Pass the Lean goal so
+      // the service can predict from the signature alone.
+      const p = estimateCost({ features, theorem: item.lean || '' })
+        .then((est) => {
+          if (est) {
+            setCost(item.id, {
+              estimating: false,
+              estUsd: est.estimateUsd,
+              estLow: est.low,
+              estHigh: est.high,
+              estRationale: est.rationale,
+              costHistoryId: est.costHistoryId,
+            });
+            // Persist onto the generated record so the estimate survives a
+            // refresh (the `costs` map is session-only). Best-effort.
+            patchGenerated(item.id, {
+              estUsd: est.estimateUsd,
+              estLow: est.low,
+              estHigh: est.high,
+              estRationale: est.rationale,
+              costHistoryId: est.costHistoryId,
+            });
+          } else setCost(item.id, { estimating: false, estFailed: true });
+          return est;
+        })
+        .catch(() => {
+          setCost(item.id, { estimating: false, estFailed: true });
+          return null;
+        });
+      estPromiseRef.current[item.id] = p;
+    },
+    [callBridge, setCost],
+  );
+
+  // Prove via the SHARED bridge, streaming EVERY step into <ProverConsole> via
+  // the same runProverStream the admin queue resolver + playground use. THROWS on
+  // a connectivity/protocol failure (unreachable bridge, non-2xx, no completion
+  // event) so the verifier treats it as transient and keeps the item queued,
+  // rather than mis-marking it "failed". Returns an outcome only on a real
+  // `done` event. A usage-limit message is detected from the streamed text and
+  // rethrown as `__limit__` so the loop pauses instead of failing the item.
+  const proveStream = useCallback(
+    async (
+      lean: string,
+      mcpServers: ProverMcpServer[],
+      signal?: AbortSignal,
+      opts?: { itemId?: string; seed?: string },
+    ) => {
+      const conn = connFor(false); // shared (verification) bridge
+      let content = ''; // accumulate text to detect a session-limit message
+      const onEvent = (ev: ProverEvent) => {
+        setVerifyEvents((prev) => [...prev, ev]);
+        if (ev.detail) content += ` ${ev.detail}`;
+        if (ev.label) content += ` ${ev.label}`;
+      };
+      try {
+        // Resuming from a saved checkpoint is always a tree run (the seed is a
+        // have-tree skeleton), so force the tree path + budget regardless of the
+        // current decompose toggle.
+        const resuming = !!opts?.seed;
+        const decompose = verifyDecomposeRef.current || resuming;
+        const strategy = verifyStrategyRef.current;
+        const model = verifyModelRef.current;
+        const outcome = await runProverStream({
+          problem: lean,
+          mcpServers,
+          model: model || undefined,
+          bridgeUrl: conn.bridgeUrl,
+          token: conn.token,
+          signal,
+          onEvent,
+          source: decompose ? `acg-tree:${strategy}` : 'acg',
+          endpoint: decompose ? 'prove-tree' : 'prove-stream',
+          strategy: decompose ? strategy : undefined,
+          seed: opts?.seed,
+          // Tree path runs under an extendable wall-clock budget; the single-agent
+          // path ignores it (and never fires onRunId), so the indicator stays off.
+          computeBudgetMs: decompose ? VERIFY_COMPUTE_BUDGET_MS : undefined,
+          onRunId: ({ runId, deadlineMs, budgetMs }) => {
+            runIdRef.current = runId;
+            setComputeLimit({ deadlineMs, budgetMs });
+          },
+          // Auto-save: persist the newest banked checkpoint on the item so ANY
+          // stop (usage-limit / Terminate / crash) can resume from it later.
+          onCheckpoint: ({ skeleton, filled, total }) => {
+            if (!opts?.itemId) return;
+            patchGenerated(opts.itemId, {
+              proofCheckpoint: skeleton,
+              proofCheckpointFilled: filled,
+              proofCheckpointTotal: total,
+            });
+          },
+        });
+        const lim = detectSessionLimit(content);
+        if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
+        return outcome;
+      } catch (e) {
+        // A usage limit takes priority even when the stream ended abruptly.
+        const lim = detectSessionLimit(content);
+        if (lim.hit) throw Object.assign(new Error('__limit__'), { limit: lim });
+        throw e; // abort (runVerifier checks signal.aborted) or transient
+      }
+    },
+    [],
+  );
+
+  const patchGenerated = async (id: string, patch: Record<string, unknown>) => {
+    const res = await fetch('/api/admin/generated', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id, ...patch }),
+    });
+    if (res.ok) {
+      const j = await res.json();
+      if (j.item)
+        setGenerated((g) => g.map((x) => (x.id === j.item.id ? j.item : x)));
+    }
+  };
+
+  // The single verifier: pulls the head of the queue, proves it on the shared
+  // bridge, persists the outcome (clearing the DB `queued` flag), and moves on.
+  // A connectivity/protocol failure PAUSES the loop and leaves the item queued —
+  // so a bridge that's down never mis-marks problems as failed.
+  const runVerifier = useCallback(async () => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    setVerifyPaused(null);
+    try {
+      while (queueRef.current.length > 0) {
+        // Stop proving while paused for a usage limit (auto-resumes on reset).
+        if (limitPausedRef.current) break;
+        const item = queueRef.current[0];
+        verifyingIdRef.current = item.id;
+        setVerifyingId(item.id);
+        setVerifyEvents([]);
+        runIdRef.current = null;
+        setComputeLimit(null);
+        const ctrl = new AbortController();
+        verifyAbortRef.current = ctrl;
+        setVerifyStartedAt(Date.now());
+
+        let verified = false;
+        let proof = '';
+        let refuted = false;
+        let counterexample = '';
+        let actualUsd: number | undefined;
+        try {
+          const mcpServers = await fetchMcp();
+          // If this item was enqueued via "Resume from saved", hand its checkpoint
+          // to the run so it finishes from banked progress. One-shot: consumed here
+          // so a later plain re-verify starts fresh.
+          const seed = resumeSeedRef.current[item.id];
+          delete resumeSeedRef.current[item.id];
+          const out = await proveStream(
+            item.lean as string,
+            mcpServers,
+            ctrl.signal,
+            { itemId: item.id, seed },
+          );
+          verified = out.verified;
+          // Actual dollar cost of the whole run (summed across sub-runs on the
+          // bridge). Shown on the card and recorded against the estimate.
+          actualUsd = typeof out.costUsd === 'number' ? out.costUsd : undefined;
+          // For a refuted theorem there is no proof — store the machine-checked
+          // `¬theorem` disproof instead so the card can show the counterexample.
+          proof = out.refuted ? out.disproof || '' : out.proof;
+          refuted = !!out.refuted;
+          counterexample = out.counterexample || '';
+        } catch (e) {
+          const title =
+            item.questionTitle || item.problem?.slice(0, 60) || item.id;
+          if (ctrl.signal.aborted) {
+            // User terminated THIS verification — mark it and move to the next.
+            await patchGenerated(item.id, {
+              verified: false,
+              error: 'Verification terminated by you',
+              queued: false,
+            });
+            setStats((s) => ({ ...s, failed: s.failed + 1 }));
+            pushLog('warn', `Verification terminated: ${title}`);
+            queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
+            syncQueue();
+            continue;
+          }
+          const lim = (e as { limit?: Parameters<typeof pauseForLimit>[0] })
+            .limit;
+          if (lim) {
+            // Usage limit — leave this item queued and pause everything.
+            pauseForLimit(lim);
+            break;
+          }
+          // Transient — keep the item queued (DB flag stays true) and stop.
+          const msg = String((e as Error)?.message || e);
+          setVerifyPaused(msg);
+          pushLog('warn', `Verification paused: ${msg} (items stay queued)`);
+          break;
+        }
+
+        // Genuine outcome: persist it and clear the queued flag. A `refuted`
+        // result (the theorem is machine-disproved false) is stored with a
+        // distinct marker so it reads as a BAD problem, not a hard one.
+        // The exact moment the Lean kernel confirmed this proof.
+        const verifiedAt = verified ? new Date().toISOString() : undefined;
+        // Mint the SIGNED certificate right now — as close to kernel verification
+        // as possible, so the signed bytes are provably what the kernel saw. The
+        // private key never leaves the server (this hits /api/admin/certificate/
+        // sign). Best-effort: an unsigned cert still publishes if signing is off.
+        let cert:
+          | { signature?: string | null; keyId?: string | null; certMintedAt?: string | null }
+          | null = null;
+        if (verified && proof) {
+          try {
+            const r = await fetch('/api/admin/certificate/sign', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                title: item.questionTitle,
+                proof,
+                verifiedAt,
+              }),
+            });
+            if (r.ok) cert = await r.json();
+          } catch {
+            /* signing best-effort — the proof is still recorded either way */
+          }
+        }
+        await patchGenerated(item.id, {
+          verified,
+          proof,
+          ...(verified ? { verifiedAt } : {}),
+          // Signature + the moment it was minted, carried through staging → prod
+          // so CompeteMath stores this exact signature instead of re-signing.
+          ...(cert?.signature
+            ? {
+                signature: cert.signature,
+                signatureKeyId: cert.keyId,
+                certMintedAt: cert.certMintedAt,
+              }
+            : {}),
+          error: verified
+            ? null
+            : refuted
+              ? `↯ REFUTED — ${counterexample || 'counterexample verified by Lean'}`
+              : 'Lean proof did not verify',
+          queued: false,
+          // A proven (or refuted) problem's checkpoint is stale — clear it so no
+          // stale "resume" is offered. An unproven item KEEPS its checkpoint.
+          ...(verified || refuted
+            ? {
+                proofCheckpoint: '',
+                proofCheckpointFilled: 0,
+                proofCheckpointTotal: 0,
+              }
+            : {}),
+        });
+        setStats((s) => ({
+          ...s,
+          verified: s.verified + (verified ? 1 : 0),
+          // A refuted problem is resolved-as-bad, not a prover failure.
+          failed: s.failed + (verified || refuted ? 0 : 1),
+        }));
+        pushLog(
+          verified ? 'info' : refuted ? 'warn' : 'warn',
+          `${verified ? 'Proved' : refuted ? `↯ Refuted (false theorem — ${counterexample})` : 'Did not verify'}: ${
+            item.questionTitle || item.problem?.slice(0, 60) || item.id
+          }`,
+        );
+        // Record the actual cost against this item's estimate. The estimate
+        // runs concurrently, so join its promise for the history row id, then
+        // PATCH the actual and refresh the scoreboard.
+        if (actualUsd != null) {
+          setCost(item.id, { actualUsd });
+          // Persist the actual onto the generated record so it survives a
+          // refresh, not just the session `costs` map. Best-effort.
+          patchGenerated(item.id, { actualUsd });
+          try {
+            const est = await estPromiseRef.current[item.id];
+            // After a refresh the in-flight estimate promise is gone; fall back
+            // to the costHistoryId persisted on the item / in the costs map.
+            const histId =
+              est?.costHistoryId ?? costsRef.current[item.id]?.costHistoryId;
+            if (histId) {
+              await fetch('/api/admin/cost-history', {
+                method: 'PATCH',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  id: histId,
+                  actualUsd,
+                  verified,
+                }),
+              });
+              loadEstStats();
+            }
+          } catch {
+            /* recording is best-effort; the actual still shows on the card */
+          }
+        }
+
+        queueRef.current = queueRef.current.filter((x) => x.id !== item.id);
+        syncQueue();
+      }
+    } finally {
+      verifyingIdRef.current = null;
+      verifyAbortRef.current = null;
+      setVerifyingId(null);
+      setVerifyStartedAt(null);
+      runningRef.current = false;
+    }
+  }, [proveStream, pushLog, pauseForLimit]);
+
+  const terminateVerification = () => verifyAbortRef.current?.abort();
+
+  // "+5 min": push the running verification's wall-clock deadline out. Best-effort
+  // — the bridge mutates the live deadline so it rescues even the current stage.
+  const extendVerification = useCallback(async () => {
+    const runId = runIdRef.current;
+    if (!runId || extending) return;
+    setExtending(true);
+    try {
+      const conn = connFor(false); // shared (verification) bridge
+      const r = await extendProverRun({
+        runId,
+        addMs: 5 * 60_000,
+        bridgeUrl: conn.bridgeUrl,
+        token: conn.token,
+      });
+      if (r) setComputeLimit(r);
+    } finally {
+      setExtending(false);
+    }
+  }, [extending]);
+
+  const resumeNow = useCallback(() => {
+    limitPausedRef.current = false;
+    setLimitPause(null);
+    // Generation loop resumes on its own (it polls limitPausedRef); kick the
+    // verifier back into gear for any still-queued items.
+    runVerifier();
+  }, [runVerifier]);
+
+  // Auto-resume at the parsed reset time (+30s buffer). If no reset time could
+  // be parsed, stays paused until the user resumes manually.
+  useEffect(() => {
+    if (!limitPause?.resetAt) return;
+    const ms = Math.max(0, limitPause.resetAt - Date.now()) + 30000;
+    const id = setTimeout(resumeNow, ms);
+    return () => clearTimeout(id);
+  }, [limitPause, resumeNow]);
+
+  // Load the estimator scoreboard on mount (and it refreshes after each actual).
+  useEffect(() => {
+    loadEstStats();
+  }, [loadEstStats]);
+
+  // Add to the verification queue — persists queued=true so it survives reloads.
+  const enqueueVerify = useCallback(
+    async (item: GeneratedItem) => {
+      if (
+        verifyingIdRef.current === item.id ||
+        queueRef.current.some((x) => x.id === item.id)
+      ) {
+        return;
+      }
+      queueRef.current = [...queueRef.current, { ...item, queued: true }];
+      syncQueue();
+      // Auto-estimate the cost the moment it enters the queue — every problem
+      // piped to the verifier gets a prediction, computed concurrently with the
+      // proof (its few-minute budget never touches the prover).
+      runEstimate(item);
+      await patchGenerated(item.id, { queued: true });
+      runVerifier();
+    },
+    [runVerifier, runEstimate],
+  );
+
+  // Resume a run from its saved checkpoint: stash the seed (consumed once by the
+  // verify loop) and enqueue. The tree run finishes the remaining holes from the
+  // banked skeleton instead of replanning from scratch.
+  const resumeVerification = useCallback(
+    (item: GeneratedItem) => {
+      if (!item.proofCheckpoint) return;
+      resumeSeedRef.current[item.id] = item.proofCheckpoint;
+      enqueueVerify(item);
+    },
+    [enqueueVerify],
+  );
+
+  const removeFromVerifyQueue = async (id: string) => {
+    queueRef.current = queueRef.current.filter((x) => x.id !== id);
+    syncQueue();
+    await patchGenerated(id, { queued: false });
+  };
+
+  // Rebuild the in-memory queue from the DB `queued` flags (on load), preserving
+  // FIFO order, and resume verifying.
+  const rebuildQueue = useCallback(
+    (list: GeneratedItem[]) => {
+      queueRef.current = list
+        .filter((g) => g.queued)
+        .sort((a, b) => (a.createdAt || '').localeCompare(b.createdAt || ''));
+      syncQueue();
+      if (queueRef.current.length > 0) runVerifier();
+    },
+    [runVerifier],
+  );
+
+  // ---- loaders (hydrate on mount / manual refresh) ----------------------
+
+  const loadQueue = useCallback(async () => {
+    try {
+      const r = await fetch('/api/admin/problems');
+      if (!r.ok) return;
+      const j = await r.json();
+      setHealth(j.health ?? null);
+      setItems(Array.isArray(j.items) ? j.items : []);
+      setProdTitles(Array.isArray(j.prodItems) ? j.prodItems : []);
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const loadGenerated = useCallback(async () => {
+    try {
+      const r = await fetch('/api/admin/generated');
+      if (!r.ok) return;
+      const j = await r.json();
+      const list: GeneratedItem[] = Array.isArray(j.items) ? j.items : [];
+      setGenerated(list);
+      if (typeof j.cap === 'number') setGenCap(j.cap);
+      // Rehydrate the per-card cost display from the persisted item fields so the
+      // estimate/actual survive a refresh (the `costs` map is session-only).
+      const seeded: Record<string, ItemCost> = { ...costsRef.current };
+      for (const it of list) {
+        if (it.estUsd != null || it.actualUsd != null || it.costHistoryId) {
+          const prev = seeded[it.id];
+          // MERGE, never null-clobber: a persisted field only overrides when it
+          // has a value. Otherwise a record whose estUsd hasn't been written yet
+          // (estimate still in flight, or lost to an old race) would wipe the
+          // estimate we just computed in memory — the "only actual, no est" bug.
+          seeded[it.id] = {
+            ...prev,
+            estUsd: it.estUsd ?? prev?.estUsd,
+            estLow: it.estLow ?? prev?.estLow,
+            estHigh: it.estHigh ?? prev?.estHigh,
+            estRationale: it.estRationale ?? prev?.estRationale,
+            costHistoryId: it.costHistoryId ?? prev?.costHistoryId,
+            actualUsd: it.actualUsd ?? prev?.actualUsd,
+          };
+        }
+      }
+      costsRef.current = seeded;
+      setCosts(seeded);
+      rebuildQueue(list);
+    } catch {
+      /* ignore */
+    }
+  }, [rebuildQueue]);
+
+  const loadAll = useCallback(() => {
+    loadQueue();
+    loadGenerated();
+  }, [loadQueue, loadGenerated]);
+
+  useEffect(() => {
+    loadAll();
+    setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
+    const savedMode = localStorage.getItem('lca.genMode') as GenMode | null;
+    if (savedMode && savedMode in MODE_LABEL) setMode(savedMode);
+    const savedLevel = Number(localStorage.getItem('lca.targetLevel'));
+    if (Number.isInteger(savedLevel) && savedLevel >= 0 && savedLevel <= 5)
+      setTargetLevel(savedLevel);
+    // Pull already-live CompeteMath problems so generation can avoid them.
+    fetch('/api/admin/live-problems')
+      .then((r) => (r.ok ? r.json() : { problems: [] }))
+      .then((j) => {
+        const p: LiveProblem[] = Array.isArray(j.problems) ? j.problems : [];
+        liveRef.current = p;
+        setLiveProblems(p);
+      })
+      .catch(() => {
+        /* live context is best-effort */
+      });
+  }, [loadAll]);
+
+  const persistMode = (m: GenMode) => {
+    setMode(m);
+    localStorage.setItem('lca.genMode', m);
+  };
+
+  const persistLevel = (n: number) => {
+    setTargetLevel(n);
+    localStorage.setItem('lca.targetLevel', String(n));
+  };
+
+  const persistWorkBridgeUrl = (value: string) => {
+    setWorkBridgeUrl(value);
+    if (value.trim()) localStorage.setItem('lca.workBridgeUrl', value.trim());
+    else localStorage.removeItem('lca.workBridgeUrl');
+  };
+
+  // ---- generation (produces unverified problems, enqueues them) ---------
+
+  // Generate ONE problem on the work bridge, save it unverified, and enqueue it
+  // for verification. Returns nothing; throws on generation failure.
+  const generateOne = useCallback(async () => {
+    const bridgeUrl =
+      (connFor(true).bridgeUrl as string) || 'http://localhost:4123';
+    const ctrl = new AbortController();
+    genAbortRef.current = ctrl;
+    setGenStartedAt(Date.now());
+    setGenStage('generating');
+    try {
+      const prompt = buildPrompt(
+        modeRef.current,
+        targetLevelRef.current,
+        buildAvoidContext(generatedRef.current, liveRef.current),
+      );
+      let genRes: Response;
+      try {
+        genRes = await callBridge(true, '/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt,
+            options: genRunOptionsFor(
+              modeRef.current,
+              genModelRef.current || undefined,
+            ),
+          }),
+          signal: ctrl.signal,
+        });
+      } catch {
+        if (ctrl.signal.aborted)
+          throw new Error('Generation terminated by you');
+        throw new Error(
+          `Couldn't reach the generation bridge at ${bridgeUrl}. Check a bridge is running there, the URL is a full http:// URL, and you're on Chrome/Edge/Firefox.`,
+        );
+      }
+      if (!genRes.ok) {
+        const body = await genRes.text().catch(() => '');
+        const detail = `${JSON.stringify(
+          {
+            bridge: bridgeUrl,
+            httpStatus: genRes.status,
+            mode: modeRef.current,
+          },
+          null,
+          2,
+        )}\n\n----- response body -----\n${body || '(empty)'}`;
+        throw Object.assign(
+          new Error(`Bridge /run failed (${genRes.status})`),
+          {
+            detail,
+          },
+        );
+      }
+      const genData = await genRes.json();
+      recordUsage(genData.usage, genData.costUsd);
+      const raw = String(genData.text || genData.proof || '');
+      const gen = extractJson(raw);
+      if (!gen?.lean) {
+        // Rich diagnostic: the bridge's own metadata explains an empty/failed run
+        // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
+        // cause, not just the symptom. Plus the full raw output for parse issues.
+        const stderr = String(genData.stderr || '').trim();
+        // Session/usage limit → surface a limit marker so the loop pauses.
+        const lim = detectSessionLimit(`${raw}\n${stderr}`);
+        if (lim.hit) {
+          throw Object.assign(
+            new Error(
+              `Session limit reached${lim.resetText ? ` — ${lim.resetText}` : ''}`,
+            ),
+            { limit: lim, detail: raw || stderr },
+          );
+        }
+        // A claude API error is returned as the "result" text, not JSON — report
+        // it verbatim rather than mislabeling it a parse failure.
+        const apiErr = raw.match(/API Error:[^\n]*/i);
+        const reason = apiErr
+          ? apiErr[0].slice(0, 180)
+          : raw
+            ? 'could not parse a problem from the output'
+            : genData.timedOut
+              ? `generation timed out after ${genData.durationMs ?? '?'}ms`
+              : genData.ok === false
+                ? `claude exited ${genData.exitCode ?? '?'}${stderr ? `: ${stderr.split('\n')[0].slice(0, 120)}` : ' (no stderr)'}`
+                : 'empty output (claude returned no text)';
+        const meta = {
+          mode: modeRef.current,
+          bridge: bridgeUrl,
+          httpStatus: genRes.status,
+          ok: genData.ok,
+          exitCode: genData.exitCode,
+          timedOut: genData.timedOut,
+          durationMs: genData.durationMs,
+          textLength: raw.length,
+          promptChars: prompt.length,
+        };
+        const detail = `${JSON.stringify(meta, null, 2)}${
+          stderr ? `\n\n----- stderr -----\n${stderr}` : ''
+        }\n\n----- raw output (${raw.length} chars) -----\n${raw || '(empty)'}`;
+        throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
+      }
+      setStats((s) => ({ ...s, generated: s.generated + 1 }));
+
+      setGenStage('saving');
+      const res = await fetch('/api/admin/generated', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          ...gen,
+          verified: false,
+          proof: '',
+          error: null,
+          queued: true,
+          toolchain: TOOLCHAIN,
+        }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        if (j.item) {
+          setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
+          // Already persisted queued=true; just add to the in-memory queue.
+          if (!queueRef.current.some((x) => x.id === j.item.id)) {
+            queueRef.current = [...queueRef.current, j.item];
+            syncQueue();
+          }
+          runVerifier();
+        }
+      }
+    } finally {
+      genAbortRef.current = null;
+      setGenStartedAt(null);
+      setGenStage('idle');
+    }
+  }, [callBridge, runVerifier, recordUsage]);
+
+  const terminateGeneration = () => genAbortRef.current?.abort();
+
+  // Manual: add one fresh unproven generation to the verify queue.
+  const addUnprovenGeneration = useCallback(async () => {
+    setGeneratingOne(true);
+    try {
+      await generateOne();
+    } catch (e) {
+      const err = e as Error & { detail?: string };
+      setStats((s) => ({ ...s, errors: s.errors + 1 }));
+      pushLog('error', err.message, err.detail);
+    } finally {
+      setGeneratingOne(false);
+    }
+  }, [generateOne, pushLog]);
+
+  // The Work loop: keep generating (each generation enqueues itself).
+  useEffect(() => {
+    workRef.current = work;
+    if (!work) {
+      setGenStage('idle');
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      while (!cancelled && workRef.current) {
+        // Hold while paused for a usage limit (auto-resumes when the limit clears).
+        if (limitPausedRef.current) {
+          await new Promise((res) => setTimeout(res, 4000));
+          continue;
+        }
+        try {
+          await generateOne();
+        } catch (e) {
+          const err = e as Error & {
+            detail?: string;
+            limit?: { message: string; resetText?: string; resetAt?: number };
+          };
+          if (err.limit) {
+            pauseForLimit(err.limit);
+          } else {
+            setStats((s) => ({ ...s, errors: s.errors + 1 }));
+            pushLog('error', err.message, err.detail);
+          }
+          await new Promise((res) => setTimeout(res, 3000));
+        }
+      }
+      if (!cancelled) setGenStage('idle');
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [work, generateOne, pushLog, pauseForLimit]);
+
+  // ---- per-item actions -------------------------------------------------
+
+  // "Verify again" simply (re)enqueues the problem — the verifier handles it.
+  const verifyAgain = (item: GeneratedItem) => {
+    if (item.lean) enqueueVerify(item);
+  };
+
+  const addToStaging = useCallback(async (item: GeneratedItem | StagedItem) => {
+    if (!item.lean) return;
+    setBusy(`stage:${item.id}`);
+    try {
+      const res = await fetch('/api/admin/problems', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          questionTitle: item.questionTitle ?? null,
+          subtitle: item.subtitle ?? null,
+          problem: item.problem ?? null,
+          answer: item.answer ?? null,
+          difficulty: item.difficulty ?? null,
+          points: item.points ?? null,
+          level: item.level ?? null,
+          insight: item.insight ?? null,
+          lean: item.lean,
+          proof: item.proof ?? '',
+          toolchain: item.toolchain ?? TOOLCHAIN,
+          verifiedAt: item.verifiedAt ?? null,
+          signature: item.signature ?? null,
+          signatureKeyId: item.signatureKeyId ?? null,
+          certMintedAt: item.certMintedAt ?? null,
+        }),
+      });
+      if (res.ok) {
+        const j = await res.json();
+        if (j.staged)
+          setItems((it) => [
+            j.staged,
+            ...it.filter((x) => x.id !== j.staged.id),
+          ]);
+      } else if (res.status === 409) {
+        // Server refused a duplicate — surface it and refresh so the chip shows.
+        const j = await res.json().catch(() => null);
+        pushLog('warn', j?.error || 'Already in staging — not added again.');
+        loadQueue();
+      }
+    } finally {
+      setBusy(null);
+    }
+  }, [pushLog, loadQueue]);
+
+  const removeGenerated = useCallback(async (id: string) => {
+    setBusy(`del:${id}`);
+    try {
+      const res = await fetch(
+        `/api/admin/generated?id=${encodeURIComponent(id)}`,
+        { method: 'DELETE' },
+      );
+      if (res.ok) {
+        setGenerated((g) => g.filter((x) => x.id !== id));
+        // The record is gone; just drop it from the in-memory queue.
+        queueRef.current = queueRef.current.filter((x) => x.id !== id);
+        syncQueue();
+      }
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const dropStaged = (id: string) => {
+    setItems((it) => it.filter((x) => x.id !== id));
+  };
+
+  const removeItem = useCallback(async (id: string) => {
+    setBusy(`del:${id}`);
+    try {
+      const res = await fetch(
+        `/api/admin/problems?id=${encodeURIComponent(id)}`,
+        { method: 'DELETE' },
+      );
+      if (res.ok) dropStaged(id);
+    } finally {
+      setBusy(null);
+    }
+  }, []);
+
+  const promoteItem = useCallback(async (id: string) => {
+    setBusy(`promote:${id}`);
+    try {
+      const r = await fetch('/api/admin/problems/promote', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      // Duplicate refusal is not a prod outage — just report it and refresh so
+      // the "In prod" state shows; don't mark prod unhealthy.
+      if (r.status === 409) {
+        pushLog('warn', (await r.text()) || 'Already in prod — not pushed.');
+        loadQueue();
+        return;
+      }
+      if (!r.ok) throw new Error((await r.text()) || `failed (${r.status})`);
+      dropStaged(id);
+    } catch (e) {
+      setHealth((h) =>
+        h
+          ? { ...h, prod: { ok: false, error: String((e as Error).message) } }
+          : h,
+      );
+    } finally {
+      setBusy(null);
+    }
+  }, [pushLog, loadQueue]);
+
+  // ---- derived ----------------------------------------------------------
+
+  const statusOf = (g: GeneratedItem) => {
+    if (verifyingId === g.id) return 'verifying';
+    if (verifyQueue.some((x) => x.id === g.id)) return 'queued';
+    if (g.verified) return 'proved';
+    if (g.error?.startsWith('↯ REFUTED')) return 'refuted';
+    if (g.error) return 'failed';
+    return 'unverified';
+  };
+
+  const badgeClass: Record<string, string> = {
+    verifying: 'bg-amber-500/15 text-amber-600 animate-pulse',
+    queued: 'bg-blue-500/15 text-blue-600',
+    proved: 'bg-emerald-500/15 text-emerald-600',
+    // Refuted = the theorem is provably false (a bad problem, distinct from a
+    // hard one the prover merely couldn't close).
+    refuted: 'bg-fuchsia-500/15 text-fuchsia-600',
+    failed: 'bg-red-500/15 text-red-500',
+    unverified: 'bg-muted text-muted-foreground',
+  };
+
+  const filtered = generated.filter(
+    (g) =>
+      genFilter === 'all' ||
+      (genFilter === 'verified' ? g.verified : !g.verified),
+  );
+
+  // Publication-state highlighting. A problem is identified across the three
+  // stores by its (normalized) title — the only field the prod payload shares
+  // with staging + the live CompeteMath set (the Lean statement isn't promoted).
+  const liveTitleSet = new Set(liveProblems.map((p) => normTitle(p.title)));
+  const stagingTitleSet = new Set(items.map((s) => normTitle(s.questionTitle)));
+  const prodTitleSet = new Set(prodTitles.map(normTitle));
+  const placementOf = (g: GeneratedItem) => {
+    const t = normTitle(g.questionTitle);
+    if (!t) return { live: false, staging: false, prod: false };
+    return {
+      live: liveTitleSet.has(t),
+      staging: stagingTitleSet.has(t),
+      prod: prodTitleSet.has(t),
+    };
+  };
+
+  // Problems waiting for proof: the verification queue minus the one currently
+  // being worked on (verifyQueue holds the in-flight item at its front until it
+  // finishes). This is what the "Queued" stat means next to Generated/Verified/
+  // Failed — NOT the staging-Redis length.
+  const queuedForVerify = verifyQueue.filter((x) => x.id !== verifyingId).length;
+
+  return (
+    <div className="mx-auto w-full max-w-3xl px-4 py-8">
+      <div className="mb-6 flex items-center justify-between">
+        <div>
+          <h1 className="text-2xl font-semibold">Content pipeline</h1>
+          <p className="text-sm text-muted-foreground">
+            Generate → queue for proof → review → publish.
+          </p>
+        </div>
+        <Button asChild variant="ghost" size="sm">
+          <Link href="/">← Back to chat</Link>
+        </Button>
+      </div>
+
+      {/* Usage-limit pause banner */}
+      {limitPause && (
+        <div className="mb-4 rounded-lg border border-amber-500/50 bg-amber-500/10 p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="font-medium text-amber-700">
+                ⏸ Paused — Claude usage limit reached
+              </p>
+              <p className="mt-0.5 text-xs text-amber-700/90">
+                {limitPause.message}
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {limitPause.resetAt
+                  ? `Auto-resumes at ${new Date(limitPause.resetAt).toLocaleTimeString()} (in ${fmtCountdown(limitPause.resetAt - Date.now())}).`
+                  : 'No reset time detected — resume manually when your limit refreshes.'}
+              </p>
+            </div>
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-8 shrink-0"
+              onClick={resumeNow}
+            >
+              Resume now
+            </Button>
+          </div>
+        </div>
+      )}
+
+      {/* Work / generation control */}
+      <div className="rounded-lg border p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <Label htmlFor="admin-work" className="text-base">
+              Work
+            </Label>
+            <p className="text-xs text-muted-foreground">
+              While on: continuously generate problems and add them to the
+              verification queue below.
+            </p>
+          </div>
+          <Switch id="admin-work" checked={work} onCheckedChange={setWork} />
+        </div>
+
+        <div className="mt-3">
+          <Label className="text-xs">Difficulty mode</Label>
+          <div className="mt-1 flex flex-wrap gap-1 text-xs">
+            {(['easy', 'medium', 'hard', 'insane', 'reverse'] as GenMode[]).map(
+              (m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => persistMode(m)}
+                  className={cn(
+                    'rounded border px-2 py-1',
+                    mode === m
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {MODE_LABEL[m]}
+                </button>
+              ),
+            )}
+          </div>
+          <label className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
+            Target level
+            <select
+              value={targetLevel}
+              onChange={(e) => persistLevel(Number(e.target.value))}
+              className="rounded-md border bg-background px-1.5 py-1 text-xs"
+              title="Target CompeteMath knowledge tier — drives how easy or hard the generated problem is. 'Any' lets the model decide."
+            >
+              <option value={0}>Any (model decides)</option>
+              {LEVELS.map((l) => (
+                <option key={l.value} value={l.value}>
+                  {l.value} · {l.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
+            Generation model
+            <select
+              value={genModel}
+              onChange={(e) => setGenModel(e.target.value)}
+              className="rounded-md border bg-background px-1.5 py-1 text-xs"
+              title="Which model generates problems (independent of the verification model). Default = the bridge/CLI default."
+            >
+              {PROVER_MODELS.map((m) => (
+                <option key={m.value} value={m.value}>
+                  {m.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            {mode === 'easy' &&
+              'A quick warm-up: one elementary observation solves it. Lean proof usually machine-checkable (decide). Emits difficulty Easy.'}
+            {mode === 'medium' &&
+              'Needs one genuine, non-obvious insight. Small-domain decide or a modest closed form. Emits difficulty Medium.'}
+            {mode === 'hard' &&
+              'No brute-force / small-search solution; Lean theorem is general (not decide) — harder to auto-prove, but the workflow still tries. Emits difficulty Hard.'}
+            {mode === 'insane' &&
+              'Chains multiple distinct insights (or one very deep idea); general (non-decide) Lean statement. Hardest to prove automatically. Emits difficulty Insane.'}
+            {mode === 'reverse' &&
+              'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
+          </p>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            De-duplicating against {generated.length} generated +{' '}
+            {liveProblems.length} live CompeteMath problems.
+          </p>
+        </div>
+
+        <div className="mt-3">
+          <Label htmlFor="admin-work-bridge" className="text-xs">
+            Generation bridge URL (optional)
+          </Label>
+          <Input
+            id="admin-work-bridge"
+            value={workBridgeUrl}
+            placeholder="defaults to your shared bridge"
+            className="mt-1 h-8 max-w-sm text-xs"
+            onChange={(e) => persistWorkBridgeUrl(e.target.value)}
+          />
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Generation runs here (e.g. http://localhost:4124); verification runs
+            on your shared bridge, so the two can work in parallel.
+          </p>
+        </div>
+
+        <div className="mt-4 grid grid-cols-4 gap-2 text-center">
+          <Stat label="Generated" value={stats.generated} />
+          <Stat
+            label="Verified"
+            value={stats.verified}
+            tone="text-emerald-600"
+          />
+          <Stat label="Failed" value={stats.failed} />
+          <Stat label="Queued" value={queuedForVerify} />
+        </div>
+
+        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
+          <span className="font-medium">Generation:</span>
+          {genStartedAt != null ? (
+            <span className="flex items-center gap-1.5 text-amber-600">
+              <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+              {genStage} ({MODE_LABEL[mode]}) · {fmtElapsed(genStartedAt)}
+              <button
+                type="button"
+                onClick={terminateGeneration}
+                className="ml-1 rounded border border-red-500/40 px-1.5 py-0.5 text-red-500 hover:bg-red-500/10"
+              >
+                Terminate
+              </button>
+            </span>
+          ) : (
+            <span className="capitalize text-muted-foreground">{genStage}</span>
+          )}
+          {stats.errors > 0 && (
+            <span className="text-red-500">· {stats.errors} errors</span>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            className="ml-auto h-7 px-2 text-xs"
+            disabled={generatingOne || genStartedAt != null}
+            onClick={addUnprovenGeneration}
+          >
+            {generatingOne ? 'Generating…' : '+ Generate one → queue'}
+          </Button>
+        </div>
+
+        {/* Usage / metadata */}
+        <div className="mt-3 grid grid-cols-3 gap-2 rounded-md border p-2 text-center text-[11px]">
+          <div>
+            <div className="font-semibold">{usage.calls}</div>
+            <div className="text-muted-foreground">claude calls</div>
+          </div>
+          <div>
+            <div className="font-semibold">{fmtTokens(usage.tokens)}</div>
+            <div className="text-muted-foreground">total tokens</div>
+          </div>
+          <div>
+            <div className="font-semibold">${usage.costUsd.toFixed(3)}</div>
+            <div className="text-muted-foreground">session cost</div>
+          </div>
+        </div>
+        {usage.lastTokens > 0 && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Last generation: {fmtTokens(usage.lastTokens)} tokens ($
+            {usage.lastCostUsd.toFixed(3)}) —{' '}
+            {((usage.lastTokens / CONTEXT_WINDOW) * 100).toFixed(1)}% of the{' '}
+            {fmtTokens(CONTEXT_WINDOW)} context window.
+          </p>
+        )}
+
+        {/* Cost estimator scoreboard — how close estimates have tracked actuals.
+            The "test the estimator" surface: it should improve as more proofs
+            land (MAPE ↓). Bias > 0 means we over-estimate on average. */}
+        <div className="mt-3 rounded-md border p-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Cost estimator
+            </span>
+            <span className="text-[10px] text-muted-foreground">
+              {estStats?.n ? `${estStats.n} scored` : 'no scored proofs yet'}
+            </span>
+          </div>
+          <div className="grid grid-cols-3 gap-2 text-center text-[11px]">
+            <div>
+              <div className="font-semibold">{fmtPct(estStats?.mape)}</div>
+              <div className="text-muted-foreground">MAPE</div>
+            </div>
+            <div>
+              <div className="font-semibold">
+                {estStats?.biasRel == null
+                  ? '—'
+                  : `${estStats.biasRel > 0 ? '+' : ''}${fmtPct(estStats.biasRel)}`}
+              </div>
+              <div className="text-muted-foreground">bias</div>
+            </div>
+            <div>
+              <div className="font-semibold">{fmtUsd(estStats?.biasAbs)}</div>
+              <div className="text-muted-foreground">avg $ error</div>
+            </div>
+          </div>
+          {estStats?.byDifficulty && estStats.byDifficulty.length > 0 && (
+            <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+              {estStats.byDifficulty.map((d) => (
+                <span key={d.difficulty}>
+                  {d.difficulty}: {fmtPct(d.mape)}{' '}
+                  <span className="opacity-60">(n={d.n})</span>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Activity / error log */}
+      <div className="mt-8">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">
+            Log{' '}
+            <span className="text-sm font-normal text-muted-foreground">
+              ({log.length})
+            </span>
+          </h2>
+          {log.length > 0 && (
+            <div className="flex items-center gap-3 text-xs">
+              <button
+                type="button"
+                onClick={() =>
+                  copy('all', log.map(formatLogEntry).join('\n\n'))
+                }
+                className="text-muted-foreground underline-offset-2 hover:underline"
+              >
+                {copied === 'all' ? 'Copied ✓' : 'Copy all'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setLog([])}
+                className="text-muted-foreground underline-offset-2 hover:underline"
+              >
+                Clear
+              </button>
+            </div>
+          )}
+        </div>
+        <p className="mb-2 text-[11px] text-muted-foreground">
+          Something break? Hit “Copy all” (or a row’s “copy”) and paste it to
+          Claude — each entry includes the full raw output, so the exact failure
+          can be diagnosed.
+        </p>
+        <div className="max-h-72 space-y-1 overflow-y-auto rounded-md border p-2">
+          {log.length === 0 && (
+            <p className="text-xs text-muted-foreground">
+              Errors, discarded generations, and verification results appear
+              here.
+            </p>
+          )}
+          {log.map((e) => (
+            <div key={e.id} className="text-xs">
+              <div className="flex items-start gap-2">
+                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                  {new Date(e.ts).toLocaleTimeString()}
+                </span>
+                <span
+                  className={cn(
+                    'break-words',
+                    e.level === 'error'
+                      ? 'text-red-500'
+                      : e.level === 'warn'
+                        ? 'text-amber-600'
+                        : 'text-muted-foreground',
+                  )}
+                >
+                  {e.message}
+                </span>
+                <div className="ml-auto flex shrink-0 gap-2 text-[10px] text-muted-foreground">
+                  <button
+                    type="button"
+                    className="underline-offset-2 hover:underline"
+                    onClick={() => copy(String(e.id), formatLogEntry(e))}
+                  >
+                    {copied === String(e.id) ? 'copied ✓' : 'copy'}
+                  </button>
+                  {e.detail && (
+                    <button
+                      type="button"
+                      className="underline-offset-2 hover:underline"
+                      onClick={() =>
+                        setLogOpen((s) => {
+                          const n = new Set(s);
+                          if (n.has(e.id)) n.delete(e.id);
+                          else n.add(e.id);
+                          return n;
+                        })
+                      }
+                    >
+                      {logOpen.has(e.id) ? 'hide raw' : 'view raw'}
+                    </button>
+                  )}
+                </div>
+              </div>
+              {e.detail && logOpen.has(e.id) && (
+                <pre className="mt-1 max-h-60 overflow-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-[10px]">
+                  {e.detail}
+                </pre>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Verification queue */}
+      <div className="mt-8">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">
+            Verification queue{' '}
+            <span className="text-sm font-normal text-muted-foreground">
+              ({verifyQueue.length})
+            </span>
+          </h2>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setVerifyDecompose((v) => !v)}
+              className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors ${
+                verifyDecompose
+                  ? 'border-violet-500/50 bg-violet-500/10 text-violet-600 dark:text-violet-400'
+                  : 'text-muted-foreground hover:bg-muted'
+              }`}
+              title="Verify generated problems via the prove-or-split decomposition tree instead of a single agent run"
+            >
+              {/* branch glyph as text to avoid adding an icon dependency */}
+              <span aria-hidden>⑂</span>
+              Decompose {verifyDecompose ? 'on' : 'off'}
+            </button>
+            <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+              Model
+              <select
+                value={verifyModel}
+                onChange={(e) => setVerifyModel(e.target.value)}
+                className="rounded-md border bg-background px-1.5 py-1 text-xs"
+                title="Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default."
+              >
+                {PROVER_MODELS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {verifyDecompose && (
+              <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                Strategy
+                <select
+                  value={verifyStrategy}
+                  onChange={(e) => setVerifyStrategy(e.target.value)}
+                  className="rounded-md border bg-background px-1.5 py-1 text-xs"
+                  title="A/B-test proof strategies; runs are tagged acg-tree:<strategy> in the agent debug log"
+                >
+                  <option value="hacker">Hacker (compiler-driven)</option>
+                  <option value="pantograph">Pantograph (interactive Leak II)</option>
+                  <option value="librarian">Librarian (search-first control)</option>
+                  <option value="sketch">Sketch (plan then formalize)</option>
+                  <option value="brute">Brute (automation only)</option>
+                  <option value="have">Have (in-context, no top-level lemmas)</option>
+                  <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
+                </select>
+              </label>
+            )}
+            {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 px-2 text-xs"
+                onClick={() => runVerifier()}
+              >
+                Resume verifying
+              </Button>
+            )}
+          </div>
+        </div>
+        {verifyDecompose && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            Decompose mode: each generated problem is proved-or-split into
+            toolchain-verified sub-lemmas (recursively) and assembled into one
+            sorry-free proof. Slower but closes goals a single run stalls on.
+          </p>
+        )}
+        {verifyPaused && (
+          <div className="mb-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-2 text-xs text-amber-600">
+            <span className="font-medium">Paused: </span>
+            <span className="font-mono">{verifyPaused}</span>. Items stay
+            queued; fix the shared bridge and resume.
+          </div>
+        )}
+        {verifyingId && verifyStartedAt != null && (
+          <div className="mb-2 flex items-center gap-2 text-xs text-amber-600">
+            <span className="size-1.5 animate-pulse rounded-full bg-amber-500" />
+            Verifying · {fmtElapsed(verifyStartedAt)}
+            <button
+              type="button"
+              onClick={terminateVerification}
+              className="rounded border border-red-500/40 px-1.5 py-0.5 text-red-500 hover:bg-red-500/10"
+            >
+              Terminate
+            </button>
+          </div>
+        )}
+        {verifyEvents.length > 0 && (
+          <ProverConsole
+            events={verifyEvents}
+            running={!!verifyingId}
+            title="Verification activity"
+            className="mb-2"
+            computeLimit={computeLimit}
+            onExtend={extendVerification}
+            extending={extending}
+          />
+        )}
+        <div className="space-y-1.5">
+          {verifyQueue.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              Nothing queued. Turn Work on, hit “Generate one”, or “Verify
+              again” on any problem below.
+            </p>
+          )}
+          {verifyQueue.map((q, i) => {
+            const active = verifyingId === q.id;
+            return (
+              <div
+                key={q.id}
+                className="flex items-center justify-between gap-2 rounded-md border p-2 text-sm"
+              >
+                <div className="flex min-w-0 items-center gap-2">
+                  <span
+                    className={cn(
+                      'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+                      active ? badgeClass.verifying : badgeClass.queued,
+                    )}
+                  >
+                    {active ? 'verifying' : `#${i + 1}`}
+                  </span>
+                  <span className="truncate">
+                    {q.questionTitle || q.problem || 'Untitled problem'}
+                  </span>
+                </div>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 shrink-0 px-2 text-xs text-red-500 hover:text-red-600"
+                  disabled={active}
+                  title={active ? 'Currently verifying' : 'Remove from queue'}
+                  onClick={() => removeFromVerifyQueue(q.id)}
+                >
+                  Remove
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Generated history */}
+      <div className="mt-8">
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">
+            Generated{' '}
+            <span className="text-sm font-normal text-muted-foreground">
+              ({generated.length}/{genCap})
+            </span>
+          </h2>
+          <div className="flex items-center gap-1 text-xs">
+            {(['all', 'verified', 'failed'] as GenFilter[]).map((f) => (
+              <button
+                key={f}
+                type="button"
+                onClick={() => setGenFilter(f)}
+                className={cn(
+                  'rounded px-2 py-1 capitalize',
+                  genFilter === f
+                    ? 'bg-muted font-medium text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                {f}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={loadGenerated}
+              className="ml-1 text-muted-foreground underline-offset-2 hover:underline"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          {filtered.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              No {genFilter === 'all' ? '' : `${genFilter} `}problems yet.
+            </p>
+          )}
+          {filtered.map((g) => {
+            const status = statusOf(g);
+            const pl = placementOf(g);
+            return (
+              <div
+                key={g.id}
+                className={cn(
+                  'rounded-lg border p-3',
+                  pl.live && 'border-rose-500/40 bg-rose-500/[0.03]',
+                )}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                      <span
+                        className={cn(
+                          'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+                          badgeClass[status],
+                        )}
+                      >
+                        {status}
+                      </span>
+                      {pl.live && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-rose-500/15 text-rose-600"
+                          title="Already published on CompeteMath practice — remove if this is a duplicate"
+                        >
+                          Live
+                        </span>
+                      )}
+                      {pl.staging && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-blue-500/15 text-blue-600"
+                          title="Sitting in the staging review queue"
+                        >
+                          Staging
+                        </span>
+                      )}
+                      {pl.prod && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-violet-500/15 text-violet-600"
+                          title="Promoted to prod — awaiting the CompeteMath publish cron, or already published"
+                        >
+                          Prod
+                        </span>
+                      )}
+                      <span className="truncate font-medium">
+                        {g.questionTitle || g.problem || 'Untitled problem'}
+                      </span>
+                    </div>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {metaLine(g, true)}
+                    </p>
+                    <CostLine cost={costs[g.id]} />
+                  </div>
+                </div>
+
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    onClick={() =>
+                      setPreviewIds((p) =>
+                        p.includes(g.id)
+                          ? p.filter((x) => x !== g.id)
+                          : [...p, g.id],
+                      )
+                    }
+                  >
+                    {previewIds.includes(g.id) ? 'Hide preview' : 'Preview'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="h-7 px-2 text-xs"
+                    disabled={status === 'queued' || status === 'verifying'}
+                    onClick={() => verifyAgain(g)}
+                  >
+                    {status === 'queued'
+                      ? 'Queued'
+                      : status === 'verifying'
+                        ? 'Verifying…'
+                        : 'Verify again'}
+                  </Button>
+                  {g.proofCheckpoint &&
+                    !g.verified &&
+                    status !== 'queued' &&
+                    status !== 'verifying' && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        className="h-7 border-violet-500/50 px-2 text-xs text-violet-600 hover:bg-violet-500/10 dark:text-violet-400"
+                        onClick={() => resumeVerification(g)}
+                        title={`Continue from the saved checkpoint (${g.proofCheckpointFilled ?? 0}/${g.proofCheckpointTotal ?? 0} holes banked) instead of restarting`}
+                      >
+                        ▶ Resume ({g.proofCheckpointFilled ?? 0}/
+                        {g.proofCheckpointTotal ?? 0})
+                      </Button>
+                    )}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 px-2 text-xs"
+                    disabled={busy === `stage:${g.id}` || pl.staging}
+                    onClick={() => addToStaging(g)}
+                    title={
+                      pl.staging
+                        ? 'Already in the staging queue'
+                        : 'Add this problem to the staging review queue'
+                    }
+                  >
+                    {busy === `stage:${g.id}`
+                      ? 'Adding…'
+                      : pl.staging
+                        ? 'In staging'
+                        : 'Add to staging'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2 text-xs text-red-500 hover:text-red-600"
+                    disabled={busy === `del:${g.id}`}
+                    onClick={() => removeGenerated(g.id)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+
+                {previewIds.includes(g.id) && (
+                  <div className="mt-3 space-y-3 border-t pt-3">
+                    {g.problem && <MathMarkdown>{g.problem}</MathMarkdown>}
+                    {g.insight && (
+                      <div className="rounded bg-muted/40 p-2 text-xs">
+                        <span className="font-medium">Insight. </span>
+                        <MathMarkdown>{g.insight}</MathMarkdown>
+                      </div>
+                    )}
+                    {!g.verified && g.error && (
+                      <p className="text-xs text-red-500">Reason: {g.error}</p>
+                    )}
+                    {g.lean && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-muted/50 p-2 text-[11px]">
+                        {g.lean}
+                      </pre>
+                    )}
+                    {g.verified && g.proof && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-emerald-500/10 p-2 text-[11px]">
+                        {g.proof}
+                      </pre>
+                    )}
+                    {statusOf(g) === 'refuted' && g.proof && (
+                      <pre className="overflow-x-auto whitespace-pre-wrap rounded bg-fuchsia-500/10 p-2 text-[11px]">
+                        <span className="mb-1 block font-medium text-fuchsia-600">
+                          Machine-checked disproof (¬theorem, compiled by Lean):
+                        </span>
+                        {g.proof}
+                      </pre>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <Separator className="my-8" />
+
+      {/* Review queue */}
+      <div>
+        <div className="mb-2 flex items-center justify-between">
+          <h2 className="text-lg font-semibold">
+            Review queue{' '}
+            <span className="text-sm font-normal text-muted-foreground">
+              ({health?.staging.length ?? items.length})
+            </span>
+          </h2>
+          <div className="flex items-center gap-2 text-xs">
+            <HealthChip label="Staging" state={health?.staging} />
+            <HealthChip label="Prod" state={health?.prod} />
+            <button
+              type="button"
+              onClick={loadQueue}
+              className="text-muted-foreground underline-offset-2 hover:underline"
+            >
+              Refresh
+            </button>
+          </div>
+        </div>
+
+        {(health?.staging.error || health?.prod.error) && (
+          <div className="mb-2 space-y-1 rounded-md border border-red-500/40 bg-red-500/5 p-2 text-[11px] text-red-500">
+            {health?.staging.error && (
+              <p>
+                <span className="font-medium">Staging: </span>
+                <span className="break-all font-mono">
+                  {health.staging.error}
+                </span>
+              </p>
+            )}
+            {health?.prod.error && (
+              <p>
+                <span className="font-medium">Prod: </span>
+                <span className="break-all font-mono">{health.prod.error}</span>
+              </p>
+            )}
+          </div>
+        )}
+
+        <div className="space-y-2">
+          {items.length === 0 && (
+            <p className="text-sm text-muted-foreground">
+              {health && !health.staging.ok
+                ? 'Staging Redis unreachable — see the error above.'
+                : 'Queue is empty.'}
+            </p>
+          )}
+          {items.map((it) => {
+            const inProd = prodTitleSet.has(normTitle(it.questionTitle));
+            return (
+            <div key={it.id} className="rounded-lg border p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate font-medium">
+                    {it.questionTitle || it.problem || 'Untitled problem'}
+                  </p>
+                  <p className="mt-0.5 text-xs text-muted-foreground">
+                    {metaLine(it)}
+                  </p>
+                </div>
+                <div className="flex shrink-0 gap-1.5">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-7 px-2 text-xs"
+                    disabled={
+                      busy === `promote:${it.id}` || !health?.prod.ok || inProd
+                    }
+                    onClick={() => promoteItem(it.id)}
+                    title={
+                      inProd
+                        ? 'Already in the prod queue'
+                        : health?.prod.ok
+                          ? 'Publish to the production weekly-problems queue'
+                          : 'Prod Redis unreachable'
+                    }
+                  >
+                    {busy === `promote:${it.id}`
+                      ? '…'
+                      : inProd
+                        ? 'In prod'
+                        : 'Push to prod'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    className="h-7 px-2 text-xs text-red-500 hover:text-red-600"
+                    disabled={busy === `del:${it.id}`}
+                    onClick={() => removeItem(it.id)}
+                  >
+                    Delete
+                  </Button>
+                </div>
+              </div>
+            </div>
+            );
+          })}
+        </div>
+      </div>
+
+      <p className="mt-8 text-xs text-muted-foreground">
+        Requires your bridge running (Local Agent → set it up). Verifying never
+        auto-stages — “Add to staging” is manual. “Push to prod” publishes to
+        the main CompeteMath queue and archives the Lean proof to the database.
+      </p>
+    </div>
+  );
+}
+
+// Per-card cost line: the estimate (with band + rationale on hover) and, once
+// the proof lands, the actual and the signed delta.
+function CostLine({ cost }: { cost?: ItemCost }) {
+  if (!cost) return null;
+  const { estimating, estFailed, estUsd, estRationale, actualUsd } = cost;
+  if (!estimating && !estFailed && estUsd == null && actualUsd == null)
+    return null;
+  const delta = estUsd != null && actualUsd != null ? actualUsd - estUsd : null;
+  return (
+    <p className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px]">
+      {estimating ? (
+        <span className="text-amber-500">estimating cost…</span>
+      ) : estFailed ? (
+        <span className="text-muted-foreground">estimate unavailable</span>
+      ) : estUsd != null ? (
+        <span className="text-amber-600" title={estRationale || undefined}>
+          est {fmtUsd(estUsd)}
+        </span>
+      ) : null}
+      {actualUsd != null && (
+        <span className="font-medium text-emerald-600">
+          actual {fmtUsd(actualUsd)}
+        </span>
+      )}
+      {delta != null && Math.abs(delta) > 1e-9 && (
+        <span className={delta > 0 ? 'text-rose-500' : 'text-emerald-500'}>
+          Δ {delta > 0 ? '+' : '−'}
+          {fmtUsd(Math.abs(delta))}
+        </span>
+      )}
+    </p>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  tone,
+}: {
+  label: string;
+  value: number | string;
+  tone?: string;
+}) {
+  return (
+    <div className="rounded-md border p-2">
+      <div className={cn('text-lg font-semibold', tone)}>{value}</div>
+      <div className="text-[11px] text-muted-foreground">{label}</div>
+    </div>
+  );
+}
+
+function HealthChip({
+  label,
+  state,
+}: {
+  label: string;
+  state?: { ok: boolean; length?: number; error?: string };
+}) {
+  const ok = state?.ok;
+  return (
+    <span
+      className={cn(
+        'flex items-center gap-1 rounded border px-1.5 py-0.5',
+        ok === undefined
+          ? 'text-muted-foreground'
+          : ok
+            ? 'border-emerald-500/40 text-emerald-600'
+            : 'border-red-500/40 text-red-500',
+      )}
+      title={state?.error || undefined}
+    >
+      <span
+        className={cn(
+          'size-1.5 rounded-full',
+          ok === undefined
+            ? 'bg-muted-foreground'
+            : ok
+              ? 'bg-emerald-500'
+              : 'bg-red-500',
+        )}
+      />
+      {label}
+      {ok && state?.length != null ? ` · ${state.length}` : ''}
+      {ok === false ? ' · error' : ''}
+    </span>
+  );
+}

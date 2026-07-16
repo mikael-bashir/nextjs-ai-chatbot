@@ -1,5 +1,6 @@
 import type { NextAuthConfig } from 'next-auth';
 import type { NextRequest } from 'next/server';
+import { isProvisioned } from '@/lib/auth-db';
 
 const useSecureCookies = process.env.NODE_ENV === 'production';
 const cookiePrefix = useSecureCookies ? '__Secure-' : '';
@@ -54,19 +55,70 @@ export const authConfig = {
   },
   providers: [],
   callbacks: {
-    authorized({ auth, request }) {
+    async authorized({ auth, request }) {
       const isLoggedIn = !!auth?.user;
-      const hasAccount = auth?.user?.hasLeakAccount;
       const { nextUrl } = request;
 
+      // Resolve provisioning robustly. The session cookie is minted by
+      // competemath.com, which never sets the leak-specific `hasLeakAccount`
+      // flag (and drops it on every re-login), and this middleware runs in the
+      // edge runtime where the node jwt callback that would populate it does not
+      // run. So trust the cookie flag when present, otherwise fall back to a
+      // direct (edge-safe) DB check by user id. Computed lazily so unauthenticated
+      // and allowlisted paths never touch the DB.
+      let accountResolved: boolean | undefined;
+      const hasAccount = async () => {
+        if (auth?.user?.hasLeakAccount) return true;
+        if (!isLoggedIn) return false;
+        if (accountResolved === undefined) {
+          accountResolved = await isProvisioned(
+            auth?.user?.id,
+            auth?.user?.email,
+          );
+        }
+        return accountResolved;
+      };
+
+      // Public static asset: the Local Agent bridge script must be downloadable
+      // without auth (users `curl` it during setup). It matches the `/:id`
+      // middleware pattern, so it needs an explicit allow here.
+      if (nextUrl.pathname === '/local-claude-bridge.mjs') return true;
+
+      // Local Agent relay data-plane: the bridge authenticates with a relay
+      // token, and the OpenAI endpoint is an internal backend call — neither
+      // carries a session cookie. They verify auth themselves.
+      if (
+        nextUrl.pathname === '/api/local-claude/agent' ||
+        nextUrl.pathname === '/api/local-claude/agent/result' ||
+        nextUrl.pathname === '/api/local-claude/v1/chat/completions'
+      ) {
+        return true;
+      }
+
       if (nextUrl.pathname.startsWith('/api/auth')) return true;
+
+      // Public Leak API: authenticated by a bearer API key (not a session
+      // cookie) and verified inside each handler. Must bypass the session gate
+      // below or every API call would 401. Likewise the worker data-plane,
+      // which authenticates with a relay token.
+      if (
+        nextUrl.pathname.startsWith('/api/v1') ||
+        nextUrl.pathname.startsWith('/api/worker')
+      ) {
+        return true;
+      }
 
       // Stripe webhooks are signature-verified inside the handler
       if (nextUrl.pathname.startsWith('/api/webhooks')) return true;
 
       if (nextUrl.pathname.startsWith('/api')) {
-        if (!isLoggedIn) return Response.json({ errorCode: 'AUTH_401' }, { status: 401 });
-        if (!hasAccount) return Response.json({ errorCode: 'AUTH_403_MODAL' }, { status: 403 });
+        if (!isLoggedIn)
+          return Response.json({ errorCode: 'AUTH_401' }, { status: 401 });
+        if (!(await hasAccount()))
+          return Response.json(
+            { errorCode: 'AUTH_403_MODAL' },
+            { status: 403 },
+          );
         return true;
       }
 
@@ -74,19 +126,26 @@ export const authConfig = {
       if (nextUrl.pathname === '/') return true;
 
       if (!isLoggedIn) {
-        const loginBase = process.env.NODE_ENV === 'production'
-          ? 'https://competemath.com/auth/login'
-          : 'http://localhost:3001/auth/login';
+        const loginBase =
+          process.env.NODE_ENV === 'production'
+            ? 'https://competemath.com/auth/login'
+            : 'http://localhost:3001/auth/login';
 
         const publicOrigin = resolvePublicOrigin(request);
         const loginUrl = new URL(loginBase);
-        loginUrl.searchParams.set('callbackUrl', publicOrigin + nextUrl.pathname + nextUrl.search);
+        loginUrl.searchParams.set(
+          'callbackUrl',
+          publicOrigin + nextUrl.pathname + nextUrl.search,
+        );
         return Response.redirect(loginUrl);
       }
 
       // Authenticated but not provisioned: inject ?modal=true so GlobalProvisioningListener
       // shows the provisioning modal on whatever page they landed on — no per-page boilerplate needed.
-      if (!hasAccount && nextUrl.searchParams.get('modal') !== 'true') {
+      if (
+        !(await hasAccount()) &&
+        nextUrl.searchParams.get('modal') !== 'true'
+      ) {
         const url = nextUrl.clone();
         url.searchParams.set('modal', 'true');
         return Response.redirect(url);

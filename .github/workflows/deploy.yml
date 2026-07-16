@@ -50,6 +50,16 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache
           cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-python:cache,mode=max
 
+      - name: Build and push cost-estimator image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/cost-estimator
+          file: services/cost-estimator/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/production-estimator:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-estimator:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-estimator:cache,mode=max
+
   deploy:
     runs-on: ubuntu-latest
     needs: build
@@ -80,9 +90,14 @@ jobs:
             XAI_FREE_KEY_3=${{ secrets.XAI_FREE_KEY_3 }}
             MEM0_API_KEY=${{ secrets.MEM0_API_KEY }}
             REDIS_URL=${{ secrets.REDIS_URL }}
+            COMPETEMATH_REDIS_URL=${{ secrets.COMPETEMATH_REDIS_URL }}
             STRIPE_SECRET=${{ secrets.STRIPE_SECRET }}
             STRIPE_WEBHOOK_SECRET=${{ secrets.STRIPE_WEBHOOK_SECRET }}
             RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
+            ESTIMATOR_URL=http://cost-estimator:8900
+            CERT_SIGN_PRIVATE_KEY=${{ secrets.CERT_SIGN_PRIVATE_KEY }}
+            LEAK_WORKER_SECRET=${{ secrets.LEAK_WORKER_SECRET }}
+            ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
             NODE_ENV=production
             EOF
 
@@ -106,6 +121,23 @@ jobs:
                 expose:
                   - "5328"
                 restart: always
+              cost-estimator:
+                image: ghcr.io/${REPO}/production-estimator:latest
+                container_name: cost-estimator
+                env_file: .env
+                environment:
+                  - EST_DB_PATH=/data/runs.db
+                  - EST_MODEL_DIR=/models
+                expose:
+                  - "8900"
+                volumes:
+                  - estimator-data:/data
+                  - estimator-models:/models
+                mem_limit: 512m
+                restart: always
+            volumes:
+              estimator-data:
+              estimator-models:
             COMPOSE
 
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
@@ -124,6 +156,7 @@ jobs:
             nohup bash -c "
               docker pull ghcr.io/${REPO}/production-nextjs:latest &&
               docker pull ghcr.io/${REPO}/production-python:latest &&
+              docker pull ghcr.io/${REPO}/production-estimator:latest &&
               touch /tmp/deploy-ready ||
               touch /tmp/deploy-failed
             " > /tmp/pull.log 2>&1 &

@@ -167,10 +167,28 @@ export async function POST(request: Request) {
                   try {
                     const data = JSON.parse(event.replace("data: ", ""))
 
+                    if (data.type === "heartbeat") {
+                      // Timer tick only — no thought, so the UI updates elapsed
+                      // time without adding a log line.
+                      controller.enqueue(
+                        encoder.encode(
+                          `data: ${JSON.stringify({ type: "message-annotation", subtype: "heartbeat", metrics: data.metrics })}\n\n`,
+                        ),
+                      )
+                    }
+
                     if (["status", "tool_intent", "tool_result"].includes(data.type)) {
                       controller.enqueue(
                         encoder.encode(
-                          `data: ${JSON.stringify({ type: "message-annotation", thought: data.message, metrics: data.metrics })}\n\n`,
+                          `data: ${JSON.stringify({
+                            type: "message-annotation",
+                            subtype: data.type,
+                            thought: data.message,
+                            tool: data.tool,
+                            input: data.input,
+                            output: data.output,
+                            metrics: data.metrics,
+                          })}\n\n`,
                         ),
                       )
                     }

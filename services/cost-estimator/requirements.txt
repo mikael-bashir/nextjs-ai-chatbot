@@ -1,0 +1,13 @@
+# Core — installs without any heavy ML/GPU deps, runs the full pipeline using the
+# built-in hashing-embedding fallback.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+scikit-learn>=1.4
+numpy>=1.26
+joblib>=1.3
+pydantic>=2.6
+redis>=5.0          # only for scripts/seed_from_leak.py
+
+# Optional — the real local embedding model. Uncomment (pulls torch, ~1GB) to
+# upgrade from the hashing fallback to semantic embeddings. No code change needed.
+# sentence-transformers>=2.7

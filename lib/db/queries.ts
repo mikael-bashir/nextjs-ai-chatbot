@@ -57,7 +57,7 @@ const schema = {
   creditTransactions,
   stripeCustomers,
   stripeSubscriptions,
-}
+};
 
 const db = drizzle(sql, { schema });
 
@@ -104,13 +104,69 @@ export async function saveChat({
 }
 
 export async function leakAccountProvisioned({
-  id
+  id,
 }: {
   id: string;
 }) {
   return await db.query.user.findFirst({
-    where: eq(user.id, id)
+    where: eq(user.id, id),
   });
+}
+
+// Every table that references User(id); used when migrating an account to a new id.
+const USER_FK_TABLES = [
+  'Chat',
+  'Document',
+  'Suggestion',
+  'UserCredits',
+  'CreditTransaction',
+  'StripeSubscription',
+  'StripeCustomer',
+  'LocalClaudeAgentConfig',
+] as const;
+
+// Resolve provisioning and self-heal an id change. The session id is minted by
+// competemath.com; a re-registration there gives the same person a new id,
+// orphaning their leak row (keyed by the old id) and locking them out of the
+// app. If no row matches `id` but one matches `email`, migrate that row — and
+// all rows referencing it — to the current id, preserving their data. Returns
+// the (final) User row, or null if genuinely not provisioned. Idempotent.
+export async function reconcileLeakAccount({
+  id,
+  email,
+}: {
+  id: string;
+  email?: string | null;
+}) {
+  const byId = await db.query.user.findFirst({ where: eq(user.id, id) });
+  if (byId) return byId; // fast path — already correct, no writes
+  if (!email) return null;
+
+  const orphan = await db.query.user.findFirst({
+    where: and(eq(user.email, email), ne(user.id, id)),
+  });
+  if (!orphan) return null;
+
+  try {
+    const oldId = orphan.id;
+    // 1. Create the row for the current id (email left null to avoid the unique
+    //    constraint clashing with the orphan row that still holds this email).
+    await sql`INSERT INTO "User" (id) VALUES (${id}) ON CONFLICT (id) DO NOTHING`;
+    // 2. Repoint every child table so deleting the orphan can't strand data.
+    for (const table of USER_FK_TABLES) {
+      await sql.query(
+        `UPDATE "${table}" SET "userId" = $1 WHERE "userId" = $2`,
+        [id, oldId],
+      );
+    }
+    // 3. Drop the orphan (frees the email), then carry email/username across.
+    await sql`DELETE FROM "User" WHERE id = ${oldId}`;
+    await sql`UPDATE "User" SET email = ${orphan.email}, username = ${orphan.username} WHERE id = ${id}`;
+  } catch (error) {
+    console.error('Failed to reconcile leak account id change', error);
+  }
+
+  return (await db.query.user.findFirst({ where: eq(user.id, id) })) ?? null;
 }
 
 export async function provisionLeakUser({
@@ -121,7 +177,8 @@ export async function provisionLeakUser({
   email: string | null;
 }) {
   try {
-    return await db.insert(user)
+    return await db
+      .insert(user)
       .values({ id, email })
       .onConflictDoNothing({ target: user.id });
   } catch (error) {
@@ -745,14 +802,18 @@ export async function saveOrUpdateSubscription({
     const [existing] = await db
       .select({ id: stripeSubscriptions.id })
       .from(stripeSubscriptions)
-      .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+      .where(
+        eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId),
+      );
 
     const now = new Date();
     if (existing) {
       await db
         .update(stripeSubscriptions)
         .set({ status, currentPeriodEnd, updatedAt: now })
-        .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+        .where(
+          eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId),
+        );
     } else {
       await db.insert(stripeSubscriptions).values({
         userId,
@@ -779,14 +840,18 @@ export async function markSubscriptionCancelled({
     await db
       .update(stripeSubscriptions)
       .set({ status: 'cancelled', updatedAt: new Date() })
-      .where(eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId));
+      .where(
+        eq(stripeSubscriptions.stripeSubscriptionId, stripeSubscriptionId),
+      );
   } catch (error) {
     console.error('Failed to cancel subscription in database');
     throw error;
   }
 }
 
-export async function getUserById({ id }: { id: string }): Promise<User | null> {
+export async function getUserById({
+  id,
+}: { id: string }): Promise<User | null> {
   try {
     const [row] = await db.select().from(user).where(eq(user.id, id));
     return row ?? null;

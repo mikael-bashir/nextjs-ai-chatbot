@@ -1,0 +1,64 @@
+name: Preview Reaper
+
+# Self-healing safety net: once a day (and on demand), destroy any preview on
+# the VPS whose PR is no longer open. This backstops preview-teardown.yml, which
+# only fires on PR close and silently no-ops if the box is unreachable at that
+# moment — the failure mode that let orphaned stacks pile up and OOM the box.
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # daily 04:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  pull-requests: read
+
+jobs:
+  reap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: List open PRs
+        id: openprs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          NUMS=$(gh pr list --repo "${{ github.repository }}" --state open --json number --jq '[.[].number] | join(" ")')
+          echo "numbers=${NUMS}" >> "$GITHUB_OUTPUT"
+          echo "Open PRs: ${NUMS}"
+
+      - name: Reap orphaned previews on VPS
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          OPEN_PRS: ${{ steps.openprs.outputs.numbers }}
+        with:
+          host:     ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key:      ${{ secrets.SSH_PRIVATE_KEY }}
+          envs: OPEN_PRS
+          script: |
+            set -uo pipefail
+            OPEN_SET=" ${OPEN_PRS:-} "
+            reaped=0
+            for dir in /opt/previews/pr-*; do
+              [ -d "$dir" ] || continue
+              sub=$(basename "$dir")
+              n=$(printf '%s' "$sub" | sed -E 's/^pr-([0-9]+)-.*/\1/')
+              case "$OPEN_SET" in
+                *" $n "*) ;;                            # PR still open — keep
+                *)
+                  echo "Reaping orphaned preview $sub (PR #$n not open)"
+                  [ -f "$dir/stripe-listener.pid" ] && kill "$(cat "$dir/stripe-listener.pid")" 2>/dev/null || true
+                  ( cd "$dir" && docker compose -p "preview-$sub" down --volumes --remove-orphans ) 2>/dev/null || true
+                  rm -rf "$dir"
+                  sudo rm -f "/etc/caddy/sites/$sub.caddy" 2>/dev/null || true
+                  reaped=$((reaped + 1))
+                  ;;
+              esac
+            done
+            if [ "$reaped" -gt 0 ]; then
+              sudo systemctl reload caddy 2>/dev/null || true
+              docker image prune -a -f 2>/dev/null || true
+            fi
+            echo "Reaped ${reaped} orphaned preview(s). Remaining:"
+            ls -1 /opt/previews 2>/dev/null || echo "(none)"
+            free -h | head -2

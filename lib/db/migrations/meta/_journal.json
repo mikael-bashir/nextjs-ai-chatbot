@@ -71,6 +71,13 @@
       "when": 1782210000000,
       "tag": "0010_nullable_email",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1782220000000,
+      "tag": "0011_local_claude_agent",
+      "breakpoints": true
     }
   ]
 }

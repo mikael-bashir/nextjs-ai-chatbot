@@ -26,6 +26,12 @@ export const chatModels: Array<ChatModel> = [
     description: 'Paid — xAI\'s fastest frontier model, credits deducted',
     paid: true,
   },
+  {
+    id: 'claude-prove',
+    name: 'Claude Prover (your machine)',
+    description: 'Proves Lean 4 theorems on your machine — Claude drives the MCP tools, streamed live',
+    paid: false,
+  },
 ];
 
 export function isPaidModel(modelId: string): boolean {

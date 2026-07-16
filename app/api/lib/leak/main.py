@@ -56,7 +56,7 @@ async def select_node(state: State) -> tuple[dict, State]:
     )
 
 
-@action(reads=["messages", "tools", "model", "stream_queue", "chat_id"], writes=["messages"])
+@action(reads=["messages", "tools", "model", "stream_queue", "chat_id", "user_id"], writes=["messages"])
 async def chat_model(state: State) -> tuple[dict, State]:
     """Generates the next step in the conversation (Expansion)."""
     raw_messages = state["messages"]
@@ -64,6 +64,7 @@ async def chat_model(state: State) -> tuple[dict, State]:
     model = state["model"]
     stream_queue : asyncio.Queue = state["stream_queue"]
     chat_id = state["chat_id"]
+    user_id = state.get("user_id")
 
     # 🚨 Apply the Sliding Window Optimization
     # messages = optimize_context_window(raw_messages, chat_id)
@@ -113,6 +114,13 @@ async def chat_model(state: State) -> tuple[dict, State]:
                 "stream_options": {"include_usage": True},  # get token counts in final chunk
             }
             kwargs["tools"] = tools
+
+            # For the local-Claude provider, forward the user_id so the relay
+            # can route to that user's own machine. Sent as a header (LiteLLM
+            # forwards extra_headers reliably) and as the OpenAI `user` field.
+            if model == "claude-local" and user_id:
+                kwargs["user"] = user_id
+                kwargs["extra_headers"] = {"x-relay-user": user_id}
 
             response = await llm_router.acompletion(**kwargs)
 
@@ -297,7 +305,7 @@ async def execute_tools(state: State) -> tuple[dict, State]:
         tool_name = tc["function"]["name"]
         tool_args = json.loads(tc["function"]["arguments"])
         logger.info(f"Executing tool: {tool_name} with args: {tool_args}")
-        
+
         client = tool_router.get(tool_name)
         if not client:
             result_str = f"Error: Tool {tool_name} not found on any active server."
@@ -312,8 +320,18 @@ async def execute_tools(state: State) -> tuple[dict, State]:
                 else:
                     result_str = str(result)
                     
-                # 🏆 INTERCEPT THE VICTORY
-                if "Tactic succeeded! Proof complete. No goals remaining." in result_str:
+                # 🏆 INTERCEPT THE VICTORY — success comes in two flavours:
+                #   apply_tactic      → "...Proof complete. No goals remaining."
+                #   verify_full_script → "✅ Compilation Successful! The proof is 100% verified."
+                # Match either (case-insensitive) so the run exits on a win from
+                # any tool. These phrases never appear in failure messages
+                # (e.g. "❌ Compilation Failed"), so no false positives.
+                _rlow = result_str.lower()
+                if (
+                    "no goals remaining" in _rlow
+                    or "compilation successful" in _rlow
+                    or "100% verified" in _rlow
+                ):
                     logger.info("🎉 VICTORY DETECTED! Proof complete.")
                     is_solved = True
                     final_script_output = result_str # Save the exact tool output
@@ -490,8 +508,9 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                 messages=messages, 
                 tools=openai_tools, 
                 tool_router=tool_router, 
-                model=model, 
-                chat_id=chat_id, 
+                model=model,
+                chat_id=chat_id,
+                user_id=user_id,
                 stream_queue=stream_queue,
                 tree=initial_tree,
                 root_id=root_id,
@@ -640,7 +659,7 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                                 for tc in msg["tool_calls"]:
                                     t_name = tc["function"]["name"]
                                     metrics["tools_invoked"] += 1
-                                    yield f"data: {json.dumps({'type': 'tool_intent', 'tool': t_name, 'message': f'Decided to use {t_name}...', 'metrics': metrics})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'tool_intent', 'tool': t_name, 'input': tc['function'].get('arguments', ''), 'message': f'Decided to use {t_name}...', 'metrics': metrics})}\n\n"
                             else:
                                 content = msg.get("content", "")
                                 logger.info(f"🚨 [PYTHON] Sending final text_response. Length: {len(content)}")
@@ -650,8 +669,9 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                             for tr in result.get("tool_results", []):
                                 status_msg = f"Received output from {tr['name']}. Analyzing..."
 
-                                # Build the payload dictionary
-                                payload = {'type': 'tool_result', 'tool': tr['name'], 'message': status_msg, 'metrics': metrics}
+                                # Build the payload dictionary (include the tool
+                                # output so the UI can show the Lean result).
+                                payload = {'type': 'tool_result', 'tool': tr['name'], 'output': tr.get('content', ''), 'message': status_msg, 'metrics': metrics}
 
                                 # Dump it cleanly without nested f-string collisions
                                 yield f"data: {json.dumps(payload)}\n\n"
@@ -661,8 +681,10 @@ async def prompt_leak_agent(authenticated_clients: Dict[str, Any]):
                         metrics["time_elapsed"] = elapsed
                         
                         # THE FIX: 2048 bytes of invisible SSE comment padding to forcefully flush the server buffer!
-                        yield f": {'=' * 2048}\n\n" 
-                        yield f"data: {json.dumps({'type': 'status', 'message': 'Thinking deep (waiting on tool)...', 'metrics': metrics})}\n\n"
+                        yield f": {'=' * 2048}\n\n"
+                        # Heartbeat: keeps the connection alive and updates the elapsed
+                        # timer, but is NOT a log line (the UI must not spam it).
+                        yield f"data: {json.dumps({'type': 'heartbeat', 'metrics': metrics})}\n\n"
             except asyncio.CancelledError:
                 logger.warning(f"Client disconnected or cancelled. Killing agent task for chat {chat_id}.")
                 task.cancel()
