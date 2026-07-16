@@ -437,7 +437,18 @@ export async function listAdminJobs({
     ORDER BY "createdAt" DESC
     LIMIT ${limit};
   `);
-  return result.rows as (ProblemJob & { reservedFor: string | null })[];
+  // vercel-postgres returns raw timestamp columns as strings; the drizzle model
+  // (and consumers, e.g. the admin page's `.toISOString()`) expect Date. The
+  // typed query builder does this conversion for us — for raw SQL we do it here.
+  const toDate = (v: unknown) => (v == null ? null : new Date(v as string));
+  return (result.rows as Record<string, unknown>[]).map((r) => ({
+    ...r,
+    createdAt: toDate(r.createdAt),
+    finishedAt: toDate(r.finishedAt),
+    leasedAt: toDate(r.leasedAt),
+    leaseExpiresAt: toDate(r.leaseExpiresAt),
+    heartbeatAt: toDate(r.heartbeatAt),
+  })) as unknown as (ProblemJob & { reservedFor: string | null })[];
 }
 
 /** Admin marks a job proved (override — no worker lease needed). */
