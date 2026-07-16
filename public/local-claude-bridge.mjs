@@ -3757,6 +3757,14 @@ const WORKER_ID = process.env.WORKER_ID || `bridge-${process.pid}`
 const WORKER_POLL_MS = Math.max(Number(process.env.WORKER_POLL_MS) || 5000, 1000)
 // Empty model => the CLI's configured default (i.e. the operator's Max plan).
 const WORKER_MODEL = process.env.WORKER_MODEL || ""
+// 'operator' => this bridge drains ONLY jobs an admin delegated to it (and the
+// autonomous hosted worker skips those). Anything else => a normal worker that
+// takes the shared queue but skips delegated jobs. Default: 'operator', since a
+// hand-run bridge is the operator's own machine.
+const WORKER_KIND =
+  (process.env.WORKER_KIND || "operator").toLowerCase() === "hosted"
+    ? "hosted"
+    : "operator"
 // Prover MCP servers the agent may drive. Provided by the lease response when
 // the app supplies them, else from WORKER_MCP_CONFIG (a JSON array), else none.
 let WORKER_MCP = []
@@ -3776,7 +3784,7 @@ async function leaseJob() {
   const res = await fetch(`${WORKER_URL}/api/worker/lease`, {
     method: "POST",
     headers: workerHeaders(),
-    body: JSON.stringify({ workerId: WORKER_ID }),
+    body: JSON.stringify({ workerId: WORKER_ID, kind: WORKER_KIND }),
   })
   if (!res.ok) throw new Error(`lease responded ${res.status}`)
   const data = await res.json()

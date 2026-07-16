@@ -19,6 +19,7 @@ export async function GET() {
       quotedCredits: j.quotedCredits,
       chargedCredits: j.chargedCredits,
       leasedBy: j.leasedBy,
+      reservedFor: j.reservedFor ?? null,
       createdAt: j.createdAt,
       finishedAt: j.finishedAt,
     })),

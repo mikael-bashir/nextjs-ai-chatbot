@@ -17,6 +17,7 @@ interface JobView {
   quotedCredits: number | null;
   chargedCredits: number | null;
   leasedBy: string | null;
+  reservedFor: string | null;
   createdAt: string;
   finishedAt: string | null;
 }
@@ -72,6 +73,25 @@ export function AdminQueueResolver({
           method: 'POST',
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(payload),
+        });
+        if (res.ok) await refresh();
+      } finally {
+        setBusy(null);
+      }
+    },
+    [refresh],
+  );
+
+  // Delegate a job to the operator's own bridge (hosted worker skips it), or
+  // release it back to the shared queue.
+  const delegate = useCallback(
+    async (id: string, on: boolean) => {
+      setBusy(id);
+      try {
+        const res = await fetch(`/api/admin/queue/${id}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ action: on ? 'delegate' : 'undelegate' }),
         });
         if (res.ok) await refresh();
       } finally {
@@ -235,6 +255,19 @@ export function AdminQueueResolver({
                     <Cpu className="size-3.5" />
                   )}
                   Prove on bridge
+                </Button>
+                <Button
+                  size="sm"
+                  variant={j.reservedFor === 'operator' ? 'default' : 'outline'}
+                  className="mb-2 ml-2 gap-1.5"
+                  disabled={busy === j.id}
+                  onClick={() =>
+                    delegate(j.id, j.reservedFor !== 'operator')
+                  }
+                >
+                  {j.reservedFor === 'operator'
+                    ? 'Delegated to my bridge ✓'
+                    : 'Delegate to my bridge'}
                 </Button>
                 {(events[j.id]?.length ?? 0) > 0 && (
                   <ProverConsole

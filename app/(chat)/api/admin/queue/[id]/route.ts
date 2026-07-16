@@ -4,6 +4,7 @@ import {
   adminResolveProved,
   adminResolveFailed,
   getJobById,
+  setJobReservation,
 } from '@/lib/db/leak-queries';
 import { deductCredits } from '@/lib/db/queries';
 
@@ -29,6 +30,16 @@ export async function POST(
   }
 
   const body = await request.json().catch(() => ({}));
+
+  // Delegation toggle — reserve this job for the operator's own bridge (the
+  // hosted worker will then skip it), or release it back to the shared queue.
+  if (body?.action === 'delegate' || body?.action === 'undelegate') {
+    const row = await setJobReservation({
+      id,
+      reservedFor: body.action === 'delegate' ? 'operator' : null,
+    });
+    return Response.json({ ok: true, reservedFor: row?.reservedFor ?? null });
+  }
 
   // Failure path.
   if (typeof body?.error === 'string' && body.error.trim()) {

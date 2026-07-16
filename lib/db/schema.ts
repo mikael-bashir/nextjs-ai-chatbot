@@ -370,6 +370,12 @@ export const problemJob = pgTable('ProblemJob', {
   pricingClass: varchar('pricingClass', { length: 32 }),
   quotedCredits: real('quotedCredits'),
   chargedCredits: real('chargedCredits'),
+  // NOTE: the `reservedFor` delegation column lives on this table too, but is
+  // deliberately kept OUT of this drizzle model and handled via raw SQL only
+  // (see lib/db/leak-queries.ts). It was never journaled (0012), so naming it in
+  // a drizzle select/returning would 500 on any deploy where the column doesn't
+  // yet exist. Raw `SELECT *` + an idempotent `ADD COLUMN IF NOT EXISTS` guard
+  // sidesteps that entirely.
   // Worker lease bookkeeping.
   leasedBy: varchar('leasedBy', { length: 128 }),
   leaseExpiresAt: timestamp('leaseExpiresAt'),

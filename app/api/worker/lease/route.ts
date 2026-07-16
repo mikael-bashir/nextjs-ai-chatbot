@@ -30,8 +30,11 @@ export async function POST(request: NextRequest) {
     typeof body?.leaseMs === 'number' && body.leaseMs > 0
       ? Math.min(body.leaseMs, 30 * 60_000)
       : DEFAULT_LEASE_MS;
+  // 'operator' worker (the admin's own bridge) drains only delegated jobs;
+  // anything else is the autonomous hosted worker, which skips delegated jobs.
+  const kind = body?.kind === 'operator' ? 'operator' : 'hosted';
 
-  const job = await leaseNextJob({ workerId, leaseMs });
+  const job = await leaseNextJob({ workerId, leaseMs, kind });
   if (!job) return Response.json({ job: null });
 
   // Hand the worker the hard-set Leak prover MCP servers so its direct

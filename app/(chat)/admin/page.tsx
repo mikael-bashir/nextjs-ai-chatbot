@@ -23,6 +23,7 @@ async function AdminContent() {
     quotedCredits: j.quotedCredits,
     chargedCredits: j.chargedCredits,
     leasedBy: j.leasedBy,
+    reservedFor: j.reservedFor ?? null,
     createdAt: j.createdAt.toISOString(),
     finishedAt: j.finishedAt ? j.finishedAt.toISOString() : null,
   }));

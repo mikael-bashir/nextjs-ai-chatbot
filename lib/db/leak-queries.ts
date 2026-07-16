@@ -249,19 +249,43 @@ export async function listJobsByUser({
     .limit(limit);
 }
 
+// The `reservedFor` column lands outside the drizzle journal (0012 was never
+// journaled), so — matching the inline-DDL pattern used elsewhere in this repo
+// — we ensure it idempotently on first use. Safe whether the schema came from a
+// migration or a hand `db:push`. Runs at most once per process.
+let reservedForReady: Promise<unknown> | undefined;
+function ensureReservedForColumn(): Promise<unknown> {
+  reservedForReady ??= db.execute(
+    sql`ALTER TABLE "ProblemJob" ADD COLUMN IF NOT EXISTS "reservedFor" varchar(32)`,
+  );
+  return reservedForReady;
+}
+
 /**
  * Atomically claim the oldest claimable job for a worker. "Claimable" = queued,
  * or previously leased/proving but whose lease has expired (dead worker). The
  * single-statement UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED)
  * guarantees two concurrent workers never grab the same row.
+ *
+ * Delegation: `kind` selects which slice of the queue this worker drains.
+ *   • 'hosted'   (default) — the autonomous prover; SKIPS operator-reserved jobs.
+ *   • 'operator' — the operator's own bridge; takes ONLY reserved jobs (the ones
+ *     an admin delegated), so it never races the hosted worker for normal work.
  */
 export async function leaseNextJob({
   workerId,
   leaseMs,
+  kind = 'hosted',
 }: {
   workerId: string;
   leaseMs: number;
+  kind?: 'hosted' | 'operator';
 }): Promise<ProblemJob | null> {
+  await ensureReservedForColumn();
+  const reservationFilter =
+    kind === 'operator'
+      ? sql`AND "reservedFor" = 'operator'`
+      : sql`AND ("reservedFor" IS NULL OR "reservedFor" <> 'operator')`;
   const result = await db.execute(sql`
     UPDATE "ProblemJob"
     SET status = 'leased',
@@ -272,8 +296,9 @@ export async function leaseNextJob({
         attempts = attempts + 1
     WHERE id = (
       SELECT id FROM "ProblemJob"
-      WHERE status = 'queued'
-         OR (status IN ('leased', 'proving') AND "leaseExpiresAt" < now())
+      WHERE (status = 'queued'
+         OR (status IN ('leased', 'proving') AND "leaseExpiresAt" < now()))
+        ${reservationFilter}
       ORDER BY "createdAt" ASC
       FOR UPDATE SKIP LOCKED
       LIMIT 1
@@ -281,6 +306,30 @@ export async function leaseNextJob({
     RETURNING *;
   `);
   return (result.rows[0] as ProblemJob) ?? null;
+}
+
+/**
+ * Delegate a job to the operator's own bridge (`reservedFor='operator'`) so the
+ * hosted worker skips it, or clear the reservation (`null`) to return it to the
+ * shared queue. Admin override — no lease scoping.
+ */
+export async function setJobReservation({
+  id,
+  reservedFor,
+}: {
+  id: string;
+  reservedFor: 'operator' | null;
+}): Promise<(ProblemJob & { reservedFor: string | null }) | null> {
+  await ensureReservedForColumn();
+  const result = await db.execute(sql`
+    UPDATE "ProblemJob"
+    SET "reservedFor" = ${reservedFor}
+    WHERE id = ${id}
+    RETURNING *;
+  `);
+  return (
+    (result.rows[0] as (ProblemJob & { reservedFor: string | null })) ?? null
+  );
 }
 
 /** Extend a lease + mark progress. Scoped to the leasing worker. */
@@ -378,13 +427,17 @@ export async function listAdminJobs({
   limit = 50,
 }: {
   limit?: number;
-}): Promise<ProblemJob[]> {
-  return db
-    .select()
-    .from(problemJob)
-    .where(eq(problemJob.isMock, false))
-    .orderBy(desc(problemJob.createdAt))
-    .limit(limit);
+}): Promise<(ProblemJob & { reservedFor: string | null })[]> {
+  // Raw SELECT * so we can surface `reservedFor` (kept out of the drizzle model);
+  // `SELECT *` also tolerates the column not yet existing on older deploys.
+  await ensureReservedForColumn();
+  const result = await db.execute(sql`
+    SELECT * FROM "ProblemJob"
+    WHERE "isMock" = false
+    ORDER BY "createdAt" DESC
+    LIMIT ${limit};
+  `);
+  return result.rows as (ProblemJob & { reservedFor: string | null })[];
 }
 
 /** Admin marks a job proved (override — no worker lease needed). */
