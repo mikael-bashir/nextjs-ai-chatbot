@@ -196,7 +196,8 @@ Core requirements:
   · a vivid scenario or stakes — "Defending the Earth", "The last coin standing", "Escape the grid"
   · a provocative teaser or claim — "Nothing adds up", "A number that shouldn't exist"
   · playful, wry, or surprising is welcome.
-  HARD BAN: the formulaic "The <Adjective> <Noun>" pattern (e.g. "The Cubic Sentinel", "The Stubborn Remainder") — it is boring and overused; do not use it, and do not start most titles with "The". Keep it short (~2-6 words), specific to THIS problem's flavour, and never spoil the answer.
+  HARD BAN: the formulaic "The <Adjective> <Noun>" pattern (e.g. "The Cubic Sentinel", "The Stubborn Remainder") — it is boring and overused; do not use it, and do not start most titles with "The". Keep it short (~2-6 words), specific to THIS problem's flavour.
+  HARD BAN #2 — the title must NEVER reveal or hint at the answer. Do not put the numeric answer in it as a digit ("… = 1", "Sum is 144") OR spelled out ("… Equal One", "… Is Unity", "Always Zero", "Exactly Seven"), and do not paraphrase its value ("… is a perfect square", "… must be prime"). The title poses the mystery; the number stays hidden until they solve it. (E.g. for a sum that equals 1, "Why Must This Sum Equal One?" is BANNED — use "What Does This Stubborn Sum Collapse To?" instead.)
 - Also give a 1-3 word subtitle (a small tagline). The "difficulty" and "points" are DICTATED by the mode below — emit exactly the values it specifies (do not choose your own).
 - Also assign a "level" as an INTEGER 1-5 = the prerequisite mathematical KNOWLEDGE required to attempt it (this is about background needed, NOT how hard the puzzle is — a level-1 problem can still be a tough puzzle):
   1 = a first-year primary school student would technically have the base knowledge to attempt it;
