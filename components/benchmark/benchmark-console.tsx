@@ -142,6 +142,7 @@ export function BenchmarkConsole() {
   const [pauseMessage, setPauseMessage] = useState<string | null>(null);
   const [currentProblemId, setCurrentProblemId] = useState<string | null>(null);
   const stopRef = useRef(false);
+  const abortRef = useRef<AbortController | null>(null);
 
   const loadRuns = useCallback(async () => {
     const res = await fetch('/api/admin/benchmark');
@@ -233,11 +234,14 @@ export function BenchmarkConsole() {
         setCurrentProblemId(item.problemId);
         setEvents([]);
         let content = '';
+        const ctrl = new AbortController();
+        abortRef.current = ctrl;
         try {
           const outcome: ProverOutcome = await runProverStream({
             problem: item.statement,
             mcpServers,
             model: model || undefined,
+            signal: ctrl.signal,
             onEvent: (ev) => {
               setEvents((prev) => [...prev, ev]);
               content += ` ${ev.label || ''} ${ev.detail || ''}`;
@@ -273,9 +277,11 @@ export function BenchmarkConsole() {
           const msg = e instanceof Error ? e.message : String(e);
           await patchItem(selected, { action: 'release', itemId: item.id });
           setPauseMessage(
-            detectSessionLimit(content) || detectSessionLimit(msg)
-              ? `Claude Max session limit hit while proving ${item.problemId} — paused. Progress is saved; click Resume once your limit resets.`
-              : `Bridge/connectivity error on ${item.problemId} — paused (nothing scored). ${msg.slice(0, 160)}`,
+            stopRef.current
+              ? `Paused on ${item.problemId} — progress saved, nothing scored. Click Resume to continue.`
+              : detectSessionLimit(content) || detectSessionLimit(msg)
+                ? `Claude Max session limit hit while proving ${item.problemId} — paused. Progress is saved; click Resume once your limit resets.`
+                : `Bridge/connectivity error on ${item.problemId} — paused (nothing scored). ${msg.slice(0, 160)}`,
           );
           break;
         }
@@ -431,7 +437,12 @@ export function BenchmarkConsole() {
                   size="sm"
                   variant="outline"
                   onClick={() => {
+                    // Stop claiming new items AND abort whatever's in flight —
+                    // a proof can run unbounded (no artificial caps), so without
+                    // the abort this button would silently do nothing until the
+                    // current attempt finished on its own.
                     stopRef.current = true;
+                    abortRef.current?.abort();
                   }}
                 >
                   Pause
