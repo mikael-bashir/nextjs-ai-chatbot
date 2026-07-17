@@ -1621,11 +1621,23 @@ const STRATEGIES = {
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
   // agent; falls back to `have` on any failure. See proveHaveTree.
   "have-tree": {
-    label: "Have-tree — planner + isolated per-hole minions (linear context)",
+    label: "V2 — planner + isolated per-hole minions (have-tree)",
     node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
     decompose: (t, m, x) => haveHoleFillPrompt("<the verified skeleton>", "hN", m, x),
     search: GOV_INITIAL,
     style: "have-tree",
+  },
+  // V3: same skeleton/hole mechanics as V2, but LOCAL decomposition is
+  // replaced by a GLOBAL refinement pass — a minion may only CLOSE/DISPROVE/
+  // FORFEIT (structured diagnosis), and a dedicated refiner rewrites the
+  // whole graph at once from every hole's diagnosis. Goedel-Architect-
+  // inspired (arXiv:2606.06468). See proveBlueprint.
+  blueprint: {
+    label: "V3 — global blueprint + refinement (structured diagnosis, negation channel)",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => blueprintHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "blueprint",
   },
 }
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
@@ -2945,6 +2957,110 @@ function spliceHole(skeleton, id, tactics) {
   return lines.join("\n")
 }
 
+// ---- V3 (blueprint) helpers ------------------------------------------------
+
+// A minion's DISPROVE reply for hole `id`: a counterexample argument, a
+// suggested fix, and a compiled proof of the hole's NEGATION. Returns null if
+// the block is missing or has no proof (never trust prose alone).
+function parseDisproveBlock(text, id) {
+  const s = String(text || "")
+  const m = s.match(
+    new RegExp("DISPROVE\\s*⟪\\s*" + id + "\\s*⟫([\\s\\S]*?)```lean\\s*\\n([\\s\\S]*?)```", "i"),
+  )
+  if (!m) return null
+  const header = m[1] || ""
+  const proof = m[2].replace(/\s+$/, "").trim()
+  if (!proof) return null
+  const argument = (header.match(/##\s*Counterexample:\s*([^\n]*)/i) || [])[1] || ""
+  const fix = (header.match(/##\s*Suggested Fix:\s*([^\n]*)/i) || [])[1] || ""
+  return { proof, argument: argument.trim(), fix: fix.trim() }
+}
+
+// A minion's FORFEIT reply for hole `id`: a structured diagnosis (never bare
+// prose) — the input to the next refinement pass. Returns null unless a valid
+// STATEMENT_WRONG/PROOF_TOO_HARD diagnosis is present.
+function parseForfeitBlock(text, id) {
+  const s = String(text || "")
+  const m = s.match(
+    new RegExp(
+      "FORFEIT\\s*⟪\\s*" + id + "\\s*⟫([\\s\\S]*?)(?=FILL\\s*⟪|DISPROVE\\s*⟪|FORFEIT\\s*⟪|$)",
+      "i",
+    ),
+  )
+  if (!m) return null
+  const body = m[1] || ""
+  const diagnosis = (body.match(/##\s*Diagnosis:\s*(STATEMENT_WRONG|PROOF_TOO_HARD)/i) || [])[1]
+  if (!diagnosis) return null
+  const analysis = (body.match(/##\s*Analysis:\s*([\s\S]*?)(?=##\s*Suggested Fix:|$)/i) || [])[1] || ""
+  const fix = (body.match(/##\s*Suggested Fix:\s*([\s\S]*?)$/i) || [])[1] || ""
+  return { diagnosis: diagnosis.toUpperCase(), analysis: analysis.trim(), fix: fix.trim() }
+}
+
+// Neutralize `-/`/`/-` inside free-form model text before embedding it in a
+// Lean block comment, so a diagnosis can never prematurely close the comment
+// (which would spill raw prose into the compiled script) or otherwise corrupt
+// the skeleton the toolchain re-verifies.
+function sanitizeForComment(s) {
+  return String(s || "").replace(/-\//g, "-⧸").replace(/\/-/g, "⧸-")
+}
+
+// Insert a `/- DIAGNOSIS ⟪id⟫ ... -/` block comment directly above hole `id`'s
+// line, for the refiner's eyes only. Comments never affect compilation, so
+// this never changes what the skeleton proves — the SAME skeleton (minus
+// annotations) is what proveBlueprint keeps iterating on.
+function annotateHoleDiagnosis(skeleton, id, block) {
+  const lines = String(skeleton || "").split("\n")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return skeleton
+  const ind = (lines[idx].match(/^\s*/) || [""])[0].length
+  const pad = " ".repeat(ind)
+  const body = sanitizeForComment(block)
+    .trim()
+    .split("\n")
+    .map((l) => pad + l)
+    .join("\n")
+  lines.splice(idx, 0, `${pad}/- DIAGNOSIS ⟪${id}⟫\n${body}\n${pad}-/`)
+  return lines.join("\n")
+}
+
+// Build a trial script proving hole `id`'s NEGATION: its declared TYPE is
+// wrapped in `¬ (...)`, its body becomes the minion's claimed closing proof
+// (no `sorry`) — every OTHER hole is untouched. Returns null if the hole's
+// line doesn't match the expected single-line shape (never guess).
+function negateHoleAndFill(skeleton, id, proofBody) {
+  const lines = String(skeleton || "").split("\n")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return null
+  const m = lines[idx].match(
+    /^(\s*have\s+\w+\s*:\s*)([\s\S]*?)(\s*:=\s*by\s+sorry\s*--\s*⟪\s*\w+\s*⟫\s*)$/,
+  )
+  if (!m) return null
+  const [, prefix, type] = m
+  const ind = (lines[idx].match(/^\s*/) || [""])[0].length
+  const pad = " ".repeat(ind + 2)
+  const body = String(proofBody)
+    .split("\n")
+    .map((t) => (t.trim() === "" ? "" : pad + t))
+    .join("\n")
+  lines[idx] = `${prefix}¬ (${type.trim()}) := by\n${body}`
+  return lines.join("\n")
+}
+
+// Independently re-verify a minion's DISPROVE claim on the daemon (the
+// minion's own verify_full_script calls don't gate — same "toolchain is the
+// source of truth" pattern used everywhere else in this file). Only a
+// machine-checked negation is trusted as a DISPROVED diagnosis; anything else
+// falls back to a PROOF_TOO_HARD forfeit.
+async function verifyDisproof(skeleton, id, proofBody, ctx) {
+  const trial = negateHoleAndFill(skeleton, id, proofBody)
+  if (!trial) return { ok: false }
+  const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  const parsed = parseVerifyOutput(v.text)
+  return { ok: v.ok && isStructurallyValidDecomposition(parsed) }
+}
+
 function haveTreePlannerPrompt(theorem, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
   return `You are the PLANNER for a Lean 4 + Mathlib proof. Your job is to produce a STRUCTURALLY VALID SKELETON that another agent will fill — NOT to finish the proof.
@@ -3010,6 +3126,107 @@ Each sub-step must be a GENUINELY smaller/easier goal. Use fresh tags (s1, s2, �
 
 ${SEARCH_USAGE_NOTE}
 ${extra ? `\n${extra}\n` : ""}`
+}
+
+// ===========================================================================
+// V3 — BLUEPRINT + GLOBAL REFINEMENT (style: "blueprint")
+// ---------------------------------------------------------------------------
+// Goedel-Architect-inspired (arXiv:2606.06468). Same tagged-`have`-hole
+// skeleton mechanics as V2/have-tree (planner, hole tags, splice, daemon-
+// gated structural validity), but replaces LOCAL per-hole decomposition with
+// a GLOBAL refinement pass. The per-hole prover here may only CLOSE, DISPROVE
+// (machine-checked negation), or FORFEIT with a structured diagnosis — it
+// never locally splits its own hole. A dedicated refiner then reads the
+// WHOLE current skeleton (every hole's status + diagnosis) in one call and
+// rewrites the graph: repairing a false statement, dropping/rewiring a dead
+// node, or inserting new helper holes to bridge a real gap — exactly the
+// move V2 could only make locally, one hole at a time, with no view of the
+// rest of the tree. Falls back to proveHaveFlat on any stall, so V3 can never
+// be weaker than the flat baseline (same safety net V2 already has).
+// ===========================================================================
+
+// The V3 per-hole prover prompt. Three outcomes only — CLOSE, DISPROVE, or a
+// structured FORFEIT — never a local DECOMPOSE (that's the refiner's job, and
+// only the refiner sees the whole graph needed to do it well).
+function blueprintHoleFillPrompt(skeleton, id, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving ONE step of a Lean 4 blueprint — hole ⟪${id}⟫. Do NOT touch any other hole, and do NOT locally decompose this one: if it resists a direct close, DIAGNOSE it instead — a separate global refinement pass owns restructuring the blueprint, not you.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE SKELETON (already compiles with every open \`have\` stubbed as \`sorry\`; a \`have\` with no \`--⟪⟫\` tag left is ALREADY PROVED — leave it completely alone):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`. Its declared type is your GOAL; the hypotheses in scope are the theorem's binders plus the EARLIER \`have\`s (available by name). To see the EXACT goal state, \`init_proof\` your hole's proposition (closed: ∀-quantify any free variable) and step it with \`apply_tactic\` — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`).
+
+You have exactly THREE possible outcomes. Pick ONE — never report plain failure or silently give up:
+
+CLOSE — if you can finish the hole: take the skeleton, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other hole/line untouched), verify_full_script until it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Then output:
+FILL ⟪${id}⟫
+\`\`\`lean
+<only the tactics that replace \`sorry\`, one per line, from the LEFT margin — no \`have\`, no leading \`by\`, no theorem>
+\`\`\`
+
+DISPROVE — if you believe the hole's STATEMENT is actually FALSE under its hypotheses: prove the NEGATION instead, in the SAME ambient context. Splice \`¬ (<the hole's declared type>)\` in place of the hole's type, write a complete closing proof (no \`sorry\`) of that negation, and verify_full_script it. Only claim this once the negation itself compiles clean — an unverified guess is worse than a FORFEIT. Then output:
+DISPROVE ⟪${id}⟫
+## Counterexample: <the concrete witness/argument that kills the original claim>
+## Suggested Fix: <how the statement should be repaired — e.g. a missing hypothesis, a sign/orientation error, a wrong bound>
+\`\`\`lean
+<a complete, verify_full_script-checked proof of the NEGATED proposition, no \`sorry\`>
+\`\`\`
+
+FORFEIT — if you can neither close nor disprove it within your effort: do NOT keep grinding silently. Write a structured post-mortem so the refinement pass — the ONLY context it will have on this hole — can act on it:
+FORFEIT ⟪${id}⟫
+## Diagnosis: STATEMENT_WRONG (you suspect it's false but couldn't produce a verified disproof) OR PROOF_TOO_HARD (you believe it's true but couldn't chain the available parents to it)
+## Analysis: what you tried, what compiled, what error/gap remained — be concrete and specific
+## Suggested Fix: for STATEMENT_WRONG, how to repair the statement; for PROOF_TOO_HARD, a helper-lemma breakdown — named sub-steps that would bridge the gap, each easy given its predecessors
+
+Prefer CLOSE, then DISPROVE, then FORFEIT — but ALWAYS pick exactly one.
+(You do NOT need to call cleanup_memory — the system frees proof state between holes for you. Spend your turns proving.)
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// The V3 global refinement prompt. Sees the WHOLE current skeleton — closed
+// haves untouched, open haves each annotated with a diagnosis comment — and
+// emits a REVISED skeleton in the same tagged format. This is the actual
+// architectural change from V2: restructuring driven by a global view, not a
+// hole deciding in isolation to split itself.
+function blueprintRefinePrompt(annotatedSkeleton, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are revising a Lean 4 proof blueprint. The input is a skeleton of \`have\`-holes: some already CLOSED (no tag left — their tactics are FINAL, do not touch them), some still OPEN and tagged \`--⟪hN⟫\`, each open hole preceded by a \`/- DIAGNOSIS ⟪hN⟫ ... -/\` comment recording what the prover found. Your job is to emit a REVISED skeleton that, handed back to the same prover, is more likely to close every remaining hole — while still proving the SAME original theorem.
+
+${toolSection}
+
+## Reading a diagnosis
+Each open hole's comment gives one of:
+- \`## Diagnosis: STATEMENT_WRONG\` — the hole's stated claim is false under its hypotheses (an \`## Analysis\` explains why) — with a \`## Suggested Fix\`.
+- \`## Diagnosis: PROOF_TOO_HARD\` — the prover believes the claim but couldn't reach it from its declared predecessors — with a \`## Suggested Fix\` (often a helper-lemma breakdown).
+- \`## Diagnosis: DISPROVED\` — the negation was MACHINE-VERIFIED (a compiled, sorry-free proof of the hole's negation). This is the strongest signal: the hole as stated cannot be salvaged by re-attempting it, only by changing it.
+These comments are INPUT ONLY — do not copy them into your revised skeleton.
+
+## What to do
+For \`STATEMENT_WRONG\` or \`DISPROVED\`: repair the hole's TYPE using the suggested fix (strengthen a hypothesis, weaken the conclusion, fix a sign/orientation/coercion) and re-emit it as a fresh open hole (\`:= by sorry --⟪hN⟫\`, the same id is fine) — or, if it's structurally unsalvageable, drop it and rewire whichever LATER holes depended on it.
+For \`PROOF_TOO_HARD\`: read the \`## Suggested Fix\` and INSERT new intermediate \`have\`-holes right before this one, each a genuinely smaller step (closable in its own right), then close THIS hole's goal from them — turning one stuck monolith into a chain the prover can actually discharge. Give new holes fresh, descriptive tags (e.g. \`⟪h3a⟫\`) — never reuse an existing tag.
+Leave every CLOSED have (no \`--⟪⟫\` tag) completely untouched — its tactics are proving budget already spent; do not re-derive it, and do not change ITS statement (that would invalidate its proof and force it back open).
+
+## Output shape (unchanged from the original skeleton format)
+Reproduce the ORIGINAL theorem VERBATIM (same name + signature). Every step is either a closed \`have\` (untouched) or an open \`have hN : <type> := by sorry --⟪hN⟫\` on ONE line with a UNIQUE tag. The final assembly (the tactics that close the theorem's own goal from the haves) must be \`sorry\`-free.
+
+## Tool use
+Use verify_full_script to check your revision. It MUST compile with the ONLY diagnostics being the open holes' \`sorry\` warnings (no errors). Iterate until it does, then output the whole revised skeleton as one \`\`\`lean block. Do NOT fill any hole yourself — that is the prover's job on the next pass, not yours.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}
+CURRENT SKELETON WITH DIAGNOSES:
+\`\`\`lean
+${annotatedSkeleton}
+\`\`\``
 }
 
 // Work one hole in an isolated minion (fresh process → bounded context). Returns
@@ -3218,6 +3435,245 @@ async function proveHaveTree(theorem, ctx) {
   return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
 }
 
+// Work one hole for V3: CLOSE, DISPROVE (machine-verified), or a structured
+// FORFEIT. Never locally decomposes — that's the refiner's job.
+async function fillHoleBlueprint(skeleton, id, ctx) {
+  if (ctx.signal?.aborted) return { fill: null, disprove: null, forfeit: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Minion working hole ⟪${id}⟫ (close / disprove / forfeit)…` })
+  const res = await spawnProverStream(
+    {
+      prompt: blueprintHoleFillPrompt(skeleton, id, ctx.mcpServers, ""),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0, // time-governed, same as have-tree minions — no turn cap
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: () => false, emit: ctx.emit },
+  )
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, disprove: null, forfeit: null }
+  const disprove = parseDisproveBlock(res.finalText, id)
+  if (disprove) return { fill: null, disprove, forfeit: null }
+  const forfeit = parseForfeitBlock(res.finalText, id)
+  if (forfeit) return { fill: null, disprove: null, forfeit }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable CLOSE/DISPROVE/FORFEIT reply.` })
+  return { fill: null, disprove: null, forfeit: null }
+}
+
+// Run one global refinement pass: the annotated skeleton (diagnoses attached)
+// in, a revised skeleton out — daemon-gated for structural validity AND that
+// it still proves the ORIGINAL target signature (the refiner's own
+// verify_full_script calls don't gate; only this independent re-check does).
+// Returns null if refinement produced nothing usable this round.
+async function runBlueprintRefiner(annotatedSkeleton, targetSig, ctx) {
+  const verifyScripts = new Map()
+  let revised = null
+  const onObj = (o) => {
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script"))
+            verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, targetSig) && HAS_HOLE_TAG.test(script)) {
+            revised = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: blueprintRefinePrompt(annotatedSkeleton, ctx.mcpServers, ""),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "🏛️♻️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onObj, emit: ctx.emit },
+  )
+  if (!revised) return null
+  const v = await verifyViaDaemon(revised, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  const parsed = parseVerifyOutput(v.text)
+  if (v.ok && isStructurallyValidDecomposition(parsed) && scriptProvesTarget(revised, targetSig)) return revised
+  return null
+}
+
+// V3 orchestrator: PLAN once (identical mechanics to have-tree), then loop
+// PROVE ⇄ REFINE — a proving pass gives every open hole one shot at
+// CLOSE/DISPROVE/FORFEIT, and whenever holes remain unresolved, ONE global
+// refinement call sees the whole graph (proved holes' tactics kept verbatim,
+// unresolved holes each carrying a diagnosis) and rewrites it. Time-governed
+// like every other have-tree/have path — no turn caps, the shared wall-clock
+// deadline is the only bound. Falls through to proveHaveFlat (seeded with the
+// best banked progress) on any stall, so V3 is never weaker than the flat
+// baseline — the same safety net V2 already relies on.
+async function proveBlueprint(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "🏛️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏛️ Blueprint (v3): planning a decomposition skeleton (structured diagnosis + global refinement)." })
+
+  // ---- 1) PLAN — identical mechanics to have-tree's planning stage ----------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script"))
+            verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+            skeleton = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "🏛️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+  ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: parseHoleIds(skeleton).length })
+
+  // ---- 2) PROVE ⇄ REFINE loop ------------------------------------------------
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  let partial = skeleton
+  const maxIters = clampNum(ctx.maxRefinements, 1, 24, 12)
+  let banked = 0
+  for (let iter = 0; iter < maxIters; iter++) {
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+    const open = parseHoleIds(partial)
+    if (!open.length) break
+
+    // -- proving pass: every open hole gets one shot at CLOSE/DISPROVE/FORFEIT.
+    const diagnoses = {} // id -> annotation text for the refiner
+    for (const id of open) {
+      if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+      const r = await fillHoleBlueprint(partial, id, ctx)
+      if (r.fill != null) {
+        partial = spliceHole(partial, id, r.fill)
+        banked++
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫.` })
+      } else if (r.disprove != null) {
+        const dv = await verifyDisproof(partial, id, r.disprove.proof, ctx)
+        diagnoses[id] = dv.ok
+          ? `## Diagnosis: DISPROVED\n## Counterexample: ${r.disprove.argument || "(see negation proof)"}\n## Suggested Fix: ${r.disprove.fix || "repair or drop this claim"}`
+          : `## Diagnosis: PROOF_TOO_HARD\n## Analysis: a claimed disproof of this hole did not independently verify.\n## Suggested Fix: reconsider the approach, or decompose into smaller steps.`
+        ctx.emit({
+          type: "message-annotation",
+          subtype: dv.ok ? "error" : "status",
+          thought: dv.ok
+            ? `🛡️ Hole ⟪${id}⟫ machine-DISPROVED — flagged for refinement.`
+            : `↩︎ Hole ⟪${id}⟫'s claimed disproof did not verify — treated as a forfeit.`,
+        })
+      } else if (r.forfeit) {
+        diagnoses[id] = `## Diagnosis: ${r.forfeit.diagnosis}\n## Analysis: ${r.forfeit.analysis || "(none given)"}\n## Suggested Fix: ${r.forfeit.fix || "(none given)"}`
+      } else {
+        diagnoses[id] = `## Diagnosis: PROOF_TOO_HARD\n## Analysis: the minion returned no usable CLOSE/DISPROVE/FORFEIT reply.\n## Suggested Fix: try a different tactic approach, or split this goal into smaller steps.`
+      }
+      const openNow = parseHoleIds(partial)
+      ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow.length })
+      if (pantoUrl)
+        await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
+    }
+
+    const stillOpen = parseHoleIds(partial)
+    if (!stillOpen.length || ctx.signal?.aborted || deadlinePassed(ctx)) break
+
+    // -- refinement pass: ONE call sees the whole graph and rewrites it.
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Refining — ${stillOpen.length} unresolved hole(s) carrying a diagnosis.` })
+    const annotated = stillOpen.reduce(
+      (s, id) => (diagnoses[id] ? annotateHoleDiagnosis(s, id, diagnoses[id]) : s),
+      partial,
+    )
+    const revised = await runBlueprintRefiner(annotated, sig, ctx)
+    if (revised) {
+      partial = revised
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏛️ Blueprint revised." })
+    } else {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "↩︎ Refinement did not produce a usable revision this round — will retry next iteration if budget remains." })
+    }
+  }
+
+  // ---- 3) Every hole filled → assemble + verify hole-free (the full win). ---
+  const remaining = parseHoleIds(partial)
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Blueprint assembled a verified proof from ${banked} banked hole(s) across refinement rounds.` })
+      return { verified: true, proof: partial }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Banked ${banked} hole(s); ${remaining.length} remain unresolved after ${maxIters} refinement round(s) — finishing in one context.` })
+  }
+
+  // ---- 4) FINISH: hand the partially-filled skeleton to flat mode as a seed,
+  // so proven holes are never thrown away. Flat mode's gate still requires a
+  // full, independently-verified proof of the master, so soundness is unchanged.
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  return proveHaveFlat(theorem, ctx, { seed: partial })
+}
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -3248,14 +3704,21 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         ? `[DECOMPOSITION MODE — have-based (flat, single agent) · strategy: ${strategy}]\n\n=== PROVER PROMPT ===\n` +
           haveProvePrompt(theorem, mcpServers)
         : style === "have-tree"
-          ? `[DECOMPOSITION MODE — have-tree (planner + isolated per-hole minions) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+          ? `[DECOMPOSITION MODE — V2 have-tree (planner + isolated per-hole minions) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
             haveTreePlannerPrompt(theorem, mcpServers) +
             "\n\n=== HOLE-FILL (MINION) PROMPT ===\n" +
             haveHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
-          : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
-            nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
-            "\n\n=== DECOMPOSER PROMPT ===\n" +
-            decomposePromptFor(strategy, theorem, mcpServers),
+          : style === "blueprint"
+            ? `[DECOMPOSITION MODE — V3 blueprint (global refinement) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+              haveTreePlannerPrompt(theorem, mcpServers) +
+              "\n\n=== HOLE-FILL (MINION) PROMPT ===\n" +
+              blueprintHoleFillPrompt("<the current skeleton>", "hN", mcpServers) +
+              "\n\n=== REFINEMENT PROMPT ===\n" +
+              blueprintRefinePrompt("<the current skeleton, annotated with diagnoses>", mcpServers)
+            : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
+              nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
+              "\n\n=== DECOMPOSER PROMPT ===\n" +
+              decomposePromptFor(strategy, theorem, mcpServers),
     model: opts.model || null,
     strategy,
     theorem,
@@ -3322,6 +3785,10 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // a child lemma or the assembly fails, before the node itself fails.
     maxRedecompose: clampNum(opts.maxRedecompose, 0, 5, 1),
     haveTurnBudget: clampNum(opts.haveTurnBudget, 5, 60, 24),
+    // V3 (blueprint) only: how many PROVE⇄REFINE rounds before falling back to
+    // the flat finisher. Iteration count, not a turn cap — the shared wall-
+    // clock deadline still governs each individual call.
+    maxRefinements: clampNum(opts.maxRefinements, 1, 24, 12),
     // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
     nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
@@ -3350,10 +3817,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     try {
       let ok = false
       let proof = ""
-      if (style === "have" || style === "have-tree") {
-        // `have`: one agent, whole proof in one context. `have-tree`: planner +
-        // isolated per-hole minions (linear context), falling back to `have`.
-        // Resuming from a saved checkpoint short-circuits both: finish the
+      if (style === "have" || style === "have-tree" || style === "blueprint") {
+        // `have`: one agent, whole proof in one context. `have-tree` (V2):
+        // planner + isolated per-hole minions with LOCAL decomposition.
+        // `blueprint` (V3): same skeleton mechanics, but a stuck hole is never
+        // locally split — it carries a structured diagnosis into a GLOBAL
+        // refinement pass instead. All three fall back to `have` on any stall.
+        // Resuming from a saved checkpoint short-circuits all three: finish the
         // remaining holes straight from the seed (proven work is handed in, not
         // rediscovered). The independent verify gate is unchanged, so soundness
         // is identical to a from-scratch run.
@@ -3361,8 +3831,12 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         if (ctx.seed) {
           emit({ type: "message-annotation", subtype: "status", thought: "▶️ Resuming from a saved checkpoint — finishing the remaining hole(s) from banked progress." })
           r = await proveHaveFlat(theorem, ctx, { seed: ctx.seed })
+        } else if (style === "have-tree") {
+          r = await proveHaveTree(theorem, ctx)
+        } else if (style === "blueprint") {
+          r = await proveBlueprint(theorem, ctx)
         } else {
-          r = style === "have-tree" ? await proveHaveTree(theorem, ctx) : await proveHaveFlat(theorem, ctx)
+          r = await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof
