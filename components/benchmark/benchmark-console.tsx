@@ -33,7 +33,8 @@ const STRATEGIES: { value: string; label: string }[] = [
   { value: 'sketch', label: 'Sketch (plan then formalize)' },
   { value: 'brute', label: 'Brute (automation only)' },
   { value: 'have', label: 'Have (in-context, no top-level lemmas)' },
-  { value: 'have-tree', label: 'Have-tree (isolated per-hole minions)' },
+  { value: 'have-tree', label: 'V2 — have-tree (isolated per-hole minions)' },
+  { value: 'blueprint', label: 'V3 — blueprint + global refinement' },
 ];
 
 // Detect Claude's usage/session-limit message so the loop pauses (never scores
