@@ -2082,6 +2082,7 @@ export function AdminPipeline() {
                   <option value="have">Have (in-context, no top-level lemmas)</option>
                   <option value="have-tree">V2 — have-tree (isolated per-hole minions)</option>
                   <option value="blueprint">V3 — blueprint + global refinement</option>
+                  <option value="blueprint-graph">V3.1 — real graph blueprint (parallel nodes)</option>
                 </select>
               </label>
             )}

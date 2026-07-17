@@ -1639,6 +1639,19 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "blueprint",
   },
+  // V3.1: the literal port — nodes are independent TOP-LEVEL declarations with
+  // an EXPLICIT `deps: [...]` list (a real DAG, not a `have`-chain where every
+  // step sees everyone before it), proved in PARALLEL (a node only ever needs
+  // its deps' signatures, never their finished proofs), refined the same
+  // global way V3 does. Kept alongside V2/V3, not replacing either — see
+  // proveBlueprintGraph.
+  "blueprint-graph": {
+    label: "V3.1 — real graph blueprint (parallel nodes, explicit deps)",
+    node: (t, m, x) => graphBlueprintPrompt(t, m, x),
+    decompose: (t, m, x) => graphNodeProverPrompt({ id: "hN", text: "<node>" }, "<deps>", m, x),
+    search: GOV_INITIAL,
+    style: "blueprint-graph",
+  },
 }
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
 // prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
@@ -3695,6 +3708,677 @@ async function proveBlueprint(theorem, ctx) {
   return { verified: false, proof: "" }
 }
 
+// ===========================================================================
+// V3.1 — REAL GRAPH BLUEPRINT (style: "blueprint-graph")
+// ---------------------------------------------------------------------------
+// V3 reused Leak's `have`-hole skeleton — a LINEAR chain where every step
+// automatically sees every earlier one, not a genuine graph. This strategy is
+// the literal port: nodes are independent TOP-LEVEL Lean declarations, each
+// declaring an EXPLICIT list of which other nodes it may cite (not "everyone
+// before me" — an actual dependency edge set), matching the paper's
+// `sorry_using [...]` mechanism. Two things this unlocks that V3 structurally
+// couldn't: (1) the refiner can rewire dependencies anywhere in the graph, not
+// just insert-before-this-point in a fixed order; (2) every OPEN node can be
+// attempted in PARALLEL, because a node only needs its declared deps'
+// SIGNATURES (already available as `sorry`-bodied stubs), never their
+// finished proofs — proving one node was never actually blocked on another's
+// completion, in either V3's chain or this graph. A capped concurrent pool
+// dispatches minions; Leak II's global `cleanup_memory` is called at most
+// once per ROUND (after every concurrent minion in it has settled), never
+// mid-round, which is the one concrete hazard of running minions concurrently
+// that the codebase's own comments flag elsewhere.
+//
+// Kept alongside V2 and V3 (not replacing either) so the three can be
+// A/B tested directly against each other.
+//
+// Not fully faithful to the paper either, worth being explicit: the paper
+// validates its graph with a real Lean package (LeanArchitect) enforcing
+// `sorry_using` at elaboration time; here the `deps:` list is BRIDGE-level
+// metadata (a doc-comment the bridge parses), not a Lean-enforced visibility
+// restriction — each node's prover is simply handed a prompt containing only
+// its own goal plus its declared deps' signatures, so it never SEES the rest
+// of the graph, but nothing at the Lean level would stop it from citing an
+// undeclared name if it somehow knew one. Same trust model as everywhere else
+// in this file: the ORCHESTRATION scopes what the model sees; the DAEMON gates
+// what's actually accepted.
+// ===========================================================================
+
+// A blueprint graph node is declared as:
+//   /-- @blueprint
+//   id: step_a
+//   deps: [] -/
+//   lemma step_a (n : ℕ) : P n := by sorry
+// `deps` is a bare-word comma list (may be empty). The declaration text is
+// everything from the `theorem|lemma|def|abbrev` keyword up to (not
+// including) the next `@blueprint` marker or end of input.
+const BLUEPRINT_GRAPH_NODE_RE =
+  /\/--\s*@blueprint\s*\n\s*id:\s*([^\n]+?)\s*\n\s*deps:\s*\[([^\]]*)\]\s*\n?-\/\s*\n((?:theorem|lemma|def|abbrev)\b[\s\S]*?)(?=\n\s*\/--\s*@blueprint|\s*$)/g
+
+function parseBlueprintGraph(script) {
+  const src = stripImports(String(script || ""))
+  const nodes = []
+  let m
+  BLUEPRINT_GRAPH_NODE_RE.lastIndex = 0
+  while ((m = BLUEPRINT_GRAPH_NODE_RE.exec(src)) !== null) {
+    const id = m[1].trim()
+    const deps = m[2]
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean)
+    const text = m[3].trim()
+    const kind = (text.match(/^(theorem|lemma|def|abbrev)\b/) || [])[1] || "lemma"
+    nodes.push({ id, deps, kind, text, name: declaredName(text), signature: theoremSignature(text) })
+  }
+  return nodes
+}
+
+// Acyclic (DFS with a recursion-stack color check) AND every node reachable
+// FROM the master by walking dep edges (no orphan/dead nodes — mirrors the
+// paper's "every node must be reachable, in reverse, from the main Theorem").
+function validateGraphShape(nodes, masterId) {
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  if (!byId.has(masterId)) return { ok: false, reason: `no node with id "${masterId}"` }
+  for (const n of nodes) {
+    for (const d of n.deps) {
+      if (!byId.has(d)) return { ok: false, reason: `node "${n.id}" declares unknown dependency "${d}"` }
+    }
+  }
+  const WHITE = 0, GRAY = 1, BLACK = 2
+  const color = new Map(nodes.map((n) => [n.id, WHITE]))
+  let cyclePath = null
+  const visit = (id, stack) => {
+    if (cyclePath) return
+    color.set(id, GRAY)
+    for (const d of byId.get(id).deps) {
+      if (color.get(d) === GRAY) {
+        cyclePath = [...stack, id, d]
+        return
+      }
+      if (color.get(d) === WHITE) visit(d, [...stack, id])
+      if (cyclePath) return
+    }
+    color.set(id, BLACK)
+  }
+  for (const n of nodes) if (color.get(n.id) === WHITE) visit(n.id, [])
+  if (cyclePath) return { ok: false, reason: `dependency cycle: ${cyclePath.join(" → ")}` }
+  const seen = new Set()
+  const stack = [masterId]
+  while (stack.length) {
+    const id = stack.pop()
+    if (seen.has(id)) continue
+    seen.add(id)
+    for (const d of byId.get(id).deps) stack.push(d)
+  }
+  const orphans = nodes.filter((n) => !seen.has(n.id)).map((n) => n.id)
+  if (orphans.length)
+    return { ok: false, reason: `node(s) unreachable from the master's dependency chain: ${orphans.join(", ")}` }
+  return { ok: true }
+}
+
+// Dependencies-before-dependents order (postorder DFS) — safe Lean
+// declaration ordering (a name must be declared before use).
+function topoOrderGraph(nodes) {
+  const byId = new Map(nodes.map((n) => [n.id, n]))
+  const visited = new Set()
+  const order = []
+  const visit = (id) => {
+    if (visited.has(id)) return
+    visited.add(id)
+    const n = byId.get(id)
+    if (!n) return
+    for (const d of n.deps) visit(d)
+    order.push(n)
+  }
+  for (const n of nodes) visit(n.id)
+  return order
+}
+
+// Bare declarations only, topo-ordered, no headers — for compilation.
+function serializeGraphBare(nodes) {
+  return topoOrderGraph(nodes)
+    .map((n) => n.text)
+    .join("\n\n")
+}
+
+// Full form WITH `@blueprint` headers (+ an optional per-node diagnosis
+// comment) — what the planner/refiner read and must reproduce, so revisions
+// round-trip through parseBlueprintGraph cleanly.
+function serializeGraphAnnotated(nodes, diagnoses = {}) {
+  return topoOrderGraph(nodes)
+    .map((n) => {
+      const header = `/-- @blueprint\nid: ${n.id}\ndeps: [${n.deps.join(", ")}] -/`
+      const diag = diagnoses[n.id] ? `\n${sanitizeForComment(diagnoses[n.id])}` : ""
+      return `${header}${diag}\n${n.text}`
+    })
+    .join("\n\n")
+}
+
+// Replace whatever proof body follows a declaration's signature with a fresh
+// one, forcing a real body to `:= by sorry` — used to build a scoped
+// verification unit where a node's DEPS are present as available signatures
+// but never need to be actually proven yet (matches the paper: "presented as
+// available facts whose signatures the prover may invoke by name").
+function stubDeclBody(declText) {
+  const idx = declText.indexOf(":=")
+  if (idx < 0) return declText
+  return `${declText.slice(0, idx).trimEnd()} := by sorry`
+}
+
+// Splice a minion's tactics into a node's declaration as its real proof body.
+function declWithBody(declText, proofBody) {
+  const idx = declText.indexOf(":=")
+  const head = idx >= 0 ? declText.slice(0, idx).trimEnd() : declText
+  const body = String(proofBody)
+    .split("\n")
+    .map((t) => (t.trim() === "" ? "" : `  ${t}`))
+    .join("\n")
+  return `${head} := by\n${body}`
+}
+
+// A standalone `theorem <id>_neg : ¬ (...) := by <proof>` for the negation
+// channel — built via masterPropOf's bracket-depth-aware binder/conclusion
+// split (the SAME robust parser Leak's own master-refutation path uses), not
+// a fragile single-line regex. Returns null if the declaration's shape can't
+// be split (never guess at a malformed statement).
+function graphNodeNegatedDecl(node, proofBody) {
+  const mp = masterPropOf(node.text)
+  if (!mp) return null
+  const body = String(proofBody)
+    .split("\n")
+    .map((t) => (t.trim() === "" ? "" : `  ${t}`))
+    .join("\n")
+  return `theorem ${node.id}_neg : ¬ (${mp.prop}) := by\n${body}`
+}
+
+// The V3.1 blueprint-generation prompt. Emits a graph of independent
+// top-level declarations with EXPLICIT dependency lists — a real DAG, not a
+// have-chain. Definitions get a real body; every Lemma/Theorem body is
+// `:= by sorry` at this stage (proving happens later, per-node).
+function graphBlueprintPrompt(theorem, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are a Lean 4 formalizer producing a DEPENDENCY-GRAPH blueprint for a theorem — a set of independent top-level declarations, each declaring EXACTLY which other declarations its proof may rely on. This is NOT a linear chain: two nodes with no dependency between them are independent, and can be proved in either order or in parallel.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+TWO OUTCOMES — pick the cheaper one:
+A) If you can close the whole theorem OUTRIGHT in roughly ≤ 40 lines, just do it: write the proof, verify_full_script it to success (no \`sorry\`), and output it as one \`\`\`lean block. Done.
+B) Otherwise, DECOMPOSE into a graph and STOP (do NOT prove any node):
+   1. Plan a dependency graph of Definitions, Lemmas, and exactly one Theorem (the master target) that builds up to the theorem. Each Lemma should be (nearly) trivial once ITS DECLARED DEPS are taken as given — at most 1-2 new logical ideas beyond them. Independent branches of the argument should be INDEPENDENT nodes with no edge between them — do not force a false dependency just because you wrote them in some order.
+   2. Emit EVERY node in this EXACT shape, one after another:
+        /-- @blueprint
+        id: descriptive_snake_case_id
+        deps: [id_of_a_dependency, id_of_another] -/
+        lemma descriptive_snake_case_id (binders) : proposition := by sorry
+      \`deps: []\` for a node with no dependencies. Use \`def\`/\`noncomputable def\`/\`abbrev\` for Definitions (these get a REAL body, never \`sorry\`). IDs must be unique, \`snake_case\`, derived from content (not \`step1\`/\`lemma_a\`).
+   3. Declare nodes so every id used in a \`deps: [...]\` list is declared SOMEWHERE in the file (order in the file doesn't matter — the graph is defined by the \`deps:\` lists, not by position).
+   4. The master Theorem's \`id\` MUST be \`MASTER\`, its Lean \`theorem\` name and signature MUST equal the targeted theorem EXACTLY (same binders, same conclusion, verbatim), and its \`deps: [...]\` must list every node it directly uses.
+   5. Every dep edge must ultimately be reachable walking backward from MASTER (no orphan nodes with no path into the master's dependency chain), and the graph must be ACYCLIC.
+   6. verify_full_script the WHOLE file: it MUST compile with the ONLY diagnostics being \`sorry\` warnings on Lemma/Theorem bodies (Definitions must have real, error-free bodies). Iterate until clean.
+   7. STOP. Output the verified graph as one \`\`\`lean block. Do NOT fill any \`sorry\`.
+
+RULES:
+- Reproduce the ORIGINAL theorem verbatim as the \`MASTER\` node — same name, binders, conclusion.
+- A node's proof will later be attempted seeing ONLY its own goal plus its declared deps' SIGNATURES (not their proofs, not the rest of the graph) — so make each node's \`deps:\` list COMPLETE: if its proof will need a fact, declare that dependency now.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}
+Theorem (its signature is immutable):
+${theorem}`
+}
+
+// The V3.1 per-node prover prompt. Same three outcomes as V3's hole-fill
+// prompt (CLOSE/DISPROVE/FORFEIT — never a local split), but scoped to ONE
+// top-level declaration, seeing ONLY its own goal and its declared deps'
+// signatures — never the rest of the graph.
+function graphNodeProverPrompt(node, depsText, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are proving ONE node of a Lean 4 blueprint graph — node ⟪${node.id}⟫. Do NOT locally decompose it: if it resists a direct close, DIAGNOSE it instead — a separate global refinement pass owns restructuring the graph, not you.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+YOUR NODE (compiles with a \`sorry\` body; this is the ONLY thing you're proving):
+\`\`\`lean
+${node.text}
+\`\`\`
+
+AVAILABLE FACTS — your declared dependencies, presented as their SIGNATURES only (you may cite them by name; you do NOT see their proofs or the rest of the graph):
+\`\`\`lean
+${depsText || "(none — this node has no dependencies)"}
+\`\`\`
+
+To see the EXACT goal state, \`init_proof\` your node's proposition (closed: ∀-quantify every free variable) and step it with \`apply_tactic\` — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`).
+
+You have exactly THREE possible outcomes. Pick ONE — never report plain failure:
+
+CLOSE — if you can finish it: submit your complete proof, verify_full_script'd together with the AVAILABLE FACTS above (as \`sorry\`-bodied stand-ins) until YOUR node compiles error-free with no \`sorry\` in it. Then output:
+FILL ⟪${node.id}⟫
+\`\`\`lean
+<only the tactics that replace \`sorry\`, one per line, from the LEFT margin — no \`theorem\`/\`lemma\`, no leading \`by\`>
+\`\`\`
+
+DISPROVE — if you believe the node's STATEMENT is actually FALSE under its hypotheses: prove the NEGATION instead (available facts still apply). Verify it compiles clean and hole-free. Then output:
+DISPROVE ⟪${node.id}⟫
+## Counterexample: <the concrete witness/argument that kills the original claim>
+## Suggested Fix: <how the statement should be repaired>
+\`\`\`lean
+<a complete, verify_full_script-checked proof of the NEGATED proposition, no \`sorry\`>
+\`\`\`
+
+FORFEIT — if you can neither close nor disprove it: write a structured post-mortem — the ONLY context the refinement pass will have on this node:
+FORFEIT ⟪${node.id}⟫
+## Diagnosis: STATEMENT_WRONG (suspected false, no verified disproof) OR PROOF_TOO_HARD (believed true, couldn't reach it from the available facts)
+## Analysis: what you tried, what compiled, what gap remained — be concrete
+## Suggested Fix: for STATEMENT_WRONG, how to repair the statement; for PROOF_TOO_HARD, a helper-lemma breakdown — named sub-steps, each easy given its own predecessors, that would bridge the gap (the refiner will insert these as NEW graph nodes)
+
+Prefer CLOSE, then DISPROVE, then FORFEIT — but ALWAYS pick exactly one.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// The V3.1 global refinement prompt. Sees the WHOLE graph — proved nodes
+// untouched, unresolved nodes each carrying a diagnosis — and may rewire
+// dependencies ANYWHERE (not just "insert before this point"): add a node
+// with edges into the middle of the graph, drop a node and reroute its
+// dependents, repair a false statement in place.
+function graphRefinePrompt(annotatedGraph, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are revising a Lean 4 blueprint GRAPH. The input is a set of \`@blueprint\`-annotated declarations, each with an \`id\` and a \`deps: [...]\` list. Some are already CLOSED (a real, complete proof body — no diagnosis comment, do not touch them). Some are OPEN (\`sorry\` body) with a diagnosis comment recording what the prover found. Your job is to emit a REVISED graph that, handed back to the same prover, is more likely to close every remaining node — while still proving the SAME master theorem.
+
+${toolSection}
+
+## Reading a diagnosis
+- \`## Diagnosis: STATEMENT_WRONG\` — the node's claim is false under its hypotheses — with a \`## Suggested Fix\`.
+- \`## Diagnosis: PROOF_TOO_HARD\` — believed true but unreachable from its declared deps — with a \`## Suggested Fix\` (often a helper-lemma breakdown).
+- \`## Diagnosis: DISPROVED\` — the negation was MACHINE-VERIFIED. The strongest signal: this node cannot be salvaged by re-attempting it, only by changing it.
+These comments are INPUT ONLY — do not copy them into your revised graph.
+
+## What to do — this is a GRAPH, use that
+For \`STATEMENT_WRONG\`/\`DISPROVED\`: repair the node's TYPE using the suggested fix and re-emit it OPEN (same id is fine) — or, if unsalvageable, DROP it and rewire every node whose \`deps:\` list cited it to depend on whatever replaces it instead (or drop that dependency entirely if it's no longer needed).
+For \`PROOF_TOO_HARD\`: read the \`## Suggested Fix\` and ADD new helper nodes anywhere in the graph — they do NOT need to sit "just before" the struggling node; give them fresh ids and whatever \`deps:\` they genuinely need (which may include OTHER existing nodes, not just ones adjacent to the stuck one). Then add those new ids to the struggling node's own \`deps: [...]\` list.
+Leave every CLOSED node (a real proof body, no diagnosis) completely untouched — its proof is budget already spent. Do not change ITS statement (that would invalidate its proof) or its id (that would break every node depending on it).
+
+## Output shape (unchanged from the original format)
+Reproduce the \`MASTER\` node's Lean signature VERBATIM. Every node is \`/-- @blueprint\\nid: ...\\ndeps: [...] -/\` followed by its declaration — closed nodes with their real proof, open nodes with \`:= by sorry\`. The graph must stay ACYCLIC and every node reachable from \`MASTER\`.
+
+## Tool use
+Use verify_full_script to check your revision (the whole graph, topologically ordered). It MUST compile with the ONLY diagnostics being \`sorry\` warnings on open nodes. Iterate until clean, then output the whole revised graph as one \`\`\`lean block. Do NOT prove any open node yourself — that is the prover's job on the next pass, not yours.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}
+CURRENT GRAPH WITH DIAGNOSES:
+\`\`\`lean
+${annotatedGraph}
+\`\`\``
+}
+
+// Run `fn` over `items` with at most `limit` in flight at once. Preserves
+// input order in the returned array. `fn` must never throw — callers wrap
+// their own per-item error handling so one node's failure can't take down a
+// whole parallel round.
+async function mapConcurrent(items, limit, fn) {
+  const results = new Array(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const i = next++
+      if (i >= items.length) return
+      results[i] = await fn(items[i], i)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
+// Verify ONE node's attempted proof in ISOLATION: its declared deps present
+// only as `sorry`-bodied stand-ins (never their real proofs — a node never
+// needs a sibling's proof to complete, only its signature, which is what
+// makes proving nodes in parallel sound), the node itself with the attempted
+// body. Must compile completely hole-free — a node's own proof has no
+// tolerance for `sorry` the way a whole-graph structural check does.
+async function verifyGraphNode(byId, node, attemptText, ctx) {
+  const depStubs = node.deps.map((d) => byId.get(d)).filter(Boolean).map((d) => stubDeclBody(d.text))
+  const script = [...depStubs, attemptText].join("\n\n")
+  const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  return { ok: v.ok && isHoleFreeProof(parseVerifyOutput(v.text)), script, verifyResult: v }
+}
+
+// Same isolation, for a claimed negation — independently re-verified before
+// ever trusting a DISPROVE (the minion's own verify_full_script calls never
+// gate; only this does).
+async function verifyGraphDisprove(byId, node, proofBody, ctx) {
+  const negated = graphNodeNegatedDecl(node, proofBody)
+  if (!negated) return { ok: false }
+  const depStubs = node.deps.map((d) => byId.get(d)).filter(Boolean).map((d) => stubDeclBody(d.text))
+  const script = [...depStubs, negated].join("\n\n")
+  const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  return { ok: v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) }
+}
+
+// Structural check on the WHOLE graph (topo-ordered, bare — no headers): must
+// compile with ONLY `sorry` warnings on still-open nodes, AND the master must
+// still prove the immutable target signature (drift guard, same pattern used
+// everywhere else in this file). Used after planning and after every accepted
+// refinement.
+async function verifyGraphStructural(nodes, ctx, targetStatement) {
+  const bare = serializeGraphBare(nodes)
+  const guarded = buildDriftGuardScript(bare, targetStatement) || bare
+  const v = await verifyViaDaemon(guarded, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+  const parsed = parseVerifyOutput(v.text)
+  return { ok: v.ok && isStructurallyValidDecomposition(parsed) }
+}
+
+// Attempt ONE graph node: CLOSE, DISPROVE, or FORFEIT. Every branch is
+// independently re-verified before being trusted — the minion's own
+// verify_full_script calls (inside its own turn) never gate; only the
+// bridge's re-check here does. Never throws — a transport/parse failure
+// degrades to a forfeit-shaped diagnosis so a parallel round's Promise.all
+// (via mapConcurrent) can never be taken down by one bad node.
+async function fillGraphNode(byId, node, ctx) {
+  if (ctx.signal?.aborted) return { id: node.id, kind: "forfeit", diagnosis: "PROOF_TOO_HARD", analysis: "aborted", fix: "" }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Minion working node ⟪${node.id}⟫ (close / disprove / forfeit)…` })
+  try {
+    const depsText = node.deps
+      .map((d) => byId.get(d))
+      .filter(Boolean)
+      .map((d) => stubDeclBody(d.text))
+      .join("\n\n")
+    const res = await spawnProverStream(
+      {
+        prompt: graphNodeProverPrompt(node, depsText, ctx.mcpServers, ""),
+        mcpServers: ctx.mcpServers,
+        model: ctx.model,
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: `⟪${node.id}⟫`,
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      { onObject: () => false, emit: ctx.emit },
+    )
+    const fill = parseFillBlock(res.finalText, node.id)
+    if (fill != null) {
+      const declText = declWithBody(node.text, fill)
+      const v = await verifyGraphNode(byId, node, declText, ctx)
+      if (v.ok) return { id: node.id, kind: "close", declText }
+      return {
+        id: node.id,
+        kind: "forfeit",
+        diagnosis: "PROOF_TOO_HARD",
+        analysis: "the minion claimed CLOSE but the proof did not independently re-verify in isolation with only its declared deps available.",
+        fix: "try a different tactic approach, or double-check the dependency list is complete.",
+      }
+    }
+    const disprove = parseDisproveBlock(res.finalText, node.id)
+    if (disprove) {
+      const dv = await verifyGraphDisprove(byId, node, disprove.proof, ctx)
+      if (dv.ok) return { id: node.id, kind: "disprove", argument: disprove.argument, fix: disprove.fix }
+      return {
+        id: node.id,
+        kind: "forfeit",
+        diagnosis: "PROOF_TOO_HARD",
+        analysis: "a claimed disproof of this node did not independently verify.",
+        fix: "reconsider the approach, or decompose into smaller steps.",
+      }
+    }
+    const forfeit = parseForfeitBlock(res.finalText, node.id)
+    if (forfeit) return { id: node.id, kind: "forfeit", ...forfeit }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Node ⟪${node.id}⟫ minion returned no usable CLOSE/DISPROVE/FORFEIT reply.` })
+    return {
+      id: node.id,
+      kind: "forfeit",
+      diagnosis: "PROOF_TOO_HARD",
+      analysis: "the minion returned no usable CLOSE/DISPROVE/FORFEIT reply.",
+      fix: "try a different tactic approach, or split this goal into smaller steps.",
+    }
+  } catch (e) {
+    return { id: node.id, kind: "forfeit", diagnosis: "PROOF_TOO_HARD", analysis: `transport error: ${oneLine(String(e?.message || e))}`, fix: "" }
+  }
+}
+
+// Run one global refinement pass over the whole graph. Validates the revision
+// three ways before adopting it: structurally valid (compiles, only `sorry`
+// warnings on open nodes, acyclic, reachable), still proves the immutable
+// target, AND every node that was CLOSED going in is preserved byte-identical
+// (the refiner must never silently touch or reprove a finished node — same
+// invariant the paper states explicitly). Returns null if nothing usable.
+async function runGraphRefiner(nodesMap, diagnoses, ctx, targetStatement) {
+  const provedIds = [...nodesMap.values()].filter((n) => n.status === "proved").map((n) => n.id)
+  const provedTextById = new Map(provedIds.map((id) => [id, nodesMap.get(id).text]))
+  const annotated = serializeGraphAnnotated([...nodesMap.values()], diagnoses)
+
+  const verifyScripts = new Map()
+  let revisedRaw = null
+  const onObj = (o) => {
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script"))
+            verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, theoremSignature(targetStatement))) {
+            revisedRaw = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: graphRefinePrompt(annotated, ctx.mcpServers, ""),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "🏛️♻️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onObj, emit: ctx.emit },
+  )
+  if (!revisedRaw) return null
+
+  const revisedNodes = parseBlueprintGraph(revisedRaw)
+  if (!revisedNodes.length) return null
+  const shape = validateGraphShape(revisedNodes, "MASTER")
+  if (!shape.ok) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Refiner's revision rejected: ${shape.reason}.` })
+    return null
+  }
+  // Every previously-CLOSED node must be untouched, byte-for-byte.
+  for (const [id, text] of provedTextById) {
+    const n = revisedNodes.find((x) => x.id === id)
+    if (!n || n.text.trim() !== text.trim()) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Refiner's revision rejected: touched or dropped closed node ⟪${id}⟫.` })
+      return null
+    }
+  }
+  const structural = await verifyGraphStructural(revisedNodes, ctx, targetStatement)
+  if (!structural.ok) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: "↩︎ Refiner's revision did not independently re-verify." })
+    return null
+  }
+  return revisedNodes
+}
+
+// V3.1 orchestrator: PLAN a real dependency graph, then loop PARALLEL PROVE ⇄
+// GLOBAL REFINE — every open node gets one concurrent shot at CLOSE/DISPROVE/
+// FORFEIT (nodes only ever need their deps' SIGNATURES, never finished
+// proofs, so this is sound), then one refinement call sees the whole graph
+// and rewires it. Leak II's cleanup_memory is called at most ONCE per round,
+// after every concurrent minion in it has settled — never mid-round. Same
+// stopping rule as V3: no cap, no fallback, wall-clock + stall governed.
+// NOTE: unlike V2/V3, this strategy does not yet emit resumable checkpoints —
+// a graph is not a `have`-chain skeleton, so feeding one through the shared
+// seed-resume path (which assumes have-chain shape) would be unsound. An
+// interrupted V3.1 run currently has to restart from scratch.
+async function proveBlueprintGraph(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🏛️𝔾"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏛️𝔾 Blueprint graph (v3.1): planning an explicit dependency graph (parallel nodes, global refinement)." })
+
+  // ---- 1) PLAN ----------------------------------------------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let graphNodes = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script"))
+            verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          const nodes = parseBlueprintGraph(script)
+          if (
+            nodes.length &&
+            isStructurallyValidDecomposition(parsed) &&
+            scriptProvesTarget(script, theoremSignature(theorem)) &&
+            validateGraphShape(nodes, "MASTER").ok
+          ) {
+            graphNodes = nodes
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: graphBlueprintPrompt(theorem, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "🏛️𝔾",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, theoremSignature(theorem))) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!graphNodes) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid dependency graph — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️𝔾 Graph verified — ${graphNodes.length} node(s).` })
+
+  // ---- 2) PARALLEL PROVE ⇄ GLOBAL REFINE loop ----------------------------
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  const byId = new Map(graphNodes.map((n) => [n.id, { ...n, status: "open" }]))
+  const concurrency = clampNum(ctx.graphConcurrency, 1, 12, 4)
+  let banked = 0
+  let rounds = 0
+  for (;;) {
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+    const open = [...byId.values()].filter((n) => n.status === "open")
+    if (!open.length) break
+    rounds++
+    let roundProgressed = false
+
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️𝔾 Round ${rounds}: proving ${open.length} open node(s), up to ${concurrency} in parallel…` })
+    const diagnoses = {}
+    const results = await mapConcurrent(open, concurrency, (node) => fillGraphNode(byId, node, ctx))
+    for (const r of results) {
+      if (r.kind === "close") {
+        byId.set(r.id, { ...byId.get(r.id), text: r.declText, status: "proved" })
+        banked++
+        roundProgressed = true
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked node ⟪${r.id}⟫.` })
+      } else if (r.kind === "disprove") {
+        diagnoses[r.id] = `## Diagnosis: DISPROVED\n## Counterexample: ${r.argument || "(see negation proof)"}\n## Suggested Fix: ${r.fix || "repair or drop this claim"}`
+        ctx.emit({ type: "message-annotation", subtype: "error", thought: `🛡️ Node ⟪${r.id}⟫ machine-DISPROVED — flagged for refinement.` })
+      } else {
+        diagnoses[r.id] = `## Diagnosis: ${r.diagnosis}\n## Analysis: ${r.analysis || "(none given)"}\n## Suggested Fix: ${r.fix || "(none given)"}`
+      }
+    }
+    // ONE cleanup, after every concurrent minion in this round has settled —
+    // never mid-round (Leak II's cleanup_memory is global; calling it while a
+    // sibling is still mid-flight would wipe its state out from under it).
+    if (pantoUrl)
+      await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, {}, { timeoutMs: 15000 }).catch(() => {})
+
+    const stillOpen = [...byId.values()].filter((n) => n.status === "open")
+    if (!stillOpen.length) break
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️𝔾 Refining (round ${rounds}) — ${stillOpen.length} unresolved node(s) carrying a diagnosis.` })
+    const revised = await runGraphRefiner(byId, diagnoses, ctx, theorem)
+    if (revised) {
+      const revisedById = new Map(revised.map((n) => [n.id, n]))
+      for (const [id, n] of byId) if (!revisedById.has(id)) byId.delete(id)
+      for (const n of revised) {
+        const prior = byId.get(n.id)
+        byId.set(n.id, { ...n, status: prior && prior.status === "proved" ? "proved" : "open" })
+      }
+      roundProgressed = true
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏛️𝔾 Graph revised." })
+    } else {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "↩︎ Refinement did not produce a usable revision this round." })
+    }
+
+    if (!roundProgressed) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "⛔ Stalled — a full round closed no nodes and produced no usable revision. Nothing left to try." })
+      break
+    }
+  }
+
+  // ---- 3) Every node proved → assemble + verify hole-free (the win). ----
+  const remaining = [...byId.values()].filter((n) => n.status !== "proved")
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All nodes proved — assembling (topo-ordered) and re-verifying the whole graph on the daemon…" })
+    const bare = serializeGraphBare([...byId.values()])
+    const guarded = buildDriftGuardScript(bare, theorem) || bare
+    const v = await verifyViaDaemon(guarded, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(guarded, theoremSignature(theorem))) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Graph assembled a verified proof from ${banked} banked node(s) across ${rounds} round(s).` })
+      return { verified: true, proof: guarded }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Assembled graph didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
+    return { verified: false, proof: "" }
+  }
+
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Not solved — banked ${banked} node(s) across ${rounds} round(s); ${remaining.length} remain unresolved.` })
+  return { verified: false, proof: "" }
+}
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -3736,10 +4420,17 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
               blueprintHoleFillPrompt("<the current skeleton>", "hN", mcpServers) +
               "\n\n=== REFINEMENT PROMPT ===\n" +
               blueprintRefinePrompt("<the current skeleton, annotated with diagnoses>", mcpServers)
-            : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
-              nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
-              "\n\n=== DECOMPOSER PROMPT ===\n" +
-              decomposePromptFor(strategy, theorem, mcpServers),
+            : style === "blueprint-graph"
+              ? `[DECOMPOSITION MODE — V3.1 graph blueprint (parallel nodes, global refinement) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+                graphBlueprintPrompt(theorem, mcpServers) +
+                "\n\n=== NODE-PROVER PROMPT ===\n" +
+                graphNodeProverPrompt({ id: "hN", text: "<node declaration>" }, "<deps>", mcpServers) +
+                "\n\n=== REFINEMENT PROMPT ===\n" +
+                graphRefinePrompt("<the current graph, annotated with diagnoses>", mcpServers)
+              : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
+                nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
+                "\n\n=== DECOMPOSER PROMPT ===\n" +
+                decomposePromptFor(strategy, theorem, mcpServers),
     model: opts.model || null,
     strategy,
     theorem,
@@ -3806,6 +4497,11 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // a child lemma or the assembly fails, before the node itself fails.
     maxRedecompose: clampNum(opts.maxRedecompose, 0, 5, 1),
     haveTurnBudget: clampNum(opts.haveTurnBudget, 5, 60, 24),
+    // V3.1 (blueprint-graph) only: how many open nodes may be proved
+    // concurrently per round. Conservative default — the underlying daemon's
+    // true concurrent-request capacity hasn't been load-tested; tune up once
+    // you've watched it hold under a few parallel rounds.
+    graphConcurrency: clampNum(opts.graphConcurrency, 1, 12, 4),
     // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
     nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
@@ -3834,16 +4530,20 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     try {
       let ok = false
       let proof = ""
-      if (style === "have" || style === "have-tree" || style === "blueprint") {
+      if (style === "have" || style === "have-tree" || style === "blueprint" || style === "blueprint-graph") {
         // `have`: one agent, whole proof in one context. `have-tree` (V2):
         // planner + isolated per-hole minions with LOCAL decomposition.
         // `blueprint` (V3): same skeleton mechanics, but a stuck hole is never
         // locally split — it carries a structured diagnosis into a GLOBAL
-        // refinement pass instead. All three fall back to `have` on any stall.
-        // Resuming from a saved checkpoint short-circuits all three: finish the
-        // remaining holes straight from the seed (proven work is handed in, not
-        // rediscovered). The independent verify gate is unchanged, so soundness
-        // is identical to a from-scratch run.
+        // refinement pass instead. `blueprint-graph` (V3.1): nodes are
+        // independent top-level declarations with explicit deps (a real DAG),
+        // proved in parallel. All fall back to `have` on a stall they can't
+        // even start from. Resuming from a saved checkpoint short-circuits the
+        // first three: finish the remaining holes straight from the seed
+        // (proven work is handed in, not rediscovered) — NOT blueprint-graph,
+        // which doesn't emit checkpoints yet (a graph isn't a `have`-chain
+        // skeleton, so feeding one through this seed path would be unsound;
+        // an interrupted V3.1 run currently restarts from scratch).
         let r
         if (ctx.seed) {
           emit({ type: "message-annotation", subtype: "status", thought: "▶️ Resuming from a saved checkpoint — finishing the remaining hole(s) from banked progress." })
@@ -3852,6 +4552,8 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           r = await proveHaveTree(theorem, ctx)
         } else if (style === "blueprint") {
           r = await proveBlueprint(theorem, ctx)
+        } else if (style === "blueprint-graph") {
+          r = await proveBlueprintGraph(theorem, ctx)
         } else {
           r = await proveHaveFlat(theorem, ctx)
         }
