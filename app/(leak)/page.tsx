@@ -59,12 +59,14 @@ export default function LandingPage() {
           Theorem-proving API
         </p>
         <h1 className="mt-4 max-w-2xl text-4xl font-semibold tracking-tight md:text-5xl">
-          Send a maths problem. Get a verified proof — or pay nothing.
+          Send a maths problem. Get a machine-checked Lean&nbsp;4 proof — pay
+          for the compute it takes.
         </h1>
         <p className="mt-5 max-w-xl text-base leading-relaxed text-muted-foreground">
-          One endpoint returns a machine-checked Lean&nbsp;4 proof — verified
-          against the kernel, not a plausible-looking argument. You only pay when
-          a proof checks out. Failed attempts are free, every time.
+          One endpoint runs an AI prover whose proofs are checked by the
+          Lean&nbsp;4 kernel — not a plausible-looking argument. You pay for the
+          compute a run uses — its actual cost plus 20% — drawn from prepaid
+          credits, whether or not it lands a proof.
         </p>
 
         <div className="mt-8 flex flex-wrap items-center gap-3">
@@ -75,7 +77,7 @@ export default function LandingPage() {
             </Link>
           </Button>
           <span className="font-mono text-sm text-muted-foreground">
-            Prepay with credits · refunded on failure
+            Prepay with credits · billed at 1.2× the compute used
           </span>
         </div>
 
@@ -107,12 +109,12 @@ export default function LandingPage() {
           <Audience
             icon={<Code2 className="size-5" />}
             title="Builders & students"
-            body="One bearer token, one POST. Wire proving into your app, generate guaranteed-correct answer keys, or just watch a hard theorem get solved. Cheap to start; free when it fails."
+            body="One bearer token, one POST. Wire proving into your app, generate guaranteed-correct answer keys, or just watch a hard theorem get solved. Cheap to start; you pay for the compute a run actually uses."
           />
           <Audience
             icon={<LineChart className="size-5" />}
             title="Investors & partners"
-            body="A pay-only-on-success proving engine with a self-improving prover + verifier at its core. Want the deeper story or a look under the hood? Talk to us."
+            body="A metered pay-for-compute proving engine with a self-improving prover + Lean verifier at its core. Want the deeper story or a look under the hood? Talk to us."
           />
         </div>
       </section>
@@ -134,8 +136,8 @@ export default function LandingPage() {
         <Step
           icon={<Coins className="size-5" />}
           n="03"
-          title="Pay on success only"
-          body="Credits are captured when a proof lands. If we can't prove it, you're charged nothing — guaranteed."
+          title="Pay for the compute"
+          body="Credits are drawn as the prover runs — its actual compute cost plus 20% — whether or not it lands a proof. It stops before exceeding your balance, so you're never charged beyond your credits."
         />
       </section>
 
@@ -152,9 +154,9 @@ export default function LandingPage() {
           <p className="mt-4 text-base leading-relaxed text-muted-foreground">
             Leak only returns a proof the Lean&nbsp;4 kernel accepts — the same
             trusted core that underpins formalised mathematics. &ldquo;Proved&rdquo;
-            means proved, not &ldquo;looks right&rdquo;. That verifiable guarantee
-            is exactly what makes the pay-on-success model possible: we can only
-            charge you because we can prove we earned it.
+            means proved, not &ldquo;looks right&rdquo;. You pay for the compute
+            either way — but when a proof comes back, that kernel check is your
+            guarantee it&rsquo;s real, not merely convincing.
           </p>
         </div>
       </section>
