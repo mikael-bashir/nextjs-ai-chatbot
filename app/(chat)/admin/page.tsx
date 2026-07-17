@@ -51,6 +51,12 @@ async function AdminContent() {
           >
             Playground →
           </Link>
+          <Link
+            href="/admin/benchmark"
+            className="inline-flex h-[34px] items-center rounded-md border px-3 text-sm font-medium transition-colors hover:bg-muted"
+          >
+            Capability benchmark →
+          </Link>
         </div>
       </div>
 
