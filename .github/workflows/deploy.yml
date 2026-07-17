@@ -60,6 +60,16 @@ jobs:
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-estimator:cache
           cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-estimator:cache,mode=max
 
+      - name: Build and push hosted-worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: services/leak-worker
+          file: services/leak-worker/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}/production-worker:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}/production-worker:cache
+          cache-to:   type=registry,ref=ghcr.io/${{ github.repository }}/production-worker:cache,mode=max
+
   deploy:
     runs-on: ubuntu-latest
     needs: build
@@ -98,6 +108,7 @@ jobs:
             CERT_SIGN_PRIVATE_KEY=${{ secrets.CERT_SIGN_PRIVATE_KEY }}
             LEAK_WORKER_SECRET=${{ secrets.LEAK_WORKER_SECRET }}
             ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
+            LEAK_PROVER_MCP_CONFIG=${{ secrets.LEAK_PROVER_MCP_CONFIG }}
             NODE_ENV=production
             EOF
 
@@ -135,6 +146,17 @@ jobs:
                   - estimator-models:/models
                 mem_limit: 512m
                 restart: always
+              leak-worker:
+                image: ghcr.io/${REPO}/production-worker:latest
+                container_name: leak-worker
+                env_file: .env
+                environment:
+                  - WORKER_KIND=hosted
+                  - WORKER_URL=http://nextjs-frontend:3000
+                  - WORKER_MODEL=claude-opus-4-8
+                restart: always
+                depends_on:
+                  - nextjs-frontend
             volumes:
               estimator-data:
               estimator-models:
@@ -157,6 +179,7 @@ jobs:
               docker pull ghcr.io/${REPO}/production-nextjs:latest &&
               docker pull ghcr.io/${REPO}/production-python:latest &&
               docker pull ghcr.io/${REPO}/production-estimator:latest &&
+              docker pull ghcr.io/${REPO}/production-worker:latest &&
               touch /tmp/deploy-ready ||
               touch /tmp/deploy-failed
             " > /tmp/pull.log 2>&1 &

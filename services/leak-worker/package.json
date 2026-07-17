@@ -1,0 +1,14 @@
+{
+  "name": "leak-hosted-agent-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Hosted Claude Agent SDK prover that drains the Leak deployment queue (hosted worker kind).",
+  "main": "hosted-agent-worker.mjs",
+  "scripts": {
+    "start": "node hosted-agent-worker.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.212"
+  }
+}
