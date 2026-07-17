@@ -2398,7 +2398,18 @@ export function AdminPipeline() {
           </h2>
           <div className="flex items-center gap-2 text-xs">
             <HealthChip label="Staging" state={health?.staging} />
-            <HealthChip label="Prod" state={health?.prod} />
+            {/* Count the DURABLE promoted set (queue ∪ GeneratedProblem archive),
+                the same source the per-item "Prod" badges use — not the transient
+                prod queue, which the CompeteMath cron drains to 0 once published.
+                Keeps the count consistent with the badges. */}
+            <HealthChip
+              label="Prod"
+              state={
+                health?.prod
+                  ? { ...health.prod, length: prodTitles.length }
+                  : undefined
+              }
+            />
             <button
               type="button"
               onClick={loadQueue}
