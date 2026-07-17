@@ -78,10 +78,23 @@ function toSdkMcpServers(list) {
   const out = {};
   for (const s of Array.isArray(list) ? list : []) {
     if (!s?.name || !s?.url) continue;
-    out[String(s.name)] = {
-      type: s.type === 'sse' ? 'sse' : 'http',
-      url: String(s.url),
-    };
+    const url = String(s.url);
+    // Transport: an explicit `type` wins, else INFER from the URL — a `/sse`
+    // endpoint is the SSE transport. This matters because the app's
+    // getProverMcpServers strips `type` from the lease (keeps only name+url),
+    // so for lease-provided servers the URL is the only signal, and defaulting
+    // to 'http' would talk the wrong protocol to an SSE server (no tools → no
+    // proofs). Leak_I/II/IV are all `…hf.space/sse`.
+    const type =
+      s.type === 'sse' || s.type === 'http'
+        ? s.type
+        : /\/sse\/?$/i.test(url)
+          ? 'sse'
+          : 'http';
+    // Sanitize the server name into a valid MCP tool prefix (spaces → '_'), so
+    // "Leak I" → "Leak_I" → tools like mcp__Leak_I__loogle_search.
+    const key = String(s.name).replace(/[^a-zA-Z0-9_-]+/g, '_');
+    out[key] = { type, url };
   }
   return out;
 }
