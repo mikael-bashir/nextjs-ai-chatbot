@@ -3141,8 +3141,12 @@ ${extra ? `\n${extra}\n` : ""}`
 // rewrites the graph: repairing a false statement, dropping/rewiring a dead
 // node, or inserting new helper holes to bridge a real gap — exactly the
 // move V2 could only make locally, one hole at a time, with no view of the
-// rest of the tree. Falls back to proveHaveFlat on any stall, so V3 can never
-// be weaker than the flat baseline (same safety net V2 already has).
+// rest of the tree. No fallback and no iteration cap — matches the paper's
+// own stopping rule exactly ("continues until every lemma is proved or the
+// iteration budget is reached"), with the budget being the shared wall-clock
+// deadline rather than a fixed round count. An unclosed hole after the
+// deadline (or a genuinely stalled round) is reported unsolved, not rescued
+// by a different strategy — deliberately unlike V2's flat-finisher fallback.
 // ===========================================================================
 
 // The V3 per-hole prover prompt. Three outcomes only — CLOSE, DISPROVE, or a
@@ -3523,10 +3527,10 @@ async function runBlueprintRefiner(annotatedSkeleton, targetSig, ctx) {
 // CLOSE/DISPROVE/FORFEIT, and whenever holes remain unresolved, ONE global
 // refinement call sees the whole graph (proved holes' tactics kept verbatim,
 // unresolved holes each carrying a diagnosis) and rewrites it. Time-governed
-// like every other have-tree/have path — no turn caps, the shared wall-clock
-// deadline is the only bound. Falls through to proveHaveFlat (seeded with the
-// best banked progress) on any stall, so V3 is never weaker than the flat
-// baseline — the same safety net V2 already relies on.
+// like every other have-tree/have path — no turn caps, no round cap either;
+// the shared wall-clock deadline is the only bound. Ends unsolved (not
+// rescued by a different strategy) when the deadline hits or a round makes
+// zero progress — matching the paper's own stopping rule exactly.
 async function proveBlueprint(theorem, ctx) {
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   const sig = theoremSignature(theorem)
@@ -3594,14 +3598,24 @@ async function proveBlueprint(theorem, ctx) {
   ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: parseHoleIds(skeleton).length })
 
   // ---- 2) PROVE ⇄ REFINE loop ------------------------------------------------
+  // No iteration cap — this matches the paper's own stopping rule exactly
+  // ("the loop continues until every lemma is proved or the iteration budget
+  // is reached") with the budget set to the shared wall-clock deadline instead
+  // of a fixed round count, consistent with every other have/have-tree path in
+  // this file ("no turn caps anywhere — TIME alone bounds them"). The only
+  // other exit is a genuinely STALLED round (zero holes closed AND no usable
+  // refinement produced) — that's not an artificial cap, it's "there is
+  // nothing left to try"; looping identically forever would just burn quota.
   const pantoUrl = resolvePantographUrl(ctx.mcpServers)
   let partial = skeleton
-  const maxIters = clampNum(ctx.maxRefinements, 1, 24, 12)
   let banked = 0
-  for (let iter = 0; iter < maxIters; iter++) {
+  let rounds = 0
+  for (;;) {
     if (ctx.signal?.aborted || deadlinePassed(ctx)) break
     const open = parseHoleIds(partial)
     if (!open.length) break
+    rounds++
+    let roundProgressed = false
 
     // -- proving pass: every open hole gets one shot at CLOSE/DISPROVE/FORFEIT.
     const diagnoses = {} // id -> annotation text for the refiner
@@ -3611,6 +3625,7 @@ async function proveBlueprint(theorem, ctx) {
       if (r.fill != null) {
         partial = spliceHole(partial, id, r.fill)
         banked++
+        roundProgressed = true
         ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫.` })
       } else if (r.disprove != null) {
         const dv = await verifyDisproof(partial, id, r.disprove.proof, ctx)
@@ -3636,10 +3651,11 @@ async function proveBlueprint(theorem, ctx) {
     }
 
     const stillOpen = parseHoleIds(partial)
-    if (!stillOpen.length || ctx.signal?.aborted || deadlinePassed(ctx)) break
+    if (!stillOpen.length) break
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
 
     // -- refinement pass: ONE call sees the whole graph and rewrites it.
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Refining — ${stillOpen.length} unresolved hole(s) carrying a diagnosis.` })
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Refining (round ${rounds}) — ${stillOpen.length} unresolved hole(s) carrying a diagnosis.` })
     const annotated = stillOpen.reduce(
       (s, id) => (diagnoses[id] ? annotateHoleDiagnosis(s, id, diagnoses[id]) : s),
       partial,
@@ -3647,31 +3663,36 @@ async function proveBlueprint(theorem, ctx) {
     const revised = await runBlueprintRefiner(annotated, sig, ctx)
     if (revised) {
       partial = revised
+      roundProgressed = true
       ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏛️ Blueprint revised." })
     } else {
-      ctx.emit({ type: "message-annotation", subtype: "error", thought: "↩︎ Refinement did not produce a usable revision this round — will retry next iteration if budget remains." })
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "↩︎ Refinement did not produce a usable revision this round." })
+    }
+
+    if (!roundProgressed) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "⛔ Stalled — a full round closed no holes and produced no usable revision. Nothing left to try." })
+      break
     }
   }
 
-  // ---- 3) Every hole filled → assemble + verify hole-free (the full win). ---
+  // ---- 3) Every hole filled → assemble + verify hole-free (the win). --------
   const remaining = parseHoleIds(partial)
   if (remaining.length === 0 && !ctx.signal?.aborted) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
     const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Blueprint assembled a verified proof from ${banked} banked hole(s) across refinement rounds.` })
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Blueprint assembled a verified proof from ${banked} banked hole(s) across ${rounds} refinement round(s).` })
       return { verified: true, proof: partial }
     }
-    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
-  } else if (!ctx.signal?.aborted) {
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Banked ${banked} hole(s); ${remaining.length} remain unresolved after ${maxIters} refinement round(s) — finishing in one context.` })
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
+    return { verified: false, proof: "" }
   }
 
-  // ---- 4) FINISH: hand the partially-filled skeleton to flat mode as a seed,
-  // so proven holes are never thrown away. Flat mode's gate still requires a
-  // full, independently-verified proof of the master, so soundness is unchanged.
-  if (ctx.signal?.aborted) return { verified: false, proof: "" }
-  return proveHaveFlat(theorem, ctx, { seed: partial })
+  // No fallback: an unclosed hole after the deadline/stall is reported as
+  // unsolved, matching the paper's own semantics exactly — it doesn't rescue
+  // a budget-exhausted attempt with a different strategy either.
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `❌ Not solved — banked ${banked} hole(s) across ${rounds} round(s); ${remaining.length} remain unresolved.` })
+  return { verified: false, proof: "" }
 }
 
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
@@ -3785,10 +3806,6 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // a child lemma or the assembly fails, before the node itself fails.
     maxRedecompose: clampNum(opts.maxRedecompose, 0, 5, 1),
     haveTurnBudget: clampNum(opts.haveTurnBudget, 5, 60, 24),
-    // V3 (blueprint) only: how many PROVE⇄REFINE rounds before falling back to
-    // the flat finisher. Iteration count, not a turn cap — the shared wall-
-    // clock deadline still governs each individual call.
-    maxRefinements: clampNum(opts.maxRefinements, 1, 24, 12),
     // 0 = no per-node timeout (default) — hard leaves shouldn't be killed
     // mid-proof; Terminate aborts the whole tree. Positive value opts into a cap.
     nodeTimeoutMs: Number(opts.nodeTimeoutMs) > 0 ? clampNum(opts.nodeTimeoutMs, 30000, 21600000, 900000) : 0,
