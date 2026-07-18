@@ -57,6 +57,12 @@ async function AdminContent() {
           >
             Capability benchmark →
           </Link>
+          <Link
+            href="/admin/push-prove"
+            className="inline-flex h-[34px] items-center rounded-md border px-3 text-sm font-medium transition-colors hover:bg-muted"
+          >
+            Push prove →
+          </Link>
         </div>
       </div>
 

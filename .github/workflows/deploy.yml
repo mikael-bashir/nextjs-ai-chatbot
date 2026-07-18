@@ -109,6 +109,7 @@ jobs:
             LEAK_WORKER_SECRET=${{ secrets.LEAK_WORKER_SECRET }}
             ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
             LEAK_PROVER_MCP_CONFIG=${{ secrets.LEAK_PROVER_MCP_CONFIG }}
+            LEAK_SYNC_SECRET=${{ secrets.LEAK_SYNC_SECRET }}
             NODE_ENV=production
             EOF
 
