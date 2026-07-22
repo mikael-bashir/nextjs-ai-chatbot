@@ -24,18 +24,20 @@ import {
   type EstimateResult,
 } from '@/lib/cost/estimator';
 import {
+  GAUNTLET_JUDGE_SYSTEM_PROMPT,
   GAUNTLET_MAX_MUTATIONS,
   GAUNTLET_MODEL,
   GAUNTLET_SAMPLES,
   GAUNTLET_SOLVER_SYSTEM_PROMPT,
   GAUNTLET_TIMEOUT_MS,
   LEVEL_ASSESSOR_SYSTEM_PROMPT,
+  gauntletJudgePrompt,
   gauntletSolverPrompt,
   levelAssessorPrompt,
   mutationPrompt,
   normalizeIntString,
   parseAssessedLevel,
-  parseGauntletAnswer,
+  parseJudgeVerdict,
   sampleChain,
   trapdoorPrompt,
   type GauntletMeta,
@@ -98,29 +100,43 @@ const GEN_RUN_OPTIONS = {
 // answer often ends up wrong. Give those modes a python tool so they compute
 // the construction exactly, in seconds. The other modes stay tool-free (lean
 // context = less rate-limit pressure when looping).
+// Drop Bash from the denylist; keep everything else blocked. Headless run on
+// the user's own local bridge — auto-approve the tool so it can actually
+// execute python without an interactive prompt.
+const BASH_TOOL_OPTIONS = {
+  disallowedTools:
+    'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
+  allowedTools: 'Bash',
+  permissionMode: 'bypassPermissions',
+};
+
 function genRunOptionsFor(mode: GenMode, model?: string) {
   const withModel = model ? { ...GEN_RUN_OPTIONS, model } : GEN_RUN_OPTIONS;
   if (mode !== 'reverse' && mode !== 'trapdoor') return withModel;
-  return {
-    ...withModel,
-    // Drop Bash from the denylist; keep everything else blocked.
-    disallowedTools:
-      'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
-    allowedTools: 'Bash',
-    // Headless run on the user's own local bridge — auto-approve the tool so it
-    // can actually execute python without an interactive prompt.
-    permissionMode: 'bypassPermissions',
-  };
+  return { ...withModel, ...BASH_TOOL_OPTIONS };
 }
 
-// The gauntlet solver: a mid-tier Claude attacking the problem cold — no
-// tools, no JSON contract, just "solve it and commit to an integer". Timeout
-// is generation-side only (a solver that can't crack it in time has failed to
-// crack it, which is the pass condition — see lib/generation/trapdoor.ts).
+// The gauntlet solver: a mid-tier Claude attacking the problem cold, WITH a
+// Bash/python tool (denying it would test mental arithmetic, not insight —
+// see lib/generation/trapdoor.ts) and no forced output format. Timeout is
+// generation-side only (a solver that can't crack it in time has failed to
+// crack it, which is the pass condition).
 const GAUNTLET_RUN_OPTIONS = {
   ...GEN_RUN_OPTIONS,
+  ...BASH_TOOL_OPTIONS,
   model: GAUNTLET_MODEL,
   systemPrompt: GAUNTLET_SOLVER_SYSTEM_PROMPT,
+  timeoutMs: GAUNTLET_TIMEOUT_MS,
+};
+
+// The gauntlet judge: also tool-equipped, so it can RUN any code the solver
+// produced and verify what it actually prints rather than trust the
+// transcript.
+const GAUNTLET_JUDGE_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  ...BASH_TOOL_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: GAUNTLET_JUDGE_SYSTEM_PROMPT,
   timeoutMs: GAUNTLET_TIMEOUT_MS,
 };
 
@@ -1336,10 +1352,11 @@ export function AdminPipeline() {
       let mutations = 0;
       for (;;) {
         setGenStage('gauntlet');
-        const expected = normalizeIntString(gen.answer);
-        const runs = await Promise.all(
+        const expected = normalizeIntString(gen.answer) ?? String(gen.answer ?? '');
+        const samples = await Promise.all(
           Array.from({ length: GAUNTLET_SAMPLES }, async () => {
-            const res = await callBridge(true, '/run', {
+            // 1. Solver attempts the problem cold, with a Bash/python tool.
+            const sRes = await callBridge(true, '/run', {
               method: 'POST',
               body: JSON.stringify({
                 prompt: gauntletSolverPrompt(gen.problem || ''),
@@ -1347,36 +1364,55 @@ export function AdminPipeline() {
               }),
               signal,
             });
-            if (!res.ok) return { text: '', answer: null as string | null };
-            const d = await res.json().catch(() => ({}) as Record<string, unknown>);
+            const empty = { cracked: false, claimedAnswer: null, reason: 'solver run failed' };
+            if (!sRes.ok) return { transcript: '', verdict: empty };
+            const sData = await sRes.json().catch(() => ({}) as Record<string, unknown>);
             recordUsage(
-              d.usage as Parameters<typeof recordUsage>[0],
-              (d.costUsd as number | undefined) ?? null,
+              sData.usage as Parameters<typeof recordUsage>[0],
+              (sData.costUsd as number | undefined) ?? null,
             );
-            const text = String(d.text || '');
-            return { text, answer: parseGauntletAnswer(text) };
+            const transcript = String(sData.text || '');
+
+            // 2. A separate, tool-equipped judge rules on the transcript —
+            // running any code it contains rather than trusting it.
+            const jRes = await callBridge(true, '/run', {
+              method: 'POST',
+              body: JSON.stringify({
+                prompt: gauntletJudgePrompt(gen.problem || '', expected, transcript),
+                options: GAUNTLET_JUDGE_RUN_OPTIONS,
+              }),
+              signal,
+            });
+            if (!jRes.ok)
+              return { transcript, verdict: { ...empty, reason: 'judge run failed' } };
+            const jData = await jRes.json().catch(() => ({}) as Record<string, unknown>);
+            recordUsage(
+              jData.usage as Parameters<typeof recordUsage>[0],
+              (jData.costUsd as number | undefined) ?? null,
+            );
+            return { transcript, verdict: parseJudgeVerdict(String(jData.text || '')) };
           }),
         );
-        const answers = runs.map((r) =>
-          r.answer == null ? null : normalizeIntString(r.answer),
-        );
-        const solved =
-          expected != null &&
-          answers.some((a) => a != null && a === expected);
-        // All samples agreeing on the SAME wrong answer is a strong smell the
-        // INTENDED answer is wrong — flag for human review, don't auto-pass it
-        // silently.
-        const nonNull = answers.filter((a): a is string => a != null);
+
+        const solved = samples.some((s) => s.verdict.cracked);
+        // Every HELD sample's judge nonetheless converging on the SAME
+        // (wrong) answer is a strong smell the INTENDED answer is wrong —
+        // flag for human review, don't auto-pass it silently.
+        const heldClaims = samples
+          .filter((s) => !s.verdict.cracked)
+          .map((s) => s.verdict.claimedAnswer)
+          .filter((a): a is string => a != null);
         const suspect =
           !solved &&
-          nonNull.length === GAUNTLET_SAMPLES &&
-          nonNull.every((a) => a === nonNull[0])
-            ? nonNull[0]
+          heldClaims.length === GAUNTLET_SAMPLES &&
+          heldClaims.every((a) => a === heldClaims[0]) &&
+          heldClaims[0] !== expected
+            ? heldClaims[0]
             : undefined;
         const meta: GauntletMeta = {
           model: GAUNTLET_MODEL,
           samples: GAUNTLET_SAMPLES,
-          answers,
+          verdicts: samples.map((s) => s.verdict),
           solved,
           mutations,
           ...(suspect ? { suspectAnswer: suspect } : {}),
@@ -1393,7 +1429,7 @@ export function AdminPipeline() {
           body: JSON.stringify({
             prompt: mutationPrompt(
               JSON.stringify(gen),
-              runs.filter((r) => r.answer != null).map((r) => r.text),
+              samples.filter((s) => s.verdict.cracked).map((s) => s.transcript),
               Array.isArray(gen.chain) && gen.chain.length > 0,
             ),
             options: genRunOptionsFor(

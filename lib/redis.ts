@@ -164,7 +164,11 @@ export interface GeneratedRecord {
   gauntlet?: {
     model: string;
     samples: number;
-    answers: (string | null)[];
+    verdicts: {
+      cracked: boolean;
+      claimedAnswer: string | null;
+      reason: string;
+    }[];
     solved: boolean;
     mutations: number;
     suspectAnswer?: string;

@@ -18,6 +18,26 @@
 // path; after MAX_MUTATIONS failed repairs the problem is scrapped. This is
 // the difficulty calibrator: "Insane" stops meaning "the generator felt it
 // was hard" and starts meaning "a real adversary failed it".
+//
+// THE SOLVER GETS TOOLS. Withholding a calculator from the gauntlet does not
+// test mathematical difficulty — it tests mental arithmetic, which is a
+// different axis entirely and a bad one (the generator itself computes with
+// python; a solver denied the same aid will "fail" a problem whose actual
+// insight chain is trivial, exactly the "five-line script prints the answer
+// in under a second" case the quality bars already ban). So the solver gets
+// the same Bash/python tool the generator does, and is never forced into a
+// rigid ANSWER: line — it just solves, naturally.
+//
+// A SEPARATE JUDGE DECIDES THE VERDICT. Parsing the solver's own claimed
+// answer isn't enough either: a solver can derive the entire correct method
+// and only fumble the final digit-crunching, which means the problem was
+// still cracked (a real solver with a calculator finishes it trivially from
+// there). So a second model — also tool-equipped, so it can actually RUN any
+// code the solver produced rather than take its word — judges the full
+// transcript against the ground-truth answer and rules CRACKED if the
+// solver stated the right answer, handed over code that (when run) computes
+// it, or reduced the problem to a single mechanical step with no insight
+// left to find.
 
 // ---------------------------------------------------------------------------
 // Move library
@@ -243,27 +263,72 @@ Respond with ONLY this JSON object, nothing else:
 }
 
 // The gauntlet solver sees the statement alone — no insight, no Lean, no hint
-// that this is a generated problem.
+// that this is a generated problem — but DOES get a Bash/python tool, same as
+// the generator, and is never forced into a rigid output format: it just
+// solves, as a real capable solver with a calculator would.
 export function gauntletSolverPrompt(problem: string): string {
   return `Solve this competition mathematics problem. The answer is a specific integer.
 
 ${problem}
 
-Work efficiently and commit to your best answer — an honest attempt matters more than exhaustive certainty. Your FINAL line must be exactly:
-ANSWER: <integer>`;
+You have a Bash tool — use python3 freely for any arithmetic, modular exponentiation, search, or verification. Never grind large computation by hand; that is not the point of this problem. Reason honestly: if you find the full method but are unsure of a final digit, say so; if you are genuinely stuck, say so rather than guessing. State your final answer clearly if you reach one.`;
 }
 
 export const GAUNTLET_SOLVER_SYSTEM_PROMPT =
-  'You are a strong competition mathematician solving a problem cold. Reason as needed, then end with the single line "ANSWER: <integer>".';
+  'You are a strong competition mathematician with a Bash/python tool, solving a problem cold. Use the tool freely for computation. Reason honestly; do not fabricate a confident final answer you have not actually derived.';
 
-// Parse the solver's final answer. Returns the DIGIT STRING (sign included) so
-// callers can compare answers larger than 2^53 without float loss; null if the
-// solver never committed to one.
-export function parseGauntletAnswer(text: string): string | null {
-  if (!text) return null;
-  const matches = [...text.matchAll(/ANSWER:\s*(-?\d+)/gi)];
-  if (matches.length === 0) return null;
-  return matches[matches.length - 1][1];
+// The judge sees the ground-truth answer and the solver's full transcript,
+// and ALSO gets a Bash tool — so a claim like "this code computes it" is
+// verified by actually running the code, not taken on the solver's word.
+export function gauntletJudgePrompt(
+  problem: string,
+  intendedAnswer: string,
+  solverTranscript: string,
+): string {
+  return `Judge whether a solver CRACKED this competition problem — do not solve it yourself from scratch, evaluate what THEY produced.
+
+--- PROBLEM ---
+${problem}
+
+--- INTENDED ANSWER (ground truth) ---
+${intendedAnswer}
+
+--- SOLVER'S FULL OUTPUT (reasoning + any code it ran) ---
+${solverTranscript}
+
+You have a Bash tool. If the solver's output contains code, RUN IT YOURSELF and check what it actually prints — do not trust a claimed result.
+
+CRACKED means ANY of:
+(a) the solver's output states the correct final integer (${intendedAnswer}), directly or paraphrased;
+(b) the solver's output contains code that, when you run it, correctly computes ${intendedAnswer} — verify this by execution, not inspection;
+(c) the solver's derivation reduces the problem to a single mechanical computation (a direct plug-in, one modular exponentiation, one closed-form evaluation) such that ANY capable solver with a calculator would finish it from here with no further insight — even if THIS solver never finished the arithmetic or made a slip at the end.
+
+NOT cracked: the solver is missing a genuine structural or conceptual step (not just an execution step), takes a clearly wrong or incomplete approach, or reaches a wrong answer via a wrong METHOD (not merely a computational slip on an otherwise-correct method).
+
+Respond with ONLY these three lines, nothing else:
+VERDICT: CRACKED|HELD
+CLAIMED_ANSWER: <the integer the solver arrived at or implied, or NONE>
+REASON: <one line — which criterion, or why it held>`;
+}
+
+export const GAUNTLET_JUDGE_SYSTEM_PROMPT =
+  'You are a rigorous adversarial judge with a Bash/python tool. Verify any code claim by actually running it — never take a transcript\'s word for what code produces. Reply in exactly the requested three-line format, nothing else.';
+
+export interface GauntletSampleVerdict {
+  cracked: boolean;
+  // Digit-string (sign included) if the judge identified one, else null.
+  claimedAnswer: string | null;
+  reason: string;
+}
+
+// Parse the judge's three-line verdict.
+export function parseJudgeVerdict(text: string): GauntletSampleVerdict {
+  const cracked = /VERDICT:\s*CRACKED/i.test(text || '');
+  const am = text?.match(/CLAIMED_ANSWER:\s*(-?\d+|NONE)/i);
+  const claimedAnswer =
+    am && am[1].toUpperCase() !== 'NONE' ? normalizeIntString(am[1]) : null;
+  const rm = text?.match(/REASON:\s*(.+)/i);
+  return { cracked, claimedAnswer, reason: rm ? rm[1].trim().slice(0, 300) : '' };
 }
 
 // Normalise an expected/parsed answer for exact comparison ("+07" → "7").
@@ -349,13 +414,14 @@ export const GAUNTLET_TIMEOUT_MS = 15 * 60 * 1000;
 export interface GauntletMeta {
   model: string;
   samples: number;
-  // Digit-string answers per sample (null = never committed to one).
-  answers: (string | null)[];
-  // True = a sample matched the intended answer → the problem was cracked.
+  // One judge verdict per solver sample.
+  verdicts: GauntletSampleVerdict[];
+  // True = any sample was judged CRACKED → the problem must repair or scrap.
   solved: boolean;
   // How many repair rounds were spent before the final verdict.
   mutations: number;
-  // Set when ALL samples agreed on the SAME wrong answer — a strong smell that
-  // the intended answer (not the problem) is wrong. Surfaced as a review flag.
+  // Set when every HELD sample's judge nonetheless converged on the SAME
+  // answer, different from the intended one — a strong smell that the
+  // INTENDED answer (not the problem) is wrong. Surfaced as a review flag.
   suspectAnswer?: string;
 }
