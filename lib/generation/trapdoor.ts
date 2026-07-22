@@ -53,6 +53,18 @@ export interface TrapdoorMove {
   // Moves this one can feed into (the NEXT layer applied to its output).
   // Empty = terminal finisher.
   feeds: string[];
+  // MECHANICAL = there is a known, textbook ALGORITHM that finds this layer
+  // (order-finding, CRT/Euler tower-mod reduction, linear-recurrence
+  // discovery via Berlekamp-Massey-style state tracking...) — a tool gets
+  // you there with no insight, only patience. STRUCTURAL (mechanical=false)
+  // = the solver has to INVENT something (a bijection, an invariant, a
+  // second counting argument, a group action) that no algorithm hands you.
+  // A chain built ENTIRELY from mechanical moves LOOKS insane (huge towers,
+  // multi-step) but is actually "run one boilerplate procedure, N times" —
+  // exactly what a tool-equipped gauntlet solver eats alive regardless of
+  // chain depth. See sampleChain: every sampled chain must include at least
+  // one structural move.
+  mechanical: boolean;
 }
 
 export const MOVE_LIBRARY: TrapdoorMove[] = [
@@ -64,6 +76,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'The statement only asks to count objects whose weight satisfies a divisibility/residue condition. Generating functions, ω, and the filter identity never appear.',
     feeds: ['modular-collapse', 'telescope', 'recurrence-fold'],
+    mechanical: false,
   },
   {
     id: 'bijection-recode',
@@ -73,6 +86,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Define B intrinsically, in its own vocabulary. A and φ are never mentioned; nothing in the statement suggests B is a re-encoding of anything.',
     feeds: ['unity-filter', 'symmetry-quotient', 'double-count', 'invariant-drop'],
+    mechanical: false,
   },
   {
     id: 'modular-collapse',
@@ -82,6 +96,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Scale the parameters astronomically (tower exponents) so direct evaluation is unthinkable, and ask only for the remainder. The order/CRT/inverse ladder is the solver’s to rediscover.',
     feeds: [],
+    mechanical: true,
   },
   {
     id: 'double-count',
@@ -91,6 +106,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'State only the non-trivial side. The incidence structure itself — the thing counted two ways — is never named.',
     feeds: ['unity-filter', 'modular-collapse', 'telescope'],
+    mechanical: false,
   },
   {
     id: 'symmetry-quotient',
@@ -100,6 +116,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Describe the equivalence informally ("two arrangements count as the same if …") without naming the group, the action, or Burnside. Pick an action whose fixed-point counts are easy for YOU but whose orbit structure is not a textbook case.',
     feeds: ['modular-collapse', 'recurrence-fold', 'double-count'],
+    mechanical: false,
   },
   {
     id: 'telescope',
@@ -109,6 +126,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Present g in expanded/rearranged form (partial-fraction remixed, factored differently). Nothing hints the terms collapse.',
     feeds: ['modular-collapse'],
+    mechanical: false,
   },
   {
     id: 'genfunc-substitute',
@@ -118,6 +136,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Present the sum in raw combinatorial form. The identity and substitution never appear; the solver must conjure both.',
     feeds: ['unity-filter', 'modular-collapse', 'telescope'],
+    mechanical: false,
   },
   {
     id: 'invariant-drop',
@@ -127,6 +146,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'The statement gives only the rules and asks about an end state after astronomically many steps. The invariant — and even the fact that one exists — is hidden.',
     feeds: ['modular-collapse', 'recurrence-fold', 'double-count'],
+    mechanical: false,
   },
   {
     id: 'recurrence-fold',
@@ -136,6 +156,11 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Only the defining object at index N is stated. The recurrence is never given — discovering it IS the problem.',
     feeds: ['modular-collapse'],
+    // Deceptively "mechanical": a small linear recurrence over a finite
+    // field is auto-discoverable by simulating a handful of terms and
+    // solving a linear system (Berlekamp-Massey-style) — no insight
+    // required, a tool finds it as fast as it can generate the terms.
+    mechanical: true,
   },
   {
     id: 'order-trap',
@@ -145,6 +170,7 @@ export const MOVE_LIBRARY: TrapdoorMove[] = [
     hide:
       'Present the iteration concretely and ask for the first return / period / a far-downstream state. The order computation and the planted factorisation are hidden.',
     feeds: ['modular-collapse'],
+    mechanical: true,
   },
 ];
 
@@ -181,9 +207,7 @@ export interface SampledChain {
   flavour: string;
 }
 
-// Sample a random chain by walking the compatibility graph. Depth 2-4,
-// weighted toward 3. All randomness is code-side by design (see doctrine).
-export function sampleChain(rand: () => number = Math.random): SampledChain {
+function sampleChainOnce(rand: () => number): TrapdoorMove[] {
   const r = rand();
   const targetDepth = r < 0.4 ? 2 : r < 0.85 ? 3 : 4;
   const byId = new Map(MOVE_LIBRARY.map((m) => [m.id, m]));
@@ -200,6 +224,26 @@ export function sampleChain(rand: () => number = Math.random): SampledChain {
     if (options.length === 0) break; // hit a terminal finisher early — fine
     current = options[Math.floor(rand() * options.length)];
     moves.push(current);
+  }
+  return moves;
+}
+
+// Sample a random chain by walking the compatibility graph. Depth 2-4,
+// weighted toward 3. All randomness is code-side by design (see doctrine).
+//
+// A chain built ENTIRELY from "mechanical" moves (modular-collapse,
+// recurrence-fold, order-trap — every one has a known textbook algorithm
+// that finds it) looks insane but is actually "run one boilerplate
+// procedure, N times", which a tool-equipped gauntlet solver cracks
+// regardless of depth or how astronomical the numbers look. So resample
+// until the chain includes at least one STRUCTURAL move (something that
+// demands the solver invent a bijection/invariant/argument no algorithm
+// hands them) — the loop converges almost immediately in practice since 7
+// of the 10 library moves are structural, but it's a guarantee, not a hope.
+export function sampleChain(rand: () => number = Math.random): SampledChain {
+  let moves = sampleChainOnce(rand);
+  for (let attempt = 0; attempt < 25 && moves.every((m) => m.mechanical); attempt++) {
+    moves = sampleChainOnce(rand);
   }
 
   return {
@@ -250,6 +294,7 @@ BUILD PROCEDURE (follow in order):
 1. Instantiate layer 1 concretely in the domain skin: pick the seed object/family and parameters.
 2. Apply each subsequent layer to the previous layer's OUTPUT — the chain must genuinely compose; do not build ${chain.moves.length} disconnected tricks.
 3. Walk the whole chain FORWARD with the Bash tool: run python3 to compute every intermediate value and the exact final INTEGER answer. Never do large arithmetic in your head. If the composition fails to produce a clean integer, adjust parameters and re-run — cheap forward, that is the whole point.
+   SELF-CHECK BUDGET: when validating a helper (e.g. brute-force vs. formula on small cases), a HANDFUL of cases (≤20) at SMALL parameter sizes (nothing near the astronomical scale of the real problem) is enough to catch a construction bug. Do NOT run large-scale validation — hundreds/thousands of random trials, or brute-forcing a case anywhere near the real magnitude — it burns minutes for no extra confidence past the first few checks and is the single biggest cause of slow generations.
 4. Write the statement exposing ONLY the outermost layer's surface. NO intermediate object, weight, bijection, group, recurrence, or identity from inner layers may be named or hinted at. A solver must re-discover every layer with none of them visible.
 5. Self-check against the quality bars below, then emit the JSON.
 ${INSANE_QUALITY_BARS}
@@ -271,7 +316,7 @@ export function gauntletSolverPrompt(problem: string): string {
 
 ${problem}
 
-You have a Bash tool — use python3 freely for any arithmetic, modular exponentiation, search, or verification. Never grind large computation by hand; that is not the point of this problem. Reason honestly: if you find the full method but are unsure of a final digit, say so; if you are genuinely stuck, say so rather than guessing. State your final answer clearly if you reach one.`;
+You have a Bash tool — use python3 freely for any arithmetic, modular exponentiation, search, or verification. Never grind large computation by hand; that is not the point of this problem. A handful of small-scale sanity checks (a few cases, small parameters) is enough to confirm a method — do not run large-scale brute-force validation (hundreds/thousands of trials); it wastes time without adding real confidence. Reason honestly: if you find the full method but are unsure of a final digit, say so; if you are genuinely stuck, say so rather than guessing. State your final answer clearly if you reach one.`;
 }
 
 export const GAUNTLET_SOLVER_SYSTEM_PROMPT =
