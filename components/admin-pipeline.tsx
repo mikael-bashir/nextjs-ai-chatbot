@@ -676,6 +676,12 @@ export function AdminPipeline() {
   // stuck or looping run can be watched live and copy-pasted whole.
   const [genEvents, setGenEvents] = useState<ProverEvent[]>([]);
   const genEventIdRef = useRef(0);
+  // Accumulates across EVERY attempt in a Work-loop session — never cleared
+  // per-attempt, or a fast-failing attempt's error would vanish the instant
+  // the next attempt starts (which is exactly what made a real stuck run look
+  // like "nothing is happening": the one attempt that mattered got wiped).
+  // Capped so an unattended overnight Work loop can't grow this unbounded.
+  const GEN_EVENTS_CAP = 500;
   const pushGenEvent = useCallback(
     (kind: ProverEventKind, label: string, extra?: Partial<ProverEvent>) => {
       genEventIdRef.current += 1;
@@ -686,7 +692,12 @@ export function AdminPipeline() {
         label,
         ...extra,
       };
-      setGenEvents((prev) => [...prev, ev]);
+      setGenEvents((prev) => {
+        const next = [...prev, ev];
+        return next.length > GEN_EVENTS_CAP
+          ? next.slice(next.length - GEN_EVENTS_CAP)
+          : next;
+      });
     },
     [],
   );
@@ -1529,8 +1540,13 @@ export function AdminPipeline() {
     genAbortRef.current = ctrl;
     setGenStartedAt(Date.now());
     setGenStage('generating');
-    setGenEvents([]);
-    pushGenEvent('received', `Generating (${MODE_LABEL[modeRef.current]})`);
+    // Never clears — each attempt appends after a divider so a fast-failing
+    // attempt's error survives long enough to actually read, instead of being
+    // wiped the instant the next attempt starts.
+    pushGenEvent(
+      'received',
+      `── Generating (${MODE_LABEL[modeRef.current]}) ──`,
+    );
     try {
       const prompt = buildPrompt(
         modeRef.current,
@@ -2162,13 +2178,23 @@ export function AdminPipeline() {
         </div>
 
         {genEvents.length > 0 && (
-          <ProverConsole
-            events={genEvents}
-            running={genStartedAt != null}
-            title="Generation activity"
-            emptyHint="No activity yet — generate a problem."
-            className="mt-2"
-          />
+          <>
+            <div className="mt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setGenEvents([])}
+                className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+              >
+                Clear generation log
+              </button>
+            </div>
+            <ProverConsole
+              events={genEvents}
+              running={genStartedAt != null}
+              title="Generation activity"
+              emptyHint="No activity yet — generate a problem."
+            />
+          </>
         )}
 
         {/* Usage / metadata */}
