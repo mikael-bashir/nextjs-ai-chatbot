@@ -17,7 +17,7 @@ import {
   extendProverRun,
 } from '@/lib/prover/run-prover-stream';
 import { ProverConsole } from '@/components/prover/prover-console';
-import type { ProverEvent } from '@/lib/prover/types';
+import type { ProverEvent, ProverEventKind } from '@/lib/prover/types';
 import {
   estimateCost,
   extractFeatures,
@@ -671,6 +671,25 @@ export function AdminPipeline() {
   // Full, normalized prover activity for the shared <ProverConsole> (thinking,
   // tool calls, tool results/errors, verify attempts, metrics) — not just names.
   const [verifyEvents, setVerifyEvents] = useState<ProverEvent[]>([]);
+  // Same console, fed by generation: the generator's own run, every gauntlet
+  // solver/judge exchange, mutation repairs, and the final save/scrap — so a
+  // stuck or looping run can be watched live and copy-pasted whole.
+  const [genEvents, setGenEvents] = useState<ProverEvent[]>([]);
+  const genEventIdRef = useRef(0);
+  const pushGenEvent = useCallback(
+    (kind: ProverEventKind, label: string, extra?: Partial<ProverEvent>) => {
+      genEventIdRef.current += 1;
+      const ev: ProverEvent = {
+        id: genEventIdRef.current,
+        ts: Date.now(),
+        kind,
+        label,
+        ...extra,
+      };
+      setGenEvents((prev) => [...prev, ev]);
+    },
+    [],
+  );
   // Decompose mode: when on, ACG verification drives the /prove-tree orchestrator
   // (prove-or-split) instead of the single-agent /prove-stream. Held in a ref so
   // proveStream can read the latest value without re-creating the verify loop.
@@ -1353,8 +1372,13 @@ export function AdminPipeline() {
       for (;;) {
         setGenStage('gauntlet');
         const expected = normalizeIntString(gen.answer) ?? String(gen.answer ?? '');
+        pushGenEvent(
+          'system',
+          `Gauntlet round ${mutations + 1}: ${GAUNTLET_SAMPLES}× ${GAUNTLET_MODEL}`,
+          { input: `expected answer: ${expected}` },
+        );
         const samples = await Promise.all(
-          Array.from({ length: GAUNTLET_SAMPLES }, async () => {
+          Array.from({ length: GAUNTLET_SAMPLES }, async (_x, i) => {
             // 1. Solver attempts the problem cold, with a Bash/python tool.
             const sRes = await callBridge(true, '/run', {
               method: 'POST',
@@ -1365,13 +1389,21 @@ export function AdminPipeline() {
               signal,
             });
             const empty = { cracked: false, claimedAnswer: null, reason: 'solver run failed' };
-            if (!sRes.ok) return { transcript: '', verdict: empty };
+            if (!sRes.ok) {
+              pushGenEvent('error', `Solver #${i + 1} — bridge call failed`, {
+                detail: `HTTP ${sRes.status}`,
+              });
+              return { transcript: '', verdict: empty };
+            }
             const sData = await sRes.json().catch(() => ({}) as Record<string, unknown>);
             recordUsage(
               sData.usage as Parameters<typeof recordUsage>[0],
               (sData.costUsd as number | undefined) ?? null,
             );
             const transcript = String(sData.text || '');
+            pushGenEvent('text', `Solver #${i + 1} (${GAUNTLET_MODEL})`, {
+              detail: transcript || '(empty output)',
+            });
 
             // 2. A separate, tool-equipped judge rules on the transcript —
             // running any code it contains rather than trusting it.
@@ -1383,14 +1415,24 @@ export function AdminPipeline() {
               }),
               signal,
             });
-            if (!jRes.ok)
+            if (!jRes.ok) {
+              pushGenEvent('error', `Judge #${i + 1} — bridge call failed`, {
+                detail: `HTTP ${jRes.status}`,
+              });
               return { transcript, verdict: { ...empty, reason: 'judge run failed' } };
+            }
             const jData = await jRes.json().catch(() => ({}) as Record<string, unknown>);
             recordUsage(
               jData.usage as Parameters<typeof recordUsage>[0],
               (jData.costUsd as number | undefined) ?? null,
             );
-            return { transcript, verdict: parseJudgeVerdict(String(jData.text || '')) };
+            const verdict = parseJudgeVerdict(String(jData.text || ''));
+            pushGenEvent(
+              verdict.cracked ? 'rejected' : 'verified',
+              `Judge #${i + 1}: ${verdict.cracked ? 'CRACKED' : 'HELD'}${verdict.claimedAnswer ? ` (claimed ${verdict.claimedAnswer})` : ''}`,
+              { detail: verdict.reason || String(jData.text || '') },
+            );
+            return { transcript, verdict };
           }),
         );
 
@@ -1417,13 +1459,27 @@ export function AdminPipeline() {
           mutations,
           ...(suspect ? { suspectAnswer: suspect } : {}),
         };
-        if (!solved) return { gen, meta, scrapped: false };
-        if (mutations >= GAUNTLET_MAX_MUTATIONS)
+        if (suspect)
+          pushGenEvent(
+            'text',
+            `Suspect: every HELD sample converged on ${suspect}, not the intended ${expected}`,
+          );
+        if (!solved) {
+          pushGenEvent('verified', `Gauntlet held — survived round ${mutations + 1}`);
+          return { gen, meta, scrapped: false };
+        }
+        if (mutations >= GAUNTLET_MAX_MUTATIONS) {
+          pushGenEvent(
+            'rejected',
+            `Gauntlet cracked after ${mutations} repair round(s) — scrapping`,
+          );
           return { gen, meta, scrapped: true };
+        }
 
         // Repair round: the generator sees exactly how it was cracked.
         setGenStage('mutating');
         mutations++;
+        pushGenEvent('system', `Mutation repair round ${mutations}`);
         const mRes = await callBridge(true, '/run', {
           method: 'POST',
           body: JSON.stringify({
@@ -1445,6 +1501,9 @@ export function AdminPipeline() {
             d.usage as Parameters<typeof recordUsage>[0],
             (d.costUsd as number | undefined) ?? null,
           );
+          pushGenEvent('text', `Repair #${mutations} output`, {
+            detail: String(d.text || '(empty output)'),
+          });
           const repaired = extractJson(String(d.text || ''));
           if (repaired?.lean) {
             if (modeRef.current === 'trapdoor') {
@@ -1458,7 +1517,7 @@ export function AdminPipeline() {
         }
       }
     },
-    [callBridge, recordUsage],
+    [callBridge, recordUsage, pushGenEvent],
   );
 
   // Generate ONE problem on the work bridge, save it unverified, and enqueue it
@@ -1470,6 +1529,8 @@ export function AdminPipeline() {
     genAbortRef.current = ctrl;
     setGenStartedAt(Date.now());
     setGenStage('generating');
+    setGenEvents([]);
+    pushGenEvent('received', `Generating (${MODE_LABEL[modeRef.current]})`);
     try {
       const prompt = buildPrompt(
         modeRef.current,
@@ -1561,6 +1622,9 @@ export function AdminPipeline() {
         throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
       }
       setStats((s) => ({ ...s, generated: s.generated + 1 }));
+      pushGenEvent('text', `Generated: ${gen.questionTitle ?? 'untitled'}`, {
+        detail: raw,
+      });
 
       // Trapdoor problems are Insane by contract, whatever the model emitted.
       if (modeRef.current === 'trapdoor') {
@@ -1606,6 +1670,10 @@ export function AdminPipeline() {
             'warn',
             `Scrapped "${gen.questionTitle ?? 'untitled'}" — cracked by ${GAUNTLET_MODEL} despite ${gauntlet.mutations} repair round(s)`,
           );
+          pushGenEvent(
+            'done',
+            `Scrapped — cracked despite ${gauntlet.mutations} repair round(s)`,
+          );
           return;
         }
       }
@@ -1631,6 +1699,9 @@ export function AdminPipeline() {
           );
           const assessed = parseAssessedLevel(String(d.text || ''));
           if (assessed) gen.level = assessed;
+          pushGenEvent('text', `Level assessed: ${assessed ?? '(kept generator estimate)'}`, {
+            detail: String(d.text || ''),
+          });
         }
       } catch {
         /* keep the generator's own level */
@@ -1660,6 +1731,9 @@ export function AdminPipeline() {
             queueRef.current = [...queueRef.current, j.item];
             syncQueue();
           }
+          pushGenEvent('done', `Saved — queued for verification`, {
+            verified: !gauntlet || !gauntlet.solved,
+          });
           runVerifier();
         }
       }
@@ -1668,7 +1742,7 @@ export function AdminPipeline() {
       setGenStartedAt(null);
       setGenStage('idle');
     }
-  }, [callBridge, runVerifier, recordUsage, runGauntlet, pushLog]);
+  }, [callBridge, runVerifier, recordUsage, runGauntlet, pushLog, pushGenEvent]);
 
   const terminateGeneration = () => genAbortRef.current?.abort();
 
@@ -1681,10 +1755,11 @@ export function AdminPipeline() {
       const err = e as Error & { detail?: string };
       setStats((s) => ({ ...s, errors: s.errors + 1 }));
       pushLog('error', err.message, err.detail);
+      pushGenEvent('error', err.message, { detail: err.detail });
     } finally {
       setGeneratingOne(false);
     }
-  }, [generateOne, pushLog]);
+  }, [generateOne, pushLog, pushGenEvent]);
 
   // The Work loop: keep generating (each generation enqueues itself).
   useEffect(() => {
@@ -1713,6 +1788,7 @@ export function AdminPipeline() {
           } else {
             setStats((s) => ({ ...s, errors: s.errors + 1 }));
             pushLog('error', err.message, err.detail);
+            pushGenEvent('error', err.message, { detail: err.detail });
           }
           await new Promise((res) => setTimeout(res, 3000));
         }
@@ -1722,7 +1798,7 @@ export function AdminPipeline() {
     return () => {
       cancelled = true;
     };
-  }, [work, generateOne, pushLog, pauseForLimit]);
+  }, [work, generateOne, pushLog, pauseForLimit, pushGenEvent]);
 
   // ---- per-item actions -------------------------------------------------
 
@@ -2084,6 +2160,16 @@ export function AdminPipeline() {
             {generatingOne ? 'Generating…' : '+ Generate one → queue'}
           </Button>
         </div>
+
+        {genEvents.length > 0 && (
+          <ProverConsole
+            events={genEvents}
+            running={genStartedAt != null}
+            title="Generation activity"
+            emptyHint="No activity yet — generate a problem."
+            className="mt-2"
+          />
+        )}
 
         {/* Usage / metadata */}
         <div className="mt-3 grid grid-cols-3 gap-2 rounded-md border p-2 text-center text-[11px]">
