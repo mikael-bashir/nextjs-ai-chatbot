@@ -23,6 +23,23 @@ import {
   extractFeatures,
   type EstimateResult,
 } from '@/lib/cost/estimator';
+import {
+  GAUNTLET_MAX_MUTATIONS,
+  GAUNTLET_MODEL,
+  GAUNTLET_SAMPLES,
+  GAUNTLET_SOLVER_SYSTEM_PROMPT,
+  GAUNTLET_TIMEOUT_MS,
+  LEVEL_ASSESSOR_SYSTEM_PROMPT,
+  gauntletSolverPrompt,
+  levelAssessorPrompt,
+  mutationPrompt,
+  normalizeIntString,
+  parseAssessedLevel,
+  parseGauntletAnswer,
+  sampleChain,
+  trapdoorPrompt,
+  type GauntletMeta,
+} from '@/lib/generation/trapdoor';
 
 // Per-item cost state (session-scoped): the estimate made on enqueue and the
 // actual recorded once the proof finishes. Persisted rows live in
@@ -75,15 +92,15 @@ const GEN_RUN_OPTIONS = {
   maxOutputTokens: 64000,
 };
 
-// Reverse mode builds problems from exact arithmetic (products, modular
-// exponentiation, witness evaluation) that a tool-less model would otherwise
+// Reverse and trapdoor modes build problems from exact arithmetic (products,
+// modular exponentiation, chain walks) that a tool-less model would otherwise
 // grind out by hand — slow (10-20 min of thinking) AND error-prone, so the
-// certificate often ends up wrong. Give ONLY reverse mode a python tool so it
-// computes and self-verifies the certificate exactly, in seconds. The other
-// modes stay tool-free (lean context = less rate-limit pressure when looping).
+// answer often ends up wrong. Give those modes a python tool so they compute
+// the construction exactly, in seconds. The other modes stay tool-free (lean
+// context = less rate-limit pressure when looping).
 function genRunOptionsFor(mode: GenMode, model?: string) {
   const withModel = model ? { ...GEN_RUN_OPTIONS, model } : GEN_RUN_OPTIONS;
-  if (mode !== 'reverse') return withModel;
+  if (mode !== 'reverse' && mode !== 'trapdoor') return withModel;
   return {
     ...withModel,
     // Drop Bash from the denylist; keep everything else blocked.
@@ -95,6 +112,25 @@ function genRunOptionsFor(mode: GenMode, model?: string) {
     permissionMode: 'bypassPermissions',
   };
 }
+
+// The gauntlet solver: a mid-tier Claude attacking the problem cold — no
+// tools, no JSON contract, just "solve it and commit to an integer". Timeout
+// is generation-side only (a solver that can't crack it in time has failed to
+// crack it, which is the pass condition — see lib/generation/trapdoor.ts).
+const GAUNTLET_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: GAUNTLET_SOLVER_SYSTEM_PROMPT,
+  timeoutMs: GAUNTLET_TIMEOUT_MS,
+};
+
+// Post-hoc level assessment: one cheap classification call per problem.
+const ASSESSOR_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: LEVEL_ASSESSOR_SYSTEM_PROMPT,
+  timeoutMs: 5 * 60 * 1000,
+};
 
 // Models selectable for the local `claude` runs (available on the Claude Max
 // plan). '' = the CLI/bridge default. Generation and verification pick one each,
@@ -170,7 +206,7 @@ function fmtCountdown(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
 }
 
-type GenMode = 'easy' | 'medium' | 'hard' | 'insane' | 'reverse';
+type GenMode = 'easy' | 'medium' | 'hard' | 'insane' | 'reverse' | 'trapdoor';
 
 const MODE_LABEL: Record<GenMode, string> = {
   easy: 'Easy',
@@ -178,6 +214,7 @@ const MODE_LABEL: Record<GenMode, string> = {
   hard: 'Hard',
   insane: 'Insane',
   reverse: 'Reverse-built',
+  trapdoor: 'Trapdoor',
 };
 
 const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
@@ -206,7 +243,9 @@ Core requirements:
   4 = built around a single advanced, university-level concept;
   5 = several advanced concepts combined together.`;
 
-const MODE_BLOCKS: Record<GenMode, string> = {
+// Trapdoor mode has no static block — its prompt is built per-run around a
+// code-sampled chain (see lib/generation/trapdoor.ts).
+const MODE_BLOCKS: Record<Exclude<GenMode, 'trapdoor'>, string> = {
   easy: `
 - EASY. A quick, approachable problem: a single clear elementary observation or a short direct computation solves it. No deep trick and no long chain of steps — it should feel like a warm-up.
 - Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
@@ -265,50 +304,10 @@ Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
 {"questionTitle":"<curious, alluring hook — a question / scenario / teaser; NEVER 'The <Adjective> <Noun>'>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
-// CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
-// prerequisite KNOWLEDGE of a generated problem. This is ORTHOGONAL to how hard
-// the problem is to solve — a Level-1 problem (primary-school knowledge) can
-// still be fiendishly hard. Difficulty/ingenuity is set by the mode, not here.
-// Level 0 = "Any" (the model assigns the level).
-const LEVELS: { value: number; label: string; need: string }[] = [
-  {
-    value: 1,
-    label: 'Foundational',
-    need: 'the base knowledge of a first-year primary-school student — basic arithmetic, counting, simple patterns',
-  },
-  {
-    value: 2,
-    label: 'Early secondary',
-    need: 'up to early high / secondary school — fractions, basic algebra, simple geometry, elementary number facts',
-  },
-  {
-    value: 3,
-    label: 'Sixth form / college',
-    need: 'up to the end of sixth form / college — algebra, functions, sequences, basic combinatorics/number theory, introductory calculus',
-  },
-  {
-    value: 4,
-    label: 'One advanced concept',
-    need: 'a single advanced, university-level concept (e.g. group theory, linear algebra, real analysis, advanced number theory)',
-  },
-  {
-    value: 5,
-    label: 'Multiple advanced concepts',
-    need: 'several advanced, university-level concepts combined',
-  },
-];
-
-// Prompt block that caps the PREREQUISITE KNOWLEDGE to a target tier. It must NOT
-// touch difficulty — that stays owned entirely by the mode block above.
-function levelBlock(level: number): string {
-  const L = LEVELS.find((l) => l.value === level);
-  if (!L) return '';
-  return `\n\nTARGET KNOWLEDGE LEVEL — CompeteMath Level ${level} (${L.label}). This constrains ONLY the prerequisite knowledge, NOT the difficulty:
-- A solver must be able to UNDERSTAND and attempt the problem with at most: ${L.need}. Do not require, in the statement or the intended human solution, any concept beyond this tier. (The Lean formalisation may still use whatever Mathlib needs — that is separate and does not count.)
-- This says NOTHING about how hard the problem is. Difficulty and ingenuity are governed entirely by the mode above and remain fully in force. A Level-${level} problem must be exactly as hard to SOLVE as the mode demands — e.g. a Level-1 HARD problem is a genuinely fiendish insight over elementary objects (arithmetic, counting, simple patterns), NOT an easy question.
-- Set "level" in your output to exactly ${level}. Set "difficulty"/"points" to reflect how hard the problem is to SOLVE (per the mode) — NEVER downgrade the difficulty just because the level is low.
-You must still produce a specific INTEGER answer and a machine-checkable Lean 4 theorem as specified below.`;
-}
+// The level (prerequisite-knowledge tier, 1-5) is no longer a generation
+// constraint: the generator works unconstrained, and the tier is judged
+// AFTER the fact by a cheap post-hoc assessor call (see generateOne). The
+// rubric lives in lib/generation/trapdoor.ts.
 
 interface LiveProblem {
   title: string;
@@ -357,11 +356,13 @@ function buildAvoidContext(
   return parts.join('\n\n');
 }
 
-function buildPrompt(mode: GenMode, level: number, avoid: string): string {
+function buildPrompt(mode: GenMode, avoid: string): string {
+  // Trapdoor builds its prompt around a per-run sampled chain instead.
+  if (mode === 'trapdoor') return trapdoorPrompt(sampleChain(), avoid);
   const avoidBlock = avoid
     ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
     : '';
-  return BASE_REQS + MODE_BLOCKS[mode] + levelBlock(level) + avoidBlock + RESPONSE_FORMAT;
+  return BASE_REQS + MODE_BLOCKS[mode] + avoidBlock + RESPONSE_FORMAT;
 }
 
 interface GenProblem {
@@ -374,6 +375,9 @@ interface GenProblem {
   level?: number;
   insight?: string;
   lean?: string;
+  // Trapdoor mode only: the hidden layer-by-layer construction (the key).
+  // Stored server-side, never shown to solvers.
+  chain?: string[];
 }
 
 interface StagedItem extends GenProblem {
@@ -407,6 +411,10 @@ interface GeneratedItem extends StagedItem {
   proofCheckpoint?: string;
   proofCheckpointFilled?: number;
   proofCheckpointTotal?: number;
+  // Which generation mode produced this item.
+  genMode?: string;
+  // Sonnet-gauntlet verdict (Insane problems only) — see lib/generation/trapdoor.
+  gauntlet?: GauntletMeta;
 }
 
 interface Health {
@@ -560,14 +568,15 @@ const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
 
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
-  const [genStage, setGenStage] = useState<'idle' | 'generating' | 'saving'>(
-    'idle',
-  );
+  const [genStage, setGenStage] = useState<
+    'idle' | 'generating' | 'gauntlet' | 'mutating' | 'assessing' | 'saving'
+  >('idle');
   const [stats, setStats] = useState({
     generated: 0,
     verified: 0,
     failed: 0,
     errors: 0,
+    scrapped: 0,
   });
   const [log, setLog] = useState<LogEntry[]>([]);
   const [logOpen, setLogOpen] = useState<Set<number>>(new Set());
@@ -624,8 +633,6 @@ export function AdminPipeline() {
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [previewIds, setPreviewIds] = useState<string[]>([]);
   const [mode, setMode] = useState<GenMode>('medium');
-  // Target CompeteMath knowledge tier for generation (0 = Any / model decides).
-  const [targetLevel, setTargetLevel] = useState(0);
   // Generation model — independent from the verification model. '' = default.
   const [genModel, setGenModel] = useState('');
   const genModelRef = useRef(genModel);
@@ -739,7 +746,6 @@ export function AdminPipeline() {
   // Refs so generateOne reads the latest mode + existing problems for the prompt
   // without depending on that state (which would restart the Work loop).
   const modeRef = useRef<GenMode>('medium');
-  const targetLevelRef = useRef(0);
   const generatedRef = useRef<GeneratedItem[]>([]);
   const liveRef = useRef<LiveProblem[]>([]);
 
@@ -748,9 +754,6 @@ export function AdminPipeline() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
-  useEffect(() => {
-    targetLevelRef.current = targetLevel;
-  }, [targetLevel]);
   useEffect(() => {
     generatedRef.current = generated;
   }, [generated]);
@@ -1291,9 +1294,6 @@ export function AdminPipeline() {
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
     const savedMode = localStorage.getItem('lca.genMode') as GenMode | null;
     if (savedMode && savedMode in MODE_LABEL) setMode(savedMode);
-    const savedLevel = Number(localStorage.getItem('lca.targetLevel'));
-    if (Number.isInteger(savedLevel) && savedLevel >= 0 && savedLevel <= 5)
-      setTargetLevel(savedLevel);
     // Pull already-live CompeteMath problems so generation can avoid them.
     fetch('/api/admin/live-problems')
       .then((r) => (r.ok ? r.json() : { problems: [] }))
@@ -1312,11 +1312,6 @@ export function AdminPipeline() {
     localStorage.setItem('lca.genMode', m);
   };
 
-  const persistLevel = (n: number) => {
-    setTargetLevel(n);
-    localStorage.setItem('lca.targetLevel', String(n));
-  };
-
   const persistWorkBridgeUrl = (value: string) => {
     setWorkBridgeUrl(value);
     if (value.trim()) localStorage.setItem('lca.workBridgeUrl', value.trim());
@@ -1324,6 +1319,111 @@ export function AdminPipeline() {
   };
 
   // ---- generation (produces unverified problems, enqueues them) ---------
+
+  // The Sonnet gauntlet: k cold-solve attempts against the problem statement
+  // alone. Any sample matching the intended answer = cracked → the generator
+  // gets the solver's own transcript and must close that path (mutation);
+  // after GAUNTLET_MAX_MUTATIONS failed repairs the problem is scrapped.
+  // Every Insane problem must pass this before it can queue or stage —
+  // "Insane" means "a real adversary failed it", not "the generator felt it
+  // was hard".
+  const runGauntlet = useCallback(
+    async (
+      gen0: GenProblem,
+      signal: AbortSignal,
+    ): Promise<{ gen: GenProblem; meta: GauntletMeta; scrapped: boolean }> => {
+      let gen = gen0;
+      let mutations = 0;
+      for (;;) {
+        setGenStage('gauntlet');
+        const expected = normalizeIntString(gen.answer);
+        const runs = await Promise.all(
+          Array.from({ length: GAUNTLET_SAMPLES }, async () => {
+            const res = await callBridge(true, '/run', {
+              method: 'POST',
+              body: JSON.stringify({
+                prompt: gauntletSolverPrompt(gen.problem || ''),
+                options: GAUNTLET_RUN_OPTIONS,
+              }),
+              signal,
+            });
+            if (!res.ok) return { text: '', answer: null as string | null };
+            const d = await res.json().catch(() => ({}) as Record<string, unknown>);
+            recordUsage(
+              d.usage as Parameters<typeof recordUsage>[0],
+              (d.costUsd as number | undefined) ?? null,
+            );
+            const text = String(d.text || '');
+            return { text, answer: parseGauntletAnswer(text) };
+          }),
+        );
+        const answers = runs.map((r) =>
+          r.answer == null ? null : normalizeIntString(r.answer),
+        );
+        const solved =
+          expected != null &&
+          answers.some((a) => a != null && a === expected);
+        // All samples agreeing on the SAME wrong answer is a strong smell the
+        // INTENDED answer is wrong — flag for human review, don't auto-pass it
+        // silently.
+        const nonNull = answers.filter((a): a is string => a != null);
+        const suspect =
+          !solved &&
+          nonNull.length === GAUNTLET_SAMPLES &&
+          nonNull.every((a) => a === nonNull[0])
+            ? nonNull[0]
+            : undefined;
+        const meta: GauntletMeta = {
+          model: GAUNTLET_MODEL,
+          samples: GAUNTLET_SAMPLES,
+          answers,
+          solved,
+          mutations,
+          ...(suspect ? { suspectAnswer: suspect } : {}),
+        };
+        if (!solved) return { gen, meta, scrapped: false };
+        if (mutations >= GAUNTLET_MAX_MUTATIONS)
+          return { gen, meta, scrapped: true };
+
+        // Repair round: the generator sees exactly how it was cracked.
+        setGenStage('mutating');
+        mutations++;
+        const mRes = await callBridge(true, '/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt: mutationPrompt(
+              JSON.stringify(gen),
+              runs.filter((r) => r.answer != null).map((r) => r.text),
+              Array.isArray(gen.chain) && gen.chain.length > 0,
+            ),
+            options: genRunOptionsFor(
+              modeRef.current,
+              genModelRef.current || undefined,
+            ),
+          }),
+          signal,
+        });
+        if (mRes.ok) {
+          const d = await mRes.json().catch(() => ({}) as Record<string, unknown>);
+          recordUsage(
+            d.usage as Parameters<typeof recordUsage>[0],
+            (d.costUsd as number | undefined) ?? null,
+          );
+          const repaired = extractJson(String(d.text || ''));
+          if (repaired?.lean) {
+            if (modeRef.current === 'trapdoor') {
+              repaired.difficulty = 'Insane';
+              repaired.points = 200;
+            }
+            gen = repaired;
+          }
+          // Repair failed to parse → the unrepaired problem is retested and,
+          // once the mutation budget is spent, scrapped — never shipped as-is.
+        }
+      }
+    },
+    [callBridge, recordUsage],
+  );
 
   // Generate ONE problem on the work bridge, save it unverified, and enqueue it
   // for verification. Returns nothing; throws on generation failure.
@@ -1337,7 +1437,6 @@ export function AdminPipeline() {
     try {
       const prompt = buildPrompt(
         modeRef.current,
-        targetLevelRef.current,
         buildAvoidContext(generatedRef.current, liveRef.current),
       );
       let genRes: Response;
@@ -1381,7 +1480,7 @@ export function AdminPipeline() {
       const genData = await genRes.json();
       recordUsage(genData.usage, genData.costUsd);
       const raw = String(genData.text || genData.proof || '');
-      const gen = extractJson(raw);
+      let gen = extractJson(raw);
       if (!gen?.lean) {
         // Rich diagnostic: the bridge's own metadata explains an empty/failed run
         // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
@@ -1427,6 +1526,80 @@ export function AdminPipeline() {
       }
       setStats((s) => ({ ...s, generated: s.generated + 1 }));
 
+      // Trapdoor problems are Insane by contract, whatever the model emitted.
+      if (modeRef.current === 'trapdoor') {
+        gen.difficulty = 'Insane';
+        gen.points = 200;
+      }
+
+      // Every Insane problem — whichever mode produced it — must survive the
+      // Sonnet gauntlet before it may queue for verification or stage.
+      let gauntlet: GauntletMeta | undefined;
+      if ((gen.difficulty || '').toLowerCase() === 'insane') {
+        const verdict = await runGauntlet(gen, ctrl.signal);
+        gauntlet = verdict.meta;
+        gen = verdict.gen;
+        if (verdict.scrapped) {
+          // Store the corpse (nothing is silently discarded) but never queue
+          // it — a cracked "Insane" is a mislabelled Hard, not a product.
+          setGenStage('saving');
+          const res = await fetch('/api/admin/generated', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              ...gen,
+              verified: false,
+              proof: '',
+              error: `Scrapped — ${GAUNTLET_MODEL} solved it even after ${gauntlet.mutations} repair round(s)`,
+              queued: false,
+              toolchain: TOOLCHAIN,
+              genMode: modeRef.current,
+              gauntlet,
+            }),
+          });
+          if (res.ok) {
+            const j = await res.json();
+            if (j.item)
+              setGenerated((g) => [
+                j.item,
+                ...g.filter((x) => x.id !== j.item.id),
+              ]);
+          }
+          setStats((s) => ({ ...s, scrapped: s.scrapped + 1 }));
+          pushLog(
+            'warn',
+            `Scrapped "${gen.questionTitle ?? 'untitled'}" — cracked by ${GAUNTLET_MODEL} despite ${gauntlet.mutations} repair round(s)`,
+          );
+          return;
+        }
+      }
+
+      // Post-hoc level assessment: the generator ran unconstrained, so the
+      // knowledge tier is judged after the fact. Best-effort — on any failure
+      // the generator's own estimate stands.
+      setGenStage('assessing');
+      try {
+        const lvRes = await callBridge(true, '/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt: levelAssessorPrompt(gen.problem || '', gen.insight),
+            options: ASSESSOR_RUN_OPTIONS,
+          }),
+          signal: ctrl.signal,
+        });
+        if (lvRes.ok) {
+          const d = await lvRes.json().catch(() => ({}) as Record<string, unknown>);
+          recordUsage(
+            d.usage as Parameters<typeof recordUsage>[0],
+            (d.costUsd as number | undefined) ?? null,
+          );
+          const assessed = parseAssessedLevel(String(d.text || ''));
+          if (assessed) gen.level = assessed;
+        }
+      } catch {
+        /* keep the generator's own level */
+      }
+
       setGenStage('saving');
       const res = await fetch('/api/admin/generated', {
         method: 'POST',
@@ -1438,6 +1611,8 @@ export function AdminPipeline() {
           error: null,
           queued: true,
           toolchain: TOOLCHAIN,
+          genMode: modeRef.current,
+          ...(gauntlet ? { gauntlet } : {}),
         }),
       });
       if (res.ok) {
@@ -1457,7 +1632,7 @@ export function AdminPipeline() {
       setGenStartedAt(null);
       setGenStage('idle');
     }
-  }, [callBridge, runVerifier, recordUsage]);
+  }, [callBridge, runVerifier, recordUsage, runGauntlet, pushLog]);
 
   const terminateGeneration = () => genAbortRef.current?.abort();
 
@@ -1522,6 +1697,15 @@ export function AdminPipeline() {
 
   const addToStaging = useCallback(async (item: GeneratedItem | StagedItem) => {
     if (!item.lean) return;
+    // A cracked Insane problem is a mislabelled Hard — it never ships as-is.
+    const gauntlet = (item as GeneratedItem).gauntlet;
+    if ((item.difficulty || '').toLowerCase() === 'insane' && gauntlet?.solved) {
+      pushLog(
+        'warn',
+        `Blocked staging "${item.questionTitle ?? 'untitled'}" — the gauntlet cracked it; regenerate instead.`,
+      );
+      return;
+    }
     setBusy(`stage:${item.id}`);
     try {
       const res = await fetch('/api/admin/problems', {
@@ -1737,7 +1921,16 @@ export function AdminPipeline() {
         <div className="mt-3">
           <Label className="text-xs">Difficulty mode</Label>
           <div className="mt-1 flex flex-wrap gap-1 text-xs">
-            {(['easy', 'medium', 'hard', 'insane', 'reverse'] as GenMode[]).map(
+            {(
+              [
+                'easy',
+                'medium',
+                'hard',
+                'insane',
+                'reverse',
+                'trapdoor',
+              ] as GenMode[]
+            ).map(
               (m) => (
                 <button
                   key={m}
@@ -1755,22 +1948,6 @@ export function AdminPipeline() {
               ),
             )}
           </div>
-          <label className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
-            Target level
-            <select
-              value={targetLevel}
-              onChange={(e) => persistLevel(Number(e.target.value))}
-              className="rounded-md border bg-background px-1.5 py-1 text-xs"
-              title="Target CompeteMath knowledge tier — drives how easy or hard the generated problem is. 'Any' lets the model decide."
-            >
-              <option value={0}>Any (model decides)</option>
-              {LEVELS.map((l) => (
-                <option key={l.value} value={l.value}>
-                  {l.value} · {l.label}
-                </option>
-              ))}
-            </select>
-          </label>
           <label className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
             Generation model
             <select
@@ -1797,6 +1974,14 @@ export function AdminPipeline() {
               'Chains multiple distinct insights (or one very deep idea); general (non-decide) Lean statement. Hardest to prove automatically. Emits difficulty Insane.'}
             {mode === 'reverse' &&
               'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
+            {mode === 'trapdoor' &&
+              'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Emits Insane; must survive the Sonnet gauntlet to ship.'}
+          </p>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Every Insane problem faces the gauntlet: {GAUNTLET_SAMPLES}× cold
+            solves by {GAUNTLET_MODEL}. Cracked → the generator repairs it
+            (max {GAUNTLET_MAX_MUTATIONS} rounds) or it is scrapped. Level is
+            assessed after generation, unconstrained.
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             De-duplicating against {generated.length} generated +{' '}
@@ -1821,7 +2006,7 @@ export function AdminPipeline() {
           </p>
         </div>
 
-        <div className="mt-4 grid grid-cols-4 gap-2 text-center">
+        <div className="mt-4 grid grid-cols-5 gap-2 text-center">
           <Stat label="Generated" value={stats.generated} />
           <Stat
             label="Verified"
@@ -1830,6 +2015,7 @@ export function AdminPipeline() {
           />
           <Stat label="Failed" value={stats.failed} />
           <Stat label="Queued" value={queuedForVerify} />
+          <Stat label="Scrapped" value={stats.scrapped} tone="text-red-500" />
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
@@ -2262,6 +2448,33 @@ export function AdminPipeline() {
                           title="Promoted to prod — awaiting the CompeteMath publish cron, or already published"
                         >
                           Prod
+                        </span>
+                      )}
+                      {g.gauntlet && (
+                        <span
+                          className={cn(
+                            'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+                            g.gauntlet.solved
+                              ? 'bg-red-500/15 text-red-600'
+                              : 'bg-emerald-500/15 text-emerald-600',
+                          )}
+                          title={
+                            g.gauntlet.solved
+                              ? `Cracked by ${g.gauntlet.model} — scrapped, cannot be staged`
+                              : `Survived ${g.gauntlet.samples} cold solve(s) by ${g.gauntlet.model}${g.gauntlet.mutations ? ` after ${g.gauntlet.mutations} repair round(s)` : ''}`
+                          }
+                        >
+                          {g.gauntlet.solved
+                            ? '🛡 cracked'
+                            : `🛡 held${g.gauntlet.mutations ? ` ×${g.gauntlet.mutations}` : ''}`}
+                        </span>
+                      )}
+                      {g.gauntlet?.suspectAnswer != null && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-amber-500/15 text-amber-600"
+                          title={`All ${g.gauntlet.samples} gauntlet samples agreed on ${g.gauntlet.suspectAnswer}, which differs from the intended answer ${g.answer} — the INTENDED answer may be wrong. Review before staging.`}
+                        >
+                          ans suspect
                         </span>
                       )}
                       <span className="truncate font-medium">

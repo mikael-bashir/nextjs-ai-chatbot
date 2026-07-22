@@ -156,6 +156,19 @@ export interface GeneratedRecord {
   proofCheckpoint?: string;
   proofCheckpointFilled?: number;
   proofCheckpointTotal?: number;
+  // Generation provenance: which mode produced it, the trapdoor key (hidden
+  // layer chain — server-side only, never shown to solvers), and the
+  // Sonnet-gauntlet verdict. See lib/generation/trapdoor.ts.
+  genMode?: string | null;
+  chain?: string[] | null;
+  gauntlet?: {
+    model: string;
+    samples: number;
+    answers: (string | null)[];
+    solved: boolean;
+    mutations: number;
+    suspectAnswer?: string;
+  } | null;
   createdAt: string;
 }
 

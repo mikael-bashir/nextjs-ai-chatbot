@@ -136,6 +136,12 @@ export async function POST(request: NextRequest) {
       // Whether it should sit in the (DB-backed) verification queue.
       queued: !!body.queued,
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+      // Generation provenance: which mode produced it, the trapdoor key
+      // (hidden layer chain — server-side only, never shown to solvers), and
+      // the Sonnet-gauntlet verdict. See lib/generation/trapdoor.ts.
+      genMode: body.genMode ?? null,
+      chain: Array.isArray(body.chain) ? body.chain : null,
+      gauntlet: body.gauntlet ?? null,
     };
     const item = await saveGenerated(record);
     // Verified ones additionally enter the promotable review queue.
