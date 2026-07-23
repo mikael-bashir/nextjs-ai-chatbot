@@ -385,33 +385,10 @@ export function normalizeIntString(v: unknown): string | null {
   return digits === '0' ? '0' : (neg ? '-' : '') + digits;
 }
 
-export function mutationPrompt(
-  itemJson: string,
-  solverTranscripts: string[],
-  hasChain: boolean,
-): string {
-  const excerpts = solverTranscripts
-    .map(
-      (t, i) =>
-        `--- SOLVER TRANSCRIPT ${i + 1} (how it was cracked) ---\n${t.slice(-4000)}`,
-    )
-    .join('\n\n');
-  const repair = hasChain
-    ? 'Either FUSE ONE ADDITIONAL hidden layer onto the chain (keeping it forward-computable — re-run the python walk for the new exact answer), or RE-SKIN the outermost surface so the pattern the solver latched onto no longer appears. Update "chain" to match.'
-    : 'Restructure the problem so the exploited approach is closed off: change the structural device, not just the constants. Cosmetic renaming fails — the solver transcript shows a PATH, and that path must no longer exist.';
-
-  return `A problem you built was SOLVED by a mid-tier model — it is not Insane yet. Repair it so that specific solution path is closed, then re-emit.
-
---- CURRENT PROBLEM (full JSON) ---
-${itemJson}
-
-${excerpts}
-
-REPAIR DOCTRINE: ${repair}
-${INSANE_QUALITY_BARS}
-
-The repaired problem must have a specific INTEGER answer and a general (non-decide) Lean 4 theorem, exactly as before. Respond with ONLY the same-shaped JSON object, nothing else.`;
-}
+// NOTE: the mutation/repair loop was removed following VHG (arXiv
+// 2605.06660): cracked problems are TIERED DOWN and shipped, never repaired
+// — measured live, repairs of a cracked design almost never survived, and a
+// fresh generation (new sampled chain) is the strictly better spend.
 
 // ---------------------------------------------------------------------------
 // Post-hoc level assessment (replaces the old target-level constraint: the
@@ -450,26 +427,24 @@ export function parseAssessedLevel(text: string): number | null {
 
 export const GAUNTLET_MODEL = 'claude-sonnet-5';
 export const GAUNTLET_SAMPLES = 2;
-// ONE repair shot, then scrap. A repair round costs a full mutation call plus
-// a complete re-gauntlet (2 solvers + 2 judges), and it keeps the same flawed
-// skeleton — while a fresh generation rolls a brand-new chain (guaranteed to
-// carry a structural move by sampleChain). Measured live, second repairs of a
-// cracked design almost never survive; regeneration is the better spend.
-export const GAUNTLET_MAX_MUTATIONS = 1;
 // Generation-side cap only (the no-wall-clock-cap rule protects the PROVER).
 // A solver that can't crack it inside this window has, for gauntlet purposes,
 // failed to crack it — which is the pass condition, so a timeout is safe.
 export const GAUNTLET_TIMEOUT_MS = 15 * 60 * 1000;
 
+// The gauntlet is a difficulty METER, not a gate (VHG, arXiv 2605.06660:
+// difficulty = measured solver failure on verifier-valid problems; nothing
+// valid is discarded). Cracked claimed-Insane problems tier DOWN to Hard and
+// ship; integral problems that hold tier UP to Insane.
 export interface GauntletMeta {
   model: string;
   samples: number;
   // One judge verdict per solver sample.
   verdicts: GauntletSampleVerdict[];
-  // True = any sample was judged CRACKED → the problem must repair or scrap.
+  // True = any sample was judged CRACKED → the item ships at a lower tier.
   solved: boolean;
-  // How many repair rounds were spent before the final verdict.
-  mutations: number;
+  // Legacy field from the removed repair loop — present on old records only.
+  mutations?: number;
   // Set when every HELD sample's judge nonetheless converged on the SAME
   // answer, different from the intended one — a strong smell that the
   // INTENDED answer (not the problem) is wrong. Surfaced as a review flag.

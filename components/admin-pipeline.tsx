@@ -25,7 +25,6 @@ import {
 } from '@/lib/cost/estimator';
 import {
   GAUNTLET_JUDGE_SYSTEM_PROMPT,
-  GAUNTLET_MAX_MUTATIONS,
   GAUNTLET_MODEL,
   GAUNTLET_SAMPLES,
   GAUNTLET_SOLVER_SYSTEM_PROMPT,
@@ -34,7 +33,6 @@ import {
   gauntletJudgePrompt,
   gauntletSolverPrompt,
   levelAssessorPrompt,
-  mutationPrompt,
   normalizeIntString,
   parseAssessedLevel,
   parseJudgeVerdict,
@@ -42,6 +40,15 @@ import {
   trapdoorPrompt,
   type GauntletMeta,
 } from '@/lib/generation/trapdoor';
+import {
+  INTEGRAL_VERIFIER_SYSTEM_PROMPT,
+  integralSetterPrompt,
+  integralVerifierPrompt,
+  parseIntegralVerdict,
+  prefilterProblem,
+  sampleIntegralRecipe,
+  type IntegralCertificate,
+} from '@/lib/generation/integral';
 
 // Per-item cost state (session-scoped): the estimate made on enqueue and the
 // actual recorded once the proof finishes. Persisted rows live in
@@ -115,15 +122,28 @@ function genRunOptionsFor(mode: GenMode, model?: string) {
   // Sonnet 5 + tools, and a generator of equal strength to its adversary
   // produces problems the adversary solves (measured live: 3/3 cracked with
   // full derivations). The asymmetry is the point — an explicit model pick
-  // in the UI still overrides this.
+  // in the UI still overrides this. Integral mode doesn't need it: its
+  // difficulty comes from the backward construction, and the gauntlet tiers
+  // it honestly either way.
   const effective =
     model || (mode === 'trapdoor' ? 'claude-opus-4-8' : undefined);
   const withModel = effective
     ? { ...GEN_RUN_OPTIONS, model: effective }
     : GEN_RUN_OPTIONS;
-  if (mode !== 'reverse' && mode !== 'trapdoor') return withModel;
+  if (mode !== 'reverse' && mode !== 'trapdoor' && mode !== 'integral')
+    return withModel;
   return { ...withModel, ...BASH_TOOL_OPTIONS };
 }
+
+// The integral hard verifier (VHG Appendix E.3): an independent run whose
+// verdict comes from executed sympy, never from the setter's own transcript.
+const INTEGRAL_VERIFIER_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  ...BASH_TOOL_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: INTEGRAL_VERIFIER_SYSTEM_PROMPT,
+  timeoutMs: 10 * 60 * 1000,
+};
 
 // The gauntlet solver: a mid-tier Claude attacking the problem cold, WITH a
 // Bash/python tool (denying it would test mental arithmetic, not insight —
@@ -231,7 +251,14 @@ function fmtCountdown(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
 }
 
-type GenMode = 'easy' | 'medium' | 'hard' | 'insane' | 'reverse' | 'trapdoor';
+type GenMode =
+  | 'easy'
+  | 'medium'
+  | 'hard'
+  | 'insane'
+  | 'reverse'
+  | 'trapdoor'
+  | 'integral';
 
 const MODE_LABEL: Record<GenMode, string> = {
   easy: 'Easy',
@@ -240,6 +267,7 @@ const MODE_LABEL: Record<GenMode, string> = {
   insane: 'Insane',
   reverse: 'Reverse-built',
   trapdoor: 'Trapdoor',
+  integral: 'Integral',
 };
 
 const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
@@ -268,9 +296,10 @@ Core requirements:
   4 = built around a single advanced, university-level concept;
   5 = several advanced concepts combined together.`;
 
-// Trapdoor mode has no static block — its prompt is built per-run around a
-// code-sampled chain (see lib/generation/trapdoor.ts).
-const MODE_BLOCKS: Record<Exclude<GenMode, 'trapdoor'>, string> = {
+// Trapdoor and Integral modes have no static block — their prompts are built
+// per-run around code-sampled recipes (see lib/generation/trapdoor.ts and
+// lib/generation/integral.ts).
+const MODE_BLOCKS: Record<Exclude<GenMode, 'trapdoor' | 'integral'>, string> = {
   easy: `
 - EASY. A quick, approachable problem: a single clear elementary observation or a short direct computation solves it. No deep trick and no long chain of steps — it should feel like a warm-up.
 - Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
@@ -382,8 +411,10 @@ function buildAvoidContext(
 }
 
 function buildPrompt(mode: GenMode, avoid: string): string {
-  // Trapdoor builds its prompt around a per-run sampled chain instead.
+  // Trapdoor and Integral build their prompts around per-run sampled recipes.
   if (mode === 'trapdoor') return trapdoorPrompt(sampleChain(), avoid);
+  if (mode === 'integral')
+    return integralSetterPrompt(sampleIntegralRecipe(), avoid);
   const avoidBlock = avoid
     ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
     : '';
@@ -403,6 +434,14 @@ interface GenProblem {
   // Trapdoor mode only: the hidden layer-by-layer construction (the key).
   // Stored server-side, never shown to solvers.
   chain?: string[];
+  // Integral mode only: the certificate consumed by the hard verifier at
+  // generation time (sympy syntax). The human-facing copy of the certificate
+  // lives in `insight`; these raw fields are not persisted.
+  integrand?: string;
+  antiderivative?: string;
+  lowerBound?: string;
+  upperBound?: string;
+  exactValue?: string;
 }
 
 interface StagedItem extends GenProblem {
@@ -594,14 +633,14 @@ const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
   const [genStage, setGenStage] = useState<
-    'idle' | 'generating' | 'gauntlet' | 'mutating' | 'assessing' | 'saving'
+    'idle' | 'generating' | 'validating' | 'gauntlet' | 'assessing' | 'saving'
   >('idle');
   const [stats, setStats] = useState({
     generated: 0,
     verified: 0,
     failed: 0,
     errors: 0,
-    scrapped: 0,
+    downgraded: 0,
   });
   const [log, setLog] = useState<LogEntry[]>([]);
   const [logOpen, setLogOpen] = useState<Set<number>>(new Set());
@@ -1376,28 +1415,25 @@ export function AdminPipeline() {
   // ---- generation (produces unverified problems, enqueues them) ---------
 
   // The Sonnet gauntlet: k cold-solve attempts against the problem statement
-  // alone. Any sample matching the intended answer = cracked → the generator
-  // gets the solver's own transcript and must close that path (mutation);
-  // after GAUNTLET_MAX_MUTATIONS failed repairs the problem is scrapped.
-  // Every Insane problem must pass this before it can queue or stage —
-  // "Insane" means "a real adversary failed it", not "the generator felt it
-  // was hard".
+  // alone. Following VHG (arXiv 2605.06660), the gauntlet is a difficulty
+  // METER, not a gate: it measures whether a tool-equipped mid-tier Claude
+  // cracks the problem, and the caller TIERS the item accordingly (cracked
+  // claimed-Insane → Hard; held integral → Insane). Nothing valid is ever
+  // discarded, and there is no repair loop — a fresh generation is the
+  // better spend than repairing a cracked design (measured live).
   const runGauntlet = useCallback(
     async (
-      gen0: GenProblem,
+      gen: GenProblem,
       signal: AbortSignal,
-    ): Promise<{ gen: GenProblem; meta: GauntletMeta; scrapped: boolean }> => {
-      let gen = gen0;
-      let mutations = 0;
-      for (;;) {
-        setGenStage('gauntlet');
-        const expected = normalizeIntString(gen.answer) ?? String(gen.answer ?? '');
-        pushGenEvent(
-          'system',
-          `Gauntlet round ${mutations + 1}: ${GAUNTLET_SAMPLES}× ${GAUNTLET_MODEL}`,
-          { input: `expected answer: ${expected}` },
-        );
-        const runSample = async (i: number) => {
+    ): Promise<{ meta: GauntletMeta }> => {
+      setGenStage('gauntlet');
+      const expected = normalizeIntString(gen.answer) ?? String(gen.answer ?? '');
+      pushGenEvent(
+        'system',
+        `Gauntlet: up to ${GAUNTLET_SAMPLES}× ${GAUNTLET_MODEL}`,
+        { input: `expected answer: ${expected}` },
+      );
+      const runSample = async (i: number) => {
           // 1. Solver attempts the problem cold, with a Bash/python tool.
           const sRes = await callBridge(true, '/run', {
             method: 'POST',
@@ -1494,7 +1530,6 @@ export function AdminPipeline() {
           samples: samples.length,
           verdicts: samples.map((s) => s.verdict),
           solved,
-          mutations,
           ...(suspect ? { suspectAnswer: suspect } : {}),
         };
         if (suspect)
@@ -1502,58 +1537,13 @@ export function AdminPipeline() {
             'text',
             `Suspect: every HELD sample converged on ${suspect}, not the intended ${expected}`,
           );
-        if (!solved) {
-          pushGenEvent('verified', `Gauntlet held — survived round ${mutations + 1}`);
-          return { gen, meta, scrapped: false };
-        }
-        if (mutations >= GAUNTLET_MAX_MUTATIONS) {
-          pushGenEvent(
-            'rejected',
-            `Gauntlet cracked after ${mutations} repair round(s) — scrapping`,
-          );
-          return { gen, meta, scrapped: true };
-        }
-
-        // Repair round: the generator sees exactly how it was cracked.
-        setGenStage('mutating');
-        mutations++;
-        pushGenEvent('system', `Mutation repair round ${mutations}`);
-        const mRes = await callBridge(true, '/run', {
-          method: 'POST',
-          body: JSON.stringify({
-            prompt: mutationPrompt(
-              JSON.stringify(gen),
-              samples.filter((s) => s.verdict.cracked).map((s) => s.transcript),
-              Array.isArray(gen.chain) && gen.chain.length > 0,
-            ),
-            options: genRunOptionsFor(
-              modeRef.current,
-              genModelRef.current || undefined,
-            ),
-          }),
-          signal,
-        });
-        if (mRes.ok) {
-          const d = await mRes.json().catch(() => ({}) as Record<string, unknown>);
-          recordUsage(
-            d.usage as Parameters<typeof recordUsage>[0],
-            (d.costUsd as number | undefined) ?? null,
-          );
-          pushGenEvent('text', `Repair #${mutations} output`, {
-            detail: String(d.text || '(empty output)'),
-          });
-          const repaired = extractJson(String(d.text || ''));
-          if (repaired?.lean) {
-            if (modeRef.current === 'trapdoor') {
-              repaired.difficulty = 'Insane';
-              repaired.points = 200;
-            }
-            gen = repaired;
-          }
-          // Repair failed to parse → the unrepaired problem is retested and,
-          // once the mutation budget is spent, scrapped — never shipped as-is.
-        }
-      }
+        pushGenEvent(
+          solved ? 'rejected' : 'verified',
+          solved
+            ? 'Gauntlet cracked — the item ships at a lower tier (VHG: measure difficulty, never discard valid problems)'
+            : 'Gauntlet held — full marks',
+        );
+        return { meta };
     },
     [callBridge, recordUsage, pushGenEvent],
   );
@@ -1620,7 +1610,7 @@ export function AdminPipeline() {
       const genData = await genRes.json();
       recordUsage(genData.usage, genData.costUsd);
       const raw = String(genData.text || genData.proof || '');
-      let gen = extractJson(raw);
+      const gen = extractJson(raw);
       if (!gen?.lean) {
         // Rich diagnostic: the bridge's own metadata explains an empty/failed run
         // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
@@ -1675,49 +1665,77 @@ export function AdminPipeline() {
         gen.points = 200;
       }
 
-      // Every Insane problem — whichever mode produced it — must survive the
-      // Sonnet gauntlet before it may queue for verification or stage.
+      // VHG local pre-filter (format/answer/degeneracy) — pure code, free,
+      // BEFORE any expensive verification or solving.
+      const preReason = prefilterProblem(gen);
+      if (preReason) {
+        throw Object.assign(new Error(`Discarded — pre-filter: ${preReason}`), {
+          detail: JSON.stringify(gen, null, 2),
+        });
+      }
+
+      // Integral mode: HARD verification (VHG Appendix E.3) before anything
+      // else — an independent run whose verdict comes from executed sympy
+      // (derivative match, exact value, numeric cross-check, answer
+      // extraction). Invalid pairs are discarded; validity is never assumed
+      // from the setter's own transcript.
+      if (modeRef.current === 'integral') {
+        setGenStage('validating');
+        const cert: IntegralCertificate = {
+          integrand: gen.integrand,
+          antiderivative: gen.antiderivative,
+          lowerBound: gen.lowerBound,
+          upperBound: gen.upperBound,
+          exactValue: gen.exactValue,
+        };
+        const vRes = await callBridge(true, '/run', {
+          method: 'POST',
+          body: JSON.stringify({
+            prompt: integralVerifierPrompt(cert, gen.answer, gen.problem || ''),
+            options: INTEGRAL_VERIFIER_RUN_OPTIONS,
+          }),
+          signal: ctrl.signal,
+        });
+        if (!vRes.ok)
+          throw new Error(`Integral verifier bridge call failed (${vRes.status})`);
+        const vData = await vRes.json().catch(() => ({}) as Record<string, unknown>);
+        recordUsage(
+          vData.usage as Parameters<typeof recordUsage>[0],
+          (vData.costUsd as number | undefined) ?? null,
+        );
+        const verdict = parseIntegralVerdict(String(vData.text || ''));
+        pushGenEvent(
+          verdict.valid ? 'verified' : 'rejected',
+          `Hard verifier: ${verdict.valid ? 'VALID' : 'INVALID'}${verdict.checkedAnswer ? ` (checked answer ${verdict.checkedAnswer})` : ''}`,
+          { detail: verdict.reason || String(vData.text || '') },
+        );
+        if (!verdict.valid) {
+          throw Object.assign(
+            new Error(`Discarded — integral failed hard verification: ${verdict.reason}`),
+            { detail: String(vData.text || '') },
+          );
+        }
+      }
+
+      // The gauntlet as difficulty METER (VHG): runs for every claimed-Insane
+      // problem and every integral. The verdict tiers the item; nothing valid
+      // is discarded and nothing is repaired.
       let gauntlet: GauntletMeta | undefined;
-      if ((gen.difficulty || '').toLowerCase() === 'insane') {
-        const verdict = await runGauntlet(gen, ctrl.signal);
-        gauntlet = verdict.meta;
-        gen = verdict.gen;
-        if (verdict.scrapped) {
-          // Store the corpse (nothing is silently discarded) but never queue
-          // it — a cracked "Insane" is a mislabelled Hard, not a product.
-          setGenStage('saving');
-          const res = await fetch('/api/admin/generated', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({
-              ...gen,
-              verified: false,
-              proof: '',
-              error: `Scrapped — ${GAUNTLET_MODEL} solved it even after ${gauntlet.mutations} repair round(s)`,
-              queued: false,
-              toolchain: TOOLCHAIN,
-              genMode: modeRef.current,
-              gauntlet,
-            }),
-          });
-          if (res.ok) {
-            const j = await res.json();
-            if (j.item)
-              setGenerated((g) => [
-                j.item,
-                ...g.filter((x) => x.id !== j.item.id),
-              ]);
-          }
-          setStats((s) => ({ ...s, scrapped: s.scrapped + 1 }));
-          pushLog(
-            'warn',
-            `Scrapped "${gen.questionTitle ?? 'untitled'}" — cracked by ${GAUNTLET_MODEL} despite ${gauntlet.mutations} repair round(s)`,
-          );
-          pushGenEvent(
-            'done',
-            `Scrapped — cracked despite ${gauntlet.mutations} repair round(s)`,
-          );
-          return;
+      const claimedInsane = (gen.difficulty || '').toLowerCase() === 'insane';
+      if (claimedInsane || modeRef.current === 'integral') {
+        const { meta } = await runGauntlet(gen, ctrl.signal);
+        gauntlet = meta;
+        if (claimedInsane && meta.solved) {
+          // Cracked "Insane" is a mislabelled Hard — tier down and ship.
+          gen.difficulty = 'Hard';
+          gen.points = 150;
+          setStats((s) => ({ ...s, downgraded: s.downgraded + 1 }));
+          pushGenEvent('text', 'Tiered down to Hard (cracked by the gauntlet)');
+        } else if (modeRef.current === 'integral' && !meta.solved) {
+          // An integral even a tool-equipped solver failed — that is Insane.
+          gen.difficulty = 'Insane';
+          gen.points = 200;
+          pushGenEvent('text', 'Promoted to Insane (held against the gauntlet)');
         }
       }
 
@@ -2084,6 +2102,7 @@ export function AdminPipeline() {
                 'insane',
                 'reverse',
                 'trapdoor',
+                'integral',
               ] as GenMode[]
             ).map(
               (m) => (
@@ -2130,13 +2149,16 @@ export function AdminPipeline() {
             {mode === 'reverse' &&
               'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
             {mode === 'trapdoor' &&
-              'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Emits Insane; must survive the Sonnet gauntlet to ship. Generates with Opus 4.8 unless you pick a model — a generator equal to its adversary loses.'}
+              'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Claims Insane; the gauntlet tiers it. Generates with Opus 4.8 unless you pick a model.'}
+            {mode === 'integral' &&
+              'VHG-style (arXiv 2605.06660): the antiderivative is chosen FIRST, differentiated, and disguised — the answer is correct by construction, and an independent hard verifier re-checks everything with executed sympy before the item can queue. Ships at Hard; promoted to Insane if the gauntlet fails to crack it.'}
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
-            Every Insane problem faces the gauntlet: {GAUNTLET_SAMPLES}× cold
-            solves by {GAUNTLET_MODEL}. Cracked → the generator repairs it
-            (max {GAUNTLET_MAX_MUTATIONS} rounds) or it is scrapped. Level is
-            assessed after generation, unconstrained.
+            The gauntlet (up to {GAUNTLET_SAMPLES}× cold solves by{' '}
+            {GAUNTLET_MODEL}) is a difficulty METER, not a gate: cracked
+            Insane → ships at Hard; an integral that holds → promoted to
+            Insane. Nothing valid is discarded. Level is assessed after
+            generation, unconstrained.
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             De-duplicating against {generated.length} generated +{' '}
@@ -2170,7 +2192,11 @@ export function AdminPipeline() {
           />
           <Stat label="Failed" value={stats.failed} />
           <Stat label="Queued" value={queuedForVerify} />
-          <Stat label="Scrapped" value={stats.scrapped} tone="text-red-500" />
+          <Stat
+            label="Downgraded"
+            value={stats.downgraded}
+            tone="text-amber-600"
+          />
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
@@ -2630,18 +2656,16 @@ export function AdminPipeline() {
                           className={cn(
                             'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
                             g.gauntlet.solved
-                              ? 'bg-red-500/15 text-red-600'
+                              ? 'bg-amber-500/15 text-amber-600'
                               : 'bg-emerald-500/15 text-emerald-600',
                           )}
                           title={
                             g.gauntlet.solved
-                              ? `Cracked by ${g.gauntlet.model} — scrapped, cannot be staged`
-                              : `Survived ${g.gauntlet.samples} cold solve(s) by ${g.gauntlet.model}${g.gauntlet.mutations ? ` after ${g.gauntlet.mutations} repair round(s)` : ''}`
+                              ? `Cracked by ${g.gauntlet.model} — tiered to its measured difficulty`
+                              : `Survived ${g.gauntlet.samples} cold solve(s) by ${g.gauntlet.model}`
                           }
                         >
-                          {g.gauntlet.solved
-                            ? '🛡 cracked'
-                            : `🛡 held${g.gauntlet.mutations ? ` ×${g.gauntlet.mutations}` : ''}`}
+                          {g.gauntlet.solved ? '🛡 cracked' : '🛡 held'}
                         </span>
                       )}
                       {g.gauntlet?.suspectAnswer != null && (

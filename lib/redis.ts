@@ -170,7 +170,8 @@ export interface GeneratedRecord {
       reason: string;
     }[];
     solved: boolean;
-    mutations: number;
+    // Legacy field from the removed repair loop — present on old records only.
+    mutations?: number;
     suspectAnswer?: string;
   } | null;
   createdAt: string;
