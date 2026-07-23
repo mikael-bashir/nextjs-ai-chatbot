@@ -450,7 +450,12 @@ export function parseAssessedLevel(text: string): number | null {
 
 export const GAUNTLET_MODEL = 'claude-sonnet-5';
 export const GAUNTLET_SAMPLES = 2;
-export const GAUNTLET_MAX_MUTATIONS = 2;
+// ONE repair shot, then scrap. A repair round costs a full mutation call plus
+// a complete re-gauntlet (2 solvers + 2 judges), and it keeps the same flawed
+// skeleton — while a fresh generation rolls a brand-new chain (guaranteed to
+// carry a structural move by sampleChain). Measured live, second repairs of a
+// cracked design almost never survive; regeneration is the better spend.
+export const GAUNTLET_MAX_MUTATIONS = 1;
 // Generation-side cap only (the no-wall-clock-cap rule protects the PROVER).
 // A solver that can't crack it inside this window has, for gauntlet purposes,
 // failed to crack it — which is the pass condition, so a timeout is safe.
