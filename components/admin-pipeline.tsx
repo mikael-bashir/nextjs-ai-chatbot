@@ -49,6 +49,13 @@ import {
   sampleIntegralRecipe,
   type IntegralCertificate,
 } from '@/lib/generation/integral';
+import {
+  MIRAGE_SETTER_SYSTEM_PROMPT,
+  mirageExactFields,
+  mirageSetterPrompt,
+  sampleThresholdMirage,
+  type MirageInstance,
+} from '@/lib/generation/mirage';
 
 // Per-item cost state (session-scoped): the estimate made on enqueue and the
 // actual recorded once the proof finishes. Persisted rows live in
@@ -157,6 +164,15 @@ const INTEGRAL_VERIFIER_RUN_OPTIONS = {
   model: GAUNTLET_MODEL,
   systemPrompt: INTEGRAL_VERIFIER_SYSTEM_PROMPT,
   timeoutMs: 10 * 60 * 1000,
+};
+
+// Mirage: the LLM only writes prose around a TS-solved instance — no tools, no
+// math, so this is a short completion. Opus for the quality of the disguise.
+const MIRAGE_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: 'claude-opus-4-8',
+  systemPrompt: MIRAGE_SETTER_SYSTEM_PROMPT,
+  timeoutMs: 5 * 60 * 1000,
 };
 
 // The gauntlet solver: a mid-tier Claude attacking the problem cold, WITH a
@@ -272,7 +288,8 @@ type GenMode =
   | 'insane'
   | 'reverse'
   | 'trapdoor'
-  | 'integral';
+  | 'integral'
+  | 'mirage';
 
 const MODE_LABEL: Record<GenMode, string> = {
   easy: 'Easy',
@@ -282,6 +299,7 @@ const MODE_LABEL: Record<GenMode, string> = {
   reverse: 'Reverse-built',
   trapdoor: 'Trapdoor',
   integral: 'Integral',
+  mirage: 'Mirage',
 };
 
 const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
@@ -310,10 +328,13 @@ Core requirements:
   4 = built around a single advanced, university-level concept;
   5 = several advanced concepts combined together.`;
 
-// Trapdoor and Integral modes have no static block — their prompts are built
-// per-run around code-sampled recipes (see lib/generation/trapdoor.ts and
-// lib/generation/integral.ts).
-const MODE_BLOCKS: Record<Exclude<GenMode, 'trapdoor' | 'integral'>, string> = {
+// Trapdoor, Integral and Mirage modes have no static block — their prompts are
+// built per-run around code-sampled recipes/instances (see the lib/generation
+// modules).
+const MODE_BLOCKS: Record<
+  Exclude<GenMode, 'trapdoor' | 'integral' | 'mirage'>,
+  string
+> = {
   easy: `
 - EASY. A quick, approachable problem: a single clear elementary observation or a short direct computation solves it. No deep trick and no long chain of steps — it should feel like a warm-up.
 - Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
@@ -426,9 +447,13 @@ function buildAvoidContext(
 
 function buildPrompt(mode: GenMode, avoid: string): string {
   // Trapdoor and Integral build their prompts around per-run sampled recipes.
+  // Mirage is handled entirely in generateOne (it needs the sampled instance
+  // for the exact-field overwrite), so it never reaches buildPrompt.
   if (mode === 'trapdoor') return trapdoorPrompt(sampleChain(), avoid);
   if (mode === 'integral')
     return integralSetterPrompt(sampleIntegralRecipe(), avoid);
+  if (mode === 'mirage')
+    throw new Error('mirage prompt is built in generateOne, not buildPrompt');
   const avoidBlock = avoid
     ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
     : '';
@@ -1691,21 +1716,24 @@ export function AdminPipeline() {
       `── Generating (${MODE_LABEL[modeRef.current]}) ──`,
     );
     try {
-      const prompt = buildPrompt(
-        modeRef.current,
-        buildAvoidContext(generatedRef.current, liveRef.current),
-      );
+      // Mirage: TS samples a fully-solved instance; the LLM only writes the
+      // disguised prose. The exact answer + Lean certificate come from the
+      // instance and overwrite whatever the model emits (see below), so the
+      // model is never authoritative for the mathematics.
+      const mirageInst: MirageInstance | null =
+        modeRef.current === 'mirage' ? sampleThresholdMirage() : null;
+      const avoid = buildAvoidContext(generatedRef.current, liveRef.current);
+      const prompt = mirageInst
+        ? mirageSetterPrompt(mirageInst, avoid)
+        : buildPrompt(modeRef.current, avoid);
+      const genOptions = mirageInst
+        ? MIRAGE_RUN_OPTIONS
+        : genRunOptionsFor(modeRef.current, genModelRef.current || undefined);
       let genData: BridgeRunResult;
       try {
         genData = await runBridgeStream(
           true,
-          {
-            prompt,
-            options: genRunOptionsFor(
-              modeRef.current,
-              genModelRef.current || undefined,
-            ),
-          },
+          { prompt, options: genOptions },
           'Generator',
           ctrl.signal,
         );
@@ -1739,6 +1767,21 @@ export function AdminPipeline() {
       );
       const raw = String(genData.text || '');
       const gen = extractJson(raw);
+      // Mirage: overwrite the mathematics with the exact TS-computed values.
+      // The setter only supplied prose (title/problem/insight) — it never
+      // produced a Lean statement, so inject the certificate here too, before
+      // the lean check below.
+      if (mirageInst && gen) {
+        const ex = mirageExactFields(mirageInst);
+        gen.answer = Number(ex.answer);
+        gen.lean = ex.lean;
+        gen.difficulty = ex.difficulty;
+        gen.points = ex.points;
+        pushGenEvent(
+          'text',
+          `Mirage exact answer ${ex.answer} injected (break index B=${mirageInst.breakIndex})`,
+        );
+      }
       if (!gen?.lean) {
         // Rich diagnostic: the bridge's own metadata explains an empty/failed run
         // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
@@ -2234,6 +2277,7 @@ export function AdminPipeline() {
                 'reverse',
                 'trapdoor',
                 'integral',
+                'mirage',
               ] as GenMode[]
             ).map(
               (m) => (
@@ -2283,6 +2327,8 @@ export function AdminPipeline() {
               'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Claims Insane; the gauntlet tiers it. Generates with Opus 4.8 unless you pick a model.'}
             {mode === 'integral' &&
               'VHG-style (arXiv 2605.06660): the antiderivative is chosen FIRST, differentiated, and disguised — the answer is correct by construction, and an independent hard verifier re-checks everything with executed sympy before the item can queue. Ships at Hard; promoted to Insane if the gauntlet fails to crack it.'}
+            {mode === 'mirage' &&
+              'Anti-inductive: TS plants a threshold-mirage instance where computing the accessible cases and extrapolating gives the WRONG answer (the break sits below numerical-detection noise) — the solver’s own tool misleads it. Code does the exact math in milliseconds; the model only writes the disguise. Answer + certificate are TS-authoritative, never the model’s.'}
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             The gauntlet (up to {GAUNTLET_SAMPLES}× cold solves by{' '}
