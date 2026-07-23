@@ -111,7 +111,16 @@ const BASH_TOOL_OPTIONS = {
 };
 
 function genRunOptionsFor(mode: GenMode, model?: string) {
-  const withModel = model ? { ...GEN_RUN_OPTIONS, model } : GEN_RUN_OPTIONS;
+  // Trapdoor defaults the GENERATOR to Opus 4.8: the gauntlet adversary is
+  // Sonnet 5 + tools, and a generator of equal strength to its adversary
+  // produces problems the adversary solves (measured live: 3/3 cracked with
+  // full derivations). The asymmetry is the point — an explicit model pick
+  // in the UI still overrides this.
+  const effective =
+    model || (mode === 'trapdoor' ? 'claude-opus-4-8' : undefined);
+  const withModel = effective
+    ? { ...GEN_RUN_OPTIONS, model: effective }
+    : GEN_RUN_OPTIONS;
   if (mode !== 'reverse' && mode !== 'trapdoor') return withModel;
   return { ...withModel, ...BASH_TOOL_OPTIONS };
 }
@@ -1388,64 +1397,80 @@ export function AdminPipeline() {
           `Gauntlet round ${mutations + 1}: ${GAUNTLET_SAMPLES}× ${GAUNTLET_MODEL}`,
           { input: `expected answer: ${expected}` },
         );
-        const samples = await Promise.all(
-          Array.from({ length: GAUNTLET_SAMPLES }, async (_x, i) => {
-            // 1. Solver attempts the problem cold, with a Bash/python tool.
-            const sRes = await callBridge(true, '/run', {
-              method: 'POST',
-              body: JSON.stringify({
-                prompt: gauntletSolverPrompt(gen.problem || ''),
-                options: GAUNTLET_RUN_OPTIONS,
-              }),
-              signal,
+        const runSample = async (i: number) => {
+          // 1. Solver attempts the problem cold, with a Bash/python tool.
+          const sRes = await callBridge(true, '/run', {
+            method: 'POST',
+            body: JSON.stringify({
+              prompt: gauntletSolverPrompt(gen.problem || ''),
+              options: GAUNTLET_RUN_OPTIONS,
+            }),
+            signal,
+          });
+          const empty = { cracked: false, claimedAnswer: null, reason: 'solver run failed' };
+          if (!sRes.ok) {
+            pushGenEvent('error', `Solver #${i + 1} — bridge call failed`, {
+              detail: `HTTP ${sRes.status}`,
             });
-            const empty = { cracked: false, claimedAnswer: null, reason: 'solver run failed' };
-            if (!sRes.ok) {
-              pushGenEvent('error', `Solver #${i + 1} — bridge call failed`, {
-                detail: `HTTP ${sRes.status}`,
-              });
-              return { transcript: '', verdict: empty };
-            }
-            const sData = await sRes.json().catch(() => ({}) as Record<string, unknown>);
-            recordUsage(
-              sData.usage as Parameters<typeof recordUsage>[0],
-              (sData.costUsd as number | undefined) ?? null,
-            );
-            const transcript = String(sData.text || '');
-            pushGenEvent('text', `Solver #${i + 1} (${GAUNTLET_MODEL})`, {
-              detail: transcript || '(empty output)',
-            });
+            return { transcript: '', verdict: empty };
+          }
+          const sData = await sRes.json().catch(() => ({}) as Record<string, unknown>);
+          recordUsage(
+            sData.usage as Parameters<typeof recordUsage>[0],
+            (sData.costUsd as number | undefined) ?? null,
+          );
+          const transcript = String(sData.text || '');
+          pushGenEvent('text', `Solver #${i + 1} (${GAUNTLET_MODEL})`, {
+            detail: transcript || '(empty output)',
+          });
 
-            // 2. A separate, tool-equipped judge rules on the transcript —
-            // running any code it contains rather than trusting it.
-            const jRes = await callBridge(true, '/run', {
-              method: 'POST',
-              body: JSON.stringify({
-                prompt: gauntletJudgePrompt(gen.problem || '', expected, transcript),
-                options: GAUNTLET_JUDGE_RUN_OPTIONS,
-              }),
-              signal,
+          // 2. A separate, tool-equipped judge rules on the transcript —
+          // running any code it contains rather than trusting it.
+          const jRes = await callBridge(true, '/run', {
+            method: 'POST',
+            body: JSON.stringify({
+              prompt: gauntletJudgePrompt(gen.problem || '', expected, transcript),
+              options: GAUNTLET_JUDGE_RUN_OPTIONS,
+            }),
+            signal,
+          });
+          if (!jRes.ok) {
+            pushGenEvent('error', `Judge #${i + 1} — bridge call failed`, {
+              detail: `HTTP ${jRes.status}`,
             });
-            if (!jRes.ok) {
-              pushGenEvent('error', `Judge #${i + 1} — bridge call failed`, {
-                detail: `HTTP ${jRes.status}`,
-              });
-              return { transcript, verdict: { ...empty, reason: 'judge run failed' } };
-            }
-            const jData = await jRes.json().catch(() => ({}) as Record<string, unknown>);
-            recordUsage(
-              jData.usage as Parameters<typeof recordUsage>[0],
-              (jData.costUsd as number | undefined) ?? null,
-            );
-            const verdict = parseJudgeVerdict(String(jData.text || ''));
-            pushGenEvent(
-              verdict.cracked ? 'rejected' : 'verified',
-              `Judge #${i + 1}: ${verdict.cracked ? 'CRACKED' : 'HELD'}${verdict.claimedAnswer ? ` (claimed ${verdict.claimedAnswer})` : ''}`,
-              { detail: verdict.reason || String(jData.text || '') },
-            );
-            return { transcript, verdict };
-          }),
-        );
+            return { transcript, verdict: { ...empty, reason: 'judge run failed' } };
+          }
+          const jData = await jRes.json().catch(() => ({}) as Record<string, unknown>);
+          recordUsage(
+            jData.usage as Parameters<typeof recordUsage>[0],
+            (jData.costUsd as number | undefined) ?? null,
+          );
+          const verdict = parseJudgeVerdict(String(jData.text || ''));
+          pushGenEvent(
+            verdict.cracked ? 'rejected' : 'verified',
+            `Judge #${i + 1}: ${verdict.cracked ? 'CRACKED' : 'HELD'}${verdict.claimedAnswer ? ` (claimed ${verdict.claimedAnswer})` : ''}`,
+            { detail: verdict.reason || String(jData.text || '') },
+          );
+          return { transcript, verdict };
+        };
+
+        // Sequential with early exit: one CRACKED verdict decides the whole
+        // round, so a cracked problem costs one solver+judge, not two. The
+        // price is serialized wall-clock on survivors — worth it while the
+        // crack rate is high.
+        const samples: Awaited<ReturnType<typeof runSample>>[] = [];
+        for (let i = 0; i < GAUNTLET_SAMPLES; i++) {
+          const s = await runSample(i);
+          samples.push(s);
+          if (s.verdict.cracked) {
+            if (i + 1 < GAUNTLET_SAMPLES)
+              pushGenEvent(
+                'system',
+                `Remaining sample(s) skipped — round already cracked`,
+              );
+            break;
+          }
+        }
 
         const solved = samples.some((s) => s.verdict.cracked);
         // Every HELD sample's judge nonetheless converging on the SAME
@@ -1464,7 +1489,9 @@ export function AdminPipeline() {
             : undefined;
         const meta: GauntletMeta = {
           model: GAUNTLET_MODEL,
-          samples: GAUNTLET_SAMPLES,
+          // Actual samples run — fewer than GAUNTLET_SAMPLES when the round
+          // early-exited on a crack.
+          samples: samples.length,
           verdicts: samples.map((s) => s.verdict),
           solved,
           mutations,
@@ -2103,7 +2130,7 @@ export function AdminPipeline() {
             {mode === 'reverse' &&
               'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
             {mode === 'trapdoor' &&
-              'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Emits Insane; must survive the Sonnet gauntlet to ship.'}
+              'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Emits Insane; must survive the Sonnet gauntlet to ship. Generates with Opus 4.8 unless you pick a model — a generator equal to its adversary loses.'}
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             Every Insane problem faces the gauntlet: {GAUNTLET_SAMPLES}× cold
