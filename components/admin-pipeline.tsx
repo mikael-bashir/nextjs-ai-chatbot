@@ -53,6 +53,20 @@ import {
 // Per-item cost state (session-scoped): the estimate made on enqueue and the
 // actual recorded once the proof finishes. Persisted rows live in
 // proof_cost_history; this map drives the live per-card display.
+// What the bridge's /run returns (and /run-stream's terminal `result` event
+// carries) — the shape every generation-phase caller consumes.
+interface BridgeRunResult {
+  ok?: boolean;
+  text?: string;
+  usage?: unknown;
+  costUsd?: number | null;
+  exitCode?: number | null;
+  durationMs?: number;
+  timedOut?: boolean;
+  aborted?: boolean;
+  stderr?: string;
+}
+
 interface ItemCost {
   estimating?: boolean;
   estFailed?: boolean;
@@ -895,6 +909,113 @@ export function AdminPipeline() {
     [],
   );
 
+  // Streaming twin of callBridge('/run'): drives the bridge's /run-stream SSE,
+  // mirroring EVERY live step (thinking deltas, tool calls, tool output, model
+  // status) into the generation console via pushGenEvent — so a 15-minute
+  // generator/solver run reads as a living transcript instead of dead air —
+  // and resolves with exactly the JSON /run would have returned. Falls back to
+  // the blocking /run on an older bridge (404), so an un-updated bridge still
+  // works; you just don't get live progress until it's re-downloaded.
+  const runBridgeStream = useCallback(
+    async (
+      useWork: boolean,
+      payload: { prompt: string; options: Record<string, unknown> },
+      tag: string,
+      signal: AbortSignal,
+    ): Promise<BridgeRunResult> => {
+      const res = await callBridge(useWork, '/run-stream', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        signal,
+      });
+      if (res.status === 404) {
+        // Old bridge without /run-stream — degrade to the silent blocking call.
+        pushGenEvent(
+          'system',
+          `${tag}: bridge has no /run-stream — re-download the bridge for live progress`,
+        );
+        const r = await callBridge(useWork, '/run', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+          signal,
+        });
+        if (!r.ok)
+          throw Object.assign(new Error(`Bridge /run failed (${r.status})`), {
+            httpStatus: r.status,
+            body: await r.text().catch(() => ''),
+          });
+        return (await r.json()) as BridgeRunResult;
+      }
+      if (!res.ok || !res.body)
+        throw Object.assign(
+          new Error(`Bridge /run-stream failed (${res.status})`),
+          { httpStatus: res.status, body: await res.text().catch(() => '') },
+        );
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      let result: BridgeRunResult | null = null;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const frames = buf.split('\n\n');
+        buf = frames.pop() || '';
+        for (const f of frames) {
+          if (!f.startsWith('data:')) continue;
+          let d: Record<string, any>;
+          try {
+            d = JSON.parse(f.replace(/^data:\s*/, ''));
+          } catch {
+            continue;
+          }
+          switch (d.type) {
+            case 'thinking':
+              pushGenEvent('thinking', `${tag} — thinking`, {
+                detail: String(d.text || ''),
+              });
+              break;
+            case 'system':
+              if (d.model) pushGenEvent('system', `${tag} — model ${d.model}`);
+              break;
+            case 'message-annotation':
+              if (d.subtype === 'tool_intent')
+                pushGenEvent('tool_call', `${tag} → ${d.tool}`, {
+                  tool: d.tool,
+                  input: typeof d.input === 'string' ? d.input : undefined,
+                });
+              else if (d.subtype === 'tool_result')
+                pushGenEvent('tool_result', `${tag} ← tool output`, {
+                  detail: String(d.output ?? ''),
+                });
+              else if (d.thought)
+                pushGenEvent(
+                  'text',
+                  `${tag}: ${String(d.thought).split('\n')[0].slice(0, 160)}`,
+                  { detail: String(d.thought) },
+                );
+              break;
+            case 'result':
+              result = d as BridgeRunResult;
+              break;
+            default:
+              // heartbeat — liveness only, nothing to render
+              break;
+          }
+        }
+      }
+      if (!result) {
+        if (signal.aborted) throw new Error('Terminated by you');
+        throw new Error(
+          `${tag}: stream ended without a result — the bridge process likely died mid-run`,
+        );
+      }
+      return result;
+    },
+    [callBridge, pushGenEvent],
+  );
+
   const fetchMcp = (): Promise<ProverMcpServer[]> => fetchProverMcpServers();
 
   // Kick off the cost estimate for an item (auto, on enqueue). Runs CONCURRENTLY
@@ -1434,49 +1555,54 @@ export function AdminPipeline() {
         { input: `expected answer: ${expected}` },
       );
       const runSample = async (i: number) => {
-          // 1. Solver attempts the problem cold, with a Bash/python tool.
-          const sRes = await callBridge(true, '/run', {
-            method: 'POST',
-            body: JSON.stringify({
-              prompt: gauntletSolverPrompt(gen.problem || ''),
-              options: GAUNTLET_RUN_OPTIONS,
-            }),
-            signal,
-          });
           const empty = { cracked: false, claimedAnswer: null, reason: 'solver run failed' };
-          if (!sRes.ok) {
+          // 1. Solver attempts the problem cold, with a Bash/python tool —
+          // every tool call and thought streams into the console live.
+          let sData: BridgeRunResult;
+          try {
+            sData = await runBridgeStream(
+              true,
+              {
+                prompt: gauntletSolverPrompt(gen.problem || ''),
+                options: GAUNTLET_RUN_OPTIONS,
+              },
+              `Solver #${i + 1}`,
+              signal,
+            );
+          } catch (e) {
             pushGenEvent('error', `Solver #${i + 1} — bridge call failed`, {
-              detail: `HTTP ${sRes.status}`,
+              detail: String((e as { httpStatus?: number })?.httpStatus ?? e),
             });
             return { transcript: '', verdict: empty };
           }
-          const sData = await sRes.json().catch(() => ({}) as Record<string, unknown>);
           recordUsage(
             sData.usage as Parameters<typeof recordUsage>[0],
             (sData.costUsd as number | undefined) ?? null,
           );
           const transcript = String(sData.text || '');
-          pushGenEvent('text', `Solver #${i + 1} (${GAUNTLET_MODEL})`, {
+          pushGenEvent('text', `Solver #${i + 1} final (${GAUNTLET_MODEL})`, {
             detail: transcript || '(empty output)',
           });
 
           // 2. A separate, tool-equipped judge rules on the transcript —
           // running any code it contains rather than trusting it.
-          const jRes = await callBridge(true, '/run', {
-            method: 'POST',
-            body: JSON.stringify({
-              prompt: gauntletJudgePrompt(gen.problem || '', expected, transcript),
-              options: GAUNTLET_JUDGE_RUN_OPTIONS,
-            }),
-            signal,
-          });
-          if (!jRes.ok) {
+          let jData: BridgeRunResult;
+          try {
+            jData = await runBridgeStream(
+              true,
+              {
+                prompt: gauntletJudgePrompt(gen.problem || '', expected, transcript),
+                options: GAUNTLET_JUDGE_RUN_OPTIONS,
+              },
+              `Judge #${i + 1}`,
+              signal,
+            );
+          } catch (e) {
             pushGenEvent('error', `Judge #${i + 1} — bridge call failed`, {
-              detail: `HTTP ${jRes.status}`,
+              detail: String((e as { httpStatus?: number })?.httpStatus ?? e),
             });
             return { transcript, verdict: { ...empty, reason: 'judge run failed' } };
           }
-          const jData = await jRes.json().catch(() => ({}) as Record<string, unknown>);
           recordUsage(
             jData.usage as Parameters<typeof recordUsage>[0],
             (jData.costUsd as number | undefined) ?? null,
@@ -1545,7 +1671,7 @@ export function AdminPipeline() {
         );
         return { meta };
     },
-    [callBridge, recordUsage, pushGenEvent],
+    [runBridgeStream, recordUsage, pushGenEvent],
   );
 
   // Generate ONE problem on the work bridge, save it unverified, and enqueue it
@@ -1569,47 +1695,49 @@ export function AdminPipeline() {
         modeRef.current,
         buildAvoidContext(generatedRef.current, liveRef.current),
       );
-      let genRes: Response;
+      let genData: BridgeRunResult;
       try {
-        genRes = await callBridge(true, '/run', {
-          method: 'POST',
-          body: JSON.stringify({
+        genData = await runBridgeStream(
+          true,
+          {
             prompt,
             options: genRunOptionsFor(
               modeRef.current,
               genModelRef.current || undefined,
             ),
-          }),
-          signal: ctrl.signal,
-        });
-      } catch {
+          },
+          'Generator',
+          ctrl.signal,
+        );
+      } catch (e) {
         if (ctrl.signal.aborted)
           throw new Error('Generation terminated by you');
+        const httpStatus = (e as { httpStatus?: number })?.httpStatus;
+        if (httpStatus) {
+          const body = (e as { body?: string })?.body || '';
+          const detail = `${JSON.stringify(
+            { bridge: bridgeUrl, httpStatus, mode: modeRef.current },
+            null,
+            2,
+          )}\n\n----- response body -----\n${body || '(empty)'}`;
+          throw Object.assign(
+            new Error(`Bridge /run-stream failed (${httpStatus})`),
+            { detail },
+          );
+        }
+        // Stream died mid-run (bridge crash) — surface that as-is; a plain
+        // fetch failure means the bridge was never reachable at all.
+        if (e instanceof Error && /stream ended without a result/.test(e.message))
+          throw e;
         throw new Error(
           `Couldn't reach the generation bridge at ${bridgeUrl}. Check a bridge is running there, the URL is a full http:// URL, and you're on Chrome/Edge/Firefox.`,
         );
       }
-      if (!genRes.ok) {
-        const body = await genRes.text().catch(() => '');
-        const detail = `${JSON.stringify(
-          {
-            bridge: bridgeUrl,
-            httpStatus: genRes.status,
-            mode: modeRef.current,
-          },
-          null,
-          2,
-        )}\n\n----- response body -----\n${body || '(empty)'}`;
-        throw Object.assign(
-          new Error(`Bridge /run failed (${genRes.status})`),
-          {
-            detail,
-          },
-        );
-      }
-      const genData = await genRes.json();
-      recordUsage(genData.usage, genData.costUsd);
-      const raw = String(genData.text || genData.proof || '');
+      recordUsage(
+        genData.usage as Parameters<typeof recordUsage>[0],
+        genData.costUsd ?? null,
+      );
+      const raw = String(genData.text || '');
       const gen = extractJson(raw);
       if (!gen?.lean) {
         // Rich diagnostic: the bridge's own metadata explains an empty/failed run
@@ -1641,7 +1769,6 @@ export function AdminPipeline() {
         const meta = {
           mode: modeRef.current,
           bridge: bridgeUrl,
-          httpStatus: genRes.status,
           ok: genData.ok,
           exitCode: genData.exitCode,
           timedOut: genData.timedOut,
@@ -1688,17 +1815,23 @@ export function AdminPipeline() {
           upperBound: gen.upperBound,
           exactValue: gen.exactValue,
         };
-        const vRes = await callBridge(true, '/run', {
-          method: 'POST',
-          body: JSON.stringify({
-            prompt: integralVerifierPrompt(cert, gen.answer, gen.problem || ''),
-            options: INTEGRAL_VERIFIER_RUN_OPTIONS,
-          }),
-          signal: ctrl.signal,
-        });
-        if (!vRes.ok)
-          throw new Error(`Integral verifier bridge call failed (${vRes.status})`);
-        const vData = await vRes.json().catch(() => ({}) as Record<string, unknown>);
+        let vData: BridgeRunResult;
+        try {
+          vData = await runBridgeStream(
+            true,
+            {
+              prompt: integralVerifierPrompt(cert, gen.answer, gen.problem || ''),
+              options: INTEGRAL_VERIFIER_RUN_OPTIONS,
+            },
+            'Hard verifier',
+            ctrl.signal,
+          );
+        } catch (e) {
+          if (ctrl.signal.aborted) throw new Error('Generation terminated by you');
+          throw new Error(
+            `Integral verifier bridge call failed (${(e as { httpStatus?: number })?.httpStatus ?? e})`,
+          );
+        }
         recordUsage(
           vData.usage as Parameters<typeof recordUsage>[0],
           (vData.costUsd as number | undefined) ?? null,
@@ -1744,26 +1877,24 @@ export function AdminPipeline() {
       // the generator's own estimate stands.
       setGenStage('assessing');
       try {
-        const lvRes = await callBridge(true, '/run', {
-          method: 'POST',
-          body: JSON.stringify({
+        const d = await runBridgeStream(
+          true,
+          {
             prompt: levelAssessorPrompt(gen.problem || '', gen.insight),
             options: ASSESSOR_RUN_OPTIONS,
-          }),
-          signal: ctrl.signal,
+          },
+          'Assessor',
+          ctrl.signal,
+        );
+        recordUsage(
+          d.usage as Parameters<typeof recordUsage>[0],
+          (d.costUsd as number | undefined) ?? null,
+        );
+        const assessed = parseAssessedLevel(String(d.text || ''));
+        if (assessed) gen.level = assessed;
+        pushGenEvent('text', `Level assessed: ${assessed ?? '(kept generator estimate)'}`, {
+          detail: String(d.text || ''),
         });
-        if (lvRes.ok) {
-          const d = await lvRes.json().catch(() => ({}) as Record<string, unknown>);
-          recordUsage(
-            d.usage as Parameters<typeof recordUsage>[0],
-            (d.costUsd as number | undefined) ?? null,
-          );
-          const assessed = parseAssessedLevel(String(d.text || ''));
-          if (assessed) gen.level = assessed;
-          pushGenEvent('text', `Level assessed: ${assessed ?? '(kept generator estimate)'}`, {
-            detail: String(d.text || ''),
-          });
-        }
       } catch {
         /* keep the generator's own level */
       }
@@ -1803,7 +1934,7 @@ export function AdminPipeline() {
       setGenStartedAt(null);
       setGenStage('idle');
     }
-  }, [callBridge, runVerifier, recordUsage, runGauntlet, pushLog, pushGenEvent]);
+  }, [runBridgeStream, runVerifier, recordUsage, runGauntlet, pushLog, pushGenEvent]);
 
   const terminateGeneration = () => genAbortRef.current?.abort();
 

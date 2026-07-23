@@ -296,6 +296,227 @@ function runClaude(args, { cwd, timeoutMs, killSignal, maxOutputTokens }) {
   })
 }
 
+// Streaming twin of /run: identical contract (prompt + options) but instead of
+// one silent multi-minute POST, runs claude with stream-json (+ partial message
+// deltas) and mirrors EVERY step over SSE — thinking, tool calls/results, text —
+// in the same event shapes /prove-stream emits, so the app's existing console
+// plumbing renders it unchanged. Ends with a terminal {type:"result"} event
+// carrying EXACTLY what /run would have returned ({ok, text, usage, costUsd,
+// exitCode, durationMs, timedOut, aborted, stderr}), so callers keep their
+// result-handling logic and only gain live progress.
+function runStream(res, body) {
+  const prompt = body.prompt
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return json(res, 400, { error: "prompt_required" })
+  }
+  const options = body.options || {}
+  // Same timeout semantics as /run: 0 = uncapped (client Terminate governs).
+  const timeoutMs =
+    Number(options.timeoutMs) === 0
+      ? 0
+      : Math.min(Math.max(Number(options.timeoutMs) || 120000, 5000), 1800000)
+  const cwd =
+    typeof options.workingDirectory === "string" && options.workingDirectory.trim()
+      ? options.workingDirectory.trim()
+      : undefined
+
+  const args = buildArgs(prompt, options)
+  // Swap the blocking `json` output for frame-per-line streaming, with partial
+  // message deltas: a tool-less single-completion run (e.g. the problem
+  // generator) would otherwise emit its ONE assistant frame only at the very
+  // end — the exact silence this endpoint exists to kill.
+  const fmtIdx = args.indexOf("--output-format")
+  args[fmtIdx + 1] = "stream-json"
+  args.splice(fmtIdx + 2, 0, "--verbose", "--include-partial-messages")
+
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform" })
+  const send = (obj) => {
+    try {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    } catch {
+      /* client gone */
+    }
+  }
+
+  const start = Date.now()
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+
+  let child
+  try {
+    child = spawn(CLAUDE_BIN, args, {
+      cwd: cwd || process.cwd(),
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      env:
+        Number(options.maxOutputTokens) > 0
+          ? { ...process.env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(Number(options.maxOutputTokens)) }
+          : process.env,
+    })
+  } catch (err) {
+    send({ type: "result", ok: false, text: "", exitCode: null, durationMs: 0, timedOut: false, aborted: false, stderr: `Failed to launch "${CLAUDE_BIN}": ${String(err)}` })
+    res.end()
+    return
+  }
+
+  let timedOut = false
+  let aborted = false
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true
+          child.kill("SIGKILL")
+        }, timeoutMs)
+      : null
+  // Terminate = client disconnect kills claude, same contract as /run.
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      aborted = true
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        /* gone */
+      }
+    }
+  })
+
+  // Liveness during silent stretches + keeps proxies from idling the socket.
+  const heartbeat = setInterval(() => {
+    metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    send({ type: "heartbeat", metrics })
+  }, 15000)
+  heartbeat.unref?.()
+
+  // Partial-delta throttle: batch thinking/text deltas and flush at most every
+  // 2s, so the console shows the model literally writing without an SSE flood.
+  let pendingThinking = ""
+  let pendingText = ""
+  let streamedChars = 0
+  let lastFlush = 0
+  const flushDeltas = (force = false) => {
+    const now = Date.now()
+    if (!force && now - lastFlush < 2000) return
+    if (!pendingThinking && !pendingText) return
+    lastFlush = now
+    metrics.time_elapsed = Math.round((now - start) / 1000)
+    if (pendingThinking) {
+      send({ type: "thinking", text: pendingThinking.slice(-2000), metrics })
+      pendingThinking = ""
+    }
+    if (pendingText) {
+      send({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `✍️ writing… (${streamedChars} chars)\n…${pendingText.slice(-300)}`,
+        metrics,
+      })
+      pendingText = ""
+    }
+  }
+
+  let buf = ""
+  let stderr = ""
+  let finalText = ""
+  let usage = null
+  let costUsd = null
+
+  child.stdout.on("data", (chunk) => {
+    buf += chunk.toString("utf8")
+    let nl
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl)
+      buf = buf.slice(nl + 1)
+      if (!line.trim()) continue
+      let o
+      try {
+        o = JSON.parse(line)
+      } catch {
+        continue
+      }
+      metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+      if (o.type === "result") {
+        finalText = String(o.result || "").slice(0, MAX_OUTPUT_BYTES)
+        if (typeof o.total_cost_usd === "number") costUsd = o.total_cost_usd
+        if (o.usage) usage = o.usage
+      } else if (o.type === "system" && (o.subtype === "init" || o.model)) {
+        send({ type: "system", model: o.model, metrics })
+      } else if (o.type === "stream_event") {
+        // Token-level deltas (--include-partial-messages): the ONLY live signal
+        // during a long single completion. Batched via flushDeltas above.
+        const ev = o.event
+        if (ev?.type === "content_block_delta") {
+          if (ev.delta?.type === "thinking_delta" && ev.delta.thinking) {
+            pendingThinking += ev.delta.thinking
+            streamedChars += ev.delta.thinking.length
+          } else if (ev.delta?.type === "text_delta" && ev.delta.text) {
+            pendingText += ev.delta.text
+            streamedChars += ev.delta.text.length
+          }
+          flushDeltas()
+        }
+      } else if (o.type === "assistant" && o.message?.content) {
+        // Full frames: flush any buffered deltas first so ordering reads right.
+        flushDeltas(true)
+        metrics.llm_invocations++
+        for (const c of o.message.content) {
+          if (c.type === "tool_use") {
+            metrics.tools_invoked++
+            const name = String(c.name || "").replace(/^mcp__[a-z0-9-]+__/i, "")
+            send({
+              type: "message-annotation",
+              subtype: "tool_intent",
+              thought: `Using ${name}`,
+              tool: name,
+              input: typeof c.input === "string" ? c.input : JSON.stringify(c.input),
+              metrics,
+            })
+          }
+          // Full text/thinking blocks are NOT re-emitted here: their content
+          // already streamed via the deltas above — re-sending would duplicate.
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_result") {
+            const t = Array.isArray(c.content)
+              ? c.content.map((x) => x.text || "").join("\n")
+              : String(c.content ?? "")
+            send({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t.slice(0, 8000), metrics })
+          }
+        }
+      }
+    }
+  })
+
+  child.stderr.on("data", (c) => {
+    stderr += c.toString("utf8")
+  })
+  child.on("error", (err) => {
+    if (timer) clearTimeout(timer)
+    clearInterval(heartbeat)
+    send({ type: "result", ok: false, text: "", exitCode: null, durationMs: Date.now() - start, timedOut: false, aborted: false, stderr: `Failed to launch "${CLAUDE_BIN}": ${err.message}` })
+    res.end()
+  })
+  child.on("close", (code) => {
+    if (timer) clearTimeout(timer)
+    clearInterval(heartbeat)
+    flushDeltas(true)
+    metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    send({
+      type: "result",
+      ok: code === 0 && !timedOut && !aborted,
+      text: finalText,
+      usage,
+      costUsd,
+      exitCode: code,
+      durationMs: Date.now() - start,
+      timedOut,
+      aborted,
+      stderr: stderr.slice(0, 4000),
+      metrics,
+    })
+    res.end()
+  })
+}
+
 function getVersion() {
   return new Promise((resolve) => {
     let out = ""
@@ -3460,6 +3681,12 @@ const server = createServer(async (req, res) => {
         maxOutputTokens: Number(options.maxOutputTokens) || 0,
       })
       return json(res, 200, result)
+    }
+
+    // Streaming /run — same contract, but live SSE progress. See runStream.
+    if (req.method === "POST" && url.pathname === "/run-stream") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      return runStream(res, body)
     }
 
     if (req.method === "POST" && url.pathname === "/prove") {
