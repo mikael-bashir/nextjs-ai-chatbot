@@ -65,7 +65,7 @@ export default async function AccountPage({
   const { payment } = await searchParams;
 
   const [balance, transactions, rateLimit, firstTx, subscription, localUser] = await Promise.all([
-    getOrCreateCreditBalance({ userId }),
+    getOrCreateCreditBalance({ userId, email: session.user.email }),
     getCreditTransactions({ userId, limit: 20, offset: 0 }),
     checkRateLimit({ userId }),
     getEarliestCreditTransaction({ userId }),
