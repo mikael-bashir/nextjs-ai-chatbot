@@ -108,7 +108,7 @@ export type Vote = InferSelectModel<typeof vote>;
 export const document = pgTable(
   'Document',
   {
-    id: uuid('id').primaryKey().notNull().defaultRandom(),
+    id: uuid('id').notNull().defaultRandom(),
     createdAt: timestamp('createdAt').notNull(),
     title: text('title').notNull(),
     content: text('content'),
@@ -121,6 +121,8 @@ export const document = pgTable(
   },
   (table) => {
     return {
+      // The real primary key is the composite below — one row per document
+      // VERSION, multiple rows sharing an id. `id` alone was never unique.
       pk: primaryKey({ columns: [table.id, table.createdAt] }),
     };
   },
@@ -144,7 +146,9 @@ export const suggestion = pgTable(
     createdAt: timestamp('createdAt').notNull(),
   },
   (table) => ({
-    pk: primaryKey({ columns: [table.id] }),
+    // `id` above already carries the real primary key (single-column, like
+    // every other table here) — this second table-level `pk` on the same
+    // column was a duplicate, which Postgres rejects on a fresh CREATE.
     documentRef: foreignKey({
       columns: [table.documentId, table.documentCreatedAt],
       foreignColumns: [document.id, document.createdAt],
