@@ -3885,7 +3885,18 @@ class McpSseClient {
   }
 
   async connect() {
-    if (!this.readyPromise) this.readyPromise = this._connect()
+    if (!this.readyPromise) {
+      // A rejected promise is still truthy, so a failed _connect() (a cold
+      // Space, a proxy hiccup mid-boot, anything) would otherwise get cached
+      // and replayed FOREVER — every later callTool() would immediately
+      // re-throw this same stale error without ever retrying the handshake,
+      // even once the Space is confirmed back up. Clear it on rejection so
+      // the next call gets a genuinely fresh /sse attempt.
+      this.readyPromise = this._connect().catch((e) => {
+        this.readyPromise = null
+        throw e
+      })
+    }
     return this.readyPromise
   }
 
