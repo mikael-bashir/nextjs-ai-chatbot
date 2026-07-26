@@ -30,22 +30,21 @@ RUN git clone --depth 50 https://github.com/leanprover-community/repl /opt/repl 
     && ls .lake/build/bin/repl
 
 RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir \
-      fastapi==0.115.* "uvicorn[standard]"==0.30.*
+      fastmcp nest_asyncio "uvicorn[standard]"
 ENV PATH=/opt/venv/bin:$PATH
 
 COPY shared/ /opt/shared/
 COPY server.py /opt/leak-xiv/server.py
 
-# Lazy single daemon: warms on first /verify, reaped after 15 min idle. On
-# HF Spaces this mostly just saves RAM within the Space's own hardware
-# allocation — the Space-level sleep timer (below) is what actually stops
+# Lazy single daemon: warms on first verify_full_script call, reaped after
+# 15 min idle. On HF Spaces this mostly just saves RAM within the Space's own
+# hardware allocation — the Space-level sleep timer is what actually stops
 # billing, independent of this internal daemon lazily napping.
 ENV POOL_SIZE=1 \
     LAZY=1 \
     REPL_IMPORTS="import Mathlib" \
-    SHARED_DIR=/opt/shared \
-    PORT=8014
+    SHARED_DIR=/opt/shared
 
-WORKDIR /opt
-EXPOSE 8014
-CMD ["sh", "-c", "uvicorn server:app --app-dir /opt/leak-xiv --host 0.0.0.0 --port ${PORT}"]
+WORKDIR /opt/leak-xiv
+EXPOSE 7860
+CMD ["python3", "server.py"]

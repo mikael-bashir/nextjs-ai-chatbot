@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Loader2,
   Play,
@@ -25,6 +25,13 @@ import type { ProverEvent, ProverOutcome } from '@/lib/prover/types';
 // governs by TIME when this is set and reports a runId so "+5 min" can push it
 // out; the single-agent path ignores it. Never a cap on the prover otherwise.
 const PLAYGROUND_COMPUTE_BUDGET_MS = 30 * 60_000;
+// The architect strategy is governed much tighter — fail fast/cheap while
+// it's under test — and extends one minute at a time instead of five.
+const ARCHITECT_COMPUTE_BUDGET_MS = 5 * 60_000;
+const ARCHITECT_EXTEND_MS = 1 * 60_000;
+// Grok is the only driver proveArchitect supports — lock the model selector
+// to this value whenever that strategy is active.
+const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
 
 // A minimal "message the prover" surface. It reuses the exact same runner +
 // console as the admin queue resolver — send a statement, watch every step,
@@ -43,6 +50,11 @@ export function ProverPlayground() {
   const [strategy, setStrategy] = useState('hacker');
   // Model the prover runs on ('' = the bridge/CLI default).
   const [model, setModel] = useState('');
+  // Architect strategy always drives Grok directly — force + lock the model.
+  useEffect(() => {
+    if (strategy === 'architect') setModel(ARCHITECT_MODEL);
+    else setModel((m) => (m === ARCHITECT_MODEL ? '' : m));
+  }, [strategy]);
 
   // Live compute-budget state for the tree path: the bridge reports a runId +
   // deadline via onRunId; the "+5 min" button (extend) pushes the deadline out.
@@ -90,7 +102,12 @@ export function ProverPlayground() {
           seed,
           // Tree path runs under an extendable wall-clock budget; the single-agent
           // path ignores it (and never fires onRunId), so no indicator shows.
-          computeBudgetMs: asTree ? PLAYGROUND_COMPUTE_BUDGET_MS : undefined,
+          // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
+          computeBudgetMs: asTree
+            ? strategy === 'architect'
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : PLAYGROUND_COMPUTE_BUDGET_MS
+            : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
             setComputeLimit({ deadlineMs, budgetMs });
@@ -110,18 +127,19 @@ export function ProverPlayground() {
     [problem, decompose, strategy, model],
   );
 
-  // "+5 min" — push the running prove's wall-clock budget out. Best-effort.
+  // Push the running prove's wall-clock budget out. Best-effort.
   const extend = useCallback(async () => {
     const runId = runIdRef.current;
     if (!runId || extending) return;
     setExtending(true);
     try {
-      const r = await extendProverRun({ runId, addMs: 5 * 60_000 });
+      const addMs = strategy === 'architect' ? ARCHITECT_EXTEND_MS : 5 * 60_000;
+      const r = await extendProverRun({ runId, addMs });
       if (r) setComputeLimit(r);
     } finally {
       setExtending(false);
     }
-  }, [extending]);
+  }, [extending, strategy]);
 
   const terminate = useCallback(() => {
     abortRef.current?.abort();
@@ -184,16 +202,29 @@ export function ProverPlayground() {
         <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
           Model
           <select
-            value={model}
+            value={strategy === 'architect' ? ARCHITECT_MODEL : model}
             onChange={(e) => setModel(e.target.value)}
-            disabled={running}
-            className="rounded-md border bg-background px-2 py-1.5 text-sm"
+            disabled={running || strategy === 'architect'}
+            className="rounded-md border bg-background px-2 py-1.5 text-sm disabled:opacity-60"
+            title={
+              strategy === 'architect'
+                ? 'Architect strategy always drives Grok directly — model is locked.'
+                : undefined
+            }
           >
-            <option value="">Default</option>
-            <option value="claude-opus-4-8">Opus 4.8</option>
-            <option value="claude-sonnet-5">Sonnet 5</option>
-            <option value="claude-fable-5">Fable 5</option>
-            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+            {strategy === 'architect' ? (
+              <option value={ARCHITECT_MODEL}>
+                Grok 4.1 Fast Reasoning (forced)
+              </option>
+            ) : (
+              <>
+                <option value="">Default</option>
+                <option value="claude-opus-4-8">Opus 4.8</option>
+                <option value="claude-sonnet-5">Sonnet 5</option>
+                <option value="claude-fable-5">Fable 5</option>
+                <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+              </>
+            )}
           </select>
         </label>
         {decompose && (
@@ -226,8 +257,17 @@ export function ProverPlayground() {
             ? 'Pantograph mode builds proofs interactively in Leak II; Leak IV is used only as the final guardrail.'
             : 'Hacker mode leads with the compiler (verify_full_script) and strong automation.'}{' '}
           Needs a verify_full_script MCP server connected. Runs under a{' '}
-          {Math.round(PLAYGROUND_COMPUTE_BUDGET_MS / 60_000)}-minute compute
-          budget you can extend live (+5 min).
+          {Math.round(
+            (strategy === 'architect'
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : PLAYGROUND_COMPUTE_BUDGET_MS) / 60_000,
+          )}
+          -minute compute budget you can extend live (+
+          {Math.round(
+            (strategy === 'architect' ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
+              60_000,
+          )}{' '}
+          min).
         </p>
       )}
 
@@ -237,6 +277,7 @@ export function ProverPlayground() {
         computeLimit={computeLimit}
         onExtend={extend}
         extending={extending}
+        extendLabel={strategy === 'architect' ? '1 min' : '5 min'}
       />
 
       {outcome && (

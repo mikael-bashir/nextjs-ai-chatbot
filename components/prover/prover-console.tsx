@@ -128,11 +128,15 @@ function ComputeLimit({
   running,
   onExtend,
   extending,
+  extendLabel = '5 min',
 }: {
   limit: { deadlineMs: number; budgetMs: number };
   running: boolean;
   onExtend?: () => void;
   extending?: boolean;
+  /** Text on the extend button (e.g. "1 min" for a tighter, faster-iterating
+   *  budget) — the actual increment is decided by whatever `onExtend` does. */
+  extendLabel?: string;
 }) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -158,10 +162,11 @@ function ComputeLimit({
           type="button"
           onClick={onExtend}
           disabled={extending}
-          title="Add 5 minutes to the computation time limit"
+          title={`Add ${extendLabel} to the computation time limit`}
           className="ml-0.5 inline-flex items-center gap-0.5 rounded border px-1 py-0.5 font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
         >
-          <Plus className="size-3" />5 min
+          <Plus className="size-3" />
+          {extendLabel}
         </button>
       )}
     </span>
@@ -217,6 +222,7 @@ export function ProverConsole({
   computeLimit = null,
   onExtend,
   extending = false,
+  extendLabel = '5 min',
 }: {
   events: ProverEvent[];
   running?: boolean;
@@ -224,10 +230,11 @@ export function ProverConsole({
   emptyHint?: string;
   className?: string;
   // Live wall-clock budget for this run (from runProverStream's onRunId). When
-  // present, the header shows a limit indicator + "+5 min" button (onExtend).
+  // present, the header shows a limit indicator + extend button (onExtend).
   computeLimit?: { deadlineMs: number; budgetMs: number } | null;
   onExtend?: () => void;
   extending?: boolean;
+  extendLabel?: string;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // Auto-scroll to the newest line unless the user has scrolled up.
@@ -257,6 +264,7 @@ export function ProverConsole({
               running={running}
               onExtend={onExtend}
               extending={extending}
+              extendLabel={extendLabel}
             />
           )}
           {lastMetrics && (
@@ -269,6 +277,11 @@ export function ProverConsole({
               )}
               {typeof lastMetrics.time_elapsed === 'number' && (
                 <span>{lastMetrics.time_elapsed}s</span>
+              )}
+              {typeof lastMetrics.cost_usd === 'number' && (
+                <span title="Running dollar cost for this run">
+                  ${lastMetrics.cost_usd.toFixed(3)}
+                </span>
               )}
             </span>
           )}

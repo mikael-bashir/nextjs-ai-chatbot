@@ -668,6 +668,16 @@ function connFor(useWork: boolean) {
 // a manual "+5 min" nudge. Generous — deep proofs (e.g. lucas_nresidue_prime)
 // legitimately take a while — and always extendable live.
 const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
+// The architect strategy is deliberately governed much tighter: it's the
+// experimental Goedel-Architect pipeline under test, so runs should fail fast
+// and cheap rather than idle for 30 minutes — extend one minute at a time
+// instead of five once you've confirmed it's making real progress.
+const ARCHITECT_COMPUTE_BUDGET_MS = 5 * 60_000;
+const ARCHITECT_EXTEND_MS = 1 * 60_000;
+// Grok is the only driver the architect pipeline supports (see
+// public/local-claude-bridge.mjs's proveArchitect) — the model selector is
+// locked to this value whenever that strategy is active.
+const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
 
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
@@ -810,6 +820,13 @@ export function AdminPipeline() {
   useEffect(() => {
     verifyModelRef.current = verifyModel;
   }, [verifyModel]);
+  // Architect strategy always drives Grok directly — force the model and lock
+  // the selector while it's active; fall back to the default the moment the
+  // operator switches to any other strategy.
+  useEffect(() => {
+    if (verifyStrategy === 'architect') setVerifyModel(ARCHITECT_MODEL);
+    else setVerifyModel((m) => (m === ARCHITECT_MODEL ? '' : m));
+  }, [verifyStrategy]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -1143,7 +1160,12 @@ export function AdminPipeline() {
           seed: opts?.seed,
           // Tree path runs under an extendable wall-clock budget; the single-agent
           // path ignores it (and never fires onRunId), so the indicator stays off.
-          computeBudgetMs: decompose ? VERIFY_COMPUTE_BUDGET_MS : undefined,
+          // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
+          computeBudgetMs: decompose
+            ? strategy === 'architect'
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : VERIFY_COMPUTE_BUDGET_MS
+            : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
             setComputeLimit({ deadlineMs, budgetMs });
@@ -1388,7 +1410,10 @@ export function AdminPipeline() {
       const conn = connFor(false); // shared (verification) bridge
       const r = await extendProverRun({
         runId,
-        addMs: 5 * 60_000,
+        addMs:
+          verifyStrategyRef.current === 'architect'
+            ? ARCHITECT_EXTEND_MS
+            : 5 * 60_000,
         bridgeUrl: conn.bridgeUrl,
         token: conn.token,
       });
@@ -2617,16 +2642,27 @@ export function AdminPipeline() {
             <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
               Model
               <select
-                value={verifyModel}
+                value={verifyStrategy === 'architect' ? ARCHITECT_MODEL : verifyModel}
                 onChange={(e) => setVerifyModel(e.target.value)}
-                className="rounded-md border bg-background px-1.5 py-1 text-xs"
-                title="Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default."
+                disabled={verifyStrategy === 'architect'}
+                className="rounded-md border bg-background px-1.5 py-1 text-xs disabled:opacity-60"
+                title={
+                  verifyStrategy === 'architect'
+                    ? 'Architect strategy always drives Grok directly — model is locked.'
+                    : 'Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default.'
+                }
               >
-                {PROVER_MODELS.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
+                {verifyStrategy === 'architect' ? (
+                  <option value={ARCHITECT_MODEL}>
+                    Grok 4.1 Fast Reasoning (forced)
                   </option>
-                ))}
+                ) : (
+                  PROVER_MODELS.map((m) => (
+                    <option key={m.value} value={m.value}>
+                      {m.label}
+                    </option>
+                  ))
+                )}
               </select>
             </label>
             {verifyDecompose && (
@@ -2697,6 +2733,7 @@ export function AdminPipeline() {
             computeLimit={computeLimit}
             onExtend={extendVerification}
             extending={extending}
+            extendLabel={verifyStrategy === 'architect' ? '1 min' : '5 min'}
           />
         )}
         <div className="space-y-1.5">

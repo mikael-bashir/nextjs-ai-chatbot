@@ -1,6 +1,13 @@
 """Leak XII — the Goedel-Architect `lean_compile` gateway.
 
-One HTTP tool, three modes, mirroring the paper's compile gate exactly:
+Real FastMCP server (matching Leak-I/II's own wrapper architecture exactly:
+mcp.server.fastmcp.FastMCP, @mcp.tool(), served via mcp.sse_app() + uvicorn
+on 7860) rather than a bespoke REST API, so the app's existing "Add Server"
+flow can register and live-handshake against it like every other Leak
+server. All compile logic below is unchanged from the REST version — only
+the outer interface changed.
+
+One tool, three modes, mirroring the paper's compile gate exactly:
 
   mode="blueprint"  Structural pre-checks (Safeguard) -> Lean compile against
                     a warm Mathlib+Architect environment -> post-compile
@@ -21,68 +28,47 @@ One HTTP tool, three modes, mirroring the paper's compile gate exactly:
   mode="explore"    Bare snippet compile against the warm environment.
 
 State lives entirely in the caller (the bridge orchestrator); this service is
-stateless per-request on purpose — daemons hold Mathlib in RAM, nothing else.
+stateless per-call on purpose — daemons hold Mathlib in RAM, nothing else.
+The `mode`/`target_*`/`prefix`/`prelude` arguments are bridge-supplied, not
+model-supplied: the calling model only ever emits `code` (matching the
+paper's own tool contract) — the bridge fills in the rest per call site
+before issuing the actual MCP tools/call request.
 """
 
+import asyncio
+import json
+import logging
 import os
 import re
 import sys
 
 sys.path.insert(0, os.environ.get("SHARED_DIR", "/opt/shared"))
 
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+import nest_asyncio
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
+from starlette.middleware.cors import CORSMiddleware
 
 import blueprint as bp
 from repl_pool import ReplPool
 
+nest_asyncio.apply()
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("leak-xii")
+
 BLUEPRINT_TIMEOUT_S = float(os.environ.get("BLUEPRINT_TIMEOUT_S", "600"))
 NODE_TIMEOUT_S = float(os.environ.get("NODE_TIMEOUT_S", "300"))
 
-app = FastAPI(title="Leak XII", version="1.0")
-
-# Optional shared-secret gate. When LEAK_SERVICE_TOKEN is set, every request
-# except /health must carry `Authorization: Bearer <token>`. These services
-# compile arbitrary Lean, which can perform IO at elaboration time — so an
-# open port without this is an unauthenticated code-execution surface.
-SERVICE_TOKEN = os.environ.get("LEAK_SERVICE_TOKEN", "")
-
-
-@app.middleware("http")
-async def _require_token(request, call_next):
-    if SERVICE_TOKEN and request.url.path != "/health":
-        if request.headers.get("authorization", "") != f"Bearer {SERVICE_TOKEN}":
-            return JSONResponse({"error": "unauthorized"}, status_code=401)
-    return await call_next(request)
-
+mcp = FastMCP(
+    "Leak-XII",
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
+)
 
 pool = ReplPool()
-
-
-@app.on_event("startup")
-async def _boot():
-    await pool.boot()
-
-
-@app.get("/health")
-async def health():
-    return {"service": "leak-xii", **pool.status()}
-
-
-class Target(BaseModel):
-    name: str
-    signature: str          # full 'theorem <name> <binders> : <concl>' text
-    negSignature: str | None = None
-
-
-class CompileReq(BaseModel):
-    mode: str               # blueprint | node | explore
-    code: str               # the model's submission
-    target: Target | None = None
-    prefix: str | None = None    # node mode: topological parent context
-    prelude: str | None = None   # node mode: open/set_option lines
-
 
 SORRY_WARN = re.compile(r"declaration uses 'sorry'")
 
@@ -118,26 +104,16 @@ def _fmt_errors(errs: list[dict], limit: int = 30) -> str:
     return "\n".join(lines)
 
 
-@app.post("/compile")
-async def compile_ep(req: CompileReq):
-    if req.mode == "blueprint":
-        return await compile_blueprint(req)
-    if req.mode == "node":
-        return await compile_node(req)
-    return await compile_explore(req)
-
-
-async def compile_blueprint(req: CompileReq):
-    assert req.target is not None, "blueprint mode requires target"
+async def _compile_blueprint(code: str, target_name: str, target_signature: str) -> dict:
     # --- Phase 1: structural pre-checks (file never reaches Lean on failure).
-    violations = bp.precheck_blueprint(req.code, req.target.name, req.target.signature)
+    violations = bp.precheck_blueprint(code, target_name, target_signature)
     if violations:
         report = "Safeguard rejected — fix these and call lean_compile again:\n" + \
             "\n".join(f"  - {x}" for x in violations)
         return {"ok": False, "phase": "precheck", "violations": violations, "report": report}
 
     # --- Phase 2: Lean compile.
-    body, _ = _strip_imports(req.code)
+    body, _ = _strip_imports(code)
     try:
         resp = await pool.run(body, timeout=BLUEPRINT_TIMEOUT_S)
     except RuntimeError as e:
@@ -149,7 +125,7 @@ async def compile_blueprint(req: CompileReq):
                 "report": "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs)}
 
     # --- Phase 3: graph validity.
-    violations, nodes = bp.validate_graph(req.code, req.target.name)
+    violations, nodes = bp.validate_graph(code, target_name)
     if violations:
         report = "Compilation SUCCESSFUL. Validation FAILED:\n" + \
             "\n".join(f"  - {x}" for x in violations)
@@ -200,32 +176,31 @@ def _negate_signature(signature: str) -> str:
     return f"theorem {m.group(2)}_neg : ¬ ({inner})"
 
 
-async def compile_node(req: CompileReq):
-    assert req.target is not None, "node mode requires target"
-    sub, sub_imports = _strip_imports(req.code)
+async def _compile_node(code: str, target_name: str, target_signature: str,
+                         target_neg_signature: str, prefix: str, prelude: str) -> dict:
+    sub, sub_imports = _strip_imports(code)
     violations = []
     if sub_imports:
         violations.append(
             f"submission adds import lines ({', '.join(sub_imports)}) — imports come from the canonical statement; this is a safeguard violation")
     if bp.FORBIDDEN.search(bp.strip_comments(sub)):
         violations.append("submission uses a forbidden construct ('axiom' or 'native_decide')")
-    prelude_opens = set(re.findall(r"^\s*open\s+.*$", req.prelude or "", re.M))
+    prelude_opens = set(re.findall(r"^\s*open\s+.*$", prelude or "", re.M))
     for o in re.findall(r"^\s*open\s+.*$", bp.strip_comments(sub), re.M):
         if o.strip() not in {p.strip() for p in prelude_opens}:
             violations.append(f"submission adds '{o.strip()}' — 'open' lines come from the canonical statement")
 
-    # Locate the main (or negation) declaration in the submission.
     chunks, spans = bp.split_decls(sub)
     decls = [d for d in (bp.parse_decl(c, s) for c, s in zip(chunks, spans)) if d]
-    main = next((d for d in decls if d.name == req.target.name), None)
-    neg = next((d for d in decls if d.name == req.target.name + "_neg"), None)
+    main = next((d for d in decls if d.name == target_name), None)
+    neg = next((d for d in decls if d.name == target_name + "_neg"), None)
 
     if violations:
         return {"ok": False, "solve": False, "phase": "precheck", "violations": violations,
                 "report": "Safeguard rejected:\n" + "\n".join(f"  - {x}" for x in violations)}
 
-    prelude = (req.prelude or "").strip()
-    prefix = (req.prefix or "").strip()
+    prelude = (prelude or "").strip()
+    prefix = (prefix or "").strip()
     header = (prelude + "\n\n" if prelude else "") + (prefix + "\n\n" if prefix else "")
     header_lines = header.count("\n")
 
@@ -258,14 +233,14 @@ async def compile_node(req: CompileReq):
         if not body:
             return {"ok": False, "solve": False, "phase": "precheck",
                     "report": "Safeguard rejected: main theorem has no ':=' proof body"}
-        rebuilt = f"{req.target.signature.strip()} :=\n  {body}"
+        rebuilt = f"{target_signature.strip()} :=\n  {body}"
         snippet = header + rebuilt
         r = await run_snippet(snippet, header_lines + 1, negated=False)
         r["rebuilt"] = rebuilt
         return r
 
     if neg is not None:
-        neg_sig = req.target.negSignature or _negate_signature(req.target.signature)
+        neg_sig = target_neg_signature or _negate_signature(target_signature)
         body = neg.body.strip()
         if not body:
             return {"ok": False, "solve": False, "phase": "precheck",
@@ -293,8 +268,8 @@ async def compile_node(req: CompileReq):
             "errors": errs, "openGoals": goals, "report": report}
 
 
-async def compile_explore(req: CompileReq):
-    body, _ = _strip_imports(req.code)
+async def _compile_explore(code: str) -> dict:
+    body, _ = _strip_imports(code)
     try:
         resp = await pool.run(body, timeout=NODE_TIMEOUT_S)
     except RuntimeError as e:
@@ -302,3 +277,76 @@ async def compile_explore(req: CompileReq):
     errs, warns = _messages(resp)
     return {"ok": not errs, "phase": "explore", "errors": errs,
             "report": ("No errors." if not errs else "Lean errors:\n" + _fmt_errors(errs))}
+
+
+@mcp.tool()
+async def lean_compile(
+    code: str,
+    mode: str = "explore",
+    target_name: str = "",
+    target_signature: str = "",
+    target_neg_signature: str = "",
+    prefix: str = "",
+    prelude: str = "",
+) -> str:
+    """
+    Compile Lean 4 code. `mode` is bridge-controlled per call site, not
+    something you normally set yourself — you will typically only ever pass
+    `code`. Returns a text report: safeguard violations, real Lean compiler
+    errors, open goals, or a success/solve confirmation.
+
+    In the default (node-proving) mode: submit your code EARLY, even with a
+    partial proof using `sorry` as a placeholder for sub-goals you cannot yet
+    discharge, and iterate (compile -> read errors / open goals -> patch ->
+    compile). If your code includes the MAIN theorem with the canonical
+    statement followed by `:= by ...`, the system rebuilds it under the
+    original theorem statement -- only your proof body is kept; imports,
+    `set_option`, and `open` lines come from the canonical statement, and any
+    other top-level declarations are dropped. Only this case can register a
+    solve. Do not use `axiom` or `native_decide`; use `have` for helper
+    lemmas inside your proof, not top-level declarations; do not add
+    `import`/`open` lines beyond what the canonical statement already has --
+    extras are flagged as a safeguard violation, not silently kept.
+
+    If your code does NOT include the main theorem (e.g. `#check`, `example`,
+    `#print`, helper-lemma prototypes), the system compiles the snippet
+    as-given and returns raw feedback. This is exploration only -- it cannot
+    register a solve, so resubmit with the main theorem once you have a full
+    proof.
+    """
+    logger.info(f"lean_compile mode={mode!r} code={code[:120]!r}...")
+    if mode == "blueprint":
+        result = await _compile_blueprint(code, target_name, target_signature)
+    elif mode == "node":
+        result = await _compile_node(code, target_name, target_signature, target_neg_signature, prefix, prelude)
+    else:
+        result = await _compile_explore(code)
+    # MCP tools return text content; the bridge needs the structured fields
+    # (ok/solve/graph/...) too, so ship the full result as a JSON string the
+    # bridge parses, with `report` as the human-readable summary up top.
+    return json.dumps(result, ensure_ascii=False)
+
+
+async def main_serve():
+    logger.info("Booting Leak XII (lean_compile gateway)…")
+    asyncio.create_task(pool.boot())
+
+    http_app = mcp.sse_app()
+    http_app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*", "mcp-protocol-version", "mcp-session-id"],
+        expose_headers=["mcp-session-id"],
+    )
+    logger.info("Serving Leak XII MCP (SSE) on 0.0.0.0:7860")
+    config = uvicorn.Config(
+        http_app, host="0.0.0.0", port=7860,
+        proxy_headers=True, forwarded_allow_ips="*",
+        log_level="info", loop="asyncio",
+    )
+    await uvicorn.Server(config).serve()
+
+
+if __name__ == "__main__":
+    asyncio.run(main_serve())

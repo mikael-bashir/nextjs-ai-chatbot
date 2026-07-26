@@ -3502,17 +3502,24 @@ const ARCHITECT_MODEL_LADDER = [
   "grok-3-mini",
 ]
 const ARCHITECT_BLUEPRINT_TOKENS = 262144
-const ARCHITECT_NODE_TOKENS = 65536
+// The UI's wall clock (default 5 min for this strategy — see
+// ARCHITECT_COMPUTE_BUDGET_MS in admin-pipeline.tsx) is now the ONLY governor
+// that's meant to actually bind on a normal run; every ceiling below is sized
+// so it never truncates a node/blueprint attempt before the deadline does.
+const ARCHITECT_NODE_TOKENS = 131072
 // MCP tools/call timeouts — match the Python services' own defaults
 // (BLUEPRINT_TIMEOUT_S/NODE_TIMEOUT_S/VERIFY_TIMEOUT_S).
 const BLUEPRINT_TIMEOUT_MS = 600000
 const NODE_TIMEOUT_MS = 300000
 const VERIFY_TIMEOUT_MS = 600000
 const ARCHITECT_BLUEPRINT_RETRIES = 8
-const ARCHITECT_NODE_RETRIES = 4
+const ARCHITECT_NODE_RETRIES = 6
 const ARCHITECT_REFINE_RETRIES = 8
 const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 8)
-const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 2)
+// Higher than the other decomposition paths' defaults: with a short wall
+// clock, more parallel node attempts is what actually buys more coverage per
+// minute (deadlinePassed() still cuts every stage off the instant time is up).
+const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 4)
 
 // Resolve XI/XII/XIV the SAME way every other Leak server is discovered in
 // this app: by NAME, from the servers the operator registered in the
@@ -3672,6 +3679,7 @@ async function grokCall(state, messages, tools, ctx) {
     if (resp.status === 429 || resp.status >= 500) {
       if (attempt < 5) {
         const ra = Number(resp.headers.get("retry-after")) || 2 ** attempt
+        ctx.emit?.({ type: "message-annotation", subtype: "status", thought: `⏳ xAI ${resp.status} — retrying in ${Math.min(ra, 30)}s (attempt ${attempt + 1}/5).` })
         await new Promise((r) => setTimeout(r, Math.min(ra, 30) * 1000))
         continue
       }
@@ -3685,6 +3693,7 @@ async function grokCall(state, messages, tools, ctx) {
         const idx = ARCHITECT_MODEL_LADDER.indexOf(state.model)
         const next = ARCHITECT_MODEL_LADDER[idx + 1]
         if (next) {
+          ctx.emit?.({ type: "message-annotation", subtype: "status", thought: `↩︎ Model ${state.model} rejected (${msg}) — falling back to ${next}.` })
           state.model = next
           continue
         }
@@ -3697,8 +3706,13 @@ async function grokCall(state, messages, tools, ctx) {
     state.usage.cached += Number(usage.prompt_tokens_details?.cached_tokens) || 0
     state.stageTokens += Number(usage.total_tokens) || 0
     ctx.metrics.llm_invocations += 1
+    // NOTE: field is `cost_usd` (snake_case) to match every other strategy's
+    // convention (see the CLI paths' `metrics.cost_usd` above) — the client
+    // (run-prover-stream.ts) only ever reads that exact key. `state.usage` is
+    // already cumulative across the whole run, so this is an assignment, not
+    // an accumulation.
     const p = /4\.3|4-3/.test(state.model) ? { i: 1.25, o: 2.5, c: 0.2 } : { i: 0.2, o: 0.5, c: 0.05 }
-    ctx.metrics.costUsd = Number((
+    ctx.metrics.cost_usd = Number((
       ((state.usage.prompt - state.usage.cached) * p.i +
         state.usage.cached * p.c +
         state.usage.completion * p.o) / 1e6
@@ -3736,13 +3750,22 @@ const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal with
 ## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
 ## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
 
-async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt }) {
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "" }) {
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
   ]
   state.stageTokens = 0
   let finalText = ""
+  const tag = label ? `[${label}] ` : ""
+
+  // Full context this conversation opens with — every dialogue the operator
+  // watches gets its own expandable "system" row before any turns happen, so
+  // the exact SYSTEM + USER text handed to Grok is always inspectable live.
+  ctx.emit({
+    type: "system",
+    detail: `${tag}Grok context opened (${state.model})\n\n--- SYSTEM ---\n${system}\n\n--- USER ---\n${user}`,
+  })
 
   // Fires ONLY on genuine exhaustion (token budget / deadline / turn cap) —
   // never on a voluntary early stop, and never available to the model until
@@ -3750,10 +3773,14 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
   const forceForfeit = async () => {
     if (!forfeitPrompt) return finalText
     messages.push({ role: "user", content: forfeitPrompt })
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Budget exhausted — requesting a structured forfeit.` })
     try {
       const msg = await grokCall(state, messages, [], ctx)
-      return String(msg.content || "") || finalText
-    } catch {
+      const text = String(msg.content || "") || finalText
+      if (text.trim()) ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${text}` })
+      return text
+    } catch (e) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `${tag}Forfeit request failed: ${String(e?.message || e)}` })
       return finalText
     }
   }
@@ -3761,9 +3788,17 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
   for (let turn = 0; turn < hardTurns; turn++) {
     if (state.stageTokens >= tokenBudget) return { finalText: await forceForfeit(), exhausted: true }
     if (deadlinePassed(ctx)) return { finalText: await forceForfeit(), exhausted: true }
-    const msg = await grokCall(state, messages, tools, ctx)
+    let msg
+    try {
+      msg = await grokCall(state, messages, tools, ctx)
+    } catch (e) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `${tag}Grok call failed (turn ${turn + 1}): ${String(e?.message || e)}` })
+      throw e
+    }
     const toolCalls = msg.tool_calls || []
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls.length ? toolCalls : undefined })
+    if (msg.content && msg.content.trim())
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${msg.content.trim()}` })
     if (!toolCalls.length) {
       finalText = String(msg.content || "")
       return { finalText, exhausted: false }
@@ -3774,17 +3809,28 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         args = JSON.parse(tc.function?.arguments || "{}")
       } catch {}
       ctx.metrics.tools_invoked += 1
+      const toolName = tc.function?.name || "tool"
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "tool_intent",
+        thought: `${tag}Using ${toolName}`,
+        tool: toolName,
+        input: JSON.stringify(args, null, 2),
+      })
       let out
       try {
-        out = await exec(tc.function?.name, args)
+        out = await exec(toolName, args)
       } catch (e) {
         out = { report: `tool error: ${String(e?.message || e)}` }
       }
-      messages.push({ role: "tool", tool_call_id: tc.id, content: String(out.report ?? JSON.stringify(out)).slice(0, 24000) })
+      const outText = String(out.report ?? JSON.stringify(out))
+      ctx.emit({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
+      messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
       if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
     }
     architectCompact(messages)
   }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}⛔ Hard turn cap (${hardTurns}) reached.` })
   return { finalText: await forceForfeit(), exhausted: true }
 }
 
@@ -4131,6 +4177,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       exec,
       tokenBudget: ARCHITECT_NODE_TOKENS,
       forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
+      label: `node ⟪${node.name}⟫ · attempt ${attempt + 1}/${ARCHITECT_NODE_RETRIES}`,
     })
     if (out.done) {
       result.solved = !out.done.negated
@@ -4150,7 +4197,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
 }
 
 // --- Blueprint / refinement conversation (shared shape) ----------------------
-async function architectBlueprintStage(ctx, state, urls, { system, user, retries }) {
+async function architectBlueprintStage(ctx, state, urls, { system, user, retries, stageLabel = "blueprint" }) {
   let lastReport = ""
   for (let attempt = 0; attempt < retries; attempt++) {
     if (deadlinePassed(ctx) || ctx.signal?.aborted) return null
@@ -4183,6 +4230,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
+      label: `${stageLabel} · attempt ${attempt + 1}/${retries}`,
     })
     if (out.done) return out.done
   }
@@ -4214,6 +4262,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     system: architectBlueprintSystem(),
     user: bpUser,
     retries: ARCHITECT_BLUEPRINT_RETRIES,
+    stageLabel: "blueprint generation",
   })
   if (!bp) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: no compiling blueprint within the retry budget." })
@@ -4311,6 +4360,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       system: architectRefineSystem(),
       user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,
       retries: ARCHITECT_REFINE_RETRIES,
+      stageLabel: `refinement ${iter + 1}/${ARCHITECT_MAX_ITERS}`,
     })
     if (!refined) {
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Refinement failed to produce a validated revised blueprint." })
