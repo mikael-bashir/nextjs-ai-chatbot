@@ -3876,8 +3876,23 @@ const ARCHITECT_SEARCH_TOOL = {
 // concurrent in-flight calls on it).
 // ---------------------------------------------------------------------------
 class McpSseClient {
-  constructor(baseUrl) {
-    this.baseUrl = baseUrl.replace(/\/$/, "")
+  constructor(sseUrl) {
+    // Registered MCP servers (findRegisteredUrl, above) store the FULL SSE
+    // endpoint — exactly the URL callRemoteMcpTool fetches as-is with no
+    // appending, same convention Leak I/II/IV already use. This class used to
+    // treat its argument as a bare origin and append "/sse" itself, which
+    // turned an already-complete ".../sse" URL into ".../sse/sse" — a path
+    // that never existed, 404ing every single connect. `origin` is derived
+    // separately (like callRemoteMcpTool's `base`/`origin` split) purely to
+    // resolve the server's `endpoint` event, which is relative to the origin,
+    // not to the /sse path.
+    this.sseUrl = sseUrl.replace(/\/$/, "")
+    try {
+      const u = new URL(this.sseUrl)
+      this.origin = `${u.protocol}//${u.host}`
+    } catch {
+      this.origin = this.sseUrl
+    }
     this.messageUrl = null
     this.nextId = 1
     this.pending = new Map() // id -> {resolve, reject}
@@ -3901,15 +3916,15 @@ class McpSseClient {
   }
 
   async _connect() {
-    const resp = await fetch(`${this.baseUrl}/sse`, { headers: { accept: "text/event-stream" } })
-    if (!resp.ok || !resp.body) throw new Error(`MCP SSE connect to ${this.baseUrl} → HTTP ${resp.status}`)
+    const resp = await fetch(this.sseUrl, { headers: { accept: "text/event-stream" } })
+    if (!resp.ok || !resp.body) throw new Error(`MCP SSE connect to ${this.sseUrl} → HTTP ${resp.status}`)
     const endpointReady = new Promise((resolve, reject) => {
       this._resolveEndpoint = resolve
       this._rejectEndpoint = reject
     })
     this._pump(resp.body) // fire-and-forget: feeds endpointReady + this.pending as frames arrive
     const timeout = new Promise((_, rej) =>
-      setTimeout(() => rej(new Error(`MCP SSE handshake with ${this.baseUrl} timed out (Space asleep? first request can take 1-2min to wake it)`)), 120000),
+      setTimeout(() => rej(new Error(`MCP SSE handshake with ${this.sseUrl} timed out (Space asleep? first request can take 1-2min to wake it)`)), 120000),
     )
     this.messageUrl = await Promise.race([endpointReady, timeout])
 
@@ -3918,7 +3933,7 @@ class McpSseClient {
       jsonrpc: "2.0", id: initId, method: "initialize",
       params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "leak-architect-bridge", version: "1.0" } },
     }, initId, 30000)
-    if (initResp.error) throw new Error(`MCP initialize with ${this.baseUrl} failed: ${JSON.stringify(initResp.error)}`)
+    if (initResp.error) throw new Error(`MCP initialize with ${this.sseUrl} failed: ${JSON.stringify(initResp.error)}`)
     await this._notify({ jsonrpc: "2.0", method: "notifications/initialized" })
   }
 
@@ -3959,7 +3974,15 @@ class McpSseClient {
     }
     if (!data) return
     if (event === "endpoint") {
-      const url = /^https?:\/\//.test(data) ? data : `${this.baseUrl}${data.startsWith("/") ? "" : "/"}${data}`
+      // Relative to the ORIGIN (matching callRemoteMcpTool's proven pattern),
+      // never to this.sseUrl — the server's `endpoint` data is always
+      // origin-relative (e.g. "/messages/?session_id=...").
+      let url
+      try {
+        url = new URL(data, this.origin).toString()
+      } catch {
+        url = this.origin + data
+      }
       if (this._resolveEndpoint) { this._resolveEndpoint(url); this._resolveEndpoint = null }
       return
     }
