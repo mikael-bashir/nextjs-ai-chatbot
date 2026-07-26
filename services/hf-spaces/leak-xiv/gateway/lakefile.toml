@@ -4,9 +4,11 @@
 #
 # Toolchain: leanprover/lean4:v4.32.0 — pinned to LeanArchitect's own pin
 # (github.com/hanwenzhu/LeanArchitect @ lean-toolchain), with the matching
-# Mathlib release tag. Mathlib is required FIRST so its transitive pins
-# (batteries, Cli, aesop, …) win dependency resolution; LeanArchitect's own
-# batteries/Cli requires are version-compatible (v4.32.0 tags).
+# Mathlib release tag. Mathlib is required LAST: in Lake resolution the last
+# require's transitive pins (batteries, Cli, aesop, …) take precedence, and
+# Mathlib's pins MUST win or its post-update cache hook computes wrong hashes
+# and `lake update` itself fails ("mathlib: failed to fetch cache").
+# LeanArchitect builds fine against Mathlib's batteries/Cli (v4.32.0-line).
 name = "gateway"
 defaultTargets = ["Gateway"]
 
@@ -14,11 +16,11 @@ defaultTargets = ["Gateway"]
 name = "Gateway"
 
 [[require]]
-name = "mathlib"
-git = "https://github.com/leanprover-community/mathlib4"
-rev = "v4.32.0"
-
-[[require]]
 name = "LeanArchitect"
 git = "https://github.com/hanwenzhu/LeanArchitect"
 rev = "main"
+
+[[require]]
+name = "mathlib"
+git = "https://github.com/leanprover-community/mathlib4"
+rev = "v4.32.0"
