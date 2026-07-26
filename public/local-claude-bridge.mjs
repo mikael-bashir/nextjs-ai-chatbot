@@ -3503,6 +3503,11 @@ const ARCHITECT_MODEL_LADDER = [
 ]
 const ARCHITECT_BLUEPRINT_TOKENS = 262144
 const ARCHITECT_NODE_TOKENS = 65536
+// MCP tools/call timeouts — match the Python services' own defaults
+// (BLUEPRINT_TIMEOUT_S/NODE_TIMEOUT_S/VERIFY_TIMEOUT_S).
+const BLUEPRINT_TIMEOUT_MS = 600000
+const NODE_TIMEOUT_MS = 300000
+const VERIFY_TIMEOUT_MS = 600000
 const ARCHITECT_BLUEPRINT_RETRIES = 8
 const ARCHITECT_NODE_RETRIES = 4
 const ARCHITECT_REFINE_RETRIES = 8
@@ -3811,27 +3816,165 @@ const ARCHITECT_SEARCH_TOOL = {
   },
 }
 
-async function architectFetch(url, path, payload, signal) {
-  // Shared-secret header, when the Leak services were started with
-  // LEAK_SERVICE_TOKEN set (they compile arbitrary Lean, so an internet-
-  // reachable port should never be left unauthenticated).
-  const tok = process.env.LEAK_SERVICE_TOKEN || ""
-  const resp = await fetch(url.replace(/\/$/, "") + path, {
-    method: "POST",
-    headers: { "content-type": "application/json", ...(tok ? { authorization: `Bearer ${tok}` } : {}) },
-    body: JSON.stringify(payload),
-    signal,
-  })
-  if (!resp.ok) throw new Error(`${path} → HTTP ${resp.status}`)
-  return resp.json()
+// ---------------------------------------------------------------------------
+// Minimal hand-rolled MCP client (SSE transport). XI/XII/XIV are real
+// FastMCP servers now (mcp.server.fastmcp, matching every other Leak
+// server's wrapper architecture) rather than a bespoke REST API, so the
+// app's own "Add Server" UI can register and live-handshake against them
+// like any other Leak server. No npm dependency added (the bridge stays a
+// zero-install script) -- this IS the whole client: open the SSE stream,
+// read the `endpoint` event for where to POST JSON-RPC, do the `initialize`
+// handshake, then match tools/call responses back to their request by id.
+// One client per server URL, reused for the whole bridge process lifetime
+// (concurrent node provers share one session; JSON-RPC ids disambiguate
+// concurrent in-flight calls on it).
+// ---------------------------------------------------------------------------
+class McpSseClient {
+  constructor(baseUrl) {
+    this.baseUrl = baseUrl.replace(/\/$/, "")
+    this.messageUrl = null
+    this.nextId = 1
+    this.pending = new Map() // id -> {resolve, reject}
+    this.readyPromise = null
+  }
+
+  async connect() {
+    if (!this.readyPromise) this.readyPromise = this._connect()
+    return this.readyPromise
+  }
+
+  async _connect() {
+    const resp = await fetch(`${this.baseUrl}/sse`, { headers: { accept: "text/event-stream" } })
+    if (!resp.ok || !resp.body) throw new Error(`MCP SSE connect to ${this.baseUrl} → HTTP ${resp.status}`)
+    const endpointReady = new Promise((resolve, reject) => {
+      this._resolveEndpoint = resolve
+      this._rejectEndpoint = reject
+    })
+    this._pump(resp.body) // fire-and-forget: feeds endpointReady + this.pending as frames arrive
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`MCP SSE handshake with ${this.baseUrl} timed out (Space asleep? first request can take 1-2min to wake it)`)), 120000),
+    )
+    this.messageUrl = await Promise.race([endpointReady, timeout])
+
+    const initId = this.nextId++
+    const initResp = await this._rpc({
+      jsonrpc: "2.0", id: initId, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "leak-architect-bridge", version: "1.0" } },
+    }, initId, 30000)
+    if (initResp.error) throw new Error(`MCP initialize with ${this.baseUrl} failed: ${JSON.stringify(initResp.error)}`)
+    await this._notify({ jsonrpc: "2.0", method: "notifications/initialized" })
+  }
+
+  async _pump(body) {
+    const reader = body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ""
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        // Servers vary between LF and CRLF frame delimiters (Leak-I's own
+        // FastMCP server uses \r\n\r\n) — normalize before splitting so
+        // frame detection isn't silently blind to CRLF-terminated streams.
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+        let idx
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          this._handleFrame(frame)
+        }
+      }
+      throw new Error("MCP SSE stream closed by server")
+    } catch (e) {
+      if (this._rejectEndpoint) { this._rejectEndpoint(e); this._rejectEndpoint = null }
+      for (const { reject } of this.pending.values()) reject(e)
+      this.pending.clear()
+      this.readyPromise = null // allow a future connect() to retry
+    }
+  }
+
+  _handleFrame(frame) {
+    let event = "message"
+    let data = ""
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim()
+      else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trim()
+    }
+    if (!data) return
+    if (event === "endpoint") {
+      const url = /^https?:\/\//.test(data) ? data : `${this.baseUrl}${data.startsWith("/") ? "" : "/"}${data}`
+      if (this._resolveEndpoint) { this._resolveEndpoint(url); this._resolveEndpoint = null }
+      return
+    }
+    let obj
+    try { obj = JSON.parse(data) } catch { return }
+    if (obj.id != null && this.pending.has(obj.id)) {
+      const { resolve } = this.pending.get(obj.id)
+      this.pending.delete(obj.id)
+      resolve(obj)
+    }
+  }
+
+  async _notify(payload) {
+    const resp = await fetch(this.messageUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) throw new Error(`MCP notify POST → HTTP ${resp.status}`)
+  }
+
+  async _rpc(payload, id, timeoutMs) {
+    const waitPromise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }))
+    const resp = await fetch(this.messageUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) { this.pending.delete(id); throw new Error(`MCP RPC POST → HTTP ${resp.status}`) }
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => { this.pending.delete(id); rej(new Error(`MCP call timed out after ${timeoutMs}ms`)) }, timeoutMs),
+    )
+    return Promise.race([waitPromise, timeout])
+  }
+
+  async callTool(name, args, timeoutMs = 300000) {
+    await this.connect()
+    const id = this.nextId++
+    const rpcResp = await this._rpc(
+      { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } },
+      id, timeoutMs,
+    )
+    if (rpcResp.error) throw new Error(`MCP tool '${name}' error: ${rpcResp.error.message || JSON.stringify(rpcResp.error)}`)
+    const content = rpcResp.result?.content || []
+    return content.filter((c) => c.type === "text").map((c) => c.text).join("\n")
+  }
 }
 
-function architectSearchReport(json) {
-  const rs = json?.results || []
-  if (!rs.length) return { report: "No Mathlib declarations matched. Try different keywords, or compile `example : <goal> := by exact?` instead." }
-  return {
-    report: rs.map((r) => `${r.kind} ${r.name} : ${r.signature}${r.docstring ? `\n    -- ${r.docstring}` : ""}`).join("\n"),
+const MCP_CLIENTS = new Map() // baseUrl -> McpSseClient, reused for the process lifetime
+function getMcpClient(baseUrl) {
+  if (!MCP_CLIENTS.has(baseUrl)) MCP_CLIENTS.set(baseUrl, new McpSseClient(baseUrl))
+  return MCP_CLIENTS.get(baseUrl)
+}
+
+// lean_compile / verify_full_script return a JSON string as their MCP text
+// content (mirroring the {ok, report, graph, ...} shape the old REST version
+// returned directly) -- parse it back into an object.
+async function architectMcpCall(url, toolName, args, timeoutMs) {
+  const text = await getMcpClient(url).callTool(toolName, args, timeoutMs)
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { ok: false, report: text }
   }
+}
+
+// mathlib_search's tool already returns fully-formatted, citeable text
+// server-side (matching Leak-I's own moogle_search/loogle_search pattern) --
+// no client-side JSON parsing/formatting needed, just pass it through.
+async function architectSearchCall(url, query, k, timeoutMs) {
+  const text = await getMcpClient(url).callTool("mathlib_search", { query, k }, timeoutMs)
+  return { report: text }
 }
 
 // Prelude = open/set_option lines between the imports and the first decl.
@@ -3959,16 +4102,18 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
     const exec = async (name, args) => {
       if (name === "mathlib_search") {
         if (!urls.xi) return { report: "mathlib_search is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback." }
-        return architectSearchReport(await architectFetch(urls.xi, "/search", { query: String(args.query || ""), k: Number(args.k) || 12 }, ctx.signal))
+        return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
       }
       if (name === "lean_compile") {
-        const r = await architectFetch(urls.xii, "/compile", {
+        const r = await architectMcpCall(urls.xii, "lean_compile", {
           mode: "node",
           code: String(args.code || ""),
-          target: { name: node.name, signature: node.signature, negSignature: negSig },
+          target_name: node.name,
+          target_signature: node.signature,
+          target_neg_signature: negSig || "",
           prefix,
           prelude,
-        }, ctx.signal)
+        }, Number(NODE_TIMEOUT_MS))
         if (r.solve) {
           // Extract the rebuilt body (everything after the first ':=').
           const rebuilt = String(r.rebuilt || "")
@@ -4013,14 +4158,15 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
     const exec = async (name, args) => {
       if (name === "mathlib_search") {
         if (!urls.xi) return { report: "mathlib_search is unavailable; proceed from Mathlib knowledge." }
-        return architectSearchReport(await architectFetch(urls.xi, "/search", { query: String(args.query || ""), k: Number(args.k) || 12 }, ctx.signal))
+        return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
       }
       if (name === "lean_compile") {
-        const r = await architectFetch(urls.xii, "/compile", {
+        const r = await architectMcpCall(urls.xii, "lean_compile", {
           mode: "blueprint",
           code: String(args.code || ""),
-          target: { name: state.targetName, signature: state.targetSignature },
-        }, ctx.signal)
+          target_name: state.targetName,
+          target_signature: state.targetSignature,
+        }, Number(BLUEPRINT_TIMEOUT_MS))
         lastReport = String(r.report || "").slice(0, 1200)
         if (r.ok) {
           captured = { graph: r.graph, code: String(args.code || "") }
@@ -4121,11 +4267,11 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       const finalCode = architectAssemble(graph, prelude, proofs)
       let cert
       try {
-        cert = await architectFetch(urls.xiv, "/verify", {
+        cert = await architectMcpCall(urls.xiv, "verify_full_script", {
           code: finalCode,
-          targetName: state.targetName,
-          targetSignature: state.targetSignature,
-        }, ctx.signal)
+          target_name: state.targetName,
+          target_signature: state.targetSignature,
+        }, Number(VERIFY_TIMEOUT_MS))
       } catch (e) {
         cert = { ok: false, report: String(e?.message || e) }
       }

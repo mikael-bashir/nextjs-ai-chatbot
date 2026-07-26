@@ -9,11 +9,13 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# Pull XAI_API_KEY / LEAK_SERVICE_TOKEN (and anything else) from .env.
+# Pull XAI_API_KEY (and anything else) from .env.
 set -a; source .env; set +a
 
 : "${XAI_API_KEY:?XAI_API_KEY missing from .env}"
-: "${LEAK_SERVICE_TOKEN:?LEAK_SERVICE_TOKEN missing from .env}"
+# LEAK_SERVICE_TOKEN is no longer required: XI/XII/XIV are now real FastMCP
+# servers matching Leak-I/II's own security model exactly (an unguessable
+# Space URL, no auth layer) rather than a bespoke bearer-token gate.
 
 # Fallback only. The bridge resolves XI/XII/XIV by NAME from whatever MCP
 # servers you've registered in the app's own MCP Servers UI first (register
