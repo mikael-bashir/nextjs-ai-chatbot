@@ -5,7 +5,7 @@ import { sql as vercelSql } from '@vercel/postgres';
 import { drizzle } from 'drizzle-orm/vercel-postgres';
 
 import { mcpServers, user } from '@/lib/db/schema';
-import { ADMIN_EMAIL } from '@/lib/admin';
+import { PRIMARY_ADMIN_EMAIL } from '@/lib/admin';
 
 const db = drizzle(vercelSql, { schema: { mcpServers, user } });
 
@@ -45,7 +45,7 @@ export async function getProverMcpServers(): Promise<ProverMcpServer[]> {
   const [admin] = await db
     .select({ id: user.id })
     .from(user)
-    .where(eq(user.email, ADMIN_EMAIL))
+    .where(eq(user.email, PRIMARY_ADMIN_EMAIL))
     .limit(1);
   if (!admin) return [];
 
