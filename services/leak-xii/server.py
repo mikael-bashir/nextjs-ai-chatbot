@@ -31,6 +31,7 @@ import sys
 sys.path.insert(0, os.environ.get("SHARED_DIR", "/opt/shared"))
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 import blueprint as bp
@@ -40,6 +41,22 @@ BLUEPRINT_TIMEOUT_S = float(os.environ.get("BLUEPRINT_TIMEOUT_S", "600"))
 NODE_TIMEOUT_S = float(os.environ.get("NODE_TIMEOUT_S", "300"))
 
 app = FastAPI(title="Leak XII", version="1.0")
+
+# Optional shared-secret gate. When LEAK_SERVICE_TOKEN is set, every request
+# except /health must carry `Authorization: Bearer <token>`. These services
+# compile arbitrary Lean, which can perform IO at elaboration time — so an
+# open port without this is an unauthenticated code-execution surface.
+SERVICE_TOKEN = os.environ.get("LEAK_SERVICE_TOKEN", "")
+
+
+@app.middleware("http")
+async def _require_token(request, call_next):
+    if SERVICE_TOKEN and request.url.path != "/health":
+        if request.headers.get("authorization", "") != f"Bearer {SERVICE_TOKEN}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
 pool = ReplPool()
 
 

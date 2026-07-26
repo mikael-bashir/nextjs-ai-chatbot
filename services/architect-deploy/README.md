@@ -44,9 +44,18 @@ lazy one in XIV, 8 GB swap. On a bigger PAYG shape set `XII_POOL_SIZE=2`–`3`
 and raise `ARCHITECT_NODE_CONCURRENCY` on the bridge to match.
 
 **Also open ports 8011/8012/8014 in the subnet Security List** (OCI console →
-VCN → Security Lists → Ingress, source `0.0.0.0/0`, TCP). The VM-local
-firewall (iptables or firewalld) is handled by `bootstrap.sh`. Nothing
-reaches the box until *both* are open.
+VCN → Security Lists → Default Security List → Add Ingress Rules, TCP). The
+VM-local firewall is handled by `bootstrap.sh`; nothing reaches the box until
+*both* layers are open.
+
+> **Scope the source CIDR.** These services compile arbitrary Lean, and Lean
+> can perform IO at elaboration time — an open, unauthenticated port here is
+> a remote-code-execution surface. Two defences, use both:
+> 1. Set the ingress **Source CIDR to your own public IP** (`curl ifconfig.me`
+>    on your laptop, then `x.x.x.x/32`) rather than `0.0.0.0/0`.
+> 2. `bootstrap.sh` generates a `LEAK_SERVICE_TOKEN` into `.env` and prints
+>    it; every request except `/health` must then carry
+>    `Authorization: Bearer <token>`. Pass the same value to the bridge.
 
 ### Known Oracle gotchas
 
@@ -67,6 +76,7 @@ xAI API directly (no Claude CLI on this path). Start the bridge with:
 
 ```sh
 XAI_API_KEY='<your xai key>' \
+LEAK_SERVICE_TOKEN='<printed by bootstrap.sh>' \
 LEAK_XI_URL='http://<vm-ip>:8011' \
 LEAK_XII_URL='http://<vm-ip>:8012' \
 LEAK_XIV_URL='http://<vm-ip>:8014' \

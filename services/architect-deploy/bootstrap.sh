@@ -85,6 +85,18 @@ else
   fi
 fi
 
+echo "== [3.5/5] service token =="
+# These services compile arbitrary Lean (which can do IO at elaboration time),
+# so they must not sit on an open port unauthenticated. Generate a shared
+# secret once into .env; compose passes it to all three, and the bridge sends
+# it as `Authorization: Bearer <token>`.
+if [ ! -f .env ]; then
+  echo "LEAK_SERVICE_TOKEN=$(openssl rand -hex 24)" > .env
+  chmod 600 .env
+fi
+grep -q '^LEAK_SERVICE_TOKEN=' .env || echo "LEAK_SERVICE_TOKEN=$(openssl rand -hex 24)" >> .env
+TOKEN=$(grep '^LEAK_SERVICE_TOKEN=' .env | cut -d= -f2-)
+
 echo "== [4/5] build shared Lean base (slow, once) =="
 sudo docker build -t leak-lean-base ../leak-lean-base
 
@@ -101,6 +113,7 @@ done
 IP=$(curl -fsS ifconfig.me 2>/dev/null || echo "<vm-ip>")
 echo
 echo "Done. On your laptop, start the bridge with:"
+echo "  LEAK_SERVICE_TOKEN=${TOKEN}"
 echo "  LEAK_XI_URL=http://${IP}:8011"
 echo "  LEAK_XII_URL=http://${IP}:8012"
 echo "  LEAK_XIV_URL=http://${IP}:8014"

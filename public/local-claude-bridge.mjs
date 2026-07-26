@@ -3759,9 +3759,13 @@ const ARCHITECT_SEARCH_TOOL = {
 }
 
 async function architectFetch(url, path, payload, signal) {
+  // Shared-secret header, when the Leak services were started with
+  // LEAK_SERVICE_TOKEN set (they compile arbitrary Lean, so an internet-
+  // reachable port should never be left unauthenticated).
+  const tok = process.env.LEAK_SERVICE_TOKEN || ""
   const resp = await fetch(url.replace(/\/$/, "") + path, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(tok ? { authorization: `Bearer ${tok}` } : {}) },
     body: JSON.stringify(payload),
     signal,
   })

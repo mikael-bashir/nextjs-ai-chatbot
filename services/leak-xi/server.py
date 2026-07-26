@@ -16,11 +16,28 @@ import re
 import sqlite3
 
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 DB_PATH = os.environ.get("DB_PATH", "/opt/index/mathlib.db")
 
 app = FastAPI(title="Leak XI", version="1.0")
+
+# Optional shared-secret gate. When LEAK_SERVICE_TOKEN is set, every request
+# except /health must carry `Authorization: Bearer <token>`. These services
+# compile arbitrary Lean, which can perform IO at elaboration time — so an
+# open port without this is an unauthenticated code-execution surface.
+SERVICE_TOKEN = os.environ.get("LEAK_SERVICE_TOKEN", "")
+
+
+@app.middleware("http")
+async def _require_token(request, call_next):
+    if SERVICE_TOKEN and request.url.path != "/health":
+        if request.headers.get("authorization", "") != f"Bearer {SERVICE_TOKEN}":
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
 con = sqlite3.connect(DB_PATH, check_same_thread=False)
 con.row_factory = sqlite3.Row
 

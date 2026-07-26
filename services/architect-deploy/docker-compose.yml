@@ -21,6 +21,8 @@ services:
     restart: unless-stopped
     ports:
       - "8011:8011"
+    environment:
+      LEAK_SERVICE_TOKEN: "${LEAK_SERVICE_TOKEN:-}"
     mem_limit: 768m
 
   leak-xii:
@@ -29,6 +31,7 @@ services:
     ports:
       - "8012:8012"
     environment:
+      LEAK_SERVICE_TOKEN: "${LEAK_SERVICE_TOKEN:-}"
       POOL_SIZE: "${XII_POOL_SIZE:-1}"
       BLUEPRINT_TIMEOUT_S: "600"
       NODE_TIMEOUT_S: "300"
@@ -40,6 +43,7 @@ services:
     ports:
       - "8014:8014"
     environment:
+      LEAK_SERVICE_TOKEN: "${LEAK_SERVICE_TOKEN:-}"
       POOL_SIZE: "1"
       LAZY: "1"
       IDLE_SHUTDOWN_S: "900"
