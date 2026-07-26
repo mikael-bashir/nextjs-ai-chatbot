@@ -212,6 +212,7 @@ export function ProverPlayground() {
               <option value="brute">Brute (automation only)</option>
               <option value="have">Have (in-context, no top-level lemmas)</option>
               <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
+              <option value="architect">Architect (Goedel blueprint · grok driver · Leak XI/XII/XIV)</option>
             </select>
           </label>
         )}

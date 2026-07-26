@@ -34,6 +34,7 @@ const STRATEGIES: { value: string; label: string }[] = [
   { value: 'brute', label: 'Brute (automation only)' },
   { value: 'have', label: 'Have (in-context, no top-level lemmas)' },
   { value: 'have-tree', label: 'Have-tree (isolated per-hole minions)' },
+  { value: 'architect', label: 'Architect (Goedel blueprint · grok driver)' },
 ];
 
 // Detect Claude's usage/session-limit message so the loop pauses (never scores

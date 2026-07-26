@@ -1848,6 +1848,17 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have-tree",
   },
+  // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
+  // isolated node provers -> global blueprint refinement, on the real
+  // LeanArchitect toolchain via Leak XI/XII/XIV. Driven by Grok (xAI API),
+  // not the Claude CLI — see proveArchitect.
+  architect: {
+    label: "Architect — Goedel blueprint pipeline (grok driver · Leak XI/XII/XIV)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+  },
 }
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
 // prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
@@ -1873,6 +1884,8 @@ const searchBudgetFor = (name) => {
 // cost only on its final frame. $/1M in/out from the model table; cache read =
 // 0.1× input, 5-min write = 1.25×, 1-hour write = 2×.
 const MODEL_PRICE = [
+  [/grok-4\.3|grok-4-3/i, { i: 1.25, o: 2.5 }],
+  [/grok/i, { i: 0.2, o: 0.5 }],
   [/opus/i, { i: 5, o: 25 }],
   [/sonnet/i, { i: 3, o: 15 }],
   [/haiku/i, { i: 1, o: 5 }],
@@ -3439,6 +3452,674 @@ async function proveHaveTree(theorem, ctx) {
   return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
 }
 
+// ===========================================================================
+// ARCHITECT — Goedel-Architect pipeline (arXiv 2606.06468), style: "architect"
+// ---------------------------------------------------------------------------
+// Faithful replication of the paper's three-stage loop on the Leak stack:
+//
+//   1. BLUEPRINT GENERATION — one model conversation emits a dependency graph
+//      of `@[blueprint]` declarations (LeanArchitect syntax, bodies
+//      `:= by sorry_using [deps]`), iterating against Leak XII's lean_compile
+//      gate (structural safeguards → Lean compile → graph validation) until
+//      "Compilation SUCCESSFUL. Validation SUCCESSFUL."
+//   2. THEOREM PROVING — every unsolved node is dispatched to a FRESH, ISOLATED
+//      prover conversation in parallel. A node prover sees ONLY its lemma and
+//      its declared parents' signatures (the paper's context discipline — no
+//      global transcript, no sibling proofs). Outcomes: solved, formally
+//      negated (compiler-corroborated disproof), or a structured forfeit
+//      (## Diagnosis / ## Analysis / ## Suggested Fix).
+//   3. BLUEPRINT REFINEMENT — a fresh conversation reads the annotated graph
+//      (decls + `-- PROVED`/`-- UNPROVED` markers + per-failure Diagnosis
+//      blocks — compact signals, never transcripts) and emits a revised
+//      blueprint. Proved nodes carry their proofs forward as long as their
+//      signature is byte-identical (modulo whitespace). Loop ≤ 8 iterations.
+//
+// The driver is xAI's Grok (default grok-4.1 fast tier — the closest open
+// analogue to the paper's DeepSeek-V4-Flash backbone), spoken to directly
+// over the OpenAI-compatible chat/completions API with function calling.
+// No Claude CLI is involved on this path.
+//
+// Budgets (paper Appendix A): blueprint 262,144 tokens/attempt, ≤8 attempts;
+// node 65,536 tokens/attempt, ≤4 attempts; refinement 262,144, ≤8 attempts
+// per step; ≤8 refinement iterations. The run-level wall clock (ctx.getDeadline)
+// still governs everything, so Terminate / +5 min behave as usual.
+//
+// Context management: fresh conversation per stage attempt and per node
+// (bounded, cache-aligned: the static behavioral prompt is the stable prefix
+// xAI's implicit caching keys on); within a conversation, stale tool outputs
+// are digested down once they stop being the latest compiler signal, so a
+// long compile-fix loop can't quadratically flood its own window. The exit
+// is compiler-gated end-to-end: only Leak XIV's certificate of the assembled
+// proof counts as success.
+// ===========================================================================
+
+const ARCHITECT_MODEL_LADDER = [
+  "grok-4.1-fast-reasoning",
+  "grok-4.1-fast",
+  "grok-4.1",
+  "grok-4-1-fast-reasoning",
+  "grok-3-mini",
+]
+const ARCHITECT_BLUEPRINT_TOKENS = 262144
+const ARCHITECT_NODE_TOKENS = 65536
+const ARCHITECT_BLUEPRINT_RETRIES = 8
+const ARCHITECT_NODE_RETRIES = 4
+const ARCHITECT_REFINE_RETRIES = 8
+const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 8)
+const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 2)
+
+function architectUrls(opts = {}) {
+  const a = opts.architect || {}
+  return {
+    xi: a.xiUrl || process.env.LEAK_XI_URL || "",
+    xii: a.xiiUrl || process.env.LEAK_XII_URL || "",
+    xiv: a.xivUrl || process.env.LEAK_XIV_URL || "",
+  }
+}
+
+// --- Appendix C.1 — blueprint generation (behavioral prompt, cached) --------
+function architectBlueprintSystem() {
+  return `## Task
+You are a Lean 4 formalizer producing a dependency graph decomposition for a Lean theorem. The input is the targeted Lean theorem signature. Design a dependency graph of named Definitions, Lemmas, and exactly one Theorem (the main target), then translate the graph into one Lean 4 file in which every node is a \`@[blueprint]\`-annotated declaration. You do not prove anything in this stage -- every theorem and lemma body is \`:= by sorry_using [...]\`.
+
+## Decomposition guidelines
+Plan a graph that captures the structure of the proof. Use Definitions for any helper functions, sets, structures, or notation the proof needs. Use Lemmas for intermediate facts that require justification. Use the Theorem for the final claim -- its name MUST equal the targeted theorem identifier given in the user prompt.
+
+Each Lemma should be (nearly) trivial once its parent nodes are taken as given: it should require at most 1-2 new logical ideas beyond its declared dependencies and its own inlined premises. If a step needs more, split it into intermediate lemmas -- use as many components as the proof requires. Independent branches stay independent: if two parts of the proof do not share reasoning, their lemmas should not depend on each other.
+
+Every natural language \`statement\` field is a closed, typed, standalone proposition: every variable carries an explicit quantifier and domain; every hypothesis the proof uses appears as a premise. Do not reach into ambient context -- restate every theorem-level typing and hypothesis your lemma uses. Every natural language \`proof\` field is a complete sketch citing each declared dep by backticked name (e.g. "by \`lemma_a\`", "from \`def_b\`"); show every key equation, and do not write "by algebra", "obviously", or "one can check".
+
+## Mapping graph nodes to Lean declarations
+Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotated Lean declaration. Use \`snake_case\` identifiers derived from content ('k_expansion', 'p_at_101'), not position ('lemma_1'); names must be unique within the file.
+
+- For a Definition, emit:
+    @[blueprint (statement := /-- natural language description of what's being defined -/)]
+    def name (binders) : type := body
+  (or \`noncomputable def\`, \`abbrev\`, \`structure\`, \`instance\` as fits.) Definitions get a real Lean body, not \`sorry_using\`.
+- For a Lemma or Theorem, emit:
+    @[blueprint
+      (statement := /-- closed, typed, standalone natural language proposition -/)
+      (proof := /-- complete natural language sketch citing parent declarations by backticked name -/)]
+    lemma|theorem name (binders) : conclusion := by sorry_using [p1, p2, ...]
+  where \`sorry_using [...]\` lists each parent declaration as a bare Lean identifier (or \`sorry_using []\` if it has no parents).
+- The main Theorem's \`name\` MUST equal the targeted theorem identifier given in the user prompt, and you must emit it with the original Lean signature (same binders, same conclusion). Do not retype the statement informally.
+- Declare nodes in topological order: Definitions first, then Lemmas in dependency order, then the main Theorem last.
+- The file starts with \`import Mathlib\` and \`import Architect\` (both required), then any \`open\`/\`set_option\` lines, then the declarations.
+
+## Tool use
+Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; forbidden constructs (\`axiom\`, \`native_decide\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a Lemma/Theorem body that is bare \`sorry\` or a real proof -- every body must be exactly \`:= by sorry_using [...]\`, since proofs belong to the next stage and bare \`sorry\` breaks dependency tracking.
+
+If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed \`@[blueprint]\` decls: every node must have a non-empty \`(statement := /-- ... -/)\` field; every Lemma and the Theorem must have a non-empty \`(proof := /-- ... -/)\` field; every name in \`sorry_using [...]\` must resolve to a declared \`@[blueprint]\` node, with no self-loops; the \`sorry_using\` graph must be acyclic; exactly one main Theorem must exist with the targeted name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
+
+If any gate fails, fix the reported issue and call \`lean_compile\` again. Sorries from \`sorry_using\` are expected and do not count as errors. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\``
+}
+
+// --- Appendix C.2 — theorem proving (behavioral prompt, cached) -------------
+function architectProverSystem() {
+  return `## Task
+You are a Lean 4 theorem prover. Given a formal statement, produce a complete, correct Lean 4 proof with no \`sorry\`.
+
+## Tool use
+You have two tools, \`lean_compile\` and \`mathlib_search\`. Commit to a concrete proof plan up front and execute it against the Lean compiler -- iterating on compiler feedback is how proofs get done, not silent reasoning or repeated searching. The compiler is a stronger signal source than search.
+
+Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial proof: use \`sorry\` as a placeholder for sub-goals you cannot yet discharge, and iterate (compile -> read errors / open goals -> patch -> compile). The system handles two cases automatically based on what you submit:
+- If your code includes the MAIN theorem with the canonical statement followed by \`:= by ...\`, the system rebuilds it under the original theorem statement: only your \`:= by\` proof body is kept from your submission; the imports, \`set_option\`, and \`open\` lines come from the canonical formal statement, and any other top-level declarations are dropped. Only this case can register a solve. Do not use \`axiom\` or \`native_decide\`; use \`have\` for helper lemmas inside your proof, not top-level declarations; and do not add \`import\` or \`open\` lines that are not already in the canonical formal statement -- any extras will be flagged as a safeguard violation, not silently kept.
+- If your code does NOT include the main theorem (e.g. \`#check\`, \`example\`, \`#print\`, helper-lemma prototypes), the system compiles the snippet as-given and returns the raw feedback. This is exploration only -- it cannot register a solve, so resubmit with the main theorem once you have a full proof. Use this sparingly: every turn against the compiler costs budget, and the only way to finish is to submit the main theorem.
+
+Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. Mathlib does NOT contain the solution to your problem directly, so do not use this tool to "find the proof" or to search for an exact bound stated in the goal -- such queries return nothing useful and waste turns.
+
+## Other outcomes
+If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.
+
+If you cannot close the goal within budget, END with a structured forfeit post-mortem in EXACTLY this format (three sections, these exact headers):
+## Diagnosis: STATEMENT_WRONG or PROOF_TOO_HARD
+## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
+## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.
+Never end with a bare apology or an unstructured summary -- the forfeit is consumed by a downstream revision stage.`
+}
+
+// --- Appendix C.3 — blueprint refinement (behavioral prompt, cached) --------
+function architectRefineSystem() {
+  return `## Task
+You are revising a Lean 4 dependency graph for a single mathematical problem. The input is a sequence of \`@[blueprint ...]\`-annotated declarations -- definitions, lemmas, and one main theorem -- each lemma or theorem with body \`:= by sorry_using [deps]\`. Your job is to emit a revised dependency graph -- again all \`sorry_using\` declarations -- that, when handed back to the same Lean 4 theorem prover, is more likely to close the previously-unsolved nodes while still proving the same main theorem.
+
+## Input format
+Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when the prover failed -- a follow-up review block describing what went wrong. There are two markers.
+
+A \`-- PROVED\` marker means the prover proved the node.
+
+A \`-- UNPROVED\` marker indicates that the prover failed on the node, and is followed by exactly one \`/- Diagnosis ... -/\` review block. The block has three sections. \`## Diagnosis\` is exactly one of \`STATEMENT_WRONG\` (the lemma is false under its hypotheses -- possibly established by a machine-checked disproof of the statement) or \`PROOF_TOO_HARD\` (the prover believes the goal is provable but could not chain the available parents to it). \`## Analysis\` is a forensic account of what the prover tried, what compiled, what errors remained, and where the gap is. \`## Suggested Fix\` is conditional on the diagnosis: for \`STATEMENT_WRONG\`, why the statement is false and how to repair it; for \`PROOF_TOO_HARD\`, a helper-lemma decomposition.
+
+These markers and review blocks are input-only -- do NOT copy them into your revised dependency graph.
+
+## Guidance
+Each \`-- UNPROVED\` node falls into one of two buckets, decided by the \`## Diagnosis\` label.
+
+When the diagnosis is \`STATEMENT_WRONG\`, the lemma's formal statement is false under its hypotheses. Fix the statement (strengthen hypotheses, weaken the conclusion, fix a quantifier or coercion, etc.) and re-emit it. If the lemma is structurally unfixable, drop it and re-route the nodes that depended on it.
+
+When the diagnosis is \`PROOF_TOO_HARD\`, the prover believes the goal is provable but could not chain the available parents to it. Read the \`## Suggested Fix\` for the prover's proposed helper-lemma decomposition and add new parent lemmas (each as a fresh \`@[blueprint ...]\` declaration with body \`:= by sorry_using [...]\`) that bridge the gap. Wire the failing node's \`sorry_using [...]\` to include the new helpers. If the analysis instead reads as though the statement itself is suspect, treat it as \`STATEMENT_WRONG\` instead -- fix or drop the statement.
+
+Leave \`-- PROVED\` nodes untouched unless a downstream revision forces a signature change: their proof bodies will carry forward automatically as long as the signature stays byte-identical.
+
+After every edit, call \`lean_compile\`. The tool reports pre-compile safeguard violations, real Lean compile errors, the skeleton-out invariant (every theorem/lemma body must remain \`:= by sorry_using [...]\`), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\`
+
+## Output
+Emit a revised dependency graph. Every theorem and lemma is \`@[blueprint (statement := /-- ... -/) (proof := /-- ... -/)]\`-annotated and ends in \`:= by sorry_using [deps]\`. Definitions are \`@[blueprint (statement := /-- ... -/)]\`-annotated with a real Lean body. Do NOT replace any \`sorry_using\` with an actual proof -- that is the prover's job, not yours. Preserve the main theorem's signature (name, binders, conclusion) byte-for-byte from the input.`
+}
+
+// --- Grok driver -------------------------------------------------------------
+// One OpenAI-compatible chat call against api.x.ai with function calling,
+// retries on 429/5xx, and a model fallback ladder on unknown-model errors.
+async function grokCall(state, messages, tools, ctx) {
+  const key = process.env.XAI_API_KEY
+  if (!key) throw new Error("XAI_API_KEY is not set on the bridge — the architect strategy drives Grok directly")
+  for (let attempt = 0; ; attempt++) {
+    if (ctx.signal?.aborted) throw new Error("aborted")
+    if (deadlinePassed(ctx)) throw new Error("wall-clock budget exhausted")
+    const body = {
+      model: state.model,
+      messages,
+      tools,
+      tool_choice: "auto",
+      max_tokens: 8192,
+    }
+    let resp
+    try {
+      resp = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify(body),
+        signal: ctx.signal,
+      })
+    } catch (e) {
+      if (attempt < 4) {
+        await new Promise((r) => setTimeout(r, 1500 * 2 ** attempt))
+        continue
+      }
+      throw e
+    }
+    if (resp.status === 429 || resp.status >= 500) {
+      if (attempt < 5) {
+        const ra = Number(resp.headers.get("retry-after")) || 2 ** attempt
+        await new Promise((r) => setTimeout(r, Math.min(ra, 30) * 1000))
+        continue
+      }
+      throw new Error(`xAI API ${resp.status} after retries`)
+    }
+    const data = await resp.json().catch(() => null)
+    if (!resp.ok) {
+      const msg = String(data?.error?.message || data?.error || resp.status)
+      // Unknown model → walk the ladder once per rung.
+      if (/model/i.test(msg) && (resp.status === 400 || resp.status === 404)) {
+        const idx = ARCHITECT_MODEL_LADDER.indexOf(state.model)
+        const next = ARCHITECT_MODEL_LADDER[idx + 1]
+        if (next) {
+          state.model = next
+          continue
+        }
+      }
+      throw new Error(`xAI API error: ${msg}`)
+    }
+    const usage = data.usage || {}
+    state.usage.prompt += Number(usage.prompt_tokens) || 0
+    state.usage.completion += Number(usage.completion_tokens) || 0
+    state.usage.cached += Number(usage.prompt_tokens_details?.cached_tokens) || 0
+    state.stageTokens += Number(usage.total_tokens) || 0
+    ctx.metrics.llm_invocations += 1
+    const p = /4\.3|4-3/.test(state.model) ? { i: 1.25, o: 2.5, c: 0.2 } : { i: 0.2, o: 0.5, c: 0.05 }
+    ctx.metrics.costUsd = Number((
+      ((state.usage.prompt - state.usage.cached) * p.i +
+        state.usage.cached * p.c +
+        state.usage.completion * p.o) / 1e6
+    ).toFixed(4))
+    return data.choices?.[0]?.message || { content: "" }
+  }
+}
+
+// Digest stale tool outputs so a long compile-fix loop cannot quadratically
+// flood its own context: everything but the newest `keep` tool results is
+// collapsed to a one-line summary (the newest compiler signal is the only one
+// that matters — the paper's stages are Markov in the latest gate report).
+function architectCompact(messages, keep = 2) {
+  const toolIdxs = []
+  for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdxs.push(i)
+  const stale = toolIdxs.slice(0, Math.max(0, toolIdxs.length - keep))
+  for (const i of stale) {
+    const c = String(messages[i].content || "")
+    if (c.length > 400)
+      messages[i].content = c.slice(0, 300) + `\n... [stale tool output elided — ${c.length} chars; rely on the newest compile report]`
+  }
+}
+
+// Generic tool loop for one stage attempt: fresh conversation, budgeted,
+// short-circuits the moment `exec` reports the stage goal reached.
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60 }) {
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ]
+  state.stageTokens = 0
+  let finalText = ""
+  for (let turn = 0; turn < hardTurns; turn++) {
+    if (state.stageTokens >= tokenBudget) return { finalText, exhausted: true }
+    if (deadlinePassed(ctx)) return { finalText, exhausted: true }
+    const msg = await grokCall(state, messages, tools, ctx)
+    const toolCalls = msg.tool_calls || []
+    messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls.length ? toolCalls : undefined })
+    if (!toolCalls.length) {
+      finalText = String(msg.content || "")
+      return { finalText, exhausted: false }
+    }
+    for (const tc of toolCalls) {
+      let args = {}
+      try {
+        args = JSON.parse(tc.function?.arguments || "{}")
+      } catch {}
+      ctx.metrics.tools_invoked += 1
+      let out
+      try {
+        out = await exec(tc.function?.name, args)
+      } catch (e) {
+        out = { report: `tool error: ${String(e?.message || e)}` }
+      }
+      messages.push({ role: "tool", tool_call_id: tc.id, content: String(out.report ?? JSON.stringify(out)).slice(0, 24000) })
+      if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
+    }
+    architectCompact(messages)
+  }
+  return { finalText, exhausted: true }
+}
+
+const ARCHITECT_COMPILE_TOOL = {
+  type: "function",
+  function: {
+    name: "lean_compile",
+    description: "Compile Lean 4 code against the gateway (Mathlib + Architect preloaded). Returns safeguard violations, compiler errors, open goals, and validation results.",
+    parameters: {
+      type: "object",
+      properties: { code: { type: "string", description: "The full Lean 4 code to compile." } },
+      required: ["code"],
+    },
+  },
+}
+const ARCHITECT_SEARCH_TOOL = {
+  type: "function",
+  function: {
+    name: "mathlib_search",
+    description: "Look up specific Mathlib lemmas by name, signature fragment, or hypothesis pattern. Returns name, kind, signature, docstring, module.",
+    parameters: {
+      type: "object",
+      properties: {
+        query: { type: "string" },
+        k: { type: "number", description: "max results (default 12)" },
+      },
+      required: ["query"],
+    },
+  },
+}
+
+async function architectFetch(url, path, payload, signal) {
+  const resp = await fetch(url.replace(/\/$/, "") + path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  })
+  if (!resp.ok) throw new Error(`${path} → HTTP ${resp.status}`)
+  return resp.json()
+}
+
+function architectSearchReport(json) {
+  const rs = json?.results || []
+  if (!rs.length) return { report: "No Mathlib declarations matched. Try different keywords, or compile `example : <goal> := by exact?` instead." }
+  return {
+    report: rs.map((r) => `${r.kind} ${r.name} : ${r.signature}${r.docstring ? `\n    -- ${r.docstring}` : ""}`).join("\n"),
+  }
+}
+
+// Prelude = open/set_option lines between the imports and the first decl.
+function architectPrelude(code) {
+  const lines = []
+  for (const ln of String(code || "").split("\n")) {
+    const t = ln.trim()
+    if (/^import\s/.test(t) || t === "") continue
+    if (/^(open|set_option|noncomputable section|section)\b/.test(t)) {
+      lines.push(t)
+      continue
+    }
+    break
+  }
+  return lines.join("\n")
+}
+
+// Compile context for one node: every earlier node in topological order —
+// defs with real bodies (attribute stripped), lemmas/theorems sorried. The
+// PROMPT context stays exactly the declared parents; this larger closure is
+// compiler-only and costs the model nothing.
+function architectNodePrefix(graph, nodeName) {
+  const idx = graph.findIndex((n) => n.name === nodeName)
+  const before = graph.slice(0, Math.max(0, idx))
+  return before
+    .map((n) =>
+      n.kind === "def" || n.kind === "abbrev" || n.kind === "structure" || n.kind === "instance" || n.kind === "inductive"
+        ? n.declTextNoAttr
+        : `${n.signature.trim()} := by sorry`,
+    )
+    .join("\n\n")
+}
+
+function architectNegSignature(signature) {
+  const m = signature.match(/^\s*(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/)
+  if (!m) return null
+  const rest = signature.slice(m[0].length)
+  let depth = 0
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (c === ":" && depth === 0 && rest.slice(i, i + 2) !== ":=") {
+      const binders = rest.slice(0, i).trim()
+      const concl = rest.slice(i + 1).trim()
+      const inner = binders ? `∀ ${binders}, ${concl}` : concl
+      return `theorem ${m[1]}_neg : ¬ (${inner})`
+    }
+  }
+  return null
+}
+
+function architectParseForfeit(text) {
+  const diag = /##\s*Diagnosis:?\s*(STATEMENT_WRONG|PROOF_TOO_HARD)/i.exec(text || "")
+  const analysis = /##\s*Analysis:?\s*([\s\S]*?)(?=##\s*Suggested Fix|$)/i.exec(text || "")
+  const fix = /##\s*Suggested Fix:?\s*([\s\S]*)$/i.exec(text || "")
+  return {
+    diagnosis: diag ? diag[1].toUpperCase() : "PROOF_TOO_HARD",
+    analysis: (analysis?.[1] || "The prover returned no structured analysis; it ran out of budget.").trim().slice(0, 2500),
+    fix: (fix?.[1] || "No suggested fix was produced.").trim().slice(0, 2500),
+  }
+}
+
+// The annotated graph the refinement stage consumes: decl + verdict marker
+// (+ Diagnosis block for failures). Compact signals, never transcripts.
+function architectAnnotate(graph, results) {
+  return graph
+    .map((n) => {
+      if (!["lemma", "theorem"].includes(n.kind)) return n.declText
+      const r = results.get(n.name)
+      if (r?.solved) return `${n.declText}\n-- PROVED`
+      const f = r?.forfeit || { diagnosis: "PROOF_TOO_HARD", analysis: "Node was not attempted (an upstream failure consumed the budget).", fix: "" }
+      const diag = r?.negated ? "STATEMENT_WRONG" : f.diagnosis
+      const analysis = r?.negated
+        ? `MACHINE-CHECKED DISPROOF: the prover formally proved the NEGATION of this statement. ${f.analysis}`
+        : f.analysis
+      return `${n.declText}\n-- UNPROVED\n/- Diagnosis\n## Diagnosis: ${diag}\n## Analysis: ${analysis}\n## Suggested Fix: ${f.fix}\n-/`
+    })
+    .join("\n\n")
+}
+
+function architectAssemble(graph, prelude, proofs) {
+  const parts = ["import Mathlib", ""]
+  if (prelude) parts.push(prelude, "")
+  for (const n of graph) {
+    if (["lemma", "theorem"].includes(n.kind)) {
+      const body = proofs.get(n.name)
+      const indented = String(body || "").split("\n").map((l) => (l.trim() ? "  " + l : l)).join("\n")
+      parts.push(`${n.signature.trim()} :=\n${indented}`, "")
+    } else {
+      parts.push(n.declTextNoAttr, "")
+    }
+  }
+  return parts.join("\n")
+}
+
+// --- Node prover (fresh, isolated conversation per attempt) -----------------
+async function architectProveNode(node, graph, prelude, urls, ctx, state) {
+  const parents = node.deps
+    .map((d) => graph.find((g) => g.name === d))
+    .filter(Boolean)
+    .map((p) => `- ${p.kind} ${p.name} : ${p.signature.replace(/^\s*(theorem|lemma|def|abbrev)\s+[A-Za-z0-9_'.]+\s*/, "").trim()}${p.statement ? `\n    (${String(p.statement).slice(0, 240)})` : ""}`)
+    .join("\n")
+  const negSig = architectNegSignature(node.signature)
+  const prefix = architectNodePrefix(graph, node.name)
+  const user = `## Target
+Prove this EXACT statement (the signature is immutable — your submission is rebuilt under it):
+
+${node.signature.trim()} := by
+  <your proof>
+
+## Blueprint context
+Natural-language statement: ${node.statement || "(none)"}
+Proof sketch from the blueprint: ${node.proofSketch || "(none)"}
+
+## Available facts (your declared dependencies — already proved or defined; invoke by name)
+${parents || "(none — this node has no parents)"}
+${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its hypotheses, prove instead exactly:\n\n${negSig} := by\n  <your disproof>\n` : ""}`
+
+  const result = { solved: false, negated: false, proofBody: null, forfeit: null, attempts: 0 }
+  for (let attempt = 0; attempt < ARCHITECT_NODE_RETRIES; attempt++) {
+    if (deadlinePassed(ctx) || ctx.signal?.aborted) break
+    result.attempts = attempt + 1
+    const retryNote = attempt === 0 ? "" : `\n\n(Attempt ${attempt + 1} of ${ARCHITECT_NODE_RETRIES}. A previous fresh attempt failed; do not repeat the same failing tactic line verbatim.)`
+    const exec = async (name, args) => {
+      if (name === "mathlib_search") {
+        if (!urls.xi) return { report: "mathlib_search is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback." }
+        return architectSearchReport(await architectFetch(urls.xi, "/search", { query: String(args.query || ""), k: Number(args.k) || 12 }, ctx.signal))
+      }
+      if (name === "lean_compile") {
+        const r = await architectFetch(urls.xii, "/compile", {
+          mode: "node",
+          code: String(args.code || ""),
+          target: { name: node.name, signature: node.signature, negSignature: negSig },
+          prefix,
+          prelude,
+        }, ctx.signal)
+        if (r.solve) {
+          // Extract the rebuilt body (everything after the first ':=').
+          const rebuilt = String(r.rebuilt || "")
+          const at = rebuilt.indexOf(":=")
+          return { report: r.report, __done: { negated: !!r.negated, body: rebuilt.slice(at + 2).trim() } }
+        }
+        return { report: r.report }
+      }
+      return { report: `unknown tool ${name}` }
+    }
+    const out = await grokLoop(ctx, state, {
+      system: architectProverSystem(),
+      user: user + retryNote,
+      tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
+      exec,
+      tokenBudget: ARCHITECT_NODE_TOKENS,
+    })
+    if (out.done) {
+      result.solved = !out.done.negated
+      result.negated = !!out.done.negated
+      result.proofBody = out.done.body
+      return result
+    }
+    // No solve this attempt: keep the best structured forfeit we saw.
+    if (out.finalText && /##\s*Diagnosis/i.test(out.finalText)) {
+      result.forfeit = architectParseForfeit(out.finalText)
+      break // an explicit forfeit is terminal for this pass — refinement owns it now
+    }
+  }
+  if (!result.solved && !result.negated && !result.forfeit)
+    result.forfeit = architectParseForfeit("")
+  return result
+}
+
+// --- Blueprint / refinement conversation (shared shape) ----------------------
+async function architectBlueprintStage(ctx, state, urls, { system, user, retries }) {
+  let lastReport = ""
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (deadlinePassed(ctx) || ctx.signal?.aborted) return null
+    let captured = null
+    const exec = async (name, args) => {
+      if (name === "mathlib_search") {
+        if (!urls.xi) return { report: "mathlib_search is unavailable; proceed from Mathlib knowledge." }
+        return architectSearchReport(await architectFetch(urls.xi, "/search", { query: String(args.query || ""), k: Number(args.k) || 12 }, ctx.signal))
+      }
+      if (name === "lean_compile") {
+        const r = await architectFetch(urls.xii, "/compile", {
+          mode: "blueprint",
+          code: String(args.code || ""),
+          target: { name: state.targetName, signature: state.targetSignature },
+        }, ctx.signal)
+        lastReport = String(r.report || "").slice(0, 1200)
+        if (r.ok) {
+          captured = { graph: r.graph, code: String(args.code || "") }
+          return { report: r.report, __done: captured }
+        }
+        return { report: r.report }
+      }
+      return { report: `unknown tool ${name}` }
+    }
+    const retryNote = attempt === 0 ? "" : `\n\n(Attempt ${attempt + 1} of ${retries}. The previous attempt failed its last gate with:\n${lastReport}\nStart fresh and fix that.)`
+    const out = await grokLoop(ctx, state, {
+      system,
+      user: user + retryNote,
+      tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
+      exec,
+      tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
+    })
+    if (out.done) return out.done
+  }
+  return null
+}
+
+// --- The pipeline -------------------------------------------------------------
+async function proveArchitect(theorem, ctx, opts = {}) {
+  const urls = architectUrls(opts)
+  if (!urls.xii || !urls.xiv) {
+    ctx.emit({ type: "error", message: "Architect needs LEAK_XII_URL and LEAK_XIV_URL set on the bridge (Leak XI optional for search). Set the env vars and restart the bridge." })
+    return { verified: false, proof: "" }
+  }
+  const state = {
+    model: /grok/i.test(String(ctx.model || "")) ? String(ctx.model) : (process.env.ARCHITECT_MODEL || ARCHITECT_MODEL_LADDER[0]),
+    usage: { prompt: 0, completion: 0, cached: 0 },
+    stageTokens: 0,
+    targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
+    targetSignature: theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry[\s\S]*$/, "").trim(),
+  }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Architect [${state.model}]: blueprint generation — dependency graph of @[blueprint] nodes (LeanArchitect, Lean v4.32.0).` })
+
+  const nlSeed = typeof opts.nlProof === "string" && opts.nlProof.trim()
+    ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${opts.nlProof.trim().slice(0, 8000)}`
+    : ""
+  const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${nlSeed}`
+
+  let bp = await architectBlueprintStage(ctx, state, urls, {
+    system: architectBlueprintSystem(),
+    user: bpUser,
+    retries: ARCHITECT_BLUEPRINT_RETRIES,
+  })
+  if (!bp) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: no compiling blueprint within the retry budget." })
+    return { verified: false, proof: "" }
+  }
+
+  const proofs = new Map() // name -> proof body ("by ...") for solved nodes
+  const sigOfProof = new Map() // name -> signatureNorm at solve time
+
+  for (let iter = 0; iter <= ARCHITECT_MAX_ITERS; iter++) {
+    const graph = bp.graph
+    const prelude = architectPrelude(bp.code)
+    const provable = graph.filter((n) => ["lemma", "theorem"].includes(n.kind))
+    // Proof reuse: byte-identical (whitespace-normalised) signatures keep their proofs.
+    for (const n of provable) {
+      if (proofs.has(n.name) && sigOfProof.get(n.name) !== n.signatureNorm) {
+        proofs.delete(n.name)
+        sigOfProof.delete(n.name)
+      }
+    }
+    const todo = provable.filter((n) => !proofs.has(n.name))
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Blueprint iteration ${iter}: ${graph.length} nodes (${provable.length} provable, ${todo.length} open, ${proofs.size} carried forward).` })
+
+    // ---- Theorem proving: isolated node conversations, capped parallel pool.
+    const results = new Map()
+    let cursor = 0
+    const workers = Array.from({ length: Math.max(1, Math.min(ARCHITECT_NODE_CONCURRENCY, todo.length)) }, async () => {
+      while (cursor < todo.length) {
+        const node = todo[cursor++]
+        if (deadlinePassed(ctx) || ctx.signal?.aborted) return
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `⛏️ node ⟪${node.name}⟫ — fresh isolated prover (${node.deps.length} parent(s)).` })
+        const r = await architectProveNode(node, graph, prelude, urls, ctx, state)
+        results.set(node.name, r)
+        if (r.solved) {
+          proofs.set(node.name, r.proofBody)
+          sigOfProof.set(node.name, node.signatureNorm)
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ node ⟪${node.name}⟫ solved (attempt ${r.attempts}).` })
+        } else if (r.negated) {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${node.name}⟫ DISPROVED — machine-checked negation registered (STATEMENT_WRONG).` })
+        } else {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏳️ node ⟪${node.name}⟫ forfeited: ${r.forfeit?.diagnosis}.` })
+        }
+      }
+    })
+    await Promise.all(workers)
+
+    const unsolved = provable.filter((n) => !proofs.has(n.name))
+    if (unsolved.length === 0) {
+      // ---- Assembly + certification (Leak XIV is the only exit).
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "🧵 All nodes solved — assembling the final proof for Leak XIV certification." })
+      const finalCode = architectAssemble(graph, prelude, proofs)
+      let cert
+      try {
+        cert = await architectFetch(urls.xiv, "/verify", {
+          code: finalCode,
+          targetName: state.targetName,
+          targetSignature: state.targetSignature,
+        }, ctx.signal)
+      } catch (e) {
+        cert = { ok: false, report: String(e?.message || e) }
+      }
+      if (cert.ok) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏁 Leak XIV certified the assembled proof — no errors, no sorry." })
+        return { verified: true, proof: finalCode }
+      }
+      // Assembly failed: demote every node named in the error report and refine.
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Assembly failed certification — demoting implicated nodes and refining. ${String(cert.report || "").slice(0, 300)}` })
+      const errText = String(cert.report || "")
+      let demoted = 0
+      for (const n of provable) {
+        if (errText.includes(n.name) && proofs.has(n.name)) {
+          proofs.delete(n.name)
+          sigOfProof.delete(n.name)
+          results.set(n.name, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `The node's proof passed in isolation but failed during final assembly: ${errText.slice(0, 800)}`, fix: "Adjust this node (or its parents) so the proof also elaborates in the assembled file." } })
+          demoted++
+        }
+      }
+      if (!demoted) {
+        // Nothing attributable — demote the main theorem as the safest restart point.
+        proofs.delete(state.targetName)
+        sigOfProof.delete(state.targetName)
+        results.set(state.targetName, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `Final assembly failed: ${errText.slice(0, 800)}`, fix: "Re-derive the main theorem's closing argument." } })
+      }
+    }
+
+    if (iter === ARCHITECT_MAX_ITERS) break
+    if (deadlinePassed(ctx) || ctx.signal?.aborted) break
+
+    // ---- Blueprint refinement on the annotated graph.
+    const stillUnsolved = provable.filter((n) => !proofs.has(n.name))
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${ARCHITECT_MAX_ITERS}: ${stillUnsolved.length} unsolved node(s) — rewriting the graph around the failures.` })
+    const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
+    const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks)}`
+    const refined = await architectBlueprintStage(ctx, state, urls, {
+      system: architectRefineSystem(),
+      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,
+      retries: ARCHITECT_REFINE_RETRIES,
+    })
+    if (!refined) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Refinement failed to produce a validated revised blueprint." })
+      break
+    }
+    bp = refined
+  }
+
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: iteration budget exhausted without a certified proof." })
+  return { verified: false, proof: "" }
+}
+
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -3465,7 +4146,14 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   send({
     type: "prompt",
     prompt:
-      style === "have"
+      style === "architect"
+        ? `[ARCHITECT MODE — Goedel-Architect blueprint pipeline · grok driver]\n\n=== C.1 BLUEPRINT GENERATION ===\n` +
+          architectBlueprintSystem() +
+          "\n\n=== C.2 THEOREM PROVING (per node) ===\n" +
+          architectProverSystem() +
+          "\n\n=== C.3 BLUEPRINT REFINEMENT ===\n" +
+          architectRefineSystem()
+        : style === "have"
         ? `[DECOMPOSITION MODE — have-based (flat, single agent) · strategy: ${strategy}]\n\n=== PROVER PROMPT ===\n` +
           haveProvePrompt(theorem, mcpServers)
         : style === "have-tree"
@@ -3490,7 +4178,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   })
 
   const verifyUrl = resolveVerifyUrl(mcpServers)
-  if (!verifyUrl) {
+  if (!verifyUrl && style !== "architect") {
     emit({ type: "error", message: "No verify_full_script MCP server is connected — decomposition needs one to gate scaffolds." })
     send({ type: "done", metrics, verified: false, proof: "" })
     res.end()
@@ -3571,7 +4259,18 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     try {
       let ok = false
       let proof = ""
-      if (style === "have" || style === "have-tree") {
+      if (style === "architect") {
+        const r = await proveArchitect(theorem, ctx, opts)
+        ok = r.verified
+        proof = r.proof
+        if (ok && proof) {
+          emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — Leak XIV certified the assembled blueprint proof." })
+          send({ type: "text-delta", content: `✅ **Verified proof** (Goedel-Architect blueprint, certified by Leak XIV):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+        } else {
+          emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
+          send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
+        }
+      } else if (style === "have" || style === "have-tree") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // Resuming from a saved checkpoint short-circuits both: finish the
