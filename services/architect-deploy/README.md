@@ -25,8 +25,8 @@ XIII does not exist for the same reason III no longer does.
 
 | Setting | Value | Why |
 |---|---|---|
-| Shape | `VM.Standard.A1.Flex`, **2 OCPU / 12 GB** | The default is 1/6 — half the free allowance. One Mathlib daemon alone wants 4–6 GB. |
-| Image | Ubuntu 24.04 **or** Oracle Linux 9 (aarch64) | `bootstrap.sh` detects and handles both. |
+| Shape | `VM.Standard.A1.Flex`, **2 OCPU / 12 GB** | Both sliders matter: the free ceiling is 2 OCPUs *and* 12 GB. One Mathlib daemon wants 4–6 GB, and Lean builds are CPU-bound, so 1 OCPU roughly doubles every compile. |
+| Image | Ubuntu 24.04 (incl. **Minimal**) or Oracle Linux 9, aarch64 | `bootstrap.sh` detects the distro and installs what Minimal omits (git, iptables-persistent). |
 | Boot volume | **100–150 GB** (default is 50) | Mathlib cache + Docker layers. Always Free covers 200 GB total. |
 | Capacity type | **On-demand** | Preemptible instances get reclaimed mid-proof. |
 | Public IPv4 | assign | The bridge talks to the box over the internet. |

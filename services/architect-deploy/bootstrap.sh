@@ -20,6 +20,20 @@ case "${ID:-}" in
 esac
 echo "== detected: ${PRETTY_NAME:-$ID} (${DISTRO}) on $(uname -m) =="
 
+echo "== [0/5] prerequisites =="
+# Ubuntu *Minimal* (the OCI default aarch64 image) ships without git, and
+# without iptables-persistent — which means firewall rules silently vanish on
+# reboot. Install both non-interactively so the persistent-save later works.
+if [ "$DISTRO" = deb ]; then
+  export DEBIAN_FRONTEND=noninteractive
+  echo 'iptables-persistent iptables-persistent/autosave_v4 boolean true' | sudo debconf-set-selections
+  echo 'iptables-persistent iptables-persistent/autosave_v6 boolean true' | sudo debconf-set-selections
+  sudo -E apt-get update -qq
+  sudo -E apt-get install -y -qq git curl ca-certificates iptables-persistent
+else
+  sudo dnf install -y -q git curl ca-certificates
+fi
+
 echo "== [1/5] docker =="
 if ! command -v docker >/dev/null 2>&1; then
   if [ "$DISTRO" = deb ]; then
