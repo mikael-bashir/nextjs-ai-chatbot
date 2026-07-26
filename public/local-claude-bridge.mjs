@@ -3494,10 +3494,11 @@ async function proveHaveTree(theorem, ctx) {
 // ===========================================================================
 
 const ARCHITECT_MODEL_LADDER = [
-  "grok-4.1-fast-reasoning",
-  "grok-4.1-fast",
-  "grok-4.1",
+  // Verified live against api.x.ai on 2026-07-26: the SKU uses dashes.
   "grok-4-1-fast-reasoning",
+  "grok-4-1-fast-non-reasoning",
+  "grok-4.1-fast-reasoning",
+  "grok-4.1",
   "grok-3-mini",
 ]
 const ARCHITECT_BLUEPRINT_TOKENS = 262144

@@ -18,7 +18,7 @@ set -a; source .env; set +a
 export LEAK_XI_URL="${LEAK_XI_URL:-https://utterfool-leak-xi.hf.space}"
 export LEAK_XII_URL="${LEAK_XII_URL:-https://utterfool-leak-xii.hf.space}"
 export LEAK_XIV_URL="${LEAK_XIV_URL:-https://utterfool-leak-xiv.hf.space}"
-export ARCHITECT_MODEL="${ARCHITECT_MODEL:-grok-4.1-fast-reasoning}"
+export ARCHITECT_MODEL="${ARCHITECT_MODEL:-grok-4-1-fast-reasoning}"
 export ARCHITECT_NODE_CONCURRENCY="${ARCHITECT_NODE_CONCURRENCY:-2}"
 
 echo "architect bridge: model=$ARCHITECT_MODEL"
