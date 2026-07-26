@@ -21,7 +21,11 @@ import time
 REPL_BIN = os.environ.get("REPL_BIN", "/opt/repl/.lake/build/bin/repl")
 PROJECT_DIR = os.environ.get("GATEWAY_DIR", "/opt/gateway")
 POOL_SIZE = int(os.environ.get("POOL_SIZE", "2"))
-IMPORTS = os.environ.get("REPL_IMPORTS", "import Mathlib\nimport Architect")
+# NOTE: Dockerfile `ENV FOO="a\nb"` stores a LITERAL backslash-n, not a
+# newline — Docker does not process escapes there. Lean then parses only the
+# first import and errors on the rest (silently, since the REPL still returns
+# an env). Decode escaped newlines so both spellings work.
+IMPORTS = os.environ.get("REPL_IMPORTS", "import Mathlib\nimport Architect").replace("\\n", "\n")
 # Lazy mode: don't warm daemons at boot; spawn on first request and shut down
 # after IDLE_SHUTDOWN_S of inactivity (Leak XIV uses this — it is called once
 # per solved blueprint, so keeping 5 GB resident around the clock is waste).
@@ -50,6 +54,15 @@ class ReplWorker:
         resp = await self._roundtrip({"cmd": IMPORTS}, timeout=INIT_TIMEOUT_S)
         if "env" not in resp:
             raise RuntimeError(f"REPL worker {self.wid} failed to import: {resp}")
+        # The REPL still hands back an env when the import header itself has
+        # errors, so a broken header (a missing package, a mangled newline)
+        # would otherwise boot a daemon that is silently missing an import and
+        # only fails much later, at compile time. Refuse to go ready instead.
+        import_errors = [m.get("data", "") for m in (resp.get("messages") or [])
+                         if m.get("severity") == "error"]
+        if import_errors:
+            raise RuntimeError(
+                f"REPL worker {self.wid} import header errored ({IMPORTS!r}): {import_errors}")
         self.base_env = resp["env"]
         self.ready = True
 
