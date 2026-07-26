@@ -4,17 +4,24 @@
 #   docker build -t leak-lean-base ../leak-lean-base     # once (slow: Mathlib cache)
 #   docker compose up -d --build
 #
-# RAM plan for the 12 GB Always Free shape: XII holds POOL_SIZE=2 warm Lean
-# daemons (~4-5 GB each), XIV is lazy (warms on first /verify, reaped after
-# idle). bootstrap.sh adds an 8 GB swapfile so a certification burst can't
-# OOM the box. On a 24 GB PAYG shape, raise XII's POOL_SIZE to 3-4.
+# RAM plan. One warm Lean daemon with all of Mathlib imported sits at roughly
+# 4-6 GB RSS, so on the 12 GB Always Free shape the defaults are ONE warm
+# daemon in XII plus a LAZY one in XIV (warms on first /verify, reaped after
+# 15 min idle) — with the 8 GB swapfile from bootstrap.sh absorbing the
+# overlap when a certification lands while XII is busy.
+#
+# Node-proving parallelism is NOT lost at POOL_SIZE=1: the model conversations
+# run concurrently and only serialise at the compile call, so one node can be
+# reasoning while another compiles. If you move to a bigger shape (PAYG
+# 4 OCPU/24 GB), set XII_POOL_SIZE=2 or 3 and raise ARCHITECT_NODE_CONCURRENCY
+# on the bridge to match.
 services:
   leak-xi:
     build: ../leak-xi
     restart: unless-stopped
     ports:
       - "8011:8011"
-    mem_limit: 1g
+    mem_limit: 768m
 
   leak-xii:
     build: ../leak-xii
@@ -22,10 +29,10 @@ services:
     ports:
       - "8012:8012"
     environment:
-      POOL_SIZE: "${XII_POOL_SIZE:-2}"
+      POOL_SIZE: "${XII_POOL_SIZE:-1}"
       BLUEPRINT_TIMEOUT_S: "600"
       NODE_TIMEOUT_S: "300"
-    mem_limit: 11g
+    mem_limit: 8g
 
   leak-xiv:
     build: ../leak-xiv
@@ -37,4 +44,4 @@ services:
       LAZY: "1"
       IDLE_SHUTDOWN_S: "900"
       VERIFY_TIMEOUT_S: "600"
-    mem_limit: 7g
+    mem_limit: 6g

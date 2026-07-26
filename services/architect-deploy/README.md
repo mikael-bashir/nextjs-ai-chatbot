@@ -21,18 +21,44 @@ XIII does not exist for the same reason III no longer does.
 
 ## Deploy (Oracle Always Free, arm64)
 
+### Instance settings that matter
+
+| Setting | Value | Why |
+|---|---|---|
+| Shape | `VM.Standard.A1.Flex`, **2 OCPU / 12 GB** | The default is 1/6 — half the free allowance. One Mathlib daemon alone wants 4–6 GB. |
+| Image | Ubuntu 24.04 **or** Oracle Linux 9 (aarch64) | `bootstrap.sh` detects and handles both. |
+| Boot volume | **100–150 GB** (default is 50) | Mathlib cache + Docker layers. Always Free covers 200 GB total. |
+| Capacity type | **On-demand** | Preemptible instances get reclaimed mid-proof. |
+| Public IPv4 | assign | The bridge talks to the box over the internet. |
+
+Save the SSH private key at creation time — OCI will not show it again.
+
 ```sh
 git clone <this repo> leak && cd leak/services/architect-deploy
 bash bootstrap.sh
 ```
 
 First build ≈ 30–60 min (Mathlib olean cache download + LeanArchitect + REPL
-compile). The compose file caps memory so the 12 GB shape survives; on a
-24 GB PAYG shape set `XII_POOL_SIZE=3` or `4`.
+compile). Defaults are tuned for the 12 GB shape: one warm daemon in XII, a
+lazy one in XIV, 8 GB swap. On a bigger PAYG shape set `XII_POOL_SIZE=2`–`3`
+and raise `ARCHITECT_NODE_CONCURRENCY` on the bridge to match.
 
 **Also open ports 8011/8012/8014 in the subnet Security List** (OCI console →
-VCN → Security Lists → Ingress). The VM-local iptables rules are handled by
-`bootstrap.sh`.
+VCN → Security Lists → Ingress, source `0.0.0.0/0`, TCP). The VM-local
+firewall (iptables or firewalld) is handled by `bootstrap.sh`. Nothing
+reaches the box until *both* are open.
+
+### Known Oracle gotchas
+
+* **"Out of host capacity"** on A1 is common and is not your fault — retry
+  across AD 1/2/3, or retry on a loop. Upgrading the tenancy to
+  pay-as-you-go keeps Always Free resources free while making A1 capacity
+  far easier to get.
+* **Idle reclamation** applies to Always Free A1 instances that stay under
+  ~20% CPU *and* network *and* memory for 7 days. A warm Lean daemon holds
+  several GB resident, which keeps memory well above that line — but if you
+  stop the stack for a week, the instance can be reclaimed. PAYG tenancies
+  are exempt.
 
 ## Wire the bridge
 
