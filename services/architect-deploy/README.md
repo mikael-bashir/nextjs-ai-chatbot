@@ -72,17 +72,38 @@ VM-local firewall is handled by `bootstrap.sh`; nothing reaches the box until
 ## Wire the bridge
 
 The `architect` strategy runs inside the local Claude bridge but drives the
-xAI API directly (no Claude CLI on this path). Start the bridge with:
+xAI API directly (no Claude CLI on this path).
+
+**Register the three services in the app's existing MCP Servers UI** —
+the same place every other Leak server lives, not a separate mechanism:
+add a server per service named exactly `Leak XI`, `Leak XII`, `Leak XIV`
+(case/punctuation-insensitive — `Leak-XI`, `leak_xi` also match) with its
+URL. Auth type on that row doesn't matter; only the name and URL are read.
+The bridge resolves each service's URL from whichever servers you've
+registered for the active session, the same way `hacker`/`have-tree`/etc.
+already discover Leak I/II/IV — no separate registration system to learn.
+
+**The bearer token is the one thing that stays outside that UI, deliberately.**
+This app's registered-server credentials never leave the server side —
+`fetchProverMcpServers` strips `credentials` down to `{name, url}` before
+anything reaches the browser or the bridge, since real MCP auth stays inside
+the Python manager. XI/XII/XIV are plain REST services the bridge calls
+directly from your machine, so their token has to actually reach the bridge
+process — pushing it through that same channel would mean transmitting a
+live secret through a client-visible request body, which is a step *backward*
+from how this app already handles secrets. `LEAK_SERVICE_TOKEN` stays a
+bridge-local env var, the same pattern as `XAI_API_KEY` and `ANTHROPIC_API_KEY`.
 
 ```sh
 XAI_API_KEY='<your xai key>' \
 LEAK_SERVICE_TOKEN='<printed by bootstrap.sh>' \
-LEAK_XI_URL='http://<vm-ip>:8011' \
-LEAK_XII_URL='http://<vm-ip>:8012' \
-LEAK_XIV_URL='http://<vm-ip>:8014' \
 ARCHITECT_MODEL='grok-4.1-fast-reasoning' \
   node claude-bridge.mjs
 ```
+
+No LEAK_XI_URL/LEAK_XII_URL/LEAK_XIV_URL needed once the servers are
+registered in the UI — they're still read as a fallback (below), useful
+for headless contexts with no browser session, like the queue worker.
 
 `ARCHITECT_MODEL` is optional — unknown models fall down a ladder
 (`grok-4.1-fast-reasoning` → `grok-4.1-fast` → `grok-4.1` → …). Optional

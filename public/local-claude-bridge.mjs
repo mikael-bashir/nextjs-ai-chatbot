@@ -3509,12 +3509,32 @@ const ARCHITECT_REFINE_RETRIES = 8
 const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 8)
 const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 2)
 
-function architectUrls(opts = {}) {
+// Resolve XI/XII/XIV the SAME way every other Leak server is discovered in
+// this app: by NAME, from the servers the operator registered in the
+// existing MCP Servers UI (ctx.mcpServers — populated via the app's normal
+// /api/mcp/servers -> fetchProverMcpServers path, not a separate mechanism).
+// Only the URL matters here; auth type on the registered row is irrelevant.
+// Matching is punctuation/case-insensitive so "Leak XI", "Leak-XI",
+// "leak_xi" all resolve.
+// LEAK_SERVICE_TOKEN deliberately stays a bridge-local env var rather than
+// living on the registered-server row: registered-server credentials in this
+// app never leave the server side (fetchProverMcpServers strips `credentials`
+// down to {name,url} before it ever reaches the browser or this bridge) --
+// the bridge needs the RAW bearer token itself to call these services
+// directly, so keeping it local matches the existing trust boundary instead
+// of poking a hole in it. Same pattern as XAI_API_KEY.
+const NORM_NAME = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+function findRegisteredUrl(mcpServers, ...aliases) {
+  const wanted = aliases.map(NORM_NAME)
+  const hit = (mcpServers || []).find((s) => wanted.includes(NORM_NAME(s?.name)))
+  return hit?.url || ""
+}
+function architectUrls(opts = {}, mcpServers = []) {
   const a = opts.architect || {}
   return {
-    xi: a.xiUrl || process.env.LEAK_XI_URL || "",
-    xii: a.xiiUrl || process.env.LEAK_XII_URL || "",
-    xiv: a.xivUrl || process.env.LEAK_XIV_URL || "",
+    xi: a.xiUrl || findRegisteredUrl(mcpServers, "Leak XI", "Leak-XI") || process.env.LEAK_XI_URL || "",
+    xii: a.xiiUrl || findRegisteredUrl(mcpServers, "Leak XII", "Leak-XII") || process.env.LEAK_XII_URL || "",
+    xiv: a.xivUrl || findRegisteredUrl(mcpServers, "Leak XIV", "Leak-XIV") || process.env.LEAK_XIV_URL || "",
   }
 }
 
@@ -4025,7 +4045,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
 
 // --- The pipeline -------------------------------------------------------------
 async function proveArchitect(theorem, ctx, opts = {}) {
-  const urls = architectUrls(opts)
+  const urls = architectUrls(opts, ctx.mcpServers)
   if (!urls.xii || !urls.xiv) {
     ctx.emit({ type: "error", message: "Architect needs LEAK_XII_URL and LEAK_XIV_URL set on the bridge (Leak XI optional for search). Set the env vars and restart the bridge." })
     return { verified: false, proof: "" }

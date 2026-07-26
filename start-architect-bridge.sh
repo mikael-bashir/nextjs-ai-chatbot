@@ -15,6 +15,11 @@ set -a; source .env; set +a
 : "${XAI_API_KEY:?XAI_API_KEY missing from .env}"
 : "${LEAK_SERVICE_TOKEN:?LEAK_SERVICE_TOKEN missing from .env}"
 
+# Fallback only. The bridge resolves XI/XII/XIV by NAME from whatever MCP
+# servers you've registered in the app's own MCP Servers UI first (register
+# them as "Leak XI" / "Leak XII" / "Leak XIV" with these URLs — same place
+# every other Leak server lives). These env vars only kick in if no matching
+# registered server is found for the active session.
 export LEAK_XI_URL="${LEAK_XI_URL:-https://utterfool-leak-xi.hf.space}"
 export LEAK_XII_URL="${LEAK_XII_URL:-https://utterfool-leak-xii.hf.space}"
 export LEAK_XIV_URL="${LEAK_XIV_URL:-https://utterfool-leak-xiv.hf.space}"
@@ -22,7 +27,6 @@ export ARCHITECT_MODEL="${ARCHITECT_MODEL:-grok-4-1-fast-reasoning}"
 export ARCHITECT_NODE_CONCURRENCY="${ARCHITECT_NODE_CONCURRENCY:-2}"
 
 echo "architect bridge: model=$ARCHITECT_MODEL"
-echo "  XI : $LEAK_XI_URL"
-echo "  XII: $LEAK_XII_URL"
-echo "  XIV: $LEAK_XIV_URL"
+echo "  (resolving Leak XI/XII/XIV by name from the app's registered MCP servers;"
+echo "   env-var fallback: XI=$LEAK_XI_URL XII=$LEAK_XII_URL XIV=$LEAK_XIV_URL)"
 exec node public/local-claude-bridge.mjs
