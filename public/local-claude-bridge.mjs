@@ -3570,13 +3570,18 @@ Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial 
 Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. Mathlib does NOT contain the solution to your problem directly, so do not use this tool to "find the proof" or to search for an exact bound stated in the goal -- such queries return nothing useful and waste turns.
 
 ## Other outcomes
-If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.
+If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.`
 
-If you cannot close the goal within budget, END with a structured forfeit post-mortem in EXACTLY this format (three sections, these exact headers):
-## Diagnosis: STATEMENT_WRONG or PROOF_TOO_HARD
-## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
-## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.
-Never end with a bare apology or an unstructured summary -- the forfeit is consumed by a downstream revision stage.`
+// The paper's actual Appendix C.2 prompt (verbatim, as published) stops here
+// -- it never mentions forfeiting. Telling the model a structured "give up"
+// format is available FROM TURN ONE makes it an easy, well-lit exit ramp: a
+// fast/cheap model takes it the moment a goal gets algebraically annoying,
+// often within a handful of turns and nowhere near its real token budget --
+// exactly what happened on this stack's own six_dvd_cubic smoke run. The
+// forfeit format is injected instead as a follow-up message, ONLY once a
+// node has genuinely exhausted its turn/token budget with no solve -- see
+// grokLoop's forced-forfeit turn below. This forces every attempt to spend
+// its real budget compiling and iterating before any exit is offered.
 }
 
 // --- Appendix C.3 — blueprint refinement (behavioral prompt, cached) --------
@@ -3694,16 +3699,43 @@ function architectCompact(messages, keep = 2) {
 
 // Generic tool loop for one stage attempt: fresh conversation, budgeted,
 // short-circuits the moment `exec` reports the stage goal reached.
-async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60 }) {
+// Requested ONLY once a grokLoop call has genuinely exhausted its turn/token
+// budget with no solve -- matches the paper's actual Appendix C.2 prompt
+// (which never mentions forfeiting at all; "user prompts... are omitted").
+// Baking this into the turn-1 SYSTEM prompt instead (the original bug here)
+// hands a fast/cheap model a well-lit, socially-sanctioned exit ramp from
+// turn one -- confirmed live: a real node forfeited in ~150s, nowhere near
+// its 65,536-token budget, the moment its Lean goal got algebraically messy.
+const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal without a verified proof. This is your FINAL turn -- do not call any tool. Write your forfeit now, in EXACTLY this format (three sections, these exact headers):
+## Diagnosis: STATEMENT_WRONG or PROOF_TOO_HARD
+## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
+## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
+
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt }) {
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
   ]
   state.stageTokens = 0
   let finalText = ""
+
+  // Fires ONLY on genuine exhaustion (token budget / deadline / turn cap) —
+  // never on a voluntary early stop, and never available to the model until
+  // this exact moment. A no-tools call so the reply can only be prose.
+  const forceForfeit = async () => {
+    if (!forfeitPrompt) return finalText
+    messages.push({ role: "user", content: forfeitPrompt })
+    try {
+      const msg = await grokCall(state, messages, [], ctx)
+      return String(msg.content || "") || finalText
+    } catch {
+      return finalText
+    }
+  }
+
   for (let turn = 0; turn < hardTurns; turn++) {
-    if (state.stageTokens >= tokenBudget) return { finalText, exhausted: true }
-    if (deadlinePassed(ctx)) return { finalText, exhausted: true }
+    if (state.stageTokens >= tokenBudget) return { finalText: await forceForfeit(), exhausted: true }
+    if (deadlinePassed(ctx)) return { finalText: await forceForfeit(), exhausted: true }
     const msg = await grokCall(state, messages, tools, ctx)
     const toolCalls = msg.tool_calls || []
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls.length ? toolCalls : undefined })
@@ -3728,7 +3760,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     }
     architectCompact(messages)
   }
-  return { finalText, exhausted: true }
+  return { finalText: await forceForfeit(), exhausted: true }
 }
 
 const ARCHITECT_COMPILE_TOOL = {
@@ -3933,6 +3965,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_NODE_TOKENS,
+      forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
     })
     if (out.done) {
       result.solved = !out.done.negated
