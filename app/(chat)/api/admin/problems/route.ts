@@ -127,6 +127,24 @@ export async function POST(request: NextRequest) {
       signature: body.signature ?? null,
       signatureKeyId: body.signatureKeyId ?? null,
       certMintedAt: body.certMintedAt ?? null,
+      // Every distinct-toolchain certificate accumulated pre-publish. Falls
+      // back to a single-entry list from the flat fields above if the caller
+      // didn't send one (defensive — the client always does via
+      // certsOrFallback), so promote always has something to iterate.
+      certs: Array.isArray(body.certs) && body.certs.length
+        ? body.certs
+        : body.proof
+          ? [{
+              toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+              mathlib: body.mathlib ?? 'v4.29.1',
+              enforcer: body.enforcer ?? null,
+              proof: body.proof,
+              verifiedAt: body.verifiedAt ?? null,
+              signature: body.signature ?? null,
+              signatureKeyId: body.signatureKeyId ?? null,
+              certMintedAt: body.certMintedAt ?? null,
+            }]
+          : [],
       createdAt: new Date().toISOString(),
     };
     const staged = await pushProblem(record);

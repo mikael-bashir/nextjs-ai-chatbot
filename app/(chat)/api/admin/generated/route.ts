@@ -206,6 +206,8 @@ export async function PATCH(request: NextRequest) {
       // Which specific strategy enforced this proof, for the certificate's
       // Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak").
       'enforcer',
+      // Every distinct-toolchain certificate accumulated pre-publish.
+      'certs',
     ] as const) {
       if (k in body) patch[k] = body[k];
     }

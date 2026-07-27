@@ -496,6 +496,26 @@ interface GenProblem {
   exactValue?: string;
 }
 
+// One independently-signed certificate for one toolchain. The flat fields on
+// StagedItem below (proof/toolchain/mathlib/...) always mirror the MOST
+// RECENT verify, for every existing UI read that expects a single proof;
+// `certs` is the full accumulated set — one entry per DISTINCT toolchain the
+// item has ever been successfully verified+signed on, upserted (not
+// appended) so re-verifying the SAME toolchain replaces its entry rather
+// than duplicating it. This is what lets an admin verify a problem on
+// several toolchains BEFORE ever promoting it, and have all of them ship as
+// independent certificates the first time it goes live.
+interface CertEntry {
+  toolchain: string;
+  mathlib?: string | null;
+  enforcer?: string | null;
+  proof: string;
+  verifiedAt?: string | null;
+  signature?: string | null;
+  signatureKeyId?: string | null;
+  certMintedAt?: string | null;
+}
+
 interface StagedItem extends GenProblem {
   id: string;
   proof?: string;
@@ -514,6 +534,9 @@ interface StagedItem extends GenProblem {
   signature?: string | null;
   signatureKeyId?: string | null;
   certMintedAt?: string | null;
+  // Every distinct-toolchain certificate accumulated across re-verifies of
+  // THIS item, pre-publish. See CertEntry.
+  certs?: CertEntry[];
 }
 
 interface GeneratedItem extends StagedItem {
@@ -763,6 +786,33 @@ function enforcerLabelFor(strategy: string): string {
   const ultra = ULTRA_STRATEGIES.find((s) => s.value === strategy);
   if (ultra) return ultra.label.split('(')[0].trim();
   return STRONGHOLD_ENFORCER_LABELS[strategy] ?? 'Leak';
+}
+
+// Replace this toolchain's entry (re-verifying the same toolchain updates it
+// in place) or append a new one (a genuinely new toolchain). Never grows
+// unbounded — one entry per distinct toolchain, always.
+function upsertCertEntry(certs: CertEntry[] | undefined, entry: CertEntry): CertEntry[] {
+  const next = (certs ?? []).filter((c) => c.toolchain !== entry.toolchain);
+  next.push(entry);
+  return next;
+}
+// certs[] is the source of truth once populated; an item that only ever had
+// ONE verify (certs never touched) falls back to synthesizing a single-entry
+// list from the flat fields, so every downstream consumer can just read
+// certs() and get the right answer regardless of how the item got there.
+function certsOrFallback(item: StagedItem): CertEntry[] {
+  if (item.certs?.length) return item.certs;
+  if (!item.proof) return [];
+  return [{
+    toolchain: item.toolchain || TOOLCHAIN,
+    mathlib: item.mathlib ?? null,
+    enforcer: item.enforcer ?? null,
+    proof: item.proof,
+    verifiedAt: item.verifiedAt ?? null,
+    signature: item.signature ?? null,
+    signatureKeyId: item.signatureKeyId ?? null,
+    certMintedAt: item.certMintedAt ?? null,
+  }];
 }
 
 // Would this proof text make a HONEST certificate for `target`? A certificate
@@ -1614,6 +1664,13 @@ export function AdminPipeline() {
             `Not signing ${item.questionTitle || item.id}: ${certShapeError}`,
           );
         }
+        // Accumulated once signing is attempted below — every DISTINCT toolchain
+        // this item has ever been verified on, upserted by toolchain (a re-verify
+        // of the SAME toolchain replaces its entry, never duplicates it). This is
+        // what lets an admin verify a problem on several toolchains before ever
+        // promoting it, and ship all of them as independent certificates the
+        // first time it goes live — see certsOrFallback/upsertCertEntry.
+        let updatedCerts: CertEntry[] | undefined;
         if (verified && proof && !certShapeError) {
           try {
             const r = await fetch('/api/admin/certificate/sign', {
@@ -1636,6 +1693,16 @@ export function AdminPipeline() {
           } catch {
             /* signing best-effort — the proof is still recorded either way */
           }
+          updatedCerts = upsertCertEntry(item.certs, {
+            toolchain: runToolchain,
+            mathlib: runMathlib,
+            enforcer: enforcerLabelFor(strategyAtStart),
+            proof,
+            verifiedAt,
+            signature: cert?.signature ?? null,
+            signatureKeyId: cert?.keyId ?? null,
+            certMintedAt: cert?.certMintedAt ?? null,
+          });
           // Robustness feature, backend-only (no UI change): if this title is
           // ALREADY published and this toolchain doesn't have a certificate
           // for it yet, push this one straight to prod as an additional
@@ -1688,6 +1755,8 @@ export function AdminPipeline() {
                 certMintedAt: cert.certMintedAt,
               }
             : {}),
+          // The full accumulated set of per-toolchain certificates (see above).
+          ...(updatedCerts ? { certs: updatedCerts } : {}),
           error: verified
             ? null
             : refuted
@@ -2513,6 +2582,9 @@ export function AdminPipeline() {
           signature: item.signature ?? null,
           signatureKeyId: item.signatureKeyId ?? null,
           certMintedAt: item.certMintedAt ?? null,
+          // Every distinct-toolchain certificate accumulated pre-publish, so
+          // promote can ship all of them the first time this problem goes live.
+          certs: certsOrFallback(item),
         }),
       });
       if (res.ok) {

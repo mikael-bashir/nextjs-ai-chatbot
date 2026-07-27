@@ -74,6 +74,10 @@ export interface StagedProblem {
   proof: string;
   toolchain?: string;
   createdAt: string;
+  // Every distinct-toolchain certificate accumulated pre-publish (see
+  // GeneratedRecord.certs — same shape). Promote pushes ALL of them, not
+  // just the single flat proof/toolchain above.
+  certs?: GeneratedRecord['certs'];
 }
 
 export async function pushProblem(
@@ -153,6 +157,22 @@ export interface GeneratedRecord {
   signature?: string;
   signatureKeyId?: string;
   certMintedAt?: string;
+  // Every distinct-toolchain certificate accumulated across re-verifies of
+  // this item, upserted by toolchain — lets an admin verify on several
+  // toolchains BEFORE ever promoting, and ship all of them as independent
+  // certificates the first time this problem goes live. The flat fields
+  // above always mirror the MOST RECENT verify (unchanged, for every
+  // existing reader); this is the full accumulated set.
+  certs?: Array<{
+    toolchain: string;
+    mathlib?: string | null;
+    enforcer?: string | null;
+    proof: string;
+    verifiedAt?: string | null;
+    signature?: string | null;
+    signatureKeyId?: string | null;
+    certMintedAt?: string | null;
+  }>;
   // Cost-estimator display state, persisted so the estimate (made on enqueue)
   // and the actual (recorded on verify) survive a page refresh. The learning
   // history lives separately in proof_cost_history; these mirror it per-card.

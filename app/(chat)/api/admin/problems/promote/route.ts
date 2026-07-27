@@ -58,10 +58,37 @@ export async function POST(request: NextRequest) {
     const knowledge =
       Number.isInteger(lvl) && lvl >= 1 && lvl <= 5 ? `Level ${lvl}` : null;
 
-    // Exactly the fields the weekly-problems cron reads. Includes the Lean proof
-    // + provenance so CompeteMath can render a verification CERTIFICATE for the
-    // problem: `proof` is the machine-checked script, `mintedAt` is when it was
-    // generated, `toolchain` is the Lean/Mathlib it was enforced against.
+    // Every distinct-toolchain certificate this problem accumulated BEFORE
+    // ever being promoted (see certsOrFallback client-side) — could be one,
+    // could be several if the admin verified it on more than one toolchain
+    // pre-publish. Falls back to a single entry from the flat fields for a
+    // staged record that predates `certs` or somehow arrived without one.
+    type Cert = {
+      toolchain: string; mathlib?: string | null; enforcer?: string | null;
+      proof: string; verifiedAt?: string | null; signature?: string | null;
+      signatureKeyId?: string | null; certMintedAt?: string | null;
+    };
+    const certList: Cert[] = (rec as { certs?: Cert[] }).certs?.length
+      ? (rec as { certs: Cert[] }).certs
+      : rec.proof
+        ? [{
+            toolchain: rec.toolchain ?? 'leanprover/lean4:v4.29.1',
+            mathlib: (rec as { mathlib?: string | null }).mathlib ?? null,
+            enforcer: (rec as { enforcer?: string | null }).enforcer ?? null,
+            proof: rec.proof,
+            verifiedAt: (rec as { verifiedAt?: string | null }).verifiedAt ?? null,
+            signature: (rec as { signature?: string | null }).signature ?? null,
+            signatureKeyId: (rec as { signatureKeyId?: string | null }).signatureKeyId ?? null,
+            certMintedAt: (rec as { certMintedAt?: string | null }).certMintedAt ?? null,
+          }]
+        : [];
+    const primary = certList[0];
+
+    // Exactly the fields the weekly-problems cron reads. The flat fields are
+    // the PRIMARY (first) certificate, kept for any consumer that only reads
+    // a single proof/toolchain; `certificates` carries the FULL list, which
+    // is what actually determines how many independent certificates this
+    // problem ships with the moment it goes live.
     const prodPayload = {
       questionTitle: rec.questionTitle ?? 'Generated Problem',
       questionProblem: rec.problem ?? '',
@@ -70,24 +97,26 @@ export async function POST(request: NextRequest) {
       points: rec.points ?? 100,
       answer: rec.answer ?? null,
       knowledge,
-      proof: rec.proof ?? null,
+      proof: primary?.proof ?? null,
       mintedAt: rec.createdAt ?? null,
       // The real Lean-kernel verification time (set by the verifier) + the
       // certificate signature minted right after it. CompeteMath stores these
       // verbatim (no re-signing), so the published signature is the one made
       // seconds after the kernel verified.
-      verifiedAt: (rec as { verifiedAt?: string | null }).verifiedAt ?? null,
-      signature: (rec as { signature?: string | null }).signature ?? null,
-      signatureKeyId:
-        (rec as { signatureKeyId?: string | null }).signatureKeyId ?? null,
-      certMintedAt: (rec as { certMintedAt?: string | null }).certMintedAt ?? null,
+      verifiedAt: primary?.verifiedAt ?? null,
+      signature: primary?.signature ?? null,
+      signatureKeyId: primary?.signatureKeyId ?? null,
+      certMintedAt: primary?.certMintedAt ?? null,
       // Which Lean/Mathlib certified this proof. Sent as a PAIR: the certificate
       // header prints both, and the two verifier groups differ in both.
-      toolchain: rec.toolchain ?? null,
-      mathlib: (rec as { mathlib?: string | null }).mathlib ?? null,
+      toolchain: primary?.toolchain ?? null,
+      mathlib: primary?.mathlib ?? null,
       // Which specific strategy enforced this proof, for the certificate's
       // Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak").
-      enforcer: (rec as { enforcer?: string | null }).enforcer ?? null,
+      enforcer: primary?.enforcer ?? null,
+      // Every independent certificate this problem has — one row in
+      // CompeteMath's question_certificates per entry (see ingestOne).
+      certificates: certList,
       // Solver-facing key idea (1-3 sentences). CompeteMath reveals it alongside
       // the answer once a problem is solved or given up.
       insight: rec.insight ?? null,
@@ -96,20 +125,26 @@ export async function POST(request: NextRequest) {
     // Order matters: publish to prod + persist metadata BEFORE removing from
     // staging, so a failure never loses the problem (it can be retried).
     const prodLength = await pushToProd(prodPayload);
-    await saveGeneratedProblem({
-      problemId: rec.id,
-      questionTitle: rec.questionTitle ?? null,
-      subtitle: rec.subtitle ?? null,
-      problem: rec.problem ?? null,
-      answer: rec.answer ?? null,
-      difficulty: rec.difficulty ?? null,
-      points: rec.points ?? null,
-      insight: rec.insight ?? null,
-      lean: rec.lean,
-      proof: rec.proof,
-      toolchain: rec.toolchain ?? null,
-      promotedAt: new Date(),
-    });
+    // Record EVERY toolchain in the leak-side promoted archive (not just the
+    // primary one), so promotedToolchainsForTitle correctly reports all of
+    // them and a later re-verify on a toolchain already shipped here is
+    // recognized as redundant rather than pushed again.
+    for (const c of certList) {
+      await saveGeneratedProblem({
+        problemId: rec.id,
+        questionTitle: rec.questionTitle ?? null,
+        subtitle: rec.subtitle ?? null,
+        problem: rec.problem ?? null,
+        answer: rec.answer ?? null,
+        difficulty: rec.difficulty ?? null,
+        points: rec.points ?? null,
+        insight: rec.insight ?? null,
+        lean: rec.lean,
+        proof: c.proof,
+        toolchain: c.toolchain,
+        promotedAt: new Date(),
+      });
+    }
     await deleteProblem(id);
 
     return Response.json({ ok: true, prodLength });

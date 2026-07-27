@@ -77,6 +77,19 @@ export async function POST(request: NextRequest) {
       mathlib: body?.mathlib ?? null,
       enforcer: body?.enforcer ?? null,
       insight: body?.insight ?? null,
+      // Same shape promote sends — one entry here, since this route only ever
+      // attaches ONE newly-verified toolchain at a time. Keeps ingestOne to a
+      // single code path regardless of which route produced the payload.
+      certificates: [{
+        toolchain,
+        mathlib: body?.mathlib ?? null,
+        enforcer: body?.enforcer ?? null,
+        proof,
+        verifiedAt: body?.verifiedAt ?? null,
+        signature: body?.signature ?? null,
+        signatureKeyId: body?.signatureKeyId ?? null,
+        certMintedAt: body?.certMintedAt ?? null,
+      }],
     };
 
     const prodLength = await pushToProd(prodPayload);
