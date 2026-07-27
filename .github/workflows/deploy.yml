@@ -106,6 +106,7 @@ jobs:
             RESEND_API_KEY=${{ secrets.RESEND_API_KEY }}
             ESTIMATOR_URL=http://cost-estimator:8900
             CERT_SIGN_PRIVATE_KEY=${{ secrets.CERT_SIGN_PRIVATE_KEY }}
+            CERT_SIGN_PRIVATE_KEY_ARCHITECT=${{ secrets.CERT_SIGN_PRIVATE_KEY_ARCHITECT }}
             LEAK_WORKER_SECRET=${{ secrets.LEAK_WORKER_SECRET }}
             ANTHROPIC_API_KEY=${{ secrets.ANTHROPIC_API_KEY }}
             LEAK_PROVER_MCP_CONFIG=${{ secrets.LEAK_PROVER_MCP_CONFIG }}
