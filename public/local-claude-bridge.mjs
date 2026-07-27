@@ -154,6 +154,19 @@ function readBody(req) {
 // agent "discover" a goal is an open conjecture and stop proving — cut them so it
 // stays in the compiler. Tune here (e.g. add "Bash" to also cut numeric probing).
 const PROVER_DISALLOWED_TOOLS = ["WebSearch", "WebFetch"]
+// The architect pipeline (Leak Ultra) is stricter: EVERY real action must go
+// through the bridge-served lean_compile/mathlib_search, by design (that's
+// what keeps the compile gate bridge-side instead of trusting the model's
+// self-report). Bash/Read/Write/Edit/Glob/Grep/Task buy nothing there — a
+// Bash-computed value still has to round-trip through lean_compile to count
+// for anything — and cost real damage in practice: a session shelled out to
+// Python to precompute a huge memoized lemma table instead of writing a
+// direct proof (inflating both the blueprint size and the bill), and a
+// separate session mistook "import Architect" (the local blueprint-attribute
+// macro) for a real package and started `find /`-ing the operator's own
+// filesystem for it, burning turns on a pure derailment with zero proof
+// value. Stronghold's PROVER_DISALLOWED_TOOLS above is unaffected.
+const ARCHITECT_DISALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "WebSearch", "WebFetch"]
 
 function buildArgs(prompt, options = {}) {
   const args = ["-p", String(prompt), "--output-format", "json"]
@@ -2553,7 +2566,7 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
@@ -2587,7 +2600,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       // it's an unsolved conjecture, and stop — burning the run on research instead
       // of the compiler. Cut them. (Leak I loogle/moogle stay for LEAN lemma search,
       // and Bash stays — numeric witness-finding is real proof work.)
-      "--disallowedTools", ...PROVER_DISALLOWED_TOOLS,
+      "--disallowedTools", ...(Array.isArray(disallowedTools) ? disallowedTools : PROVER_DISALLOWED_TOOLS),
     ]
     if (model) args.push("--model", model)
     if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
@@ -4207,6 +4220,13 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
       metrics: ctx.metrics,
       signal: ctx.signal,
       searchBudget: 0,
+      // Every real action here must go through lean_compile/mathlib_search
+      // (served above via bridgeHandlers) — Bash/filesystem/Task access buys
+      // nothing for this pipeline and has caused real derailments (shelling
+      // out to Python instead of writing a direct proof; mistaking `import
+      // Architect` for a real package and searching the local filesystem
+      // for it). See ARCHITECT_DISALLOWED_TOOLS.
+      disallowedTools: ARCHITECT_DISALLOWED_TOOLS,
     },
     {
       // Stop the CLI the moment a stage's gate is satisfied; SIGINT (not kill) so
