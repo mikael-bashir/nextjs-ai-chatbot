@@ -2653,6 +2653,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     const clearTimers = () => {
       if (timer) clearTimeout(timer)
       if (deadlineTimer) clearInterval(deadlineTimer)
+      clearInterval(idleTimer)
     }
     const onAbort = () => {
       stopped = true
@@ -2662,6 +2663,29 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       if (signal.aborted) onAbort()
       else signal.addEventListener("abort", onAbort, { once: true })
     }
+
+    // ---- Liveness ----------------------------------------------------------
+    // The CLI owns its own tool loop, so between two of its JSON objects the
+    // bridge emits NOTHING. A stalled CLI and a thinking CLI look identical in
+    // the transcript, and with timeoutMs=0 on the architect stages the only
+    // bound is the run deadline — so "nothing for ten minutes" is unreadable:
+    // it could be a long think, a wedged subprocess, or a hung MCP call, and
+    // there is no way to tell them apart from outside. Say so on a timer.
+    // Observability only: it never stops or changes anything.
+    let lastObjectAt = Date.now()
+    let objectCount = 0
+    const idleTimer = setInterval(() => {
+      const idleS = Math.round((Date.now() - lastObjectAt) / 1000)
+      if (idleS < ARCHITECT_IDLE_NOTICE_S) return
+      emit?.({
+        type: "message-annotation",
+        subtype: "status",
+        thought:
+          `⏳${stage ? ` ${stage}` : ""} still running — ${idleS}s since the CLI last produced output ` +
+          `(${objectCount} message(s) so far). Nothing is capped here; the run deadline is the only bound.`,
+      })
+    }, ARCHITECT_IDLE_NOTICE_S * 1000)
+    idleTimer.unref?.()
 
     let buf = ""
     let stderr = ""
@@ -2685,6 +2709,8 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         } catch {
           continue
         }
+        lastObjectAt = Date.now()
+        objectCount++
         let stop = false
         try {
           stop = onObject ? onObject(o) : false
@@ -3680,6 +3706,9 @@ const ARCHITECT_NODE_TOKENS = 131072
 const BLUEPRINT_TIMEOUT_MS = 600000
 const NODE_TIMEOUT_MS = 300000
 const VERIFY_TIMEOUT_MS = 600000
+// How long the CLI may produce nothing before the bridge says so. Purely a
+// notice: it never stops anything.
+const ARCHITECT_IDLE_NOTICE_S = 45
 const ARCHITECT_BLUEPRINT_RETRIES = 9999
 const ARCHITECT_NODE_RETRIES = 9999
 const ARCHITECT_REFINE_RETRIES = 9999
