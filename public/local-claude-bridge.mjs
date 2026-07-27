@@ -3877,6 +3877,7 @@ Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotate
     @[blueprint (statement := /-- natural language description of what's being defined -/)]
     def name (binders) : type := body
   (or \`noncomputable def\`, \`abbrev\`, \`structure\`, \`instance\` as fits.) Definitions get a real Lean body, not \`sorry_using\`.
+- A SUPPORTING declaration — one the signatures need only in order to ELABORATE, such as an \`instance\` supplying a typeclass the target's own statement requires — is written WITHOUT an \`@[blueprint]\` attribute. It is then not a graph node: it needs no \`statement\` field, it is exempt from the reachability check, and it is still carried into every node prover's prefix and into the final assembled file. Use this when the target does not typecheck on its own; do NOT use it to smuggle in a lemma (a theorem or lemma always has to be a real node).
 - For a Lemma or Theorem, emit:
     @[blueprint
       (statement := /-- closed, typed, standalone natural language proposition -/)
@@ -5781,6 +5782,46 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.metrics.max_iters = maxIters()
     ctx.metrics.models_used = []
     ctx.metrics.driver = driver
+  }
+
+  // ---- Pre-flight: the TARGET itself must elaborate ------------------------
+  // Nothing downstream can succeed if the goal does not typecheck, and the
+  // blueprint stage cannot tell the difference between "my graph is wrong" and
+  // "the target is unusable" — every attempt fails on the same Lean error, and
+  // with retries effectively unbounded it re-attempts until the clock or the
+  // cost cap ends the run. `insane_lamp_circle` burned its whole budget on
+  //     failed to synthesize instance of type class Fintype (ZMod N)
+  // and never emitted a single iteration marker, because an iteration is only
+  // announced once a graph validates.
+  //
+  // Five seconds here converts that into a legible failure. This is NOT a cap
+  // on the prover: it rejects an input that provably cannot be proved, and it
+  // is fatal ONLY on real Lean errors. A backend fault, a timeout or a cold
+  // service warns and proceeds, so an infrastructure hiccup can never cost a
+  // runnable problem.
+  try {
+    const pre = await architectMcpCall(urls.xii, "lean_compile", {
+      mode: "explore",
+      code: `${state.targetSignature.trim()} := by sorry`,
+    }, Number(NODE_TIMEOUT_MS))
+    if (Array.isArray(pre?.errors) && pre.errors.length) {
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "error",
+        thought:
+          `🚫 The target theorem does not elaborate — stopping before the blueprint stage.\n` +
+          `Nothing can be proved about a statement Lean cannot typecheck, and every blueprint ` +
+          `attempt would fail on this same error until the run's budget ran out.\n\n` +
+          String(pre.report || "").slice(0, 1200),
+      })
+      return { verified: false, proof: "" }
+    }
+  } catch (e) {
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `⚠️ Target pre-flight could not run (${String(e?.message || e).slice(0, 160)}) — continuing anyway.`,
+    })
   }
   ctx.emit({
     type: "message-annotation",

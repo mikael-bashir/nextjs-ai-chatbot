@@ -535,8 +535,29 @@ def validate_graph(code: str, target_name: str) -> tuple[list[str], list[Node]]:
     if len(mains) != 1:
         v.append(f"exactly one main Theorem named '{target_name}' must exist (found {len(mains)})")
 
+    # A DEFINITION carrying no `@[blueprint]` attribute is a SUPPORTING
+    # declaration, not a graph node: an `instance`, a helper `def`, notation the
+    # signatures need. It is exempt from the statement field and from
+    # reachability, and it is still emitted into node prefixes and the assembled
+    # file because it is returned in `nodes` like everything else.
+    #
+    # Without this there was no legal way to write a target that needs an
+    # instance to elaborate at all. `insane_lamp_circle` needs `NeZero N` for
+    # `Fintype (ZMod N)` to exist; the driver worked that out, added the
+    # instance, and got back "isolated/dead nodes: neZeroOfEqN" — which reads as
+    # "delete this", so the blueprint could never validate and the run spun on
+    # attempt 1 until its budget ran out.
+    #
+    # Theorems and lemmas are NOT eligible: precheck_blueprint already requires
+    # every one of them to be a `@[blueprint]` node with a `sorry_using` body,
+    # and that is what keeps proofs out of this stage.
+    def _is_support(n: Node) -> bool:
+        return n.kind not in ("theorem", "lemma") and "blueprint" not in n.attr_text
+
+    support = {n.name for n in nodes if _is_support(n)}
+
     for n in nodes:
-        if not n.statement_doc:
+        if not n.statement_doc and n.name not in support:
             v.append(f"'{n.name}': empty or missing '(statement := /-- ... -/)' field")
         if n.kind in ("theorem", "lemma") and not n.proof_doc:
             v.append(f"'{n.name}': Lemma/Theorem missing a non-empty '(proof := /-- ... -/)' field")
@@ -579,11 +600,14 @@ def validate_graph(code: str, target_name: str) -> tuple[list[str], list[Node]]:
                 continue
             reach.add(x)
             stack.extend(d for d in byname[x].deps if d in byname)
-        dead = [n.name for n in nodes if n.name not in reach]
+        dead = [n.name for n in nodes if n.name not in reach and n.name not in support]
         if dead:
             v.append(
                 "every node must be reachable, in reverse, from the main Theorem "
-                f"(isolated/dead nodes: {', '.join(dead)})"
+                f"(isolated/dead nodes: {', '.join(dead)}). If one of these is a "
+                "supporting declaration the signatures need to elaborate (an "
+                "instance, a helper def), drop its '@[blueprint]' attribute and it "
+                "will be carried into the proofs without being a graph node."
             )
     return v, nodes
 

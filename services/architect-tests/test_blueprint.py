@@ -239,6 +239,36 @@ n = parse_one(node("main_t", deps="a, a, b"))
 check("deps de-duplicated", n.deps, ["a", "b"])
 
 # ---------------------------------------------------------------------------
+print("\n== supporting declarations (un-annotated def/instance) ==")
+# ---------------------------------------------------------------------------
+# `insane_lamp_circle` needs `NeZero N` for `Fintype (ZMod N)` to exist at all.
+# The driver worked that out, added the instance, and got "isolated/dead nodes:
+# neZeroOfEqN" — so the blueprint could never validate and the run spun on
+# attempt 1 until its budget ran out. A definition with no `@[blueprint]` is now
+# support: exempt from the statement field and from reachability, still returned
+# in `nodes` so it reaches node prefixes and the assembled file.
+MAIN_T = ("@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\n"
+          "theorem main_t : True := by sorry_using []")
+
+
+def gv(code, target="main_t"):
+    return bp.validate_graph(code, target)
+
+
+v, nodes = gv("instance foo : NeZero 3 := ⟨by norm_num⟩\n\n" + MAIN_T)
+ok("un-annotated instance is accepted", v == [], "; ".join(v))
+ok("...and is still returned for assembly", [n.name for n in nodes] == ["foo", "main_t"])
+v, _ = gv("def powMod (b e m : Nat) : Nat := b\n\n" + MAIN_T)
+ok("un-annotated helper def is accepted", v == [], "; ".join(v))
+# Everything that was strict stays strict.
+v, _ = gv("@[blueprint]\ndef bar : Nat := 7\n\n" + MAIN_T)
+ok("an ANNOTATED def with no statement is still rejected", any("statement" in x for x in v))
+v, _ = gv("@[blueprint (statement := /-- s -/)]\ndef bar : Nat := 7\n\n" + MAIN_T)
+ok("an ANNOTATED unreachable def is still dead", any("dead nodes" in x for x in v))
+v, _ = gv("theorem sneaky : True := by trivial\n\n" + MAIN_T)
+ok("a theorem is never support, however it is written", v != [])
+
+# ---------------------------------------------------------------------------
 print("\n== is_exploration_only (the #eval escape hatch) ==")
 # ---------------------------------------------------------------------------
 # Both stage prompts tell the model to CHECK a constant with a bare `#eval`.
