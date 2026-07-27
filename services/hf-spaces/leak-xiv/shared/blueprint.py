@@ -310,20 +310,51 @@ def parse_decl(chunk: str, span: tuple[int, int]) -> Node | None:
     if not m:
         return None
     kind, name = m.group(1), m.group(2)
-    # Split signature / body at the first top-level `:=` after the decl name.
+    # Split signature / body at the top-level `:=` that actually introduces the
+    # BODY. "First top-level `:=`" — what this used to do — is wrong whenever
+    # the STATEMENT itself contains a term-level binder, because `let x : T := v`
+    # and `have h : T := v` each put a `:=` at bracket depth 0 ahead of it.
+    #
+    # Observed live on `enclosing_circle_radius`, whose statement opens
+    # `let k1 : ℚ := 1`: the signature was cut to
+    # `theorem enclosing_circle_radius : let k1 : ℚ`, so the verbatim-signature
+    # gate could never pass, and the remainder was read as the body, so the
+    # `:= by sorry_using [...]` shape check failed too. Both safeguard errors,
+    # every attempt, with no edit the model could make to escape — it burned the
+    # whole stage probing (`Rat` for `ℚ`, one-lining, even a trivial `(1:ℚ) = 1`)
+    # against a parser that was never going to look past the first `let`.
+    #
+    # Each `let`/`have` binder consumes exactly one `:=`, so count them and skip
+    # that many. Binders nested inside brackets are already excluded by `depth`.
     srest = strip_comments(rest)
     depth = 0
     body_at = -1
+    pending_binders = 0
     i = m.end()
-    while i < len(srest) - 1:
+    n = len(srest)
+    while i < n - 1:
         c = srest[i]
         if c in "([{⟨":
             depth += 1
         elif c in ")]}⟩":
             depth -= 1
-        elif depth == 0 and srest[i : i + 2] == ":=":
-            body_at = i
-            break
+        elif depth == 0:
+            if srest[i : i + 2] == ":=":
+                if pending_binders:
+                    pending_binders -= 1
+                    i += 2
+                    continue
+                body_at = i
+                break
+            for kw in ("let", "have"):
+                if not srest.startswith(kw, i):
+                    continue
+                prev = srest[i - 1] if i else " "
+                nxt = srest[i + len(kw)] if i + len(kw) < n else " "
+                # Real keyword, not a substring of an identifier ("complete").
+                if not (prev.isalnum() or prev in "_'.") and not (nxt.isalnum() or nxt in "_'."):
+                    pending_binders += 1
+                break
         i += 1
     if body_at < 0:
         # structure/inductive bodies use `where`/`|` instead of `:=` — accept.
