@@ -71,6 +71,11 @@ mcp = FastMCP(
 pool = ReplPool()
 
 SORRY_WARN = re.compile(r"declaration uses 'sorry'")
+# Lean's "a tactic ran after its goal was already closed" family ("No goals to
+# be solved", "no goals"). When these are the ONLY errors in a node submission,
+# the proof is complete modulo stray trailing tactics — see the auto-repair in
+# `_compile_node.run_snippet`.
+NO_GOALS = re.compile(r"no goals", re.I)
 
 
 def _messages(resp: dict):
@@ -204,7 +209,8 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
     header = (prelude + "\n\n" if prelude else "") + (prefix + "\n\n" if prefix else "")
     header_lines = header.count("\n")
 
-    async def run_snippet(snippet: str, decl_start_line: int, *, negated: bool):
+    async def run_snippet(snippet: str, decl_start_line: int, *, negated: bool,
+                          repair: bool = True):
         try:
             resp = await pool.run(snippet, timeout=NODE_TIMEOUT_S)
         except RuntimeError as e:
@@ -216,6 +222,41 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
         goals = [s.get("goal", "") for s in resp.get("sorries", []) or []
                  if ((s.get("pos") or {}).get("line") or 0) >= decl_start_line]
         solve = not errs and not node_sorries and not goals
+
+        # ── Deterministic auto-repair (no LLM): "no goals to be solved" only ──
+        # Observed live (cyclotomic_2026_eval_one): a COMPLETE proof was
+        # resubmitted ~15 times across two attempts and ultimately forfeited
+        # because one trailing tactic (`norm_num` after a goal-closing `rw`)
+        # errored with "No goals to be solved" — a state one line-deletion away
+        # from a registered solve. When EVERY error is of that family and sits
+        # inside the rebuilt declaration, drop exactly those lines and compile
+        # once more. Single retry, never recursive, and strictly no-worse: if
+        # the repaired snippet does not fully solve, the ORIGINAL result is
+        # returned (plus a hint telling the model which lines to delete).
+        if (repair and errs
+                and all(NO_GOALS.search(e["msg"] or "") for e in errs)
+                and all((e.get("line") or 0) >= decl_start_line for e in errs)):
+            drop = {e["line"] for e in errs}
+            kept = [ln for i, ln in enumerate(snippet.split("\n"), start=1)
+                    if i not in drop]
+            repaired = "\n".join(kept)
+            r2 = await run_snippet(repaired, decl_start_line, negated=negated,
+                                   repair=False)
+            if r2.get("solve"):
+                n = len(drop)
+                r2["repairedSnippet"] = repaired
+                r2["report"] = (
+                    f"⚙️ Harness auto-repair: {n} stray tactic line(s) that ran after "
+                    "their goal was already closed (\"no goals to be solved\") were "
+                    "deleted; the remaining proof is complete.\n" + r2["report"])
+                return r2
+            hint = ("\nNote: every error above says a tactic ran AFTER its goal was "
+                    "already closed — the proof is likely complete once those tactic "
+                    "lines are deleted. Resubmit WITHOUT them; do not restructure.")
+            report = "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs) + hint
+            return {"ok": False, "solve": False, "negated": negated, "phase": "compile",
+                    "errors": errs, "openGoals": goals, "report": report}
+
         if errs:
             report = "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs)
         elif not solve:
@@ -236,7 +277,10 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
         rebuilt = f"{target_signature.strip()} :=\n  {body}"
         snippet = header + rebuilt
         r = await run_snippet(snippet, header_lines + 1, negated=False)
-        r["rebuilt"] = rebuilt
+        # If the no-goals auto-repair fired, the registered proof must be the
+        # REPAIRED text (what actually compiled), not the submission.
+        r["rebuilt"] = ("\n".join(r["repairedSnippet"].split("\n")[header_lines:])
+                        if r.get("repairedSnippet") else rebuilt)
         return r
 
     if neg is not None:
@@ -248,7 +292,8 @@ async def _compile_node(code: str, target_name: str, target_signature: str,
         rebuilt = f"{neg_sig.strip()} :=\n  {body}"
         snippet = header + rebuilt
         r = await run_snippet(snippet, header_lines + 1, negated=True)
-        r["rebuilt"] = rebuilt
+        r["rebuilt"] = ("\n".join(r["repairedSnippet"].split("\n")[header_lines:])
+                        if r.get("repairedSnippet") else rebuilt)
         return r
 
     # Exploration compile: no main theorem in the submission -> raw feedback.
