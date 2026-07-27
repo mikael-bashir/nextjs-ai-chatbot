@@ -54,13 +54,34 @@ export function extract(names) {
   const missing = names.filter((n) => !at.has(n))
   if (missing.length) throw new Error(`not found as top-level declarations in the bridge: ${missing.join(", ")}`)
 
-  const chunks = []
-  for (const n of names) {
+  const sliceOf = (n) => {
     const s = at.get(n)
     const e = starts.find((x) => x > s)
-    chunks.push(lines.slice(s, e === undefined ? lines.length : e).join("\n"))
+    return lines.slice(s, e === undefined ? lines.length : e).join("\n")
   }
-  return chunks.join("\n\n") + `\n\nexport { ${names.join(", ")} }\n`
+
+  // Pull in helpers the requested functions call. Without this, factoring a
+  // shared helper out of a tested function silently produces a module that
+  // throws ReferenceError at call time — which is how splitting
+  // architectBodyStart out of architectSignatureOf broke this suite. Only
+  // architect-namespaced top-level declarations are followed, so the closure
+  // stays inside the pipeline instead of dragging in the whole bridge.
+  const REF = /\b(architect[A-Za-z0-9_$]*|ARCHITECT_[A-Z0-9_]+)\b/g
+  const included = [...names]
+  const seen = new Set(names)
+  for (let i = 0; i < included.length; i++) {
+    const text = sliceOf(included[i])
+    for (const m of text.matchAll(REF)) {
+      const dep = m[1]
+      if (seen.has(dep) || !at.has(dep)) continue
+      seen.add(dep)
+      included.push(dep)
+    }
+  }
+
+  // Emit in source order so a `const` helper is never used before it is defined.
+  included.sort((a, b) => at.get(a) - at.get(b))
+  return included.map(sliceOf).join("\n\n") + `\n\nexport { ${names.join(", ")} }\n`
 }
 
 export async function loadBridgeSymbols(names) {

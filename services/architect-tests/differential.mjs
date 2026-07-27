@@ -29,7 +29,10 @@ const HERE = dirname(fileURLToPath(import.meta.url))
 const COUNT = Number(process.argv[2] || 3000)
 const SEED = Number(process.argv[3] || 20260727)
 
-const { architectSignatureOf } = await loadBridgeSymbols(["architectSignatureOf"])
+const { architectSignatureOf, architectProofBody } = await loadBridgeSymbols([
+  "architectSignatureOf",
+  "architectProofBody",
+])
 
 // xorshift32 — small, deterministic, dependency-free.
 let s = SEED >>> 0
@@ -101,13 +104,15 @@ out = {}
 for c in cases:
     chunks, spans = bp.split_decls(c["lean"])
     nodes = [n for n in (bp.parse_decl(ch, sp) for ch, sp in zip(chunks, spans)) if n]
-    out[c["id"]] = bp.normalize_sig(nodes[0].signature) if nodes else None
+    out[c["id"]] = ([bp.normalize_sig(nodes[0].signature), " ".join((nodes[0].body or "").split())]
+                    if nodes else None)
 print(json.dumps(out))
 `
 const pyOut = JSON.parse(execFileSync("python3", ["-c", PY], { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 }))
 
 // Mirror of blueprint.normalize_sig so the two sides are compared on equal terms.
 const normalize = (sig) => String(sig || "").replace(/\s+/g, " ").trim().replace(/^lemma\b/, "theorem")
+const flat = (s) => String(s || "").replace(/\s+/g, " ").trim()
 
 let mismatches = 0
 let nulls = 0
@@ -118,11 +123,22 @@ for (const c of cases) {
     console.log(`FAIL ${c.id}: python parsed nothing\n   lean: ${JSON.stringify(c.lean)}`)
     continue
   }
-  const js = normalize(architectSignatureOf(c.lean))
-  if (py !== js) {
+  // Both halves of the cut. Comparing only the signature left the body
+  // extraction untested, which is precisely where the fourth instance of this
+  // defect class lived: the assembler's `indexOf(":=")` cut inside the
+  // statement's own `let` binder and every assembled proof came out mangled.
+  const [pySig, pyBody] = py
+  const jsSig = normalize(architectSignatureOf(c.lean))
+  const jsBody = flat(architectProofBody(c.lean))
+  const bad = pySig !== jsSig ? "signature" : pyBody !== jsBody ? "body" : null
+  if (bad) {
     mismatches++
     if (mismatches <= 15) {
-      console.log(`FAIL ${c.id}\n   lean  : ${JSON.stringify(c.lean)}\n   python: ${JSON.stringify(py)}\n   js    : ${JSON.stringify(js)}`)
+      console.log(
+        `FAIL ${c.id} (${bad})\n   lean  : ${JSON.stringify(c.lean)}\n` +
+          `   python: sig=${JSON.stringify(pySig)} body=${JSON.stringify(pyBody)}\n` +
+          `   js    : sig=${JSON.stringify(jsSig)} body=${JSON.stringify(jsBody)}`,
+      )
     }
   }
 }

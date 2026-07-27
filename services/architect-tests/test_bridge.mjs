@@ -29,6 +29,8 @@ const M = await loadBridgeSymbols([
   "architectStripVerdicts",
   "architectAnnotate",
   "architectAssemble",
+  "architectProofBody",
+  "architectAssemblyDefects",
 ])
 
 const fails = []
@@ -79,6 +81,79 @@ eq(
 eq("prefix/no decl keyword is passed through", M.architectSignatureOf("garbage"), "garbage")
 eq("empty input", M.architectSignatureOf(""), "")
 eq("null input", M.architectSignatureOf(null), "")
+
+// ---------------------------------------------------------------------------
+console.log("\n== shared corpus: body extraction (the OTHER half of the cut) ==")
+// ---------------------------------------------------------------------------
+// The signature and the body are two halves of one cut, and for a long time
+// only the signature half used the real scanner -- the body half was a bare
+// `indexOf(":=")`. Nothing caught it, because nothing tested the body half in
+// JS. The corpus already carries the expected body for the Python splitter, so
+// hold JS to the identical expectation.
+for (const c of CORPUS) eq(`corpus-body/${c.id}`, M.architectProofBody(c.lean), c.body === null ? "" : c.body.trim())
+
+// The live failure, end to end: a target whose statement opens with `let`.
+{
+  const rebuilt = [
+    "theorem enclosing_circle_radius :",
+    "    let k1 : ℚ := 1",
+    "    let k2 : ℚ := 1/2",
+    "    let k3 : ℚ := 1/3",
+    "    let R : ℚ := 6",
+    "    let k4 : ℚ := -1/R",
+    "    (k1 + k2 + k3 + k4)^2 = 2*(k1^2 + k2^2 + k3^2 + k4^2) := by",
+    "  norm_num",
+  ].join("\n")
+  const sig = rebuilt.slice(0, rebuilt.lastIndexOf(" :="))
+  eq("enclosing_circle_radius: scanner cut (no signature given)", M.architectProofBody(rebuilt), "by\n  norm_num")
+  eq("enclosing_circle_radius: exact cut against the sent signature", M.architectProofBody(rebuilt, sig), "by\n  norm_num")
+  ok(
+    "enclosing_circle_radius: signature survives the cut whole",
+    M.architectSignatureOf(rebuilt).endsWith("2*(k1^2 + k2^2 + k3^2 + k4^2)"),
+    M.architectSignatureOf(rebuilt),
+  )
+  // The exact cut is what actually protects the certified file: it does not
+  // parse, so it cannot be fooled by anything inside the statement.
+  eq(
+    "exact cut is used in preference to the scanner",
+    M.architectProofBody("theorem t :\n    let a : Nat := 1\n    a = 1 :=\n  by simp", "theorem t :\n    let a : Nat := 1\n    a = 1"),
+    "by simp",
+  )
+  eq("exact cut falls back to the scanner when the signature is not a prefix", M.architectProofBody("theorem t : True := trivial", "theorem OTHER : True"), "trivial")
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== architectAssemblyDefects (harness-fault guard) ==")
+// ---------------------------------------------------------------------------
+{
+  const letSig =
+    "theorem t :\n    let k1 : ℚ := 1\n    let k2 : ℚ := 1/2\n    (k1 + k2)^2 = 2*(k1^2 + k2^2)"
+  const g = [
+    { name: "d", kind: "def", signature: "def d : Nat", declTextNoAttr: "def d : Nat := 7" },
+    { name: "t", kind: "theorem", signature: letSig },
+  ]
+  eq("clean assembly reports no defects", M.architectAssemblyDefects(g, new Map([["t", "by norm_num"]])), [])
+  ok("a missing body is caught", M.architectAssemblyDefects(g, new Map()).length === 1)
+  ok("an empty body is caught", M.architectAssemblyDefects(g, new Map([["t", "   \n "]])).length === 1)
+  // The signature the ORIGINAL bug produced: cut short at the first `let`, so
+  // the appended `:=` gets eaten by that binder and the read-back runs on into
+  // the body. This is the shape the check exists for.
+  ok(
+    "a signature truncated at a let binder is caught",
+    M.architectAssemblyDefects(
+      [{ name: "t", kind: "theorem", signature: "theorem t :\n    let k1 : ℚ" }],
+      new Map([["t", "by norm_num"]]),
+    ).length === 1,
+  )
+  ok("definitions are not subject to the check", M.architectAssemblyDefects([g[0]], new Map()).length === 0)
+  // Honest about the limit: a split-based mangling round-trips through this
+  // check, which is exactly why architectProofBody cuts against the known
+  // signature rather than relying on a parse being right.
+  ok(
+    "known limit: a split-based mangling round-trips past this backstop",
+    M.architectAssemblyDefects(g, new Map([["t", "1\n    let k2 : ℚ := 1/2\n    (k1 + k2)^2 = 2*(k1^2 + k2^2) := by norm_num"]])).length === 0,
+  )
+}
 
 // ---------------------------------------------------------------------------
 console.log("\n== architectSplitSig (drives the refutation gate) ==")

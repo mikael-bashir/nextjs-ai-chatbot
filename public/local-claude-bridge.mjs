@@ -4667,12 +4667,25 @@ function architectNodePrefix(graph, nodeName) {
 //
 // Same rule as the Python splitter: find the top-level `:=` that starts the
 // body, skipping the one each `let`/`have` binder in the statement consumes.
-function architectSignatureOf(text) {
+//
+// This is the ONE scanner. Everything that needs to cut a declaration in two
+// calls it: architectSignatureOf takes what is before the returned index, the
+// node-solve handler takes what is after. They used to be separate code (the
+// body side was a bare `indexOf(":=")`), and the result was that a target whose
+// statement opens with a `let` binder produced a body of `1\n let k2 := ...` —
+// every node registered a solve, the assembled file was nonsense, and Leak XIV
+// rejected it with "numerals are data in Lean, but the expected type is a
+// proposition" on EVERY iteration until the refinement budget ran out. Nothing
+// the refinement model could write to the graph would have fixed it.
+//
+// Returns the index of the body-starting `:=`, or -1 if the declaration has no
+// proof body.
+function architectBodyStart(text) {
   const src = String(text || "")
   const m = src.match(
     /(?:^|\n)[ \t]*(?:private\s+|protected\s+|noncomputable\s+|public\s+)*(?:theorem|lemma)\s+[A-Za-z_][A-Za-z0-9_'.]*/,
   )
-  if (!m) return src.trim()
+  if (!m) return -1
   const isIdent = (c) => !!c && /[A-Za-z0-9_'.]/.test(c)
   let depth = 0
   let pending = 0
@@ -4711,7 +4724,7 @@ function architectSignatureOf(text) {
           i += 2
           continue
         }
-        return src.slice(0, i).trim()
+        return i
       }
       for (const kw of ["let", "have"]) {
         if (!src.startsWith(kw, i)) continue
@@ -4721,7 +4734,33 @@ function architectSignatureOf(text) {
     }
     i++
   }
-  return src.trim()
+  return -1
+}
+
+// Strip the proof body, leaving the signature.
+function architectSignatureOf(text) {
+  const src = String(text || "")
+  const at = architectBodyStart(src)
+  return at < 0 ? src.trim() : src.slice(0, at).trim()
+}
+
+// Keep only the proof body.
+//
+// Leak XII builds the declaration it verified as `${target_signature} :=\n
+// ${body}` from the signature THIS bridge sent it, so when that signature is
+// still a literal prefix the cut needs no parsing at all — exact beats clever,
+// and a parse that has been wrong four times does not get a fifth chance at
+// the one path whose output goes straight into the certified file. The scanner
+// is the fallback for callers with no signature to match against.
+function architectProofBody(text, signature = "") {
+  const src = String(text || "")
+  const sig = String(signature || "").trim()
+  if (sig && src.startsWith(sig)) {
+    const rest = src.slice(sig.length).trimStart()
+    if (rest.startsWith(":=")) return rest.slice(2).trim()
+  }
+  const at = architectBodyStart(src)
+  return at < 0 ? "" : src.slice(at + 2).trim()
 }
 
 function architectNegSignature(signature) {
@@ -5380,6 +5419,45 @@ function architectAssemble(graph, prelude, proofs) {
   return parts.join("\n")
 }
 
+// Assembly invariant: every declaration the assembler emits must read back as
+// the signature it was built from, with a non-empty body.
+//
+// This is not a mathematical check -- it cannot fail because a proof is wrong.
+// It fails only when the harness has mangled a declaration between "Leak XII
+// registered this solve" and "Leak XIV sees this file". That happened: the
+// `indexOf(":=")` body extraction cut inside the statement's own `let` binder,
+// every node solved, the assembled file was garbage, and the failure surfaced
+// as a `PROOF_TOO_HARD` verdict against an innocent node — so refinement spent
+// the entire budget rewriting a graph that was never the problem. Hence:
+// checked BEFORE certification, and reported as a harness fault rather than
+// attributed to a node.
+//
+// It is a backstop, not a proof of correctness — a split-based mangling can
+// round-trip, which is why architectProofBody cuts against the known signature
+// instead of parsing. What it does catch soundly: a missing body, and a
+// declaration whose signature does not read back as itself.
+function architectAssemblyDefects(graph, proofs) {
+  const flat = (s) => String(s || "").replace(/\s+/g, " ").trim()
+  const defects = []
+  for (const n of graph) {
+    if (!["lemma", "theorem"].includes(n.kind)) continue
+    const body = String(proofs.get(n.name) || "").trim()
+    if (!body) {
+      defects.push(`${n.name}: registered a solve but carries no proof body`)
+      continue
+    }
+    const decl = `${n.signature.trim()} :=\n${body}`
+    const readBack = architectSignatureOf(decl)
+    if (flat(readBack) !== flat(n.signature))
+      defects.push(
+        `${n.name}: assembled declaration does not read back as its own signature\n` +
+          `      expected: ${flat(n.signature).slice(0, 200)}\n` +
+          `      read back: ${flat(readBack).slice(0, 200)}`,
+      )
+  }
+  return defects
+}
+
 // --- Hallucinated-name enforcement --------------------------------------------
 // Grok's failure mode here is the mirror of Claude's on Stronghold/Ultra:
 // Claude over-searches (hence governedSearchCall's rationed search budget,
@@ -5499,10 +5577,14 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           prelude,
         }, Number(NODE_TIMEOUT_MS))
         if (r.solve) {
-          // Extract the rebuilt body (everything after the first ':=').
-          const rebuilt = String(r.rebuilt || "")
-          const at = rebuilt.indexOf(":=")
-          return { report: r.report, __done: { negated: !!r.negated, body: rebuilt.slice(at + 2).trim() } }
+          // Everything after the `:=` that starts the BODY -- not the first
+          // `:=` in the text, which for a `let`-binding statement belongs to
+          // the statement itself.
+          // Cut against the signature we sent, not at the first `:=` in the
+          // text -- for a `let`-binding statement that `:=` belongs to the
+          // statement itself.
+          const sentSig = r.negated ? negSig || "" : node.signature
+          return { report: r.report, __done: { negated: !!r.negated, body: architectProofBody(r.rebuilt, sentSig) } }
         }
         lastError = String(r.report || "").slice(0, 900)
         result.lastError = lastError
@@ -5937,6 +6019,20 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       // ---- Assembly + certification (Leak XIV is the only exit).
       ctx.emit({ type: "message-annotation", subtype: "status", thought: "🧵 All nodes solved — assembling the final proof for Leak XIV certification." })
       const finalCode = architectAssemble(graph, prelude, proofs)
+      // A harness fault here is not the graph's fault; do not spend the
+      // refinement budget on it, and do not blame a node for it.
+      const defects = architectAssemblyDefects(graph, proofs)
+      if (defects.length) {
+        ctx.emit({
+          type: "message-annotation",
+          subtype: "error",
+          thought:
+            `🧨 HARNESS FAULT — the assembler mangled ${defects.length} declaration(s); the file was NOT sent to Leak XIV. ` +
+            `Every node proved; this is a bug in the bridge, not in the blueprint. Refinement cannot fix it, so the run stops here.\n  - ` +
+            defects.join("\n  - "),
+        })
+        return { verified: false, proof: "" }
+      }
       let cert
       try {
         cert = await architectMcpCall(urls.xiv, "verify_full_script", {

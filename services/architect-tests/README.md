@@ -13,7 +13,7 @@ Two parsers in this stack implement the *same* rule in different languages:
 | | file | function |
 |---|---|---|
 | Python | `services/hf-spaces/leak-*/shared/blueprint.py` | `parse_decl` |
-| JS | `public/local-claude-bridge.mjs` | `architectSignatureOf` |
+| JS | `public/local-claude-bridge.mjs` | `architectBodyStart` (via `architectSignatureOf` / `architectProofBody`) |
 
 Both must find the top-level `:=` that starts a declaration's proof body.
 Every parser defect found here so far has been that rule implemented wrongly in
@@ -32,6 +32,21 @@ Every parser defect found here so far has been that rule implemented wrongly in
    signature, making the gate unsatisfiable).
 3. Neither scanner skipped string literals, so `theorem t : "a := b".length = 6`
    split inside the string.
+4. The proof-body extraction — the *other half of the same cut* — was still a
+   bare `indexOf(":=")` after 1–3 were fixed, because only the signature half
+   was ever tested. For `enclosing_circle_radius` this banked a body of
+   `1\n let k2 : ℚ := 1/2 ...`; every node registered a solve, the assembled
+   file was nonsense, and Leak XIV rejected it with *"numerals are data in
+   Lean, but the expected type is a proposition"* on **every** iteration until
+   the refinement budget ran out. Worse, the failure was recorded as
+   `PROOF_TOO_HARD` against an innocent node, so the refinement model spent the
+   whole run restructuring a graph that was never the problem.
+
+The lesson from 4 is in the fix: there is now ONE scanner
+(`architectBodyStart`), both halves go through it, and the differential
+compares both halves. The certified path does not even use it —
+`architectProofBody` cuts against the signature the bridge sent Leak XII, so
+the output that reaches Leak XIV is not produced by a parse at all.
 
 Hand-written cases only cover mistakes already thought of. Hence the
 differential fuzzer.
@@ -43,8 +58,8 @@ differential fuzzer.
 | `corpus.json` | 32 declarations with expected signature/body. Shared by both suites, so the implementations cannot drift. |
 | `test_blueprint.py` | The corpus against `parse_decl`, plus `strip_comments`, `normalize_sig`, `precheck_blueprint`, `validate_graph`, `extract_set_options`, `forbidden_violations`, `strip_blueprint_attr`, `topo_order`, `split_decls`. |
 | `test_bridge.mjs` | The corpus against `architectSignatureOf`, plus `architectSplitSig`, `architectNegSignature`, `architectPrelude`, `architectNodePrefix`, `architectIsResourceFailure`, `architectStripVerdicts`, `architectAnnotate` (every failure class and its directive), `architectAssemble`. |
-| `differential.mjs` | Generates declarations from the grammar fragments that have historically broken these scanners and asserts the two implementations agree. Seeded, so a failure is reproducible. |
-| `bridge-lib.mjs` | Slices named top-level declarations out of the bridge (it cannot be imported — it is a long-running script). Syntax-checks the extraction and asserts every symbol resolved, so a mis-slice fails loudly instead of silently testing nothing. |
+| `differential.mjs` | Generates declarations from the grammar fragments that have historically broken these scanners and asserts the two implementations agree on **both** the signature and the body. Seeded, so a failure is reproducible. |
+| `bridge-lib.mjs` | Slices named top-level declarations out of the bridge (it cannot be imported — it is a long-running script). Syntax-checks the extraction, follows `architect*`/`ARCHITECT_*` references so a shared helper comes along with its callers, and asserts every symbol resolved. |
 
 ## Two traps this suite is built to catch
 
@@ -59,10 +74,15 @@ bug and confirming it is caught:
 
 | mutation | mismatches / 800 |
 |---|---|
+| JS body extraction reverts to `indexOf(":=")` (bug 4) | 746 |
 | JS ignores `let`/`have` binders (bug 1) | 598 |
 | JS stops skipping string literals (bug 3) | 216 |
 | Python stops skipping string literals (bug 3) | 177 |
 | *(unmutated)* | **0** |
+
+Bug 4 also trips 18 corpus body cases — but only since the body half was added
+to the corpus checks. Before that, this mutation was invisible to the entire
+suite while every test reported green.
 
 ## Adding a case
 
@@ -75,8 +95,15 @@ languages is exactly the failure mode this directory exists to prevent.
 * The scanners lex brackets, comments and strings, but not char literals
   (`'a'`) — deliberately, because `'` is legal in identifiers (`h'`) and a
   `:=` cannot fit inside a char literal anyway.
-* The differential compares *signatures*. `parse_decl` additionally returns the
-  body, which the Python suite checks against the corpus but the fuzzer does
-  not cross-check, since `architectSignatureOf` does not compute one.
+* `architectAssemblyDefects` is a backstop, not a proof of correctness: a
+  split-based mangling round-trips past it, because any split reassembles into
+  the string it came from. It catches a missing body and a signature that does
+  not read back as itself. The real protection is that the certified path does
+  not parse — see `architectProofBody`.
+* Two functions on the **Stronghold** path have the identical unfixed defect:
+  `theoremSignature` (`/\b(?:theorem|lemma)\b[\s\S]*?(?=:=)/`) and
+  `masterStatementHead` (`s.indexOf(":=")`). Both return
+  `theorem t :\n let k1 : ℚ` for a `let`-binding statement. Out of scope here
+  and deliberately untouched; not covered by this suite.
 * These are unit tests. Nothing here talks to Lean; the compile, validation and
   refutation gates are only exercised end to end against a live Leak XII.
