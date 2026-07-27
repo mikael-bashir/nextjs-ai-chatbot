@@ -1852,18 +1852,55 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have-tree",
   },
+  // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
   // LeanArchitect toolchain via Leak XI/XII/XIV. Driven by Grok (xAI API),
   // not the Claude CLI — see proveArchitect.
-  architect: {
-    label: "Architect — Goedel blueprint pipeline (grok driver · Leak XI/XII/XIV)",
+  //
+  // Three variants, each an ablation of the one before it, so the research
+  // tables isolate exactly one change at a time:
+  //   river-stone  CONTROL — the paper as written, nothing added.
+  //   river-gate   + shared dead-end ledger across node provers.
+  //   river-delta  + a one-shot local Sonnet 5 natural-language proof seed.
+  "river-stone": {
+    label: "Leak River Stone — CONTROL: bare Goedel blueprint pipeline, isolated nodes",
     node: (t, m, x) => architectProverSystem(),
     decompose: (t, m, x) => architectRefineSystem(),
     search: 0,
     style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false },
+  },
+  "river-gate": {
+    label: "Leak River Gate — Stone + shared dead-end ledger (no node rediscovers another's wall)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: true, nlSeedLocal: false },
+  },
+  "river-delta": {
+    label: "Leak River Delta — Gate + one-shot local Sonnet 5 natural-language proof seed",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: true, nlSeedLocal: true },
+  },
+  // Back-compat: runs saved/queued under the old name behave as the control.
+  architect: {
+    label: "Architect — alias for Leak River Stone (control)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false },
   },
 }
+// Per-variant architect knobs (see the Leak River family above). Unknown or
+// non-architect strategies get the control's settings.
+const architectConfigFor = (name) =>
+  pickStrategy(name).architect || { shareDeadEnds: false, nlSeedLocal: false }
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
 // prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
 // with local `have`s (proveHaveFlat). Defaults to "lemma" for existing modes.
@@ -3519,7 +3556,65 @@ const VERIFY_TIMEOUT_MS = 600000
 const ARCHITECT_BLUEPRINT_RETRIES = 8
 const ARCHITECT_NODE_RETRIES = 6
 const ARCHITECT_REFINE_RETRIES = 8
-const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 8)
+// Default refinement-iteration budget. The UI sends a per-run value (its own
+// default is 5, +1 per click) as opts.maxIters, so this is only the fallback
+// for callers that don't specify one.
+const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 5)
+// Model for the river-delta natural-language proof seed. Runs through the LOCAL
+// Claude CLI (one shot, no tools), so its cost is whatever the CLI reports as
+// total_cost_usd on its result frame — see architectNlSeed.
+const ARCHITECT_SEED_MODEL = process.env.ARCHITECT_SEED_MODEL || "claude-sonnet-5"
+
+// --- Cost accounting ---------------------------------------------------------
+// USD per MILLION tokens for the xAI models this pipeline drives. Keyed by
+// model-id prefix, longest match first, so a ladder fallback is still priced
+// correctly. Verified against xAI's published pricing for the grok-4.1-fast
+// SKUs; `c` is the cached-input (prompt-cache read) rate.
+//
+// The Sonnet seed is NOT priced here: the Claude CLI reports its own
+// authoritative `total_cost_usd`, which already accounts for cache reads and
+// writes, so using the reported figure is both more accurate and immune to
+// price changes (e.g. Sonnet 5's introductory rate ending 2026-08-31).
+const GROK_PRICES = [
+  ["grok-4.3", { i: 1.25, o: 2.5, c: 0.2 }],
+  ["grok-4-3", { i: 1.25, o: 2.5, c: 0.2 }],
+  ["grok-4.1-fast", { i: 0.2, o: 0.5, c: 0.05 }],
+  ["grok-4-1-fast", { i: 0.2, o: 0.5, c: 0.05 }],
+  ["grok-4.1", { i: 0.2, o: 0.5, c: 0.05 }],
+  ["grok-3-mini", { i: 0.3, o: 0.5, c: 0.075 }],
+]
+function grokPrice(model) {
+  const m = String(model || "").toLowerCase()
+  let best = null
+  for (const [prefix, price] of GROK_PRICES) {
+    if (m.startsWith(prefix) && (!best || prefix.length > best[0].length)) best = [prefix, price]
+  }
+  // Unknown SKU: fall back to the fast-tier rate rather than reporting $0, so a
+  // new model id can never make a run look free in the research tables.
+  return best ? best[1] : { i: 0.2, o: 0.5, c: 0.05 }
+}
+// Recompute the run's total cost from cumulative token counts + the seed's
+// CLI-reported cost. Called after every Grok reply so the live UI figure and the
+// cap guard always reflect the same number the research row records.
+function architectRecost(ctx, state) {
+  const p = grokPrice(state.model)
+  const driver = Number(
+    (((state.usage.prompt - state.usage.cached) * p.i +
+      state.usage.cached * p.c +
+      state.usage.completion * p.o) /
+      1e6).toFixed(6),
+  )
+  const seed = Number((state.seedCostUsd || 0).toFixed(6))
+  state.driverCostUsd = driver
+  if (!ctx.metrics) return
+  ctx.metrics.cost_driver_usd = driver
+  ctx.metrics.cost_seed_usd = seed
+  ctx.metrics.cost_usd = Number((driver + seed).toFixed(6))
+  ctx.metrics.prompt_tokens = state.usage.prompt
+  ctx.metrics.completion_tokens = state.usage.completion
+  ctx.metrics.cached_tokens = state.usage.cached
+  ctx.metrics.models_used = Array.from(state.models)
+}
 // Higher than the other decomposition paths' defaults: with a short wall
 // clock, more parallel node attempts is what actually buys more coverage per
 // minute (deadlinePassed() still cuts every stage off the instant time is up).
@@ -3748,17 +3843,15 @@ async function grokCall(state, messages, tools, ctx, callOpts = {}) {
     state.usage.cached += Number(usage.prompt_tokens_details?.cached_tokens) || 0
     state.stageTokens += Number(usage.total_tokens) || 0
     ctx.metrics.llm_invocations += 1
-    // NOTE: field is `cost_usd` (snake_case) to match every other strategy's
-    // convention (see the CLI paths' `metrics.cost_usd` above) — the client
-    // (run-prover-stream.ts) only ever reads that exact key. `state.usage` is
-    // already cumulative across the whole run, so this is an assignment, not
-    // an accumulation.
-    const p = /4\.3|4-3/.test(state.model) ? { i: 1.25, o: 2.5, c: 0.2 } : { i: 0.2, o: 0.5, c: 0.05 }
-    ctx.metrics.cost_usd = Number((
-      ((state.usage.prompt - state.usage.cached) * p.i +
-        state.usage.cached * p.c +
-        state.usage.completion * p.o) / 1e6
-    ).toFixed(4))
+    // Record the SKU that actually served this call (may differ from the one
+    // first requested if the ladder fell back) for the row's models_used.
+    state.models?.add(state.model)
+    // Recompute the whole run's cost — driver tokens priced per SKU, plus any
+    // NL-seed cost the CLI reported. Writes `cost_usd` (snake_case) because
+    // that's the only key run-prover-stream.ts reads, alongside the per-source
+    // split and token counts the research tables record. `state.usage` is
+    // cumulative, so this is an assignment, not an accumulation.
+    architectRecost(ctx, state)
     return data.choices?.[0]?.message || { content: "" }
   }
 }
@@ -4184,6 +4277,74 @@ function architectNegSignature(signature) {
   return null
 }
 
+// --- Dead-end ledger (river-gate / river-delta) ------------------------------
+// The paper isolates node provers deliberately: each gets a fresh context with
+// only its declared parents, so parallel attempts can't correlate. That is right
+// for proof STRATEGY, but it also means every node independently rediscovers the
+// same environment facts. Observed live on mirage_break: three sibling nodes each
+// burned turns learning that `partial_sum_mono` doesn't exist, and separately
+// that `1 / list.getD i 1` elaborates over ℕ without a `(1:ℚ)` ascription.
+//
+// The ledger shares ONLY environment facts — names that don't resolve, typeclass
+// instances that aren't available, elaboration/coercion traps. It never shares a
+// tactic that worked, a proof body, or any node's approach, so node independence
+// (and the paper's parallel-attempt semantics) is preserved.
+//
+// Bounded by construction: deduped by key, capped at LEDGER_MAX entries, each
+// entry one short line. Run-scoped rather than iteration-scoped because "this
+// name is not in Mathlib" stays true across refinements.
+const LEDGER_MAX = 40
+function makeDeadEndLedger() {
+  return { entries: new Map(), shared: 0 }
+}
+// Pull environment-level dead ends out of one compiler report.
+function ledgerHarvest(ledger, report, nodeName) {
+  if (!ledger || !report) return
+  const text = String(report)
+  const add = (key, note) => {
+    if (ledger.entries.size >= LEDGER_MAX || ledger.entries.has(key)) return
+    ledger.entries.set(key, { note, from: nodeName })
+  }
+  // Names the environment does not contain — highest-signal, zero strategy leak.
+  for (const m of text.matchAll(/Unknown (?:identifier|constant)\s+`([^`]+)`/g))
+    add(`name:${m[1]}`, `\`${m[1]}\` does not exist — do not use it (or any close guess at it).`)
+  // Typeclass instances that aren't derivable for the types in play.
+  for (const m of text.matchAll(/failed to synthesize(?:\s+instance of type class)?\s*\n?\s*([A-Za-z_][\w'.]*(?:\s+[^\n]{0,60})?)/g))
+    add(`inst:${m[1].trim()}`, `typeclass \`${m[1].trim()}\` is not available here — avoid lemmas that require it.`)
+  for (const m of text.matchAll(/typeclass instance problem is stuck\s*\n?\s*([A-Za-z_][\w'.]*)/g))
+    add(`stuck:${m[1]}`, `typeclass \`${m[1]}\` gets stuck (needs its type pinned by an explicit ascription).`)
+  // Elaboration / coercion traps: record the mismatched pair compactly. This is
+  // the class of failure that cost the most turns in practice (e.g. `1 / xs.getD
+  // i 1` silently elaborating over ℕ instead of ℚ).
+  //
+  // Mismatches containing metavariables (`?m.57`, `?a`) are SKIPPED: they are
+  // artefacts of a unification that never completed, not stable facts about the
+  // environment, and they read as noise in a sibling's prompt. Verified against a
+  // real mirage_break run — 3 of 12 harvested mismatches were metavariable-only
+  // and carried no actionable information, while the named-identifier and
+  // typeclass facts were all genuinely load-bearing.
+  for (const m of text.matchAll(/has type\s*\n?\s*\(?([^\n]{1,90}?)\)?\s*\n?\s*but is expected to have type\s*\n?\s*\(?([^\n]{1,90}?)\)?\s*\n/g)) {
+    const got = m[1].trim()
+    const want = m[2].trim()
+    if (!got || !want || got === want) continue
+    if (/\?\w/.test(got) || /\?\w/.test(want)) continue
+    add(`coe:${got}=>${want}`, `type mismatch seen: \`${got}\` where \`${want}\` was expected — ascribe the numeral/type explicitly.`)
+  }
+}
+// Render the ledger for a node's prompt. `excludeNode` drops facts the node
+// found itself (its own context already has those errors verbatim).
+function ledgerRender(ledger, excludeNode) {
+  if (!ledger || ledger.entries.size === 0) return ""
+  const lines = []
+  for (const [, v] of ledger.entries) {
+    if (v.from && v.from === excludeNode) continue
+    lines.push(`- ${v.note}`)
+  }
+  if (!lines.length) return ""
+  ledger.shared += lines.length
+  return `\n\n## Known dead ends (established by the compiler on sibling nodes of this same problem — treat as facts, not suggestions)\n${lines.join("\n")}\n\nThese are environment facts only; no proof strategy is implied. Do not spend turns rediscovering them.`
+}
+
 function architectParseForfeit(text) {
   const diag = /##\s*Diagnosis:?\s*(STATEMENT_WRONG|PROOF_TOO_HARD)/i.exec(text || "")
   const analysis = /##\s*Analysis:?\s*([\s\S]*?)(?=##\s*Suggested Fix|$)/i.exec(text || "")
@@ -4270,6 +4431,9 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
   for (let attempt = 0; attempt < ARCHITECT_NODE_RETRIES; attempt++) {
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
     result.attempts = attempt + 1
+    // Rendered per attempt (not once per node) so a node starting late in the
+    // pass — or retrying — sees everything its siblings have learned by then.
+    const deadEnds = ledgerRender(state.ledger, node.name)
     const retryNote =
       attempt === 0
         ? ""
@@ -4298,13 +4462,16 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           return { report: r.report, __done: { negated: !!r.negated, body: rebuilt.slice(at + 2).trim() } }
         }
         lastError = String(r.report || "").slice(0, 900)
+        // Pool environment-level facts for sibling nodes (gate/delta only —
+        // state.ledger is null for the control).
+        ledgerHarvest(state.ledger, r.report, node.name)
         return { report: r.report }
       }
       return { report: `unknown tool ${name}` }
     }
     const out = await grokLoop(ctx, state, {
       system: architectProverSystem(),
-      user: user + retryNote,
+      user: user + deadEnds + retryNote,
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_NODE_TOKENS,
@@ -4369,6 +4536,62 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
   return null
 }
 
+// --- Natural-language proof seed (river-delta) --------------------------------
+// One shot, before blueprint generation: ask the LOCAL Claude CLI (Sonnet 5) for
+// an informal proof of the target, and hand it to the blueprint stage as a
+// structural guide (the paper's §4.2 NL guidance, where a separate model writes
+// the informal argument and the pipeline derives the lemma graph from it).
+//
+// Deliberately NOT reused for refinement: refinement's input is the annotated
+// graph plus machine-checked per-node diagnoses, and the paper only ever seeds
+// the INITIAL blueprint. Feeding a static informal proof back in would compete
+// with concrete compiler evidence about what actually failed.
+//
+// Cost: the CLI's own reported total_cost_usd, added to the run's total.
+async function architectNlSeed(theorem, ctx, state) {
+  const system =
+    "You are a research mathematician. Given a Lean 4 theorem signature, write the natural-language proof of the mathematical statement it expresses. Plain mathematical prose only — no Lean code, no tactics, no Mathlib lemma names. State every intermediate claim you rely on explicitly, as a numbered chain of steps a formaliser could turn one-for-one into named lemmas. If you believe the statement is FALSE, say so plainly and give the counterexample. Be complete but do not pad."
+  const prompt = `Write the natural-language proof of this Lean 4 theorem's mathematical content:\n\n${state.targetSignature}\n\nAnswer with the proof only.`
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🌱 NL seed [${ARCHITECT_SEED_MODEL}, local]: writing an informal proof to guide blueprint generation.`,
+  })
+  let r
+  try {
+    r = await runClaude(
+      buildArgs(prompt, {
+        model: ARCHITECT_SEED_MODEL,
+        systemPrompt: system,
+        // Pure reasoning task: no tools, no MCP, no dynamic sections — keeps the
+        // call cheap and makes its cost attributable to the seed alone.
+        disallowedTools: "Bash Read Write Edit Glob Grep WebFetch WebSearch Task",
+        strictMcpConfig: true,
+        excludeDynamicSections: true,
+      }),
+      { cwd: undefined, timeoutMs: Number(BLUEPRINT_TIMEOUT_MS) },
+    )
+  } catch (e) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ NL seed failed (${String(e?.message || e)}) — continuing without it.` })
+    return ""
+  }
+  if (typeof r?.costUsd === "number") {
+    state.seedCostUsd = (state.seedCostUsd || 0) + r.costUsd
+    state.models.add(ARCHITECT_SEED_MODEL)
+    architectRecost(ctx, state)
+  }
+  const text = String(r?.text || "").trim()
+  if (!r?.ok || !text) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ NL seed produced nothing usable — continuing without it.` })
+    return ""
+  }
+  ctx.emit({
+    type: "system",
+    detail: `[NL seed · ${ARCHITECT_SEED_MODEL} · $${(r.costUsd || 0).toFixed(4)}]\n\n${text}`,
+  })
+  return text
+}
+
 // --- The pipeline -------------------------------------------------------------
 async function proveArchitect(theorem, ctx, opts = {}) {
   const urls = architectUrls(opts, ctx.mcpServers)
@@ -4376,18 +4599,43 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.emit({ type: "error", message: "Architect needs LEAK_XII_URL and LEAK_XIV_URL set on the bridge (Leak XI optional for search). Set the env vars and restart the bridge." })
     return { verified: false, proof: "" }
   }
+  const variant = architectConfigFor(ctx.strategy)
+  // Refinement budget for THIS run (the UI's button; see ARCHITECT_MAX_ITERS).
+  const maxIters = clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS)
   const state = {
     model: /grok/i.test(String(ctx.model || "")) ? String(ctx.model) : (process.env.ARCHITECT_MODEL || ARCHITECT_MODEL_LADDER[0]),
     usage: { prompt: 0, completion: 0, cached: 0 },
     stageTokens: 0,
+    // Cost accounting: driver (Grok, from token counts) + seed (Sonnet, from the
+    // CLI's reported total_cost_usd). `models` records every model that actually
+    // ran, including ladder fallbacks, for the research row's models_used.
+    seedCostUsd: 0,
+    driverCostUsd: 0,
+    models: new Set(),
+    // Shared environment facts across node provers — gate/delta only. Null for
+    // the control, so its nodes stay exactly as isolated as the paper's.
+    ledger: variant.shareDeadEnds ? makeDeadEndLedger() : null,
     targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
     targetSignature: theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry[\s\S]*$/, "").trim(),
   }
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Architect [${state.model}]: blueprint generation — dependency graph of @[blueprint] nodes (LeanArchitect, Lean v4.32.0).` })
+  if (ctx.metrics) {
+    ctx.metrics.max_iters = maxIters
+    ctx.metrics.models_used = []
+  }
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${state.model} · refinement budget=${maxIters} · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}`,
+  })
 
-  const nlSeed = typeof opts.nlProof === "string" && opts.nlProof.trim()
-    ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${opts.nlProof.trim().slice(0, 8000)}`
+  // NL guidance: river-delta generates it locally with Sonnet 5; any variant will
+  // use one handed in by the caller (opts.nlProof) if present.
+  let nlText = typeof opts.nlProof === "string" && opts.nlProof.trim() ? opts.nlProof.trim() : ""
+  if (variant.nlSeedLocal && !nlText) nlText = await architectNlSeed(theorem, ctx, state)
+  const nlSeed = nlText
+    ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${nlText.slice(0, 8000)}`
     : ""
+  if (ctx.metrics) ctx.metrics.nl_seed_used = !!nlSeed
   const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${nlSeed}`
 
   let bp = await architectBlueprintStage(ctx, state, urls, {
@@ -4404,7 +4652,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   const proofs = new Map() // name -> proof body ("by ...") for solved nodes
   const sigOfProof = new Map() // name -> signatureNorm at solve time
 
-  for (let iter = 0; iter <= ARCHITECT_MAX_ITERS; iter++) {
+  for (let iter = 0; iter <= maxIters; iter++) {
     const graph = bp.graph
     const prelude = architectPrelude(bp.code)
     const provable = graph.filter((n) => ["lemma", "theorem"].includes(n.kind))
@@ -4450,6 +4698,12 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.metrics.nodes_solved = proofs.size
     ctx.metrics.nodes_negated = Array.from(results.values()).filter((r) => r.negated).length
     ctx.metrics.nodes_forfeited = Array.from(results.values()).filter((r) => !r.solved && !r.negated).length
+    // Gate/delta only: how many dead-end facts were injected into node prompts,
+    // and how many distinct ones the run learned. Both 0/absent for the control.
+    if (state.ledger) {
+      ctx.metrics.dead_ends_shared = state.ledger.shared
+      ctx.metrics.dead_ends_known = state.ledger.entries.size
+    }
 
     const unsolved = provable.filter((n) => !proofs.has(n.name))
     if (unsolved.length === 0) {
@@ -4490,19 +4744,19 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       }
     }
 
-    if (iter === ARCHITECT_MAX_ITERS) break
+    if (iter === maxIters) break
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
 
     // ---- Blueprint refinement on the annotated graph.
     const stillUnsolved = provable.filter((n) => !proofs.has(n.name))
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${ARCHITECT_MAX_ITERS}: ${stillUnsolved.length} unsolved node(s) — rewriting the graph around the failures.` })
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters}: ${stillUnsolved.length} unsolved node(s) — rewriting the graph around the failures.` })
     const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
     const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks)}`
     const refined = await architectBlueprintStage(ctx, state, urls, {
       system: architectRefineSystem(),
       user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,
       retries: ARCHITECT_REFINE_RETRIES,
-      stageLabel: `refinement ${iter + 1}/${ARCHITECT_MAX_ITERS}`,
+      stageLabel: `refinement ${iter + 1}/${maxIters}`,
     })
     if (!refined) {
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Refinement failed to produce a validated revised blueprint." })
@@ -4543,7 +4797,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     type: "prompt",
     prompt:
       style === "architect"
-        ? `[ARCHITECT MODE — Goedel-Architect blueprint pipeline · grok driver]\n\n=== C.1 BLUEPRINT GENERATION ===\n` +
+        ? `[LEAK RIVER — ${pickStrategy(strategy).label}]\n\n=== C.1 BLUEPRINT GENERATION ===\n` +
           architectBlueprintSystem() +
           "\n\n=== C.2 THEOREM PROVING (per node) ===\n" +
           architectProverSystem() +

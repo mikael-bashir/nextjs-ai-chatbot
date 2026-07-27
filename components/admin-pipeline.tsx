@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
@@ -672,16 +673,48 @@ function connFor(useWork: boolean) {
 // a manual "+5 min" nudge. Generous — deep proofs (e.g. lucas_nresidue_prime)
 // legitimately take a while — and always extendable live.
 const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
-// The architect strategy is deliberately governed much tighter: it's the
+// The Leak River strategies are deliberately governed much tighter: they're the
 // experimental Goedel-Architect pipeline under test, so runs should fail fast
 // and cheap rather than idle for 30 minutes — extend one minute at a time
 // instead of five once you've confirmed it's making real progress.
 const ARCHITECT_COMPUTE_BUDGET_MS = 5 * 60_000;
 const ARCHITECT_EXTEND_MS = 1 * 60_000;
-// Grok is the only driver the architect pipeline supports (see
-// public/local-claude-bridge.mjs's proveArchitect) — the model selector is
-// locked to this value whenever that strategy is active.
+// Grok is the only driver the pipeline supports (see proveArchitect in
+// public/local-claude-bridge.mjs) — the model selector is locked to this value
+// whenever a River strategy is active. river-delta additionally makes one local
+// Sonnet 5 call for its NL-proof seed, which is not a driver choice.
 const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
+// Refinement-iteration budget: the paper's Figure 2 shows solve rate climbing
+// log-linearly with refinement iterations, so this is the main quality dial.
+// Starts at 5, +1 per click.
+const ARCHITECT_DEFAULT_ITERS = 5;
+
+// The three Leak River variants, each an ablation of the one before it so the
+// research table isolates exactly one change at a time. `note` is shown in the
+// UI under the selector.
+const RIVER_STRATEGIES: {
+  value: string;
+  label: string;
+  note: string;
+}[] = [
+  {
+    value: 'river-stone',
+    label: 'Leak River Stone (control)',
+    note: 'Control: the Goedel-Architect paper as written — blueprint → parallel isolated node provers → refinement. Nothing added.',
+  },
+  {
+    value: 'river-gate',
+    label: 'Leak River Gate (+ dead-end ledger)',
+    note: 'Stone + a shared dead-end ledger: environment facts the compiler establishes on one node (names that do not exist, unavailable typeclasses, coercion traps) are pooled and handed to sibling nodes, so no two nodes independently rediscover the same wall. Proof strategy is never shared.',
+  },
+  {
+    value: 'river-delta',
+    label: 'Leak River Delta (+ Sonnet 5 NL seed)',
+    note: 'Gate + one local Sonnet 5 call up front for a natural-language proof of the target, handed to blueprint generation as a structural guide (the paper’s §4.2 NL guidance). Refinement is deliberately left unseeded — it reasons from machine-checked diagnoses instead.',
+  },
+];
+const isRiverStrategy = (s: string) =>
+  s === 'architect' || s.startsWith('river-');
 
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
@@ -824,13 +857,20 @@ export function AdminPipeline() {
   useEffect(() => {
     verifyModelRef.current = verifyModel;
   }, [verifyModel]);
-  // Architect strategy always drives Grok directly — force the model and lock
-  // the selector while it's active; fall back to the default the moment the
-  // operator switches to any other strategy.
+  // The Leak River strategies always drive Grok directly — force the model and
+  // lock the selector while one is active; fall back to the default the moment
+  // the operator switches to any other strategy.
   useEffect(() => {
-    if (verifyStrategy === 'architect') setVerifyModel(ARCHITECT_MODEL);
+    if (isRiverStrategy(verifyStrategy)) setVerifyModel(ARCHITECT_MODEL);
     else setVerifyModel((m) => (m === ARCHITECT_MODEL ? '' : m));
   }, [verifyStrategy]);
+  // Refinement-iteration budget for River runs (the "+1 iter" button). Held in a
+  // ref too so the async verify loop reads the value at dispatch time.
+  const [verifyMaxIters, setVerifyMaxIters] = useState(ARCHITECT_DEFAULT_ITERS);
+  const verifyMaxItersRef = useRef(verifyMaxIters);
+  useEffect(() => {
+    verifyMaxItersRef.current = verifyMaxIters;
+  }, [verifyMaxIters]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -1167,9 +1207,13 @@ export function AdminPipeline() {
           // path ignores it (and never fires onRunId), so the indicator stays off.
           // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
           computeBudgetMs: decompose
-            ? strategy === 'architect'
+            ? isRiverStrategy(strategy)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : VERIFY_COMPUTE_BUDGET_MS
+            : undefined,
+          // Leak River only: refinement budget from the "+1 iter" control.
+          maxIters: isRiverStrategy(strategy)
+            ? verifyMaxItersRef.current
             : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
@@ -1253,10 +1297,18 @@ export function AdminPipeline() {
         generatedItemId: item.id,
         problemTitle: item.questionTitle ?? item.problem?.slice(0, 80) ?? null,
         difficulty: item.difficulty ?? null,
-        points: item.points ?? null,
         theoremName,
         sorriedTheorem: item.lean || '',
         model: model || null,
+        // Every model that actually served a call. The bridge reports this for
+        // River runs (driver + any ladder fallback + the Sonnet seed); for the
+        // Claude strategies the configured model is the only one that runs.
+        modelsUsed:
+          metrics?.models_used && metrics.models_used.length
+            ? metrics.models_used
+            : model
+              ? [model]
+              : null,
         verified,
         refuted,
         costUsd: costUsd ?? null,
@@ -1268,21 +1320,31 @@ export function AdminPipeline() {
         error,
         bridgeBuild: metrics?.bridge_build ?? null,
       };
-      const path =
-        strategy === 'architect'
-          ? '/api/admin/research/river'
-          : '/api/admin/research/stronghold';
-      const body =
-        strategy === 'architect'
-          ? {
+      const path = isRiverStrategy(strategy)
+        ? '/api/admin/research/river'
+        : '/api/admin/research/stronghold';
+      const body = isRiverStrategy(strategy)
+        ? {
               ...common,
-              nlSeedUsed,
+              // Which River variant ran — the GROUP BY key for the comparison.
+              strategy,
+              // Prefer the bridge's own observation of whether a seed was used
+              // (river-delta generates its own), falling back to what we sent.
+              nlSeedUsed: metrics?.nl_seed_used ?? nlSeedUsed,
+              costDriverUsd: metrics?.cost_driver_usd ?? null,
+              costSeedUsd: metrics?.cost_seed_usd ?? null,
+              promptTokens: metrics?.prompt_tokens ?? null,
+              completionTokens: metrics?.completion_tokens ?? null,
+              cachedTokens: metrics?.cached_tokens ?? null,
               costCapHit: metrics?.cost_cap_hit ?? null,
+              maxIters: metrics?.max_iters ?? null,
               blueprintIterations: metrics?.blueprint_iterations ?? null,
               nodesTotal: metrics?.nodes_total ?? null,
               nodesSolved: metrics?.nodes_solved ?? null,
               nodesForfeited: metrics?.nodes_forfeited ?? null,
               nodesNegated: metrics?.nodes_negated ?? null,
+              deadEndsShared: metrics?.dead_ends_shared ?? null,
+              deadEndsKnown: metrics?.dead_ends_known ?? null,
             }
           : {
               ...common,
@@ -1351,7 +1413,7 @@ export function AdminPipeline() {
           // "on these problems natural-language guidance is decisive"). The
           // generator already produced the informal argument; hand it over.
           const nlProof =
-            verifyStrategyRef.current === 'architect'
+            isRiverStrategy(verifyStrategyRef.current)
               ? [
                   item.problem ? `Problem: ${item.problem}` : '',
                   typeof item.answer === 'number' ? `Answer: ${item.answer}` : '',
@@ -1364,7 +1426,7 @@ export function AdminPipeline() {
           // Mirrors proveStream's own decompose check exactly (a resumed seed
           // always runs the tree path, even with the toggle off).
           computeBudgetMsAtStart = verifyDecomposeRef.current || seedUsed
-            ? strategyAtStart === 'architect'
+            ? isRiverStrategy(strategyAtStart)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : VERIFY_COMPUTE_BUDGET_MS
             : undefined;
@@ -1558,10 +1620,9 @@ export function AdminPipeline() {
       const conn = connFor(false); // shared (verification) bridge
       const r = await extendProverRun({
         runId,
-        addMs:
-          verifyStrategyRef.current === 'architect'
-            ? ARCHITECT_EXTEND_MS
-            : 5 * 60_000,
+        addMs: isRiverStrategy(verifyStrategyRef.current)
+          ? ARCHITECT_EXTEND_MS
+          : 5 * 60_000,
         bridgeUrl: conn.bridgeUrl,
         token: conn.token,
       });
@@ -2790,17 +2851,17 @@ export function AdminPipeline() {
             <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
               Model
               <select
-                value={verifyStrategy === 'architect' ? ARCHITECT_MODEL : verifyModel}
+                value={isRiverStrategy(verifyStrategy) ? ARCHITECT_MODEL : verifyModel}
                 onChange={(e) => setVerifyModel(e.target.value)}
-                disabled={verifyStrategy === 'architect'}
+                disabled={isRiverStrategy(verifyStrategy)}
                 className="rounded-md border bg-background px-1.5 py-1 text-xs disabled:opacity-60"
                 title={
-                  verifyStrategy === 'architect'
-                    ? 'Architect strategy always drives Grok directly — model is locked.'
+                  isRiverStrategy(verifyStrategy)
+                    ? 'Leak River strategies always drive Grok directly — model is locked.'
                     : 'Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default.'
                 }
               >
-                {verifyStrategy === 'architect' ? (
+                {isRiverStrategy(verifyStrategy) ? (
                   <option value={ARCHITECT_MODEL}>
                     Grok 4.1 Fast Reasoning (forced)
                   </option>
@@ -2829,9 +2890,50 @@ export function AdminPipeline() {
                   <option value="brute">Brute (automation only)</option>
                   <option value="have">Have (in-context, no top-level lemmas)</option>
                   <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
-                  <option value="architect">Architect (Goedel blueprint · grok driver · Leak XI/XII/XIV)</option>
+                  <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
+                    {RIVER_STRATEGIES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </optgroup>
                 </select>
               </label>
+            )}
+            {/* Refinement-iteration budget — River strategies only. The paper's
+                solve rate climbs log-linearly with refinement iterations, so
+                this is the main quality dial; +1 per click. */}
+            {verifyDecompose && isRiverStrategy(verifyStrategy) && (
+              <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+                Iterations
+                <span
+                  className="font-mono text-xs font-semibold text-foreground"
+                  title="Blueprint-refinement iterations this run may use"
+                >
+                  {verifyMaxIters}
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVerifyMaxIters((n) => Math.min(32, n + 1))
+                  }
+                  disabled={verifyMaxIters >= 32}
+                  title="Add one blueprint-refinement iteration (applies to the next run)"
+                  className="inline-flex items-center gap-0.5 rounded border px-1.5 py-1 text-[11px] font-medium transition-colors hover:bg-muted disabled:opacity-50"
+                >
+                  <Plus className="size-3" />1 iter
+                </button>
+                {verifyMaxIters !== ARCHITECT_DEFAULT_ITERS && (
+                  <button
+                    type="button"
+                    onClick={() => setVerifyMaxIters(ARCHITECT_DEFAULT_ITERS)}
+                    title={`Reset to the default (${ARCHITECT_DEFAULT_ITERS})`}
+                    className="rounded border px-1.5 py-1 text-[11px] transition-colors hover:bg-muted"
+                  >
+                    reset
+                  </button>
+                )}
+              </span>
             )}
             {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
               <Button
@@ -2845,11 +2947,27 @@ export function AdminPipeline() {
             )}
           </div>
         </div>
-        {verifyDecompose && (
+        {verifyDecompose && !isRiverStrategy(verifyStrategy) && (
           <p className="mb-2 text-xs text-muted-foreground">
             Decompose mode: each generated problem is proved-or-split into
             toolchain-verified sub-lemmas (recursively) and assembled into one
             sorry-free proof. Slower but closes goals a single run stalls on.
+          </p>
+        )}
+        {verifyDecompose && isRiverStrategy(verifyStrategy) && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">
+              {RIVER_STRATEGIES.find((s) => s.value === verifyStrategy)?.label ??
+                'Leak River Stone (control)'}
+              {': '}
+            </span>
+            {RIVER_STRATEGIES.find((s) => s.value === verifyStrategy)?.note ??
+              RIVER_STRATEGIES[0].note}{' '}
+            Results are logged to the{' '}
+            <Link href="/admin/research" className="underline">
+              Leak River research table
+            </Link>
+            .
           </p>
         )}
         {verifyPaused && (
@@ -2881,7 +2999,7 @@ export function AdminPipeline() {
             computeLimit={computeLimit}
             onExtend={extendVerification}
             extending={extending}
-            extendLabel={verifyStrategy === 'architect' ? '1 min' : '5 min'}
+            extendLabel={isRiverStrategy(verifyStrategy) ? '1 min' : '5 min'}
           />
         )}
         <div className="space-y-1.5">

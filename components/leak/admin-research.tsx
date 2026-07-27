@@ -16,8 +16,15 @@ interface RiverRow {
   difficulty: string | null;
   theorem_name: string | null;
   sorried_theorem: string;
+  strategy: string | null;
   model: string | null;
+  models_used: string[] | null;
   nl_seed_used: boolean | null;
+  cost_driver_usd: number | null;
+  cost_seed_usd: number | null;
+  max_iters: number | null;
+  dead_ends_shared: number | null;
+  dead_ends_known: number | null;
   verified: boolean | null;
   refuted: boolean | null;
   cost_usd: number | null;
@@ -43,6 +50,7 @@ interface StrongholdRow {
   theorem_name: string | null;
   sorried_theorem: string;
   model: string | null;
+  models_used: string[] | null;
   strategy: string | null;
   verified: boolean | null;
   refuted: boolean | null;
@@ -56,6 +64,14 @@ interface StrongholdRow {
   error: string | null;
   bridge_build: string | null;
 }
+
+// Short labels for the Leak River variants (the `strategy` column).
+const RIVER_LABELS: Record<string, string> = {
+  'river-stone': 'Stone · control',
+  'river-gate': 'Gate · ledger',
+  'river-delta': 'Delta · ledger+NL',
+  architect: 'Stone · control (legacy tag)',
+};
 
 function fmtNum(v: number | null | undefined, digits = 0): string {
   return v == null ? '—' : v.toFixed(digits);
@@ -156,6 +172,7 @@ function ResearchTable<T extends { id: string; created_at: string }>({
               llm_calls: number | null;
               tool_calls: number | null;
               model: string | null;
+              models_used: string[] | null;
               error: string | null;
             };
             return (
@@ -186,7 +203,17 @@ function ResearchTable<T extends { id: string; created_at: string }>({
                   </span>
                   <span title="LLM calls">{row.llm_calls ?? '—'} llm</span>
                   <span title="Tool calls">{row.tool_calls ?? '—'} tools</span>
-                  <span title="Driver model">{row.model || '—'}</span>
+                  <span
+                    title={
+                      row.models_used?.length
+                        ? `Models used: ${row.models_used.join(', ')}`
+                        : 'Driver model'
+                    }
+                  >
+                    {row.models_used?.length
+                      ? row.models_used.join(' + ')
+                      : row.model || '—'}
+                  </span>
                   {renderExtra(r)}
                   {row.error && (
                     <span
@@ -215,8 +242,17 @@ export function AdminLeakRiver() {
       endpoint="/api/admin/research/river"
       renderExtra={(r) => (
         <>
-          <span title="Blueprint iterations reached">
+          {r.strategy && (
+            <span
+              className="rounded bg-violet-500/10 px-1.5 py-0.5 font-medium text-violet-600 dark:text-violet-400"
+              title="Which Leak River variant ran"
+            >
+              {RIVER_LABELS[r.strategy] ?? r.strategy}
+            </span>
+          )}
+          <span title="Blueprint iterations reached / budget">
             iter {r.blueprint_iterations ?? '—'}
+            {r.max_iters ? `/${r.max_iters}` : ''}
           </span>
           <span title="Nodes solved / total in the final blueprint">
             nodes {r.nodes_solved ?? '—'}/{r.nodes_total ?? '—'}
@@ -227,7 +263,19 @@ export function AdminLeakRiver() {
           {!!r.nodes_negated && (
             <span title="Nodes machine-disproved">🧨 {r.nodes_negated}</span>
           )}
+          {!!r.dead_ends_shared && (
+            <span title="Dead-end facts injected into node prompts (distinct facts learned)">
+              🚧 {r.dead_ends_shared}
+              {r.dead_ends_known ? `/${r.dead_ends_known}` : ''}
+            </span>
+          )}
           {r.nl_seed_used && <span title="NL proof seed used">NL-seeded</span>}
+          {r.cost_seed_usd != null && r.cost_seed_usd > 0 && (
+            <span title="Cost split: Grok driver + local Sonnet NL seed">
+              (drv ${fmtNum(r.cost_driver_usd, 3)} + seed $
+              {fmtNum(r.cost_seed_usd, 3)})
+            </span>
+          )}
           {r.cost_cap_hit && (
             <span className="text-amber-500" title="Hit the dollar cap">
               💸 cap hit

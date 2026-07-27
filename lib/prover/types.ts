@@ -28,6 +28,25 @@ export interface ProverMetrics {
   tokens?: number;
   /** Architect (Leak River) only: latest blueprint iteration reached. */
   blueprint_iterations?: number;
+  /** Architect only: refinement-iteration budget this run was given. */
+  max_iters?: number;
+  /** Architect only: cost split — driver (Grok, from tokens) vs NL seed
+   *  (local Sonnet, from the CLI's reported total_cost_usd). Sums to cost_usd. */
+  cost_driver_usd?: number;
+  cost_seed_usd?: number;
+  /** Architect only: cumulative driver token counts, so cost can be recomputed
+   *  independently of whatever prices were in effect at run time. */
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  /** Every model that actually served a call (incl. ladder fallbacks + seed). */
+  models_used?: string[];
+  /** Architect only: whether an NL proof seeded blueprint generation. */
+  nl_seed_used?: boolean;
+  /** river-gate / river-delta only: dead-end facts injected into node prompts,
+   *  and distinct facts the run learned. Absent on the control (no ledger). */
+  dead_ends_shared?: number;
+  dead_ends_known?: number;
   /** Architect only: provable node count in the current/final blueprint. */
   nodes_total?: number;
   /** Architect only: nodes with a registered solve (proof or negation). */

@@ -64,7 +64,11 @@ interface RunOpts {
   // Architect strategy only: a natural-language proof / solution sketch that
   // seeds blueprint generation as a structural guide (Goedel-Architect §4.2).
   // Informal math only — never Lean code. Ignored by every other strategy.
+  // river-delta generates its own with local Sonnet 5 when this is absent.
   nlProof?: string;
+  // Leak River only: refinement-iteration budget for this run (the UI's
+  // "+1 iter" button). Clamped 1..32 on the bridge; ignored elsewhere.
+  maxIters?: number;
   // Fires whenever the tree run banks progress — the latest resumable checkpoint
   // (skeleton with proven holes filled, rest still `sorry`). Persist the newest
   // one so any stop (limit / terminate / crash) can resume from it.
@@ -197,6 +201,9 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
           ...(opts.seed && opts.seed.trim() ? { seed: opts.seed } : {}),
           ...(opts.nlProof && opts.nlProof.trim()
             ? { nlProof: opts.nlProof }
+            : {}),
+          ...(opts.maxIters && opts.maxIters > 0
+            ? { maxIters: opts.maxIters }
             : {}),
         },
       }),

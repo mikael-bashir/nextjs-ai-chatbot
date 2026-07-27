@@ -30,8 +30,11 @@ const PLAYGROUND_COMPUTE_BUDGET_MS = 30 * 60_000;
 const ARCHITECT_COMPUTE_BUDGET_MS = 5 * 60_000;
 const ARCHITECT_EXTEND_MS = 1 * 60_000;
 // Grok is the only driver proveArchitect supports — lock the model selector
-// to this value whenever that strategy is active.
+// to this value whenever a Leak River strategy is active.
 const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
+const ARCHITECT_DEFAULT_ITERS = 5;
+const isRiverStrategy = (s: string) =>
+  s === 'architect' || s.startsWith('river-');
 
 // A minimal "message the prover" surface. It reuses the exact same runner +
 // console as the admin queue resolver — send a statement, watch every step,
@@ -52,9 +55,11 @@ export function ProverPlayground() {
   const [model, setModel] = useState('');
   // Architect strategy always drives Grok directly — force + lock the model.
   useEffect(() => {
-    if (strategy === 'architect') setModel(ARCHITECT_MODEL);
+    if (isRiverStrategy(strategy)) setModel(ARCHITECT_MODEL);
     else setModel((m) => (m === ARCHITECT_MODEL ? '' : m));
   }, [strategy]);
+  // Refinement-iteration budget for Leak River runs (+1 per click).
+  const [maxIters, setMaxIters] = useState(ARCHITECT_DEFAULT_ITERS);
 
   // Live compute-budget state for the tree path: the bridge reports a runId +
   // deadline via onRunId; the "+5 min" button (extend) pushes the deadline out.
@@ -104,10 +109,11 @@ export function ProverPlayground() {
           // path ignores it (and never fires onRunId), so no indicator shows.
           // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
           computeBudgetMs: asTree
-            ? strategy === 'architect'
+            ? isRiverStrategy(strategy)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : PLAYGROUND_COMPUTE_BUDGET_MS
             : undefined,
+          maxIters: isRiverStrategy(strategy) ? maxIters : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
             setComputeLimit({ deadlineMs, budgetMs });
@@ -124,7 +130,7 @@ export function ProverPlayground() {
         abortRef.current = null;
       }
     },
-    [problem, decompose, strategy, model],
+    [problem, decompose, strategy, model, maxIters],
   );
 
   // Push the running prove's wall-clock budget out. Best-effort.
@@ -133,7 +139,7 @@ export function ProverPlayground() {
     if (!runId || extending) return;
     setExtending(true);
     try {
-      const addMs = strategy === 'architect' ? ARCHITECT_EXTEND_MS : 5 * 60_000;
+      const addMs = isRiverStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000;
       const r = await extendProverRun({ runId, addMs });
       if (r) setComputeLimit(r);
     } finally {
@@ -202,17 +208,17 @@ export function ProverPlayground() {
         <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
           Model
           <select
-            value={strategy === 'architect' ? ARCHITECT_MODEL : model}
+            value={isRiverStrategy(strategy) ? ARCHITECT_MODEL : model}
             onChange={(e) => setModel(e.target.value)}
-            disabled={running || strategy === 'architect'}
+            disabled={running || isRiverStrategy(strategy)}
             className="rounded-md border bg-background px-2 py-1.5 text-sm disabled:opacity-60"
             title={
-              strategy === 'architect'
-                ? 'Architect strategy always drives Grok directly — model is locked.'
+              isRiverStrategy(strategy)
+                ? 'Leak River strategies always drive Grok directly — model is locked.'
                 : undefined
             }
           >
-            {strategy === 'architect' ? (
+            {isRiverStrategy(strategy) ? (
               <option value={ARCHITECT_MODEL}>
                 Grok 4.1 Fast Reasoning (forced)
               </option>
@@ -243,9 +249,30 @@ export function ProverPlayground() {
               <option value="brute">Brute (automation only)</option>
               <option value="have">Have (in-context, no top-level lemmas)</option>
               <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
-              <option value="architect">Architect (Goedel blueprint · grok driver · Leak XI/XII/XIV)</option>
+              <optgroup label="Leak River (Goedel blueprint · grok driver)">
+                <option value="river-stone">Leak River Stone (control)</option>
+                <option value="river-gate">Leak River Gate (+ dead-end ledger)</option>
+                <option value="river-delta">Leak River Delta (+ Sonnet 5 NL seed)</option>
+              </optgroup>
             </select>
           </label>
+        )}
+        {decompose && isRiverStrategy(strategy) && (
+          <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
+            Iterations
+            <span className="font-mono font-semibold text-foreground">
+              {maxIters}
+            </span>
+            <button
+              type="button"
+              onClick={() => setMaxIters((n) => Math.min(32, n + 1))}
+              disabled={running || maxIters >= 32}
+              title="Add one blueprint-refinement iteration"
+              className="rounded-md border px-2 py-1.5 text-xs font-medium transition-colors hover:bg-muted disabled:opacity-50"
+            >
+              +1 iter
+            </button>
+          </span>
         )}
       </div>
       {decompose && (
@@ -258,16 +285,16 @@ export function ProverPlayground() {
             : 'Hacker mode leads with the compiler (verify_full_script) and strong automation.'}{' '}
           Needs a verify_full_script MCP server connected. Runs under a{' '}
           {Math.round(
-            (strategy === 'architect'
+            (isRiverStrategy(strategy)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : PLAYGROUND_COMPUTE_BUDGET_MS) / 60_000,
           )}
           -minute compute budget you can extend live (+
           {Math.round(
-            (strategy === 'architect' ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
+            (isRiverStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
               60_000,
           )}{' '}
-          min).
+          min){isRiverStrategy(strategy) ? `, with ${maxIters} refinement iteration(s)` : ''}.
         </p>
       )}
 
@@ -277,7 +304,7 @@ export function ProverPlayground() {
         computeLimit={computeLimit}
         onExtend={extend}
         extending={extending}
-        extendLabel={strategy === 'architect' ? '1 min' : '5 min'}
+        extendLabel={isRiverStrategy(strategy) ? '1 min' : '5 min'}
       />
 
       {outcome && (
