@@ -85,6 +85,9 @@ export async function POST(request: NextRequest) {
       // header prints both, and the two verifier groups differ in both.
       toolchain: rec.toolchain ?? null,
       mathlib: (rec as { mathlib?: string | null }).mathlib ?? null,
+      // Which specific strategy enforced this proof, for the certificate's
+      // Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak").
+      enforcer: (rec as { enforcer?: string | null }).enforcer ?? null,
       // Solver-facing key idea (1-3 sentences). CompeteMath reveals it alongside
       // the answer once a problem is solved or given up.
       insight: rec.insight ?? null,

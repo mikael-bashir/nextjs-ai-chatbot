@@ -26,11 +26,46 @@ export const CERTIFICATE = {
   // with. This is public by design — anyone can verify a certificate's signature
   // against it. The matching PRIVATE key lives only in CERT_SIGN_PRIVATE_KEY
   // (server env, never committed); without it, nobody can forge a signature.
+  //
+  // This is the LEGACY key (Leak I/II/IV, Lean 4.29.1) — kept exactly as-is so
+  // every certificate signed before per-toolchain keys existed still verifies.
   publicKey:
     "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQWF1WXJDbitsb2ErTGhadzBJN1QxQkROcEJjMno3VTJ1UDZGaERQNDlVUlU9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=",
   // Short fingerprint (first 16 hex of SHA-256 of the public-key PEM) for display.
   keyId: "120beb3b40504cca",
 } as const;
+
+// Certificates from different toolchain groups are signed with DIFFERENT keys
+// and treated as fully independent artifacts (per-toolchain certificates for
+// the same problem must not share trust roots). "legacy" is CERTIFICATE above
+// (Leak I/II/IV, Lean 4.29.1); "architect" covers Leak XI/XII/XIV (Lean
+// 4.32.0), used by every Leak River / Leak Ultra variant regardless of which
+// specific strategy proved it — the strategy name is a separate `enforcer`
+// field, not a key-selection axis. Matching PRIVATE key lives in
+// CERT_SIGN_PRIVATE_KEY_ARCHITECT (server env, never committed).
+export type CertKeyGroup = "legacy" | "architect";
+export const CERT_KEYS: Record<CertKeyGroup, { publicKey: string; keyId: string }> = {
+  legacy: { publicKey: CERTIFICATE.publicKey, keyId: CERTIFICATE.keyId },
+  architect: {
+    publicKey:
+      "LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQVJUandEWnk2NWcxWWZkSTYvbEhlc3JVTlRhRzRqYmlFR2UvVkZHQVVLaUU9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=",
+    keyId: "433325952cd0eb34",
+  },
+};
+// Which key group a run's recorded toolchain implies. Empty/legacy-looking
+// toolchain (or none — pre-toolchain-recording rows) ⇒ legacy, so old rows
+// keep resolving to the key they were actually signed with.
+export function certKeyGroup(toolchain?: string | null): CertKeyGroup {
+  return /4\.32\b/.test(String(toolchain ?? "")) ? "architect" : "legacy";
+}
+// Look up which public key a given keyId belongs to — used when SERVING a
+// certificate, so the embedded Public-Key block matches whichever key
+// actually produced that row's stored signature (not just whatever the
+// current toolchain implies).
+export function publicKeyForKeyId(keyId?: string | null): { publicKey: string; keyId: string } {
+  const hit = Object.values(CERT_KEYS).find((k) => k.keyId === keyId);
+  return hit ?? CERT_KEYS.legacy;
+}
 
 // Banner that separates the signed certificate content from the appended
 // signature block. A verifier splits the pasted text here: everything BEFORE
@@ -64,19 +99,24 @@ export interface CertificateMeta {
    *  byte-identical (and therefore still verifiable). */
   toolchain?: string | null;
   mathlib?: string | null;
+  /** Which specific strategy/prover enforced this proof (e.g. "Leak Ultra
+   *  Fleeting", "Leak River Gate"). Omitted ⇒ falls back to CERTIFICATE.prover
+   *  ("Leak"), which keeps every certificate signed before this field existed
+   *  byte-identical. */
+  enforcer?: string | null;
 }
 
 // Render a run's toolchain the way the header has always read ("Lean 4.29.1"),
 // accepting either the bare version or the full elan string the bridge reports
 // ("leanprover/lean4:v4.32.0"). No per-run value ⇒ the constant, so certificates
 // signed before toolchain was recorded still hash to the same bytes.
-function certToolchain(toolchain?: string | null): string {
+export function certToolchain(toolchain?: string | null): string {
   const t = (toolchain ?? "").trim();
   if (!t) return CERTIFICATE.toolchain;
   const v = t.replace(/^leanprover\/lean4:v?/, "").replace(/^v/, "");
   return `Lean ${v}`;
 }
-function certMathlib(mathlib?: string | null): string {
+export function certMathlib(mathlib?: string | null): string {
   const m = (mathlib ?? "").trim();
   if (!m) return CERTIFICATE.mathlib;
   return m.startsWith("Mathlib") ? m : `Mathlib ${m}`;
@@ -94,7 +134,7 @@ export function certificateHeader(meta: CertificateMeta): string {
     `  Problem   : ${meta.title ?? "—"}`,
     `  Verified  : ${fmtCertDate(meta.provedAt)}  (machine-checked by the Lean kernel)`,
     `  Minted    : ${fmtCertDate(meta.mintedAt)}  (certificate signed)`,
-    `  Enforcer  : ${CERTIFICATE.prover} · ${CERTIFICATE.proverUrl}`,
+    `  Enforcer  : ${meta.enforcer?.trim() || CERTIFICATE.prover} · ${CERTIFICATE.proverUrl}`,
     `  Toolchain : ${certToolchain(meta.toolchain)} · ${certMathlib(meta.mathlib)}`,
     `  Support   : ${CERTIFICATE.supportEmail}`,
     `  ${line}`,

@@ -87,6 +87,32 @@ export async function hasPromotedTitle(
   return titles.some((x) => normTitle(x) === t);
 }
 
+// Which toolchains a title has ALREADY been promoted under. The table has no
+// uniqueness constraint on questionTitle — a title can have more than one
+// promoted row, one per toolchain — so this is a genuine multi-row query, not
+// just an existence check. Used by the auto-attach flow to decide whether a
+// freshly re-verified proof is a NEW certificate for this problem (a toolchain
+// not yet represented) or a redundant re-proof of one already covered.
+export async function promotedToolchainsForTitle(
+  title?: string | null,
+): Promise<string[]> {
+  await ensureTable();
+  const t = normTitle(title);
+  if (!t) return [];
+  const { rows } = await sql`
+    SELECT "toolchain" FROM "GeneratedProblem"
+    WHERE "promotedAt" IS NOT NULL AND "toolchain" IS NOT NULL
+      AND btrim(lower(regexp_replace("questionTitle", '\\s+', ' ', 'g'))) = ${t}
+  `;
+  return Array.from(
+    new Set(
+      rows
+        .map((r) => (r as { toolchain?: string }).toolchain)
+        .filter((x): x is string => !!x),
+    ),
+  );
+}
+
 export async function saveGeneratedProblem(
   input: GeneratedProblemInput,
 ): Promise<GeneratedProblem> {

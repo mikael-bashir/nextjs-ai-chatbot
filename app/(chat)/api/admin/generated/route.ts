@@ -203,6 +203,9 @@ export async function PATCH(request: NextRequest) {
       // group), so staging → prod can state it instead of assuming one.
       'toolchain',
       'mathlib',
+      // Which specific strategy enforced this proof, for the certificate's
+      // Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak").
+      'enforcer',
     ] as const) {
       if (k in body) patch[k] = body[k];
     }

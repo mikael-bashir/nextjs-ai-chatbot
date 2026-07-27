@@ -119,6 +119,10 @@ export async function POST(request: NextRequest) {
       // legacy pin — architect-certified items carry 4.32.0 and must keep it.
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
       mathlib: body.mathlib ?? 'v4.29.1',
+      // Which specific strategy enforced this proof, for the certificate's
+      // Enforcer line. No fallback pin (unlike toolchain/mathlib) — an absent
+      // value just means the pre-attribution certificate constant applies.
+      enforcer: body.enforcer ?? null,
       verifiedAt: body.verifiedAt ?? null,
       signature: body.signature ?? null,
       signatureKeyId: body.signatureKeyId ?? null,

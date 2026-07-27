@@ -146,6 +146,9 @@ export interface GeneratedRecord {
   toolchain?: string;
   /** Mathlib version of the group that certified it — pairs with `toolchain`. */
   mathlib?: string;
+  /** Specific strategy that enforced this proof, for the certificate's
+   *  Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak"). */
+  enforcer?: string;
   verifiedAt?: string;
   signature?: string;
   signatureKeyId?: string;

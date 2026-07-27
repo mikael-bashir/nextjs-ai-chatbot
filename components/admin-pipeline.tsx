@@ -502,6 +502,9 @@ interface StagedItem extends GenProblem {
   /** Lean toolchain + Mathlib version of the group that certified this proof. */
   toolchain?: string;
   mathlib?: string;
+  /** Specific strategy that enforced this proof, for the certificate's
+   *  Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak"). */
+  enforcer?: string;
   createdAt?: string;
   // ISO time the Lean kernel confirmed the proof (set by the verify loop),
   // threaded to the prod payload so the certificate's "verified" time is real.
@@ -741,6 +744,26 @@ const isUltraStrategy = (s: string) => s.startsWith('ultra-');
 // Both families run the architect orchestrator (and therefore Leak XI/XII/XIV).
 const isArchitectStrategy = (s: string) =>
   isRiverStrategy(s) || isUltraStrategy(s);
+
+// Human-readable "who enforced this" name for the certificate's Enforcer line
+// (e.g. "Leak Ultra Fleeting", "Leak River Gate") — distinct per strategy,
+// replacing the bland "Leak" every certificate showed before this existed.
+const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
+  hacker: 'Leak Hacker',
+  pantograph: 'Leak Pantograph',
+  librarian: 'Leak Librarian',
+  sketch: 'Leak Sketch',
+  brute: 'Leak Brute',
+  have: 'Leak Have',
+  'have-tree': 'Leak Stronghold Dark',
+};
+function enforcerLabelFor(strategy: string): string {
+  const river = RIVER_STRATEGIES.find((s) => s.value === strategy);
+  if (river) return river.label.split('(')[0].trim();
+  const ultra = ULTRA_STRATEGIES.find((s) => s.value === strategy);
+  if (ultra) return ultra.label.split('(')[0].trim();
+  return STRONGHOLD_ENFORCER_LABELS[strategy] ?? 'Leak';
+}
 
 // Would this proof text make a HONEST certificate for `target`? A certificate
 // asserts "sorry-free Lean proof of THIS theorem", so both claims are checked
@@ -1604,11 +1627,47 @@ export function AdminPipeline() {
                 // covered by the signature rather than being loose metadata.
                 toolchain: runToolchain,
                 mathlib: runMathlib,
+                // Which specific strategy enforced this proof — shown on the
+                // certificate instead of the bland "Leak".
+                enforcer: enforcerLabelFor(strategyAtStart),
               }),
             });
             if (r.ok) cert = await r.json();
           } catch {
             /* signing best-effort — the proof is still recorded either way */
+          }
+          // Robustness feature, backend-only (no UI change): if this title is
+          // ALREADY published and this toolchain doesn't have a certificate
+          // for it yet, push this one straight to prod as an additional
+          // certificate. No-ops if never published, or if this toolchain is
+          // already covered. Fire-and-forget — never blocks the verify loop.
+          if (cert?.signature) {
+            fetch('/api/admin/problems/attach-certificate', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                id: item.id,
+                questionTitle: item.questionTitle,
+                subtitle: item.subtitle,
+                problem: item.problem,
+                difficulty: item.difficulty,
+                points: item.points,
+                answer: item.answer,
+                level: item.level,
+                insight: item.insight,
+                lean: item.lean,
+                proof,
+                toolchain: runToolchain,
+                mathlib: runMathlib,
+                enforcer: enforcerLabelFor(strategyAtStart),
+                verifiedAt,
+                signature: cert.signature,
+                signatureKeyId: cert.keyId,
+                certMintedAt: cert.certMintedAt,
+              }),
+            }).catch(() => {
+              /* best-effort — a failed attach just means this stays local */
+            });
           }
         }
         await patchGenerated(item.id, {
@@ -1617,7 +1676,9 @@ export function AdminPipeline() {
           ...(verified ? { verifiedAt } : {}),
           // Carried so staging → promote → CompeteMath ship the toolchain that
           // actually certified THIS proof, not the pipeline's default.
-          ...(verified ? { toolchain: runToolchain, mathlib: runMathlib } : {}),
+          ...(verified
+            ? { toolchain: runToolchain, mathlib: runMathlib, enforcer: enforcerLabelFor(strategyAtStart) }
+            : {}),
           // Signature + the moment it was minted, carried through staging → prod
           // so CompeteMath stores this exact signature instead of re-signing.
           ...(cert?.signature
@@ -2447,6 +2508,7 @@ export function AdminPipeline() {
           // only applies to rows proved before toolchain was carried per run.
           toolchain: item.toolchain ?? TOOLCHAIN,
           mathlib: item.mathlib ?? MATHLIB_VERSION,
+          enforcer: item.enforcer ?? null,
           verifiedAt: item.verifiedAt ?? null,
           signature: item.signature ?? null,
           signatureKeyId: item.signatureKeyId ?? null,
