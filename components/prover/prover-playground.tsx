@@ -68,6 +68,7 @@ export function ProverPlayground() {
     budgetMs: number;
   } | null>(null);
   const [extending, setExtending] = useState(false);
+  const [extendingIters, setExtendingIters] = useState(false);
   const runIdRef = useRef<string | null>(null);
   // Latest saved checkpoint (a partially-filled skeleton) from a decompose run.
   // Persists in component state so you can Resume after a Terminate or a stop.
@@ -146,6 +147,22 @@ export function ProverPlayground() {
       setExtending(false);
     }
   }, [extending, strategy]);
+
+  // "+1 iter": raise the refinement budget for the NEXT run and, while a River
+  // run is live, for that run too (the bridge re-reads the budget each iteration).
+  const extendIters = useCallback(async () => {
+    if (extendingIters) return;
+    setExtendingIters(true);
+    try {
+      setMaxIters((n) => Math.min(32, n + 1));
+      const runId = runIdRef.current;
+      if (!runId) return;
+      const r = await extendProverRun({ runId, addIters: 1 });
+      if (r?.maxIters) setMaxIters(r.maxIters);
+    } finally {
+      setExtendingIters(false);
+    }
+  }, [extendingIters]);
 
   const terminate = useCallback(() => {
     abortRef.current?.abort();
@@ -257,23 +274,8 @@ export function ProverPlayground() {
             </select>
           </label>
         )}
-        {decompose && isRiverStrategy(strategy) && (
-          <span className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
-            Iterations
-            <span className="font-mono font-semibold text-foreground">
-              {maxIters}
-            </span>
-            <button
-              type="button"
-              onClick={() => setMaxIters((n) => Math.min(32, n + 1))}
-              disabled={running || maxIters >= 32}
-              title="Add one blueprint-refinement iteration"
-              className="rounded-md border px-2 py-1.5 text-xs font-medium transition-colors hover:bg-muted disabled:opacity-50"
-            >
-              +1 iter
-            </button>
-          </span>
-        )}
+        {/* The refinement-budget control lives on the console below, alongside the
+            clock control, so it can be raised MID-FLIGHT and not just per run. */}
       </div>
       {decompose && (
         <p className="text-xs text-muted-foreground">
@@ -294,7 +296,11 @@ export function ProverPlayground() {
             (isRiverStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
               60_000,
           )}{' '}
-          min){isRiverStrategy(strategy) ? `, with ${maxIters} refinement iteration(s)` : ''}.
+          min)
+          {isRiverStrategy(strategy)
+            ? `, with ${maxIters} refinement iteration(s) — raise either live from the console header`
+            : ''}
+          .
         </p>
       )}
 
@@ -305,6 +311,16 @@ export function ProverPlayground() {
         onExtend={extend}
         extending={extending}
         extendLabel={isRiverStrategy(strategy) ? '1 min' : '5 min'}
+        iterLimit={
+          decompose && isRiverStrategy(strategy) ? { budget: maxIters } : null
+        }
+        onExtendIters={extendIters}
+        extendingIters={extendingIters}
+        onResetIters={
+          maxIters === ARCHITECT_DEFAULT_ITERS
+            ? undefined
+            : () => setMaxIters(ARCHITECT_DEFAULT_ITERS)
+        }
       />
 
       {outcome && (

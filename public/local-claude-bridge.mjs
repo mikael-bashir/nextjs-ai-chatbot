@@ -2394,12 +2394,16 @@ const clampNum = (v, lo, hi, dflt) => {
 // killers read the deadline LIVE (not a fixed timer), so the UI's "+5 min" button
 // (POST /extend) rescues even the stage that's currently running. No budget (0)
 // means uncapped — deadline Infinity — preserving the old "let it run" behavior.
-const ACTIVE_RUNS = new Map() // runId -> { deadlineMs, budgetMs }
-function registerRun(budgetMs) {
+// `maxIters` is the Leak River refinement budget, mutable for the same reason:
+// the UI's "+1 iter" button must be able to rescue a run that is already on its
+// final iteration, not just configure the next run.
+const ACTIVE_RUNS = new Map() // runId -> { deadlineMs, budgetMs, maxIters }
+function registerRun(budgetMs, maxIters = 0) {
   const runId = randomUUID()
   const st = {
     deadlineMs: budgetMs > 0 ? Date.now() + budgetMs : Infinity,
     budgetMs: budgetMs > 0 ? budgetMs : 0,
+    maxIters: maxIters > 0 ? maxIters : 0,
   }
   ACTIVE_RUNS.set(runId, st)
   return { runId, st }
@@ -4600,8 +4604,13 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     return { verified: false, proof: "" }
   }
   const variant = architectConfigFor(ctx.strategy)
-  // Refinement budget for THIS run (the UI's button; see ARCHITECT_MAX_ITERS).
-  const maxIters = clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS)
+  // Refinement budget for THIS run, read LIVE off the run state (the UI's
+  // "+1 iter" button raises it via /extend, exactly like "+5 min" raises the
+  // deadline) so a bump lands even while the final iteration is running. Falls
+  // back to opts for callers with no run registry (e.g. direct invocation).
+  const maxIters = () =>
+    (typeof ctx.getMaxIters === "function" ? ctx.getMaxIters() : 0) ||
+    clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS)
   const state = {
     model: /grok/i.test(String(ctx.model || "")) ? String(ctx.model) : (process.env.ARCHITECT_MODEL || ARCHITECT_MODEL_LADDER[0]),
     usage: { prompt: 0, completion: 0, cached: 0 },
@@ -4619,13 +4628,13 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     targetSignature: theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry[\s\S]*$/, "").trim(),
   }
   if (ctx.metrics) {
-    ctx.metrics.max_iters = maxIters
+    ctx.metrics.max_iters = maxIters()
     ctx.metrics.models_used = []
   }
   ctx.emit({
     type: "message-annotation",
     subtype: "status",
-    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${state.model} · refinement budget=${maxIters} · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}`,
+    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}`,
   })
 
   // NL guidance: river-delta generates it locally with Sonnet 5; any variant will
@@ -4652,7 +4661,9 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   const proofs = new Map() // name -> proof body ("by ...") for solved nodes
   const sigOfProof = new Map() // name -> signatureNorm at solve time
 
-  for (let iter = 0; iter <= maxIters; iter++) {
+  // Unbounded loop with a LIVE cap check at the bottom — the budget can grow
+  // mid-iteration, so it can't be baked into the loop condition.
+  for (let iter = 0; ; iter++) {
     const graph = bp.graph
     const prelude = architectPrelude(bp.code)
     const provable = graph.filter((n) => ["lemma", "theorem"].includes(n.kind))
@@ -4694,6 +4705,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     // not — reflect the state at that point. Same `ctx.metrics` object every
     // SSE frame carries, so this reaches the client's terminal `done` frame for free.
     ctx.metrics.blueprint_iterations = iter + 1
+    ctx.metrics.max_iters = maxIters()
     ctx.metrics.nodes_total = provable.length
     ctx.metrics.nodes_solved = proofs.size
     ctx.metrics.nodes_negated = Array.from(results.values()).filter((r) => r.negated).length
@@ -4744,19 +4756,19 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       }
     }
 
-    if (iter === maxIters) break
+    if (iter >= maxIters()) break
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
 
     // ---- Blueprint refinement on the annotated graph.
     const stillUnsolved = provable.filter((n) => !proofs.has(n.name))
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters}: ${stillUnsolved.length} unsolved node(s) — rewriting the graph around the failures.` })
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters()}: ${stillUnsolved.length} unsolved node(s) — rewriting the graph around the failures.` })
     const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
     const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks)}`
     const refined = await architectBlueprintStage(ctx, state, urls, {
       system: architectRefineSystem(),
       user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,
       retries: ARCHITECT_REFINE_RETRIES,
-      stageLabel: `refinement ${iter + 1}/${maxIters}`,
+      stageLabel: `refinement ${iter + 1}/${maxIters()}`,
     })
     if (!refined) {
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Refinement failed to produce a validated revised blueprint." })
@@ -4843,10 +4855,17 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     Number.isFinite(rawBudget) && rawBudget > 0
       ? Math.min(Math.max(rawBudget, 60000), 21600000)
       : 0
-  const { runId, st: runState } = registerRun(budgetMs)
-  // Tell the client its runId + current deadline so it can render the limit
-  // indicator and target /extend. Only meaningful when a budget was requested.
-  if (budgetMs > 0) send({ type: "run", runId, deadlineMs: runState.deadlineMs, budgetMs: runState.budgetMs })
+  // Leak River's refinement budget lives on the run state too, so the UI's
+  // "+1 iter" button can raise it mid-flight (see /extend). Meaningless for the
+  // other styles, which have no blueprint loop.
+  const iterBudget = style === "architect" ? clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS) : 0
+  const { runId, st: runState } = registerRun(budgetMs, iterBudget)
+  // Tell the client its runId + current budgets so it can render the limit
+  // indicators and target /extend. Architect runs always get the frame (the
+  // iteration button needs a runId even on an uncapped clock); the others only
+  // when a wall-clock budget was requested.
+  if (budgetMs > 0 || iterBudget > 0)
+    send({ type: "run", runId, deadlineMs: runState.deadlineMs, budgetMs: runState.budgetMs, maxIters: runState.maxIters })
 
   const abort = new AbortController()
   const ctx = {
@@ -4868,6 +4887,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // killers poll it, so the "+5 min" /extend rescues whichever stage is running.
     // No turn caps anywhere on these paths — TIME alone bounds them.
     getDeadline: () => runState.deadlineMs,
+    // Live refinement budget for the architect loop — same mutable-state trick as
+    // getDeadline, so "+1 iter" reaches a run already on its last iteration.
+    getMaxIters: () => runState.maxIters,
     computeGoverned: budgetMs > 0,
     // Turn budgets below are used ONLY by the lemma-style prove-or-split tree
     // (proveNode), where the budget doubles as a "force a decomposition after N
@@ -5058,20 +5080,36 @@ const server = createServer(async (req, res) => {
       return
     }
 
-    // Push out a running prove's wall-clock budget (the UI's "+5 min" button).
-    // Mutates the live deadline the subprocess killers poll, so it rescues even
-    // the stage currently executing. Behind the same token + CORS gate above.
+    // Push out a running prove's budget: wall-clock (the UI's "+5 min" button)
+    // and/or Leak River refinement iterations (the "+1 iter" button). Mutates the
+    // live values the run polls, so either rescues even the stage currently
+    // executing. Behind the same token + CORS gate above.
     if (req.method === "POST" && url.pathname === "/extend") {
       const body = JSON.parse((await readBody(req)) || "{}")
       const runId = String(body.runId || "")
-      const addMs = clampNum(body.addMs, 60000, 3600000, 300000) // +5 min default, 1–60 min
+      const addIters = clampNum(body.addIters, 0, 32, 0)
+      // Absent addMs means "+5 min" for back-compat, EXCEPT on a pure iteration
+      // bump — clicking "+1 iter" must not silently buy wall-clock time too.
+      const addMs =
+        body.addMs == null && addIters > 0 ? 0 : clampNum(body.addMs, 60000, 3600000, 300000)
       const st = ACTIVE_RUNS.get(runId)
       if (!st) return json(res, 404, { error: "run_not_found" })
-      // If the run was uncapped, base the fresh deadline on now.
-      const base = Number.isFinite(st.deadlineMs) ? st.deadlineMs : Date.now()
-      st.deadlineMs = base + addMs
-      st.budgetMs = (Number.isFinite(st.budgetMs) ? st.budgetMs : 0) + addMs
-      return json(res, 200, { ok: true, runId, deadlineMs: st.deadlineMs, budgetMs: st.budgetMs, addedMs: addMs })
+      if (addMs > 0) {
+        // If the run was uncapped, base the fresh deadline on now.
+        const base = Number.isFinite(st.deadlineMs) ? st.deadlineMs : Date.now()
+        st.deadlineMs = base + addMs
+        st.budgetMs = (Number.isFinite(st.budgetMs) ? st.budgetMs : 0) + addMs
+      }
+      if (addIters > 0) st.maxIters = Math.min((st.maxIters || 0) + addIters, 64)
+      return json(res, 200, {
+        ok: true,
+        runId,
+        deadlineMs: st.deadlineMs,
+        budgetMs: st.budgetMs,
+        addedMs: addMs,
+        maxIters: st.maxIters,
+        addedIters: addIters,
+      })
     }
 
     // Decomposition orchestrator: prove-or-split proof tree. Same SSE shape as

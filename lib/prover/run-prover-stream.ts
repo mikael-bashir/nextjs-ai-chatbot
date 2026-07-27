@@ -56,6 +56,8 @@ interface RunOpts {
     runId: string;
     deadlineMs: number;
     budgetMs: number;
+    /** Leak River only: the refinement budget the run started with (0 elsewhere). */
+    maxIters: number;
   }) => void;
   // Resume a saved run: a checkpoint (partially-filled `have`-skeleton) from a
   // prior run. The tree path finishes the remaining holes straight from it
@@ -66,8 +68,9 @@ interface RunOpts {
   // Informal math only — never Lean code. Ignored by every other strategy.
   // river-delta generates its own with local Sonnet 5 when this is absent.
   nlProof?: string;
-  // Leak River only: refinement-iteration budget for this run (the UI's
-  // "+1 iter" button). Clamped 1..32 on the bridge; ignored elsewhere.
+  // Leak River only: refinement-iteration budget this run STARTS with. Clamped
+  // 1..32 on the bridge; ignored elsewhere. Raise it mid-flight with
+  // extendProverRun({ addIters }) — the bridge reads the budget live.
   maxIters?: number;
   // Fires whenever the tree run banks progress — the latest resumable checkpoint
   // (skeleton with proven holes filled, rest still `sorry`). Persist the newest
@@ -79,28 +82,46 @@ interface RunOpts {
   }) => void;
 }
 
-// Push out a running prove's wall-clock budget (the "+5 min" button). Returns the
-// new deadline/budget, or null on any failure (extension is best-effort — never
-// let it break the run). Requires the runId from onRunId above.
+// Push out a running prove's budget: wall-clock (the "+5 min" button) and/or
+// Leak River refinement iterations (the "+1 iter" button). Pass `addIters` alone
+// for a pure iteration bump — it deliberately does NOT also buy time. Returns the
+// new budgets, or null on any failure (extension is best-effort — never let it
+// break the run). Requires the runId from onRunId above.
 export async function extendProverRun(args: {
   runId: string;
   addMs?: number;
+  addIters?: number;
   bridgeUrl?: string;
   token?: string;
-}): Promise<{ deadlineMs: number; budgetMs: number } | null> {
+}): Promise<{
+  deadlineMs: number;
+  budgetMs: number;
+  maxIters: number;
+} | null> {
   const conn = bridgeConnection();
   const base = normalizeBase(args.bridgeUrl ?? conn.bridgeUrl);
   const token = args.token ?? conn.token ?? '';
+  const itersOnly = !!args.addIters && args.addMs == null;
   try {
     const res = await fetch(`${base}/extend`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'x-bridge-token': token },
-      body: JSON.stringify({ runId: args.runId, addMs: args.addMs ?? 300000 }),
+      body: JSON.stringify({
+        runId: args.runId,
+        // Omit addMs entirely on an iterations-only bump; sending it (even as 0)
+        // would trip the bridge's back-compat "+5 min" default.
+        ...(itersOnly ? {} : { addMs: args.addMs ?? 300000 }),
+        ...(args.addIters ? { addIters: args.addIters } : {}),
+      }),
     });
     if (!res.ok) return null;
     const j = await res.json();
     if (typeof j?.deadlineMs !== 'number') return null;
-    return { deadlineMs: j.deadlineMs, budgetMs: j.budgetMs ?? 0 };
+    return {
+      deadlineMs: j.deadlineMs,
+      budgetMs: j.budgetMs ?? 0,
+      maxIters: j.maxIters ?? 0,
+    };
   } catch {
     return null;
   }
@@ -278,6 +299,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
               runId: d.runId,
               deadlineMs: Number(d.deadlineMs) || 0,
               budgetMs: Number(d.budgetMs) || 0,
+              maxIters: Number(d.maxIters) || 0,
             });
           break;
         case 'checkpoint':

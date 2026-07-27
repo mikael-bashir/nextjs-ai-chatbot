@@ -2,7 +2,6 @@
 
 import Link from 'next/link';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Plus } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
@@ -884,6 +883,7 @@ export function AdminPipeline() {
     budgetMs: number;
   } | null>(null);
   const [extending, setExtending] = useState(false);
+  const [extendingIters, setExtendingIters] = useState(false);
   const runIdRef = useRef<string | null>(null);
   // item.id -> saved checkpoint to resume from, set by "Resume from saved" and
   // consumed once by the verify loop (so a plain re-verify still starts fresh).
@@ -1217,7 +1217,9 @@ export function AdminPipeline() {
             : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
-            setComputeLimit({ deadlineMs, budgetMs });
+            // River runs report a runId even on an uncapped clock (the "+1 iter"
+            // button needs one), so only show the time indicator for a real budget.
+            if (budgetMs > 0) setComputeLimit({ deadlineMs, budgetMs });
           },
           // Auto-save: persist the newest banked checkpoint on the item so ANY
           // stop (usage-limit / Terminate / crash) can resume from it later.
@@ -1631,6 +1633,36 @@ export function AdminPipeline() {
       setExtending(false);
     }
   }, [extending]);
+
+  // "+1 iter": raise the Leak River refinement budget. Always bumps the value the
+  // next run starts with, AND — when a River run is in flight — the live budget of
+  // that run, since the bridge reads it per iteration. A stale runId just 404s
+  // (the bridge drops finished runs), leaving the local bump in place.
+  const extendIterations = useCallback(async () => {
+    if (extendingIters) return;
+    setExtendingIters(true);
+    try {
+      const next = Math.min(32, verifyMaxItersRef.current + 1);
+      verifyMaxItersRef.current = next;
+      setVerifyMaxIters(next);
+      const runId = runIdRef.current;
+      if (!runId) return;
+      const conn = connFor(false); // shared (verification) bridge
+      const r = await extendProverRun({
+        runId,
+        addIters: 1, // no addMs — never buy wall-clock time from this button
+        bridgeUrl: conn.bridgeUrl,
+        token: conn.token,
+      });
+      // Trust the bridge's number over ours if the run is live (it clamps).
+      if (r?.maxIters) {
+        verifyMaxItersRef.current = r.maxIters;
+        setVerifyMaxIters(r.maxIters);
+      }
+    } finally {
+      setExtendingIters(false);
+    }
+  }, [extendingIters]);
 
   const resumeNow = useCallback(() => {
     limitPausedRef.current = false;
@@ -2900,41 +2932,9 @@ export function AdminPipeline() {
                 </select>
               </label>
             )}
-            {/* Refinement-iteration budget — River strategies only. The paper's
-                solve rate climbs log-linearly with refinement iterations, so
-                this is the main quality dial; +1 per click. */}
-            {verifyDecompose && isRiverStrategy(verifyStrategy) && (
-              <span className="inline-flex items-center gap-1 text-xs text-muted-foreground">
-                Iterations
-                <span
-                  className="font-mono text-xs font-semibold text-foreground"
-                  title="Blueprint-refinement iterations this run may use"
-                >
-                  {verifyMaxIters}
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    setVerifyMaxIters((n) => Math.min(32, n + 1))
-                  }
-                  disabled={verifyMaxIters >= 32}
-                  title="Add one blueprint-refinement iteration (applies to the next run)"
-                  className="inline-flex items-center gap-0.5 rounded border px-1.5 py-1 text-[11px] font-medium transition-colors hover:bg-muted disabled:opacity-50"
-                >
-                  <Plus className="size-3" />1 iter
-                </button>
-                {verifyMaxIters !== ARCHITECT_DEFAULT_ITERS && (
-                  <button
-                    type="button"
-                    onClick={() => setVerifyMaxIters(ARCHITECT_DEFAULT_ITERS)}
-                    title={`Reset to the default (${ARCHITECT_DEFAULT_ITERS})`}
-                    className="rounded border px-1.5 py-1 text-[11px] transition-colors hover:bg-muted"
-                  >
-                    reset
-                  </button>
-                )}
-              </span>
-            )}
+            {/* The refinement-iteration budget lives on the verifier console
+                itself (next to the "+1 min" clock control), so it can be raised
+                MID-FLIGHT rather than only configured before a run. */}
             {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
               <Button
                 size="sm"
@@ -2990,7 +2990,10 @@ export function AdminPipeline() {
             </button>
           </div>
         )}
-        {verifyEvents.length > 0 && (
+        {/* Rendered for a selected River strategy even with no events yet, so the
+            refinement-budget control has a home before the first run too. */}
+        {(verifyEvents.length > 0 ||
+          (verifyDecompose && isRiverStrategy(verifyStrategy))) && (
           <ProverConsole
             events={verifyEvents}
             running={!!verifyingId}
@@ -3000,6 +3003,18 @@ export function AdminPipeline() {
             onExtend={extendVerification}
             extending={extending}
             extendLabel={isRiverStrategy(verifyStrategy) ? '1 min' : '5 min'}
+            iterLimit={
+              verifyDecompose && isRiverStrategy(verifyStrategy)
+                ? { budget: verifyMaxIters }
+                : null
+            }
+            onExtendIters={extendIterations}
+            extendingIters={extendingIters}
+            onResetIters={
+              verifyMaxIters === ARCHITECT_DEFAULT_ITERS
+                ? undefined
+                : () => setVerifyMaxIters(ARCHITECT_DEFAULT_ITERS)
+            }
           />
         )}
         <div className="space-y-1.5">

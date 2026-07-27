@@ -19,6 +19,7 @@ import {
   Check,
   Timer,
   Plus,
+  Repeat,
 } from 'lucide-react';
 
 import type { ProverEvent, ProverEventKind } from '@/lib/prover/types';
@@ -173,6 +174,58 @@ function ComputeLimit({
   );
 }
 
+// The refinement-iteration budget indicator + "+1 iter" button, sitting right
+// next to the time limit so both governors are adjustable from one place —
+// mid-flight included (the bridge reads the budget live, so a bump lands even on
+// the final iteration). Leak River only; omit `iterLimit` to hide it.
+function IterLimit({
+  iterLimit,
+  onExtend,
+  extending,
+  onReset,
+}: {
+  /** `budget` = iterations allotted; `reached` = iterations run so far, read off
+   *  the live run metrics (absent before the first pass completes). */
+  iterLimit: { budget: number; reached?: number | null };
+  onExtend?: () => void;
+  extending?: boolean;
+  /** Shown only when the budget has been raised above its default AND no run is
+   *  live — iterations already granted to a running prove can't be taken back. */
+  onReset?: () => void;
+}) {
+  return (
+    <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
+      <Repeat className="size-3" />
+      <span title="Blueprint refinement iterations: reached / budget for this run">
+        {iterLimit.reached ? `${iterLimit.reached}/` : ''}
+        {iterLimit.budget} iter
+      </span>
+      {onExtend && (
+        <button
+          type="button"
+          onClick={onExtend}
+          disabled={extending}
+          title="Add one blueprint refinement iteration — applies to the run in flight"
+          className="ml-0.5 inline-flex items-center gap-0.5 rounded border px-1 py-0.5 font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground disabled:opacity-50"
+        >
+          <Plus className="size-3" />
+          1 iter
+        </button>
+      )}
+      {onReset && (
+        <button
+          type="button"
+          onClick={onReset}
+          title="Reset the refinement budget to its default"
+          className="rounded border px-1 py-0.5 font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          reset
+        </button>
+      )}
+    </span>
+  );
+}
+
 function Row({ e }: { e: ProverEvent }) {
   const { icon: Icon, color } = STYLE[e.kind] ?? STYLE.text;
   const body = e.input ?? e.detail;
@@ -223,6 +276,10 @@ export function ProverConsole({
   onExtend,
   extending = false,
   extendLabel = '5 min',
+  iterLimit = null,
+  onExtendIters,
+  extendingIters = false,
+  onResetIters,
 }: {
   events: ProverEvent[];
   running?: boolean;
@@ -235,6 +292,15 @@ export function ProverConsole({
   onExtend?: () => void;
   extending?: boolean;
   extendLabel?: string;
+  // Leak River's refinement-iteration budget. Unlike computeLimit this is shown
+  // before the run too (it's the value the next run will start with), so the one
+  // control both configures and rescues. Iterations reached come from the run's
+  // own metrics — the parent only supplies the budget.
+  iterLimit?: { budget: number } | null;
+  onExtendIters?: () => void;
+  extendingIters?: boolean;
+  // Optional; the console hides it while a run is live (see IterLimit.onReset).
+  onResetIters?: () => void;
 }) {
   const scrollRef = useRef<HTMLDivElement>(null);
   // Auto-scroll to the newest line unless the user has scrolled up.
@@ -265,6 +331,17 @@ export function ProverConsole({
               onExtend={onExtend}
               extending={extending}
               extendLabel={extendLabel}
+            />
+          )}
+          {iterLimit && (
+            <IterLimit
+              iterLimit={{
+                budget: iterLimit.budget,
+                reached: lastMetrics?.blueprint_iterations,
+              }}
+              onExtend={onExtendIters}
+              extending={extendingIters}
+              onReset={running ? undefined : onResetIters}
             />
           )}
           {lastMetrics && (
