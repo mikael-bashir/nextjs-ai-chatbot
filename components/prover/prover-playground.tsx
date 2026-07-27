@@ -35,6 +35,11 @@ const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
 const ARCHITECT_DEFAULT_ITERS = 5;
 const isRiverStrategy = (s: string) =>
   s === 'architect' || s.startsWith('river-');
+// Leak Ultra runs the same blueprint pipeline with the local Claude CLI as
+// driver, so it inherits the model selector instead of locking it.
+const isUltraStrategy = (s: string) => s.startsWith('ultra-');
+const isArchitectStrategy = (s: string) =>
+  isRiverStrategy(s) || isUltraStrategy(s);
 
 // A minimal "message the prover" surface. It reuses the exact same runner +
 // console as the admin queue resolver — send a statement, watch every step,
@@ -110,11 +115,11 @@ export function ProverPlayground() {
           // path ignores it (and never fires onRunId), so no indicator shows.
           // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
           computeBudgetMs: asTree
-            ? isRiverStrategy(strategy)
+            ? isArchitectStrategy(strategy)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : PLAYGROUND_COMPUTE_BUDGET_MS
             : undefined,
-          maxIters: isRiverStrategy(strategy) ? maxIters : undefined,
+          maxIters: isArchitectStrategy(strategy) ? maxIters : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
             setComputeLimit({ deadlineMs, budgetMs });
@@ -140,7 +145,7 @@ export function ProverPlayground() {
     if (!runId || extending) return;
     setExtending(true);
     try {
-      const addMs = isRiverStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000;
+      const addMs = isArchitectStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000;
       const r = await extendProverRun({ runId, addMs });
       if (r) setComputeLimit(r);
     } finally {
@@ -265,7 +270,16 @@ export function ProverPlayground() {
               <option value="sketch">Sketch (plan then formalize)</option>
               <option value="brute">Brute (automation only)</option>
               <option value="have">Have (in-context, no top-level lemmas)</option>
-              <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
+              {/* value stays `have-tree` — renaming it would orphan saved
+                  checkpoints and every existing research row. */}
+              <option value="have-tree">
+                Leak Stronghold Dark (planner + isolated per-hole minions)
+              </option>
+              <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
+                <option value="ultra-fleeting">
+                  Leak Ultra Fleeting (model from the selector)
+                </option>
+              </optgroup>
               <optgroup label="Leak River (Goedel blueprint · grok driver)">
                 <option value="river-stone">Leak River Stone (control)</option>
                 <option value="river-gate">Leak River Gate (+ dead-end ledger)</option>
@@ -287,17 +301,17 @@ export function ProverPlayground() {
             : 'Hacker mode leads with the compiler (verify_full_script) and strong automation.'}{' '}
           Needs a verify_full_script MCP server connected. Runs under a{' '}
           {Math.round(
-            (isRiverStrategy(strategy)
+            (isArchitectStrategy(strategy)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : PLAYGROUND_COMPUTE_BUDGET_MS) / 60_000,
           )}
           -minute compute budget you can extend live (+
           {Math.round(
-            (isRiverStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
+            (isArchitectStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
               60_000,
           )}{' '}
           min)
-          {isRiverStrategy(strategy)
+          {isArchitectStrategy(strategy)
             ? `, with ${maxIters} refinement iteration(s) — raise either live from the console header`
             : ''}
           .
@@ -310,9 +324,9 @@ export function ProverPlayground() {
         computeLimit={computeLimit}
         onExtend={extend}
         extending={extending}
-        extendLabel={isRiverStrategy(strategy) ? '1 min' : '5 min'}
+        extendLabel={isArchitectStrategy(strategy) ? '1 min' : '5 min'}
         iterLimit={
-          decompose && isRiverStrategy(strategy) ? { budget: maxIters } : null
+          decompose && isArchitectStrategy(strategy) ? { budget: maxIters } : null
         }
         onExtendIters={extendIters}
         extendingIters={extendingIters}

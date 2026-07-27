@@ -59,6 +59,16 @@ export interface ProverMetrics {
   cost_cap_hit?: boolean;
   /** Free-text tag identifying the bridge build/experiment batch (BRIDGE_BUILD_TAG). */
   bridge_build?: string;
+  /** Which LLM drove an architect run: 'grok' (River, xAI API) or 'claude'
+   *  (Leak Ultra, local CLI). Absent on the non-architect paths. */
+  driver?: string;
+  /** Lean toolchain + Mathlib version that ACTUALLY certified this run, from the
+   *  armed verifier group — Leak XI/XII/XIV run 4.32.0, Leak I/II/IV run 4.29.1.
+   *  Carried per run so a certificate never claims the wrong one. */
+  lean_toolchain?: string;
+  mathlib_version?: string;
+  /** Human label for that group, e.g. "Leak XI/XII/XIV". */
+  verifier_group?: string;
 }
 
 export interface ProverEvent {

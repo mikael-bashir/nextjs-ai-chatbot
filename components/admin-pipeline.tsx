@@ -105,7 +105,16 @@ const fmtPct = (n: number | null | undefined) =>
   n == null ? '—' : `${(n * 100).toFixed(0)}%`;
 import { MathMarkdown } from '@/components/math-markdown';
 
+// Lean pins per verifier group. These are NOT interchangeable: the original Leak
+// group (I/II/IV, gate = verify_full_script) runs 4.29.1, while the architect
+// group (XI/XII/XIV, gate = Leak XIV) runs 4.32.0. A proof certified by one does
+// not carry a claim about the other, so a run's toolchain is taken from the
+// bridge's own report (metrics.lean_toolchain) and only falls back to these when
+// an older bridge didn't send it. Keep in sync with TOOLCHAINS in the bridge.
 const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
+const MATHLIB_VERSION = 'v4.29.1';
+const ARCHITECT_TOOLCHAIN = 'leanprover/lean4:v4.32.0';
+const ARCHITECT_MATHLIB_VERSION = 'v4.32.0';
 
 // Generation needs no tools/MCP — run claude lean so each call carries ~4k
 // tokens of context instead of ~17k (default system prompt + tool schemas),
@@ -216,7 +225,7 @@ const ASSESSOR_RUN_OPTIONS = {
 // independently.
 const PROVER_MODELS: { value: string; label: string }[] = [
   { value: '', label: 'Default' },
-  { value: 'claude-opus-4-8', label: 'Opus 4.8' },
+  { value: 'claude-opus-5', label: 'Opus 5' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5' },
   { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
   { value: 'claude-fable-5', label: 'Fable 5' },
@@ -490,7 +499,9 @@ interface GenProblem {
 interface StagedItem extends GenProblem {
   id: string;
   proof?: string;
+  /** Lean toolchain + Mathlib version of the group that certified this proof. */
   toolchain?: string;
+  mathlib?: string;
   createdAt?: string;
   // ISO time the Lean kernel confirmed the proof (set by the verify loop),
   // threaded to the prod payload so the certificate's "verified" time is real.
@@ -714,6 +725,48 @@ const RIVER_STRATEGIES: {
 ];
 const isRiverStrategy = (s: string) =>
   s === 'architect' || s.startsWith('river-');
+
+// Leak Ultra — Stone's blueprint pipeline with the LOCAL Claude CLI as driver, on
+// whatever model the dropdown says. Same Leak XI/XII/XIV gates as River, so it
+// shares the architect toolchain, but its own research table: the driver differs,
+// so its rows are not a River ablation.
+const ULTRA_STRATEGIES: { value: string; label: string; note: string }[] = [
+  {
+    value: 'ultra-fleeting',
+    label: 'Leak Ultra Fleeting (Claude driver)',
+    note: "Stone's pipeline — identical prompts, tool contract and gates — driven by the local Claude CLI instead of the xAI API, on the model selected above. The bridge serves lean_compile/mathlib_search to the CLI from a local MCP server so the compile gate stays bridge-side; cost is the CLI's own reported total_cost_usd, so no price table is involved.",
+  },
+];
+const isUltraStrategy = (s: string) => s.startsWith('ultra-');
+// Both families run the architect orchestrator (and therefore Leak XI/XII/XIV).
+const isArchitectStrategy = (s: string) =>
+  isRiverStrategy(s) || isUltraStrategy(s);
+
+// Would this proof text make a HONEST certificate for `target`? A certificate
+// asserts "sorry-free Lean proof of THIS theorem", so both claims are checked
+// here rather than trusted from whichever orchestrator produced the text. This is
+// deliberately shape-only — the kernel already ruled on correctness; this catches
+// a proof of the wrong statement, or one that still has a hole, before it gets
+// signed and published. Returns null when the proof is fit to certify.
+//
+// Whitespace-insensitive on the signature: the architect path re-emits the
+// declaration with its own formatting, and the certified file legitimately opens
+// with `import Mathlib` where the have-path proofs are import-less.
+function certifiableProof(target: string, proof: string): string | null {
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+  const name = /(?:theorem|lemma)\s+([A-Za-z_][\w'.]*)/.exec(target)?.[1];
+  if (!name) return null; // no target declaration to compare against
+  if (!new RegExp(`(?:theorem|lemma)\\s+${name.replace(/\./g, '\\.')}\\b`).test(proof))
+    return `proof does not declare the target theorem \`${name}\``;
+  // The signature is everything up to the `:=` that opens the proof body.
+  const sig = norm(
+    target.replace(/:=\s*by[\s\S]*$/, '').replace(/:=\s*sorry[\s\S]*$/, ''),
+  );
+  if (sig && !norm(proof).includes(sig))
+    return `proof's declaration does not match the target signature byte-for-byte`;
+  if (/\bsorry\b/.test(proof)) return 'proof still contains `sorry`';
+  return null;
+}
 
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
@@ -1207,12 +1260,13 @@ export function AdminPipeline() {
           // path ignores it (and never fires onRunId), so the indicator stays off.
           // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
           computeBudgetMs: decompose
-            ? isRiverStrategy(strategy)
+            ? isArchitectStrategy(strategy)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : VERIFY_COMPUTE_BUDGET_MS
             : undefined,
-          // Leak River only: refinement budget from the "+1 iter" control.
-          maxIters: isRiverStrategy(strategy)
+          // Architect pipeline only (River + Ultra): refinement budget from the
+          // "+1 iter" control.
+          maxIters: isArchitectStrategy(strategy)
             ? verifyMaxItersRef.current
             : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
@@ -1321,11 +1375,40 @@ export function AdminPipeline() {
         finalProof: finalProof || null,
         error,
         bridgeBuild: metrics?.bridge_build ?? null,
+        // The toolchain that ACTUALLY certified this run, as reported by the
+        // bridge from the armed verifier group. Falling back to the group implied
+        // by the strategy keeps older bridges honest rather than defaulting every
+        // row to 4.29.1, which would be a false claim for architect runs.
+        leanToolchain:
+          metrics?.lean_toolchain ??
+          (isArchitectStrategy(strategy) ? ARCHITECT_TOOLCHAIN : TOOLCHAIN),
+        mathlibVersion:
+          metrics?.mathlib_version ??
+          (isArchitectStrategy(strategy)
+            ? ARCHITECT_MATHLIB_VERSION
+            : MATHLIB_VERSION),
       };
       const path = isRiverStrategy(strategy)
         ? '/api/admin/research/river'
-        : '/api/admin/research/stronghold';
-      const body = isRiverStrategy(strategy)
+        : isUltraStrategy(strategy)
+          ? '/api/admin/research/ultra'
+          : '/api/admin/research/stronghold';
+      const body = isUltraStrategy(strategy)
+        ? {
+            ...common,
+            strategy,
+            // Claude CLI driver: one authoritative cost, one combined token
+            // total — no per-bucket counts and no driver/seed split to report.
+            tokens: metrics?.tokens ?? null,
+            costCapHit: metrics?.cost_cap_hit ?? null,
+            maxIters: metrics?.max_iters ?? null,
+            blueprintIterations: metrics?.blueprint_iterations ?? null,
+            nodesTotal: metrics?.nodes_total ?? null,
+            nodesSolved: metrics?.nodes_solved ?? null,
+            nodesForfeited: metrics?.nodes_forfeited ?? null,
+            nodesNegated: metrics?.nodes_negated ?? null,
+          }
+        : isRiverStrategy(strategy)
         ? {
               ...common,
               // Which River variant ran — the GROUP BY key for the comparison.
@@ -1415,7 +1498,7 @@ export function AdminPipeline() {
           // "on these problems natural-language guidance is decisive"). The
           // generator already produced the informal argument; hand it over.
           const nlProof =
-            isRiverStrategy(verifyStrategyRef.current)
+            isArchitectStrategy(verifyStrategyRef.current)
               ? [
                   item.problem ? `Problem: ${item.problem}` : '',
                   typeof item.answer === 'number' ? `Answer: ${item.answer}` : '',
@@ -1428,7 +1511,7 @@ export function AdminPipeline() {
           // Mirrors proveStream's own decompose check exactly (a resumed seed
           // always runs the tree path, even with the toggle off).
           computeBudgetMsAtStart = verifyDecomposeRef.current || seedUsed
-            ? isRiverStrategy(strategyAtStart)
+            ? isArchitectStrategy(strategyAtStart)
               ? ARCHITECT_COMPUTE_BUDGET_MS
               : VERIFY_COMPUTE_BUDGET_MS
             : undefined;
@@ -1483,6 +1566,18 @@ export function AdminPipeline() {
         // distinct marker so it reads as a BAD problem, not a hard one.
         // The exact moment the Lean kernel confirmed this proof.
         const verifiedAt = verified ? new Date().toISOString() : undefined;
+        // The toolchain that ACTUALLY certified this proof, straight from the
+        // bridge. Architect runs are certified by Leak XIV on 4.32.0, the others
+        // by the Leak II/IV daemon on 4.29.1 — the certificate must not claim one
+        // when the other did the work.
+        const runToolchain =
+          outMetrics?.lean_toolchain ??
+          (isArchitectStrategy(strategyAtStart) ? ARCHITECT_TOOLCHAIN : TOOLCHAIN);
+        const runMathlib =
+          outMetrics?.mathlib_version ??
+          (isArchitectStrategy(strategyAtStart)
+            ? ARCHITECT_MATHLIB_VERSION
+            : MATHLIB_VERSION);
         // Mint the SIGNED certificate right now — as close to kernel verification
         // as possible, so the signed bytes are provably what the kernel saw. The
         // private key never leaves the server (this hits /api/admin/certificate/
@@ -1490,7 +1585,19 @@ export function AdminPipeline() {
         let cert:
           | { signature?: string | null; keyId?: string | null; certMintedAt?: string | null }
           | null = null;
-        if (verified && proof) {
+        // Shape gate before signing. A certificate asserts "this text is a
+        // sorry-free Lean proof of THIS theorem", so refuse to sign anything that
+        // doesn't carry the target declaration or still contains a hole — cheap
+        // insurance that holds for every strategy, including new ones whose
+        // assembly step the certificate layer knows nothing about.
+        const certShapeError = verified && proof ? certifiableProof(item.lean || '', proof) : null;
+        if (certShapeError) {
+          pushLog(
+            'warn',
+            `Not signing ${item.questionTitle || item.id}: ${certShapeError}`,
+          );
+        }
+        if (verified && proof && !certShapeError) {
           try {
             const r = await fetch('/api/admin/certificate/sign', {
               method: 'POST',
@@ -1499,6 +1606,10 @@ export function AdminPipeline() {
                 title: item.questionTitle,
                 proof,
                 verifiedAt,
+                // Signed INTO the certificate bytes, so the toolchain claim is
+                // covered by the signature rather than being loose metadata.
+                toolchain: runToolchain,
+                mathlib: runMathlib,
               }),
             });
             if (r.ok) cert = await r.json();
@@ -1510,6 +1621,9 @@ export function AdminPipeline() {
           verified,
           proof,
           ...(verified ? { verifiedAt } : {}),
+          // Carried so staging → promote → CompeteMath ship the toolchain that
+          // actually certified THIS proof, not the pipeline's default.
+          ...(verified ? { toolchain: runToolchain, mathlib: runMathlib } : {}),
           // Signature + the moment it was minted, carried through staging → prod
           // so CompeteMath stores this exact signature instead of re-signing.
           ...(cert?.signature
@@ -1622,7 +1736,7 @@ export function AdminPipeline() {
       const conn = connFor(false); // shared (verification) bridge
       const r = await extendProverRun({
         runId,
-        addMs: isRiverStrategy(verifyStrategyRef.current)
+        addMs: isArchitectStrategy(verifyStrategyRef.current)
           ? ARCHITECT_EXTEND_MS
           : 5 * 60_000,
         bridgeUrl: conn.bridgeUrl,
@@ -2335,7 +2449,10 @@ export function AdminPipeline() {
           insight: item.insight ?? null,
           lean: item.lean,
           proof: item.proof ?? '',
+          // Whatever certified this item, recorded at verify time. The fallback
+          // only applies to rows proved before toolchain was carried per run.
           toolchain: item.toolchain ?? TOOLCHAIN,
+          mathlib: item.mathlib ?? MATHLIB_VERSION,
           verifiedAt: item.verifiedAt ?? null,
           signature: item.signature ?? null,
           signatureKeyId: item.signatureKeyId ?? null,
@@ -2890,7 +3007,9 @@ export function AdminPipeline() {
                 title={
                   isRiverStrategy(verifyStrategy)
                     ? 'Leak River strategies always drive Grok directly — model is locked.'
-                    : 'Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default.'
+                    : isUltraStrategy(verifyStrategy)
+                      ? 'Leak Ultra inherits this model as its blueprint-pipeline driver (passed to claude --model).'
+                      : 'Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default.'
                 }
               >
                 {isRiverStrategy(verifyStrategy) ? (
@@ -2921,9 +3040,20 @@ export function AdminPipeline() {
                   <option value="sketch">Sketch (plan then formalize)</option>
                   <option value="brute">Brute (automation only)</option>
                   <option value="have">Have (in-context, no top-level lemmas)</option>
-                  <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
+                  {/* value stays `have-tree` — renaming it would orphan saved
+                      checkpoints, queued items and every existing research row. */}
+                  <option value="have-tree">
+                    Leak Stronghold Dark (planner + isolated per-hole minions)
+                  </option>
                   <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
                     {RIVER_STRATEGIES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Leak Ultra (Goedel blueprint · claude driver · Leak XI/XII/XIV)">
+                    {ULTRA_STRATEGIES.map((s) => (
                       <option key={s.value} value={s.value}>
                         {s.label}
                       </option>
@@ -2947,25 +3077,37 @@ export function AdminPipeline() {
             )}
           </div>
         </div>
-        {verifyDecompose && !isRiverStrategy(verifyStrategy) && (
+        {verifyDecompose && !isArchitectStrategy(verifyStrategy) && (
           <p className="mb-2 text-xs text-muted-foreground">
             Decompose mode: each generated problem is proved-or-split into
             toolchain-verified sub-lemmas (recursively) and assembled into one
             sorry-free proof. Slower but closes goals a single run stalls on.
+            Verified on{' '}
+            <span className="font-mono">{TOOLCHAIN.replace(/^.*:/, '')}</span> ·
+            Mathlib {MATHLIB_VERSION} (Leak I/II/IV).
           </p>
         )}
-        {verifyDecompose && isRiverStrategy(verifyStrategy) && (
+        {verifyDecompose && isArchitectStrategy(verifyStrategy) && (
           <p className="mb-2 text-xs text-muted-foreground">
             <span className="font-medium text-foreground">
-              {RIVER_STRATEGIES.find((s) => s.value === verifyStrategy)?.label ??
-                'Leak River Stone (control)'}
+              {[...RIVER_STRATEGIES, ...ULTRA_STRATEGIES].find(
+                (s) => s.value === verifyStrategy,
+              )?.label ?? 'Leak River Stone (control)'}
               {': '}
             </span>
-            {RIVER_STRATEGIES.find((s) => s.value === verifyStrategy)?.note ??
-              RIVER_STRATEGIES[0].note}{' '}
-            Results are logged to the{' '}
+            {[...RIVER_STRATEGIES, ...ULTRA_STRATEGIES].find(
+              (s) => s.value === verifyStrategy,
+            )?.note ?? RIVER_STRATEGIES[0].note}{' '}
+            Certified on{' '}
+            <span className="font-mono">
+              {ARCHITECT_TOOLCHAIN.replace(/^.*:/, '')}
+            </span>{' '}
+            · Mathlib {ARCHITECT_MATHLIB_VERSION} (Leak XI/XII/XIV) — a different
+            Lean from the {MATHLIB_VERSION} group, and recorded per row. Results
+            are logged to the{' '}
             <Link href="/admin/research" className="underline">
-              Leak River research table
+              {isUltraStrategy(verifyStrategy) ? 'Leak Ultra' : 'Leak River'}{' '}
+              research table
             </Link>
             .
           </p>
@@ -2990,10 +3132,10 @@ export function AdminPipeline() {
             </button>
           </div>
         )}
-        {/* Rendered for a selected River strategy even with no events yet, so the
+        {/* Rendered for a selected architect strategy (River or Ultra) even with no events yet, so the
             refinement-budget control has a home before the first run too. */}
         {(verifyEvents.length > 0 ||
-          (verifyDecompose && isRiverStrategy(verifyStrategy))) && (
+          (verifyDecompose && isArchitectStrategy(verifyStrategy))) && (
           <ProverConsole
             events={verifyEvents}
             running={!!verifyingId}
@@ -3002,9 +3144,9 @@ export function AdminPipeline() {
             computeLimit={computeLimit}
             onExtend={extendVerification}
             extending={extending}
-            extendLabel={isRiverStrategy(verifyStrategy) ? '1 min' : '5 min'}
+            extendLabel={isArchitectStrategy(verifyStrategy) ? '1 min' : '5 min'}
             iterLimit={
-              verifyDecompose && isRiverStrategy(verifyStrategy)
+              verifyDecompose && isArchitectStrategy(verifyStrategy)
                 ? { budget: verifyMaxIters }
                 : null
             }

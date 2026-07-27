@@ -191,6 +191,18 @@ export async function PATCH(request: NextRequest) {
       'proofCheckpoint',
       'proofCheckpointFilled',
       'proofCheckpointTotal',
+      // Certificate provenance, minted the instant the kernel verified. These
+      // were previously absent from this allowlist, so the pipeline's signature
+      // and verification timestamp were silently dropped here and CompeteMath
+      // re-signed at ingestion — stamping the cron's run time as the proof time.
+      'verifiedAt',
+      'signature',
+      'signatureKeyId',
+      'certMintedAt',
+      // Which Lean/Mathlib ACTUALLY certified this proof (the armed verifier
+      // group), so staging → prod can state it instead of assuming one.
+      'toolchain',
+      'mathlib',
     ] as const) {
       if (k in body) patch[k] = body[k];
     }

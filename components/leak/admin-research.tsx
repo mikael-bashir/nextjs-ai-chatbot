@@ -38,6 +38,39 @@ interface RiverRow {
   nodes_solved: number | null;
   nodes_forfeited: number | null;
   nodes_negated: number | null;
+  lean_toolchain: string | null;
+  mathlib_version: string | null;
+  error: string | null;
+  bridge_build: string | null;
+}
+
+interface UltraRow {
+  id: string;
+  created_at: string;
+  problem_title: string | null;
+  difficulty: string | null;
+  theorem_name: string | null;
+  sorried_theorem: string;
+  strategy: string | null;
+  model: string | null;
+  models_used: string[] | null;
+  verified: boolean | null;
+  refuted: boolean | null;
+  cost_usd: number | null;
+  tokens: number | null;
+  cost_cap_hit: boolean | null;
+  compute_budget_ms: number | null;
+  time_elapsed_s: number | null;
+  llm_calls: number | null;
+  tool_calls: number | null;
+  max_iters: number | null;
+  blueprint_iterations: number | null;
+  nodes_total: number | null;
+  nodes_solved: number | null;
+  nodes_forfeited: number | null;
+  nodes_negated: number | null;
+  lean_toolchain: string | null;
+  mathlib_version: string | null;
   error: string | null;
   bridge_build: string | null;
 }
@@ -61,6 +94,8 @@ interface StrongholdRow {
   tool_calls: number | null;
   have_case_count: number | null;
   checkpoint_used: boolean | null;
+  lean_toolchain: string | null;
+  mathlib_version: string | null;
   error: string | null;
   bridge_build: string | null;
 }
@@ -72,6 +107,37 @@ const RIVER_LABELS: Record<string, string> = {
   'river-delta': 'Delta · ledger+NL',
   architect: 'Stone · control (legacy tag)',
 };
+
+// Display names for the Claude strategies. `have-tree` is shown as "Leak
+// Stronghold Dark"; the stored value stays `have-tree` so existing rows, queued
+// items and saved checkpoints keep resolving.
+const STRONGHOLD_LABELS: Record<string, string> = {
+  'have-tree': 'Stronghold Dark · planner+minions',
+  have: 'Have · single context',
+};
+
+// The Lean toolchain that certified a row. Shown on every table because the two
+// verifier groups are on DIFFERENT Lean versions — a row without it isn't
+// reproducible. "—" means the row predates toolchain recording.
+function Toolchain({
+  lean,
+  mathlib,
+}: {
+  lean: string | null;
+  mathlib: string | null;
+}) {
+  if (!lean && !mathlib) return null;
+  const short = (lean || '').replace(/^leanprover\/lean4:/, '');
+  return (
+    <span
+      title={`Certified on Lean ${lean || '?'} · Mathlib ${mathlib || '?'}`}
+      className="rounded bg-sky-500/10 px-1.5 py-0.5 text-sky-700 dark:text-sky-400"
+    >
+      {short || '?'}
+      {mathlib && mathlib !== short ? ` · mathlib ${mathlib}` : ''}
+    </span>
+  );
+}
 
 function fmtNum(v: number | null | undefined, digits = 0): string {
   return v == null ? '—' : v.toFixed(digits);
@@ -281,6 +347,52 @@ export function AdminLeakRiver() {
               💸 cap hit
             </span>
           )}
+          <Toolchain lean={r.lean_toolchain} mathlib={r.mathlib_version} />
+        </>
+      )}
+    />
+  );
+}
+
+// Leak Ultra — Stone's pipeline with the local Claude CLI as driver.
+export function AdminLeakUltra() {
+  return (
+    <ResearchTable<UltraRow>
+      title="Leak Ultra — research log"
+      subtitle="blueprint pipeline (Claude CLI driver), one row per attempt"
+      endpoint="/api/admin/research/ultra"
+      renderExtra={(r) => (
+        <>
+          <span
+            className="rounded bg-teal-500/10 px-1.5 py-0.5 font-medium text-teal-700 dark:text-teal-400"
+            title="Leak Ultra variant"
+          >
+            {r.strategy === 'ultra-fleeting' ? 'Fleeting' : r.strategy || '—'}
+          </span>
+          <span title="Blueprint iterations reached / budget">
+            iter {r.blueprint_iterations ?? '—'}
+            {r.max_iters ? `/${r.max_iters}` : ''}
+          </span>
+          <span title="Nodes solved / total in the final blueprint">
+            nodes {r.nodes_solved ?? '—'}/{r.nodes_total ?? '—'}
+          </span>
+          {!!r.nodes_forfeited && (
+            <span title="Nodes forfeited">🏳️ {r.nodes_forfeited}</span>
+          )}
+          {!!r.nodes_negated && (
+            <span title="Nodes machine-disproved">🧨 {r.nodes_negated}</span>
+          )}
+          {!!r.tokens && (
+            <span title="Total tokens across every CLI sub-run">
+              {r.tokens.toLocaleString()} tok
+            </span>
+          )}
+          {r.cost_cap_hit && (
+            <span className="text-amber-500" title="Hit the dollar cap">
+              💸 cap hit
+            </span>
+          )}
+          <Toolchain lean={r.lean_toolchain} mathlib={r.mathlib_version} />
         </>
       )}
     />
@@ -296,13 +408,21 @@ export function AdminLeakStronghold() {
       endpoint="/api/admin/research/stronghold"
       renderExtra={(r) => (
         <>
-          {r.strategy && <span title="Strategy">{r.strategy}</span>}
+          {r.strategy && (
+            <span
+              className="rounded bg-violet-500/10 px-1.5 py-0.5 font-medium text-violet-600 dark:text-violet-400"
+              title={`Strategy (stored value: ${r.strategy})`}
+            >
+              {STRONGHOLD_LABELS[r.strategy] ?? r.strategy}
+            </span>
+          )}
           <span title="have-tactic count in the final proof">
             {r.have_case_count ?? '—'} have
           </span>
           {r.checkpoint_used && (
             <span title="Resumed from a saved checkpoint">resumed</span>
           )}
+          <Toolchain lean={r.lean_toolchain} mathlib={r.mathlib_version} />
         </>
       )}
     />

@@ -56,6 +56,30 @@ export interface CertificateMeta {
   title?: string | null;
   mintedAt?: string | null;
   provedAt?: string | null;
+  /** Lean toolchain + Mathlib version that ACTUALLY certified this proof. The
+   *  verifier groups are not on the same Lean (Leak XI/XII/XIV run 4.32.0, Leak
+   *  I/II/IV run 4.29.1), so a header that always printed the constant would be
+   *  making a false claim about half the corpus. Omitted ⇒ falls back to the
+   *  CERTIFICATE constant, which keeps every previously-signed certificate
+   *  byte-identical (and therefore still verifiable). */
+  toolchain?: string | null;
+  mathlib?: string | null;
+}
+
+// Render a run's toolchain the way the header has always read ("Lean 4.29.1"),
+// accepting either the bare version or the full elan string the bridge reports
+// ("leanprover/lean4:v4.32.0"). No per-run value ⇒ the constant, so certificates
+// signed before toolchain was recorded still hash to the same bytes.
+function certToolchain(toolchain?: string | null): string {
+  const t = (toolchain ?? "").trim();
+  if (!t) return CERTIFICATE.toolchain;
+  const v = t.replace(/^leanprover\/lean4:v?/, "").replace(/^v/, "");
+  return `Lean ${v}`;
+}
+function certMathlib(mathlib?: string | null): string {
+  const m = (mathlib ?? "").trim();
+  if (!m) return CERTIFICATE.mathlib;
+  return m.startsWith("Mathlib") ? m : `Mathlib ${m}`;
 }
 
 // A Lean block-comment header stamped onto the proof for the copy/download form.
@@ -71,7 +95,7 @@ export function certificateHeader(meta: CertificateMeta): string {
     `  Verified  : ${fmtCertDate(meta.provedAt)}  (machine-checked by the Lean kernel)`,
     `  Minted    : ${fmtCertDate(meta.mintedAt)}  (certificate signed)`,
     `  Enforcer  : ${CERTIFICATE.prover} · ${CERTIFICATE.proverUrl}`,
-    `  Toolchain : ${CERTIFICATE.toolchain} · ${CERTIFICATE.mathlib}`,
+    `  Toolchain : ${certToolchain(meta.toolchain)} · ${certMathlib(meta.mathlib)}`,
     `  Support   : ${CERTIFICATE.supportEmail}`,
     `  ${line}`,
     "-/",

@@ -625,6 +625,11 @@ function createGovernor({ initial } = {}) {
     searchCount: 0,
     grantCount: 0,
     blockedCount: 0,
+    // Bridge-served tools: name -> { description, inputSchema, run(args) }. Used by
+    // the Claude-driven architect (Leak Ultra) so the CLI's tool calls execute in
+    // the bridge — same executors, same gates as the Grok loop — instead of the CLI
+    // talking to Leak XII/XIV directly, where the bridge could not see the results.
+    handlers: new Map(),
   }
   governors.set(id, g)
   return g
@@ -672,6 +677,10 @@ function buildGovernedMcpConfig(mcpServers, governor) {
       servers[s.name] = { type: "sse", url: s.url }
     }
   }
+  // Bridge-served tools get their own entry so the CLI can reach the architect
+  // executors. Named "architect" so tools surface as mcp__architect__lean_compile.
+  if (governor?.handlers?.size)
+    servers.architect = { type: "sse", url: `http://127.0.0.1:${PORT}/gov/${governor.id}/sse` }
   return { mcpServers: servers }
 }
 
@@ -771,10 +780,27 @@ async function governorMessage(req, res, govId, sid) {
         required: [t.argKey],
       },
     }))
+    for (const [name, h] of g.handlers)
+      tools.push({ name, description: h.description || name, inputSchema: h.inputSchema || { type: "object", properties: {} } })
     reply({ tools })
   } else if (method === "tools/call") {
-    const text = await governedSearchCall(g, msg.params?.name, msg.params?.arguments || {})
-    reply({ content: [{ type: "text", text }] })
+    const name = msg.params?.name
+    const h = g.handlers.get(name)
+    if (h) {
+      // Bridge-served tool (architect stage executor). Errors come back as tool
+      // TEXT, never as a JSON-RPC error: the driver has to be able to read and
+      // react to a failure the same way it reads a compile report.
+      let text
+      try {
+        text = await h.run(msg.params?.arguments || {})
+      } catch (e) {
+        text = `Tool error: ${String(e?.message || e)}`
+      }
+      reply({ content: [{ type: "text", text: String(text ?? "") }] })
+    } else {
+      const text = await governedSearchCall(g, name, msg.params?.arguments || {})
+      reply({ content: [{ type: "text", text }] })
+    }
   } else if (msg.id != null) {
     reply({})
   }
@@ -1846,7 +1872,10 @@ const STRATEGIES = {
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
   // agent; falls back to `have` on any failure. See proveHaveTree.
   "have-tree": {
-    label: "Have-tree — planner + isolated per-hole minions (linear context)",
+    // Named "Leak Stronghold Dark" in the research tables; the VALUE stays
+    // `have-tree` so saved checkpoints, queued items and existing rows keep
+    // resolving. See STRONGHOLD_LABELS on the client for the display name.
+    label: "Leak Stronghold Dark — planner + isolated per-hole minions (linear context)",
     node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
     decompose: (t, m, x) => haveHoleFillPrompt("<the verified skeleton>", "hN", m, x),
     search: GOV_INITIAL,
@@ -1887,6 +1916,27 @@ const STRATEGIES = {
     style: "architect",
     architect: { shareDeadEnds: true, nlSeedLocal: true },
   },
+  // ---- Leak Ultra family -------------------------------------------------------
+  // The same Goedel blueprint pipeline as Leak River Stone — identical prompts,
+  // identical tool contract, identical Leak XI/XII/XIV gates — but driven by the
+  // LOCAL Claude CLI instead of the xAI API, on whatever model the operator picks
+  // in the dropdown. A separate branch, not a River ablation: the driver changes,
+  // so its numbers belong in their own table.
+  //
+  // The driver swap is real work, not a model string: the CLI calls MCP tools
+  // itself, so the bridge serves `lean_compile`/`mathlib_search` to it from a
+  // LOCAL MCP server (the governor) whose handlers are the very same `exec`
+  // closures the Grok loop uses. That keeps the compile gate and the blueprint
+  // capture on the bridge, where they have to be — the CLI is never trusted to
+  // self-report that a blueprint compiled.
+  "ultra-fleeting": {
+    label: "Leak Ultra Fleeting — Stone's pipeline, local Claude CLI driver (model from the dropdown)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false, driver: "claude" },
+  },
   // Back-compat: runs saved/queued under the old name behave as the control.
   architect: {
     label: "Architect — alias for Leak River Stone (control)",
@@ -1901,6 +1951,27 @@ const STRATEGIES = {
 // non-architect strategies get the control's settings.
 const architectConfigFor = (name) =>
   pickStrategy(name).architect || { shareDeadEnds: false, nlSeedLocal: false }
+// Which LLM drives the architect pipeline: "grok" (xAI API, the River family) or
+// "claude" (the local CLI, Leak Ultra). Anything unset is Grok, so the River
+// variants and the legacy alias are untouched.
+const architectDriverFor = (name) => (architectConfigFor(name).driver === "claude" ? "claude" : "grok")
+
+// ── Lean toolchain provenance ────────────────────────────────────────────────
+// The two verifier groups DO NOT run the same Lean. A certificate that names the
+// wrong one is a false claim about how the proof was checked, so the toolchain is
+// carried per run (from whichever group actually certified the proof) instead of
+// being assumed. Sources: Leak II/IV lean-toolchain + lake-manifest (mathlib tag
+// v4.29.1, rev 5e932f9…); Leak XII/XIV gateway/lean-toolchain + lakefile.toml
+// (mathlib tag v4.32.0). Update these together with those pins.
+const TOOLCHAINS = {
+  // Leak I / II / IV — the original group, gate = verify_full_script.
+  legacy: { lean: "leanprover/lean4:v4.29.1", mathlib: "v4.29.1", group: "Leak I/II/IV" },
+  // Leak XI / XII / XIV — the LeanArchitect group, gate = Leak XIV.
+  architect: { lean: "leanprover/lean4:v4.32.0", mathlib: "v4.32.0", group: "Leak XI/XII/XIV" },
+}
+// Which pins applied to THIS run, keyed off the orchestrator style: the architect
+// styles are certified by Leak XIV, everything else by the Leak II/IV daemon.
+const toolchainForStyle = (style) => (style === "architect" ? TOOLCHAINS.architect : TOOLCHAINS.legacy)
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
 // prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
 // with local `have`s (proveHaveFlat). Defaults to "lemma" for existing modes.
@@ -2169,7 +2240,17 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
   })
 
   const start = Date.now()
-  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0, bridge_build: BRIDGE_BUILD }
+  // Single-agent path: always gated by verify_full_script on the Leak II/IV
+  // daemon, so the legacy pins are the honest ones to report.
+  const metrics = {
+    tools_invoked: 0,
+    llm_invocations: 0,
+    time_elapsed: 0,
+    bridge_build: BRIDGE_BUILD,
+    lean_toolchain: TOOLCHAINS.legacy.lean,
+    mathlib_version: TOOLCHAINS.legacy.mathlib,
+    verifier_group: TOOLCHAINS.legacy.group,
+  }
   const stripName = (n) => String(n || "").replace(/^mcp__[a-z0-9-]+__/i, "")
 
   // System gate: the ONE enforced restriction. We only accept a proof that the
@@ -2472,13 +2553,17 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
     // budget is strategy-dependent (e.g. librarian gets a large one). Search tools
     // are routed through the bridge; verify + Pantograph stay direct.
     const governor = createGovernor({ initial: searchBudget })
+    // Bridge-served tools (the architect stages' own executors) ride the same
+    // local MCP server as the governed search, so the CLI reaches them without
+    // ever talking to Leak XII/XIV directly.
+    if (bridgeHandlers) for (const [n, h] of bridgeHandlers) governor.handlers.set(n, h)
     let cfgPath
     try {
       const dir = mkdtempSync(join(tmpdir(), "claude-tree-"))
@@ -2506,6 +2591,11 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     ]
     if (model) args.push("--model", model)
     if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
+    // The architect stage contract (blueprint rules / prover rules / refinement
+    // rules) rides as a system prompt so it outranks the conversation, matching
+    // how the Grok driver sends it as role:"system".
+    if (typeof systemAppend === "string" && systemAppend.trim())
+      args.push("--append-system-prompt", systemAppend.trim())
 
     let child
     try {
@@ -3601,22 +3691,36 @@ function grokPrice(model) {
 // CLI-reported cost. Called after every Grok reply so the live UI figure and the
 // cap guard always reflect the same number the research row records.
 function architectRecost(ctx, state) {
-  const p = grokPrice(state.model)
-  const driver = Number(
-    (((state.usage.prompt - state.usage.cached) * p.i +
-      state.usage.cached * p.c +
-      state.usage.completion * p.o) /
-      1e6).toFixed(6),
-  )
+  // Claude driver (Leak Ultra): the CLI reports authoritative total_cost_usd per
+  // stage, already accounting for cache reads/writes — no price table, and the
+  // accumulated figure is used as-is. Grok driver: priced from token counts.
+  let driver
+  if (state.driver === "claude") {
+    driver = Number(Number(state.driverCostUsd || 0).toFixed(6))
+  } else {
+    const p = grokPrice(state.model)
+    driver = Number(
+      (((state.usage.prompt - state.usage.cached) * p.i +
+        state.usage.cached * p.c +
+        state.usage.completion * p.o) /
+        1e6).toFixed(6),
+    )
+    state.driverCostUsd = driver
+  }
   const seed = Number((state.seedCostUsd || 0).toFixed(6))
-  state.driverCostUsd = driver
   if (!ctx.metrics) return
   ctx.metrics.cost_driver_usd = driver
   ctx.metrics.cost_seed_usd = seed
   ctx.metrics.cost_usd = Number((driver + seed).toFixed(6))
-  ctx.metrics.prompt_tokens = state.usage.prompt
-  ctx.metrics.completion_tokens = state.usage.completion
-  ctx.metrics.cached_tokens = state.usage.cached
+  // Per-bucket token counts exist only for the Grok driver (the xAI response
+  // reports them per call). For the Claude driver the CLI reports a combined
+  // total, already accumulated into metrics.tokens — leave these unset rather
+  // than writing zeros, which would read as "this run used no tokens".
+  if (state.driver !== "claude") {
+    ctx.metrics.prompt_tokens = state.usage.prompt
+    ctx.metrics.completion_tokens = state.usage.completion
+    ctx.metrics.cached_tokens = state.usage.cached
+  }
   ctx.metrics.models_used = Array.from(state.models)
 }
 // Higher than the other decomposition paths' defaults: with a short wall
@@ -3629,6 +3733,9 @@ const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY
 // (ctx.metrics.cost_usd), so this is enforceable exactly: once crossed, no
 // further LLM call is issued anywhere in the pipeline. 0 disables.
 const ARCHITECT_MAX_COST_USD = Number(process.env.ARCHITECT_MAX_COST_USD ?? 5)
+// Fallback driver model for Leak Ultra when the operator left the dropdown on
+// "bridge default". Normally the dropdown value wins — inheriting it is the point.
+const ARCHITECT_ULTRA_MODEL = process.env.ARCHITECT_ULTRA_MODEL || "claude-opus-5"
 function architectCostCapHit(ctx) {
   return ARCHITECT_MAX_COST_USD > 0 && (ctx?.metrics?.cost_usd || 0) >= ARCHITECT_MAX_COST_USD
 }
@@ -4007,6 +4114,114 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}⛔ Hard turn cap (${hardTurns}) reached.` })
   return { finalText: await forceForfeit(), exhausted: true }
 }
+
+// ── Claude driver for the architect pipeline (Leak Ultra) ────────────────────
+// Same contract as grokLoop — {system, user, tools, exec} in, {finalText, done,
+// exhausted} out — so every stage works with either driver and the prompts, gates
+// and exit conditions stay identical across the two branches.
+//
+// The one structural difference: the CLI owns its own tool loop, so instead of us
+// dispatching tool calls we SERVE the tools to it from a local MCP server whose
+// handlers are these very `exec` closures. Two consequences that matter:
+//   * the compile gate and blueprint capture stay bridge-side — a stage can only
+//     succeed because `exec` saw lean_compile return ok, never because the model
+//     claimed success in prose (the failure mode that wasted whole Grok attempts);
+//   * cost is the CLI's own reported total_cost_usd, so Ultra needs no price
+//     table and cannot drift when published prices change.
+async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "" }) {
+  const tag = label ? `[${label}] ` : ""
+  ctx.emit({
+    type: "system",
+    detail: `${tag}Claude context opened (${state.model})\n\n--- SYSTEM ---\n${system}\n\n--- USER ---\n${user}`,
+  })
+
+  let done = null
+  const handlers = new Map()
+  for (const t of tools || []) {
+    const fn = t.function || t
+    if (!fn?.name) continue
+    handlers.set(fn.name, {
+      description: fn.description,
+      inputSchema: fn.parameters || { type: "object", properties: {} },
+      run: async (args) => {
+        const out = await exec(fn.name, args || {})
+        if (out && out.__done) done = out.__done
+        return String(out?.report ?? JSON.stringify(out ?? ""))
+      },
+    })
+  }
+
+  // Cost: read the delta on ctx.metrics.cost_usd, which spawnProverStream sums
+  // from each sub-run's result frame. architectRecost then republishes it as the
+  // driver share, so the two never double-count.
+  const costBefore = Number(ctx.metrics?.cost_usd || 0)
+  // The CLI namespaces MCP tools (mcp__architect__lean_compile), while the shared
+  // stage contracts name them bare — say so once rather than forking the prompts,
+  // which would break the "same prompts as Stone" property this branch rests on.
+  const toolNote = `\n\n## Tool names in this session\nThe tools named in these instructions are served over MCP and appear namespaced: \`lean_compile\` is \`mcp__architect__lean_compile\`, \`mathlib_search\` is \`mcp__architect__mathlib_search\`. They are the same tools with the same arguments. Nothing is registered or checked unless you actually CALL the tool — never paste Lean code as chat text.`
+
+  const r = await spawnProverStream(
+    {
+      prompt: user,
+      systemAppend: system + toolNote,
+      mcpServers: [],
+      bridgeHandlers: handlers,
+      model: state.model,
+      maxTurns: hardTurns,
+      timeoutMs: 0, // the shared wall-clock deadline governs (see getDeadline)
+      getDeadline: ctx.getDeadline,
+      stage: label ? `[${label}]` : "",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: 0,
+    },
+    {
+      // Stop the CLI the moment a stage's gate is satisfied; SIGINT (not kill) so
+      // the result frame carrying total_cost_usd still flushes.
+      onObject: (o) => {
+        if (o?.type === "system" && typeof o.model === "string") state.models?.add(o.model)
+        return !!done
+      },
+      emit: ctx.emit,
+    },
+  )
+  state.models?.add(state.model)
+  state.driverCostUsd = Number(state.driverCostUsd || 0) + Math.max(0, Number(ctx.metrics?.cost_usd || 0) - costBefore)
+  architectRecost(ctx, state)
+
+  if (done) return { finalText: r.finalText || "", exhausted: false, done }
+
+  // No gate satisfied. Ask once, with no tools, for the structured forfeit the
+  // refinement stage reads (the paper's §4.4 decomposition proposal) — otherwise
+  // an exhausted node teaches the next blueprint nothing.
+  if (forfeitPrompt) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Stage ended without a gate — requesting a structured forfeit.` })
+    const fr = await runClaude(
+      buildArgs(`${user}\n\n---\n\n${forfeitPrompt}`, {
+        model: state.model,
+        systemPrompt: system,
+        disallowedTools: "Bash Read Write Edit Glob Grep WebFetch WebSearch Task",
+        strictMcpConfig: true,
+        excludeDynamicSections: true,
+      }),
+      { cwd: process.cwd(), timeoutMs: 180000 },
+    )
+    if (typeof fr.costUsd === "number") {
+      state.driverCostUsd = Number(state.driverCostUsd || 0) + fr.costUsd
+      architectRecost(ctx, state)
+    }
+    if (fr.ok && fr.text.trim()) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${fr.text.trim()}` })
+      return { finalText: fr.text, exhausted: true }
+    }
+  }
+  return { finalText: r.finalText || "", exhausted: true }
+}
+
+// Stage-level driver dispatch: the River family drives Grok over the xAI API,
+// Leak Ultra drives the local Claude CLI. Identical opts either way.
+const architectLoop = (ctx, state, opts) =>
+  state.driver === "claude" ? claudeArchitectLoop(ctx, state, opts) : grokLoop(ctx, state, opts)
 
 const ARCHITECT_COMPILE_TOOL = {
   type: "function",
@@ -4473,7 +4688,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       }
       return { report: `unknown tool ${name}` }
     }
-    const out = await grokLoop(ctx, state, {
+    const out = await architectLoop(ctx, state, {
       system: architectProverSystem(),
       user: user + deadEnds + retryNote,
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
@@ -4527,7 +4742,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
       return { report: `unknown tool ${name}` }
     }
     const retryNote = attempt === 0 ? "" : `\n\n(Attempt ${attempt + 1} of ${retries}. The previous attempt failed its last gate with:\n${lastReport}\nStart fresh and fix that.)`
-    const out = await grokLoop(ctx, state, {
+    const out = await architectLoop(ctx, state, {
       system,
       user: user + retryNote,
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
@@ -4611,8 +4826,18 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   const maxIters = () =>
     (typeof ctx.getMaxIters === "function" ? ctx.getMaxIters() : 0) ||
     clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS)
+  const driver = architectDriverFor(ctx.strategy)
   const state = {
-    model: /grok/i.test(String(ctx.model || "")) ? String(ctx.model) : (process.env.ARCHITECT_MODEL || ARCHITECT_MODEL_LADDER[0]),
+    driver,
+    // Grok driver: force a grok SKU (the River family locks the selector to one).
+    // Claude driver: honour the operator's dropdown choice verbatim — that is the
+    // whole point of Leak Ultra, so no ladder and no substitution here.
+    model:
+      driver === "claude"
+        ? String(ctx.model || "").trim() || ARCHITECT_ULTRA_MODEL
+        : /grok/i.test(String(ctx.model || ""))
+          ? String(ctx.model)
+          : process.env.ARCHITECT_MODEL || ARCHITECT_MODEL_LADDER[0],
     usage: { prompt: 0, completion: 0, cached: 0 },
     stageTokens: 0,
     // Cost accounting: driver (Grok, from token counts) + seed (Sonnet, from the
@@ -4630,11 +4855,12 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   if (ctx.metrics) {
     ctx.metrics.max_iters = maxIters()
     ctx.metrics.models_used = []
+    ctx.metrics.driver = driver
   }
   ctx.emit({
     type: "message-annotation",
     subtype: "status",
-    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}`,
+    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${driver === "claude" ? "claude CLI" : "grok API"}:${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}\n   toolchain=${TOOLCHAINS.architect.lean} · Mathlib ${TOOLCHAINS.architect.mathlib} (${TOOLCHAINS.architect.group})`,
   })
 
   // NL guidance: river-delta generates it locally with Sonnet 5; any variant will
@@ -4804,6 +5030,16 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
 
   const strategy = STRATEGIES[opts.strategy] ? opts.strategy : "hacker"
   const style = styleOf(strategy)
+  // Toolchain provenance: the architect styles are certified by Leak XIV (Lean
+  // 4.32.0), everything else by the Leak II/IV daemon (4.29.1). Reported per run
+  // so the certificate can state what ACTUALLY checked the proof instead of
+  // assuming one group — the two are NOT interchangeable.
+  {
+    const tc = toolchainForStyle(style)
+    metrics.lean_toolchain = tc.lean
+    metrics.mathlib_version = tc.mathlib
+    metrics.verifier_group = tc.group
+  }
   // Admin debug log: the exact prompt(s) the agent(s) receive.
   send({
     type: "prompt",

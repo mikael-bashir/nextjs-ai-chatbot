@@ -25,6 +25,12 @@ export async function POST(request: NextRequest) {
   const title = typeof body?.title === 'string' ? body.title : null;
   const verifiedAt =
     typeof body?.verifiedAt === 'string' ? body.verifiedAt : null;
+  // The toolchain that actually certified this proof. Signed INTO the canonical
+  // bytes, so the toolchain claim is covered by the signature and can't be
+  // swapped afterwards. Absent ⇒ the certificate constant, which reproduces the
+  // exact bytes of every certificate signed before this field existed.
+  const toolchain = typeof body?.toolchain === 'string' ? body.toolchain : null;
+  const mathlib = typeof body?.mathlib === 'string' ? body.mathlib : null;
   if (!proof.trim()) {
     return Response.json({ error: 'proof required' }, { status: 400 });
   }
@@ -34,6 +40,8 @@ export async function POST(request: NextRequest) {
     title,
     mintedAt: certMintedAt, // signing moment (this call)
     provedAt: verifiedAt, // real kernel-verify moment
+    toolchain,
+    mathlib,
   }).trimEnd();
   const sig = signCertificate(canonical);
   if (!sig) {

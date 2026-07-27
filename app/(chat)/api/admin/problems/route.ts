@@ -115,7 +115,10 @@ export async function POST(request: NextRequest) {
       insight: body.insight ?? null,
       lean: body.lean,
       proof: body.proof ?? '',
+      // The verifier group that certified this proof. Only the fallback is the
+      // legacy pin — architect-certified items carry 4.32.0 and must keep it.
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+      mathlib: body.mathlib ?? 'v4.29.1',
       verifiedAt: body.verifiedAt ?? null,
       signature: body.signature ?? null,
       signatureKeyId: body.signatureKeyId ?? null,

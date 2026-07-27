@@ -3,7 +3,11 @@ import { redirect } from 'next/navigation';
 
 import { auth } from '@/app/(auth)/auth';
 import { isAdminEmail } from '@/lib/admin';
-import { AdminLeakRiver, AdminLeakStronghold } from '@/components/leak/admin-research';
+import {
+  AdminLeakRiver,
+  AdminLeakStronghold,
+  AdminLeakUltra,
+} from '@/components/leak/admin-research';
 
 export default async function ResearchPage() {
   const session = await auth();
@@ -16,13 +20,24 @@ export default async function ResearchPage() {
           Leak · admin
         </p>
         <h1 className="mt-1 text-2xl font-semibold tracking-tight">
-          Research: Leak River vs Leak Stronghold
+          Research: Leak River vs Leak Ultra vs Leak Stronghold
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          Every verification attempt on the ACG pipeline is auto-recorded
-          here — Leak River for the architect (blueprint) strategy, Leak
-          Stronghold for every Claude-driven strategy. Export CSV from either
-          table to plot.
+          Every verification attempt on the ACG pipeline is auto-recorded here.
+          <span className="font-medium text-foreground"> Leak River</span> — the
+          blueprint pipeline driven by Grok, in three nested variants (Stone
+          control → Gate ledger → Delta ledger+NL seed).
+          <span className="font-medium text-foreground"> Leak Ultra</span> — the
+          same pipeline driven by the local Claude CLI, so the driver is the
+          only difference from Stone.
+          <span className="font-medium text-foreground">
+            {' '}
+            Leak Stronghold
+          </span>{' '}
+          — the pre-existing Claude strategies. Each table records the Lean
+          toolchain that actually certified the run: the architect group runs
+          4.32.0 and the original group 4.29.1, so rows from different tables
+          are not interchangeable. Export CSV from any table to plot.
         </p>
         <Link
           href="/admin"
@@ -32,6 +47,7 @@ export default async function ResearchPage() {
         </Link>
       </div>
       <AdminLeakRiver />
+      <AdminLeakUltra />
       <AdminLeakStronghold />
     </div>
   );

@@ -81,7 +81,10 @@ export async function POST(request: NextRequest) {
       signatureKeyId:
         (rec as { signatureKeyId?: string | null }).signatureKeyId ?? null,
       certMintedAt: (rec as { certMintedAt?: string | null }).certMintedAt ?? null,
+      // Which Lean/Mathlib certified this proof. Sent as a PAIR: the certificate
+      // header prints both, and the two verifier groups differ in both.
       toolchain: rec.toolchain ?? null,
+      mathlib: (rec as { mathlib?: string | null }).mathlib ?? null,
       // Solver-facing key idea (1-3 sentences). CompeteMath reveals it alongside
       // the answer once a problem is solved or given up.
       insight: rec.insight ?? null,

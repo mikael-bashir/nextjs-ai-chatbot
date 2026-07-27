@@ -140,7 +140,16 @@ export interface GeneratedRecord {
   // DB-backed membership of the verification queue, so a queued problem survives
   // reloads and the verifier can resume it later.
   queued?: boolean;
+  // Provenance of the verification, all stamped the instant the kernel confirmed
+  // the proof and carried through staging → prod so CompeteMath stores these
+  // exact values rather than re-deriving (or re-signing) them later.
   toolchain?: string;
+  /** Mathlib version of the group that certified it — pairs with `toolchain`. */
+  mathlib?: string;
+  verifiedAt?: string;
+  signature?: string;
+  signatureKeyId?: string;
+  certMintedAt?: string;
   // Cost-estimator display state, persisted so the estimate (made on enqueue)
   // and the actual (recorded on verify) survive a page refresh. The learning
   // history lives separately in proof_cost_history; these mirror it per-card.
