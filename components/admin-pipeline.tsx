@@ -1129,7 +1129,7 @@ export function AdminPipeline() {
       lean: string,
       mcpServers: ProverMcpServer[],
       signal?: AbortSignal,
-      opts?: { itemId?: string; seed?: string },
+      opts?: { itemId?: string; seed?: string; nlProof?: string },
     ) => {
       const conn = connFor(false); // shared (verification) bridge
       let content = ''; // accumulate text to detect a session-limit message
@@ -1158,6 +1158,7 @@ export function AdminPipeline() {
           endpoint: decompose ? 'prove-tree' : 'prove-stream',
           strategy: decompose ? strategy : undefined,
           seed: opts?.seed,
+          nlProof: opts?.nlProof,
           // Tree path runs under an extendable wall-clock budget; the single-agent
           // path ignores it (and never fires onRunId), so the indicator stays off.
           // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
@@ -1241,11 +1242,25 @@ export function AdminPipeline() {
           // so a later plain re-verify starts fresh.
           const seed = resumeSeedRef.current[item.id];
           delete resumeSeedRef.current[item.id];
+          // Architect strategy: seed blueprint generation with the item's own
+          // natural-language solution material (the paper's §4.2 NL guidance —
+          // "on these problems natural-language guidance is decisive"). The
+          // generator already produced the informal argument; hand it over.
+          const nlProof =
+            verifyStrategyRef.current === 'architect'
+              ? [
+                  item.problem ? `Problem: ${item.problem}` : '',
+                  typeof item.answer === 'number' ? `Answer: ${item.answer}` : '',
+                  item.insight ? `Key idea / solution sketch: ${item.insight}` : '',
+                ]
+                  .filter(Boolean)
+                  .join('\n\n') || undefined
+              : undefined;
           const out = await proveStream(
             item.lean as string,
             mcpServers,
             ctrl.signal,
-            { itemId: item.id, seed },
+            { itemId: item.id, seed, nlProof },
           );
           verified = out.verified;
           // Actual dollar cost of the whole run (summed across sub-runs on the

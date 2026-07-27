@@ -56,6 +56,10 @@ interface RunOpts {
   // prior run. The tree path finishes the remaining holes straight from it
   // instead of replanning. Tree path only; ignored by the single-agent path.
   seed?: string;
+  // Architect strategy only: a natural-language proof / solution sketch that
+  // seeds blueprint generation as a structural guide (Goedel-Architect §4.2).
+  // Informal math only — never Lean code. Ignored by every other strategy.
+  nlProof?: string;
   // Fires whenever the tree run banks progress — the latest resumable checkpoint
   // (skeleton with proven holes filled, rest still `sorry`). Persist the newest
   // one so any stop (limit / terminate / crash) can resume from it.
@@ -186,6 +190,9 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
             ? { computeBudgetMs: opts.computeBudgetMs }
             : {}),
           ...(opts.seed && opts.seed.trim() ? { seed: opts.seed } : {}),
+          ...(opts.nlProof && opts.nlProof.trim()
+            ? { nlProof: opts.nlProof }
+            : {}),
         },
       }),
       signal,

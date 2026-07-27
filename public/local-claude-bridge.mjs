@@ -3520,6 +3520,29 @@ const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 8)
 // clock, more parallel node attempts is what actually buys more coverage per
 // minute (deadlinePassed() still cuts every stage off the instant time is up).
 const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 4)
+// HARD dollar ceiling for one architect run — the paper (Appendix A) governs
+// by token budgets, never wall clock, and the operator's real fear is an
+// unbounded bill, not a long run. Cost is computed live after every Grok call
+// (ctx.metrics.cost_usd), so this is enforceable exactly: once crossed, no
+// further LLM call is issued anywhere in the pipeline. 0 disables.
+const ARCHITECT_MAX_COST_USD = Number(process.env.ARCHITECT_MAX_COST_USD ?? 5)
+function architectCostCapHit(ctx) {
+  return ARCHITECT_MAX_COST_USD > 0 && (ctx?.metrics?.cost_usd || 0) >= ARCHITECT_MAX_COST_USD
+}
+// Guard used at every stage boundary: true (and emits a one-time notice) when
+// the run must stop because the dollar cap is spent.
+function architectCapStop(ctx) {
+  if (!architectCostCapHit(ctx)) return false
+  if (!ctx._costCapNoted) {
+    ctx._costCapNoted = true
+    ctx.emit?.({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `💸 Architect cost cap reached ($${ARCHITECT_MAX_COST_USD.toFixed(2)}, spend so far $${(ctx.metrics?.cost_usd || 0).toFixed(3)}) — stopping. Raise ARCHITECT_MAX_COST_USD on the bridge to allow deeper runs.`,
+    })
+  }
+  return true
+}
 
 // Resolve XI/XII/XIV the SAME way every other Leak server is discovered in
 // this app: by NAME, from the servers the operator registered in the
@@ -3648,18 +3671,32 @@ Emit a revised dependency graph. Every theorem and lemma is \`@[blueprint (state
 // --- Grok driver -------------------------------------------------------------
 // One OpenAI-compatible chat call against api.x.ai with function calling,
 // retries on 429/5xx, and a model fallback ladder on unknown-model errors.
-async function grokCall(state, messages, tools, ctx) {
+async function grokCall(state, messages, tools, ctx, callOpts = {}) {
   const key = process.env.XAI_API_KEY
   if (!key) throw new Error("XAI_API_KEY is not set on the bridge — the architect strategy drives Grok directly")
+  if (architectCostCapHit(ctx))
+    throw new Error(`architect cost cap reached ($${ARCHITECT_MAX_COST_USD.toFixed(2)}) — no further LLM calls this run`)
   for (let attempt = 0; ; attempt++) {
     if (ctx.signal?.aborted) throw new Error("aborted")
-    if (deadlinePassed(ctx)) throw new Error("wall-clock budget exhausted")
+    // callOpts.grace: the forced-forfeit turn is the ONE call allowed past the
+    // wall-clock deadline — it is what feeds the refinement stage (§4.4), and
+    // under a short operator clock most exhaustion IS deadline exhaustion.
+    // Bounded: a single no-tools call per attempt, still under the cost cap.
+    if (deadlinePassed(ctx) && !callOpts.grace) throw new Error("wall-clock budget exhausted")
     const body = {
       model: state.model,
       messages,
-      tools,
-      tool_choice: "auto",
       max_tokens: 8192,
+    }
+    // xAI rejects tool_choice with an empty tools array outright ("A
+    // tool_choice was set on the request but no tools were specified") — this
+    // exact 400 was silently killing every forced-forfeit turn, starving the
+    // refinement stage of the diagnoses that are its entire input (§4.4 of
+    // the paper: forfeits ARE the decomposition proposals). Only attach the
+    // tool plumbing when there are tools.
+    if (Array.isArray(tools) && tools.length) {
+      body.tools = tools
+      body.tool_choice = "auto"
     }
     let resp
     try {
@@ -3775,7 +3812,9 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     messages.push({ role: "user", content: forfeitPrompt })
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Budget exhausted — requesting a structured forfeit.` })
     try {
-      const msg = await grokCall(state, messages, [], ctx)
+      // grace: allowed past the wall-clock deadline (one small no-tools call)
+      // so refinement always gets its diagnosis, even on time exhaustion.
+      const msg = await grokCall(state, messages, [], ctx, { grace: true })
       const text = String(msg.content || "") || finalText
       if (text.trim()) ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${text}` })
       return text
@@ -3785,9 +3824,18 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     }
   }
 
+  // Duplicate-submission guard: hash of every tool call this attempt → its
+  // report. Observed live: the prover resubmitting BYTE-IDENTICAL code 8+
+  // times, eating the whole budget on a compile loop that can only return the
+  // same error. A repeat is answered from cache (no service round-trip) with
+  // an explicit "identical input, identical outcome" banner.
+  const seen = new Map()
+  let nudges = 0
+
   for (let turn = 0; turn < hardTurns; turn++) {
     if (state.stageTokens >= tokenBudget) return { finalText: await forceForfeit(), exhausted: true }
     if (deadlinePassed(ctx)) return { finalText: await forceForfeit(), exhausted: true }
+    if (architectCostCapHit(ctx)) return { finalText, exhausted: true }
     let msg
     try {
       msg = await grokCall(state, messages, tools, ctx)
@@ -3801,6 +3849,21 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${msg.content.trim()}` })
     if (!toolCalls.length) {
       finalText = String(msg.content || "")
+      // Every registered exit is tool-driven (a lean_compile solve / a
+      // validated blueprint) or a structured forfeit. A bare prose reply ends
+      // the attempt with NOTHING — observed live as whole blueprint attempts
+      // burned on the model pasting a ```lean block as chat instead of
+      // calling the tool. Steer it back to the compiler (twice max), per the
+      // paper's loop contract ("iterate until lean_compile reports ...").
+      if (!/##\s*Diagnosis/i.test(finalText) && nudges < 2) {
+        nudges++
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}↩︎ Reply had no tool call — steering the prover back to lean_compile (nudge ${nudges}/2).` })
+        messages.push({
+          role: "user",
+          content: "Your reply was NOT submitted to the compiler — nothing is checked or registered unless you CALL the lean_compile tool. Never paste Lean code as chat text. Call lean_compile now with your full current candidate.",
+        })
+        continue
+      }
       return { finalText, exhausted: false }
     }
     for (const tc of toolCalls) {
@@ -3817,13 +3880,22 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         tool: toolName,
         input: JSON.stringify(args, null, 2),
       })
+      const sig = `${toolName} ${JSON.stringify(args)}`
       let out
-      try {
-        out = await exec(toolName, args)
-      } catch (e) {
-        out = { report: `tool error: ${String(e?.message || e)}` }
+      if (seen.has(sig)) {
+        out = {
+          report:
+            `⚠️ IDENTICAL RESUBMISSION — you already made exactly this ${toolName} call this attempt; identical input can only produce the identical result (repeated below). Change the proof STRUCTURALLY before compiling again — do not rename variables or reorder the same failing tactics.\n\n${seen.get(sig)}`,
+        }
+      } else {
+        try {
+          out = await exec(toolName, args)
+        } catch (e) {
+          out = { report: `tool error: ${String(e?.message || e)}` }
+        }
       }
       const outText = String(out.report ?? JSON.stringify(out))
+      if (!seen.has(sig)) seen.set(sig, outText.slice(0, 4000))
       ctx.emit({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
       messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
       if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
@@ -4156,7 +4228,17 @@ async function architectProveNode(node, graph, prelude, urls, ctx, state) {
   const parents = node.deps
     .map((d) => graph.find((g) => g.name === d))
     .filter(Boolean)
-    .map((p) => `- ${p.kind} ${p.name} : ${p.signature.replace(/^\s*(theorem|lemma|def|abbrev)\s+[A-Za-z0-9_'.]+\s*/, "").trim()}${p.statement ? `\n    (${String(p.statement).slice(0, 240)})` : ""}`)
+    .map((p) => {
+      // Present a clean `name : type` fact line. The raw signature keeps its
+      // modifiers + keyword + name (e.g. "noncomputable def partial_sum (n :
+      // ℕ) : ℚ"), which the old strip missed for modifier-prefixed decls and
+      // double-rendered for lemmas ("sum_13_eq_one : : partial_sum 13 = 1").
+      const sig = p.signature
+        .replace(/^\s*(?:noncomputable\s+|private\s+|protected\s+)*(?:theorem|lemma|def|abbrev|structure|instance|inductive)\s+[A-Za-z0-9_'.]+\s*/, "")
+        .replace(/^:\s*/, "")
+        .trim()
+      return `- ${p.kind} ${p.name} : ${sig}${p.statement ? `\n    (${String(p.statement).slice(0, 240)})` : ""}`
+    })
     .join("\n")
   const negSig = architectNegSignature(node.signature)
   const prefix = architectNodePrefix(graph, node.name)
@@ -4175,10 +4257,20 @@ ${parents || "(none — this node has no parents)"}
 ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its hypotheses, prove instead exactly:\n\n${negSig} := by\n  <your disproof>\n` : ""}`
 
   const result = { solved: false, negated: false, proofBody: null, forfeit: null, attempts: 0 }
+  // The last compiler feedback of the previous fresh attempt. Fed into the
+  // next attempt's retry note so "fresh" never means "amnesiac": observed
+  // live, a node repeated the exact same broken tactic skeleton across every
+  // fresh attempt because nothing carried the wall it kept hitting.
+  let lastError = ""
   for (let attempt = 0; attempt < ARCHITECT_NODE_RETRIES; attempt++) {
-    if (deadlinePassed(ctx) || ctx.signal?.aborted) break
+    if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
     result.attempts = attempt + 1
-    const retryNote = attempt === 0 ? "" : `\n\n(Attempt ${attempt + 1} of ${ARCHITECT_NODE_RETRIES}. A previous fresh attempt failed; do not repeat the same failing tactic line verbatim.)`
+    const retryNote =
+      attempt === 0
+        ? ""
+        : `\n\n(Attempt ${attempt + 1} of ${ARCHITECT_NODE_RETRIES}. A previous fresh attempt failed.${
+            lastError ? ` Its final compiler feedback was:\n${lastError}\nThat approach hit a wall — take a structurally different route.` : " Do not repeat the same failing tactic line verbatim."
+          })`
     const exec = async (name, args) => {
       if (name === "mathlib_search") {
         if (!urls.xi) return { report: "mathlib_search is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback." }
@@ -4200,6 +4292,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           const at = rebuilt.indexOf(":=")
           return { report: r.report, __done: { negated: !!r.negated, body: rebuilt.slice(at + 2).trim() } }
         }
+        lastError = String(r.report || "").slice(0, 900)
         return { report: r.report }
       }
       return { report: `unknown tool ${name}` }
@@ -4234,7 +4327,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
 async function architectBlueprintStage(ctx, state, urls, { system, user, retries, stageLabel = "blueprint" }) {
   let lastReport = ""
   for (let attempt = 0; attempt < retries; attempt++) {
-    if (deadlinePassed(ctx) || ctx.signal?.aborted) return null
+    if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return null
     let captured = null
     const exec = async (name, args) => {
       if (name === "mathlib_search") {
@@ -4326,7 +4419,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     const workers = Array.from({ length: Math.max(1, Math.min(ARCHITECT_NODE_CONCURRENCY, todo.length)) }, async () => {
       while (cursor < todo.length) {
         const node = todo[cursor++]
-        if (deadlinePassed(ctx) || ctx.signal?.aborted) return
+        if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return
         ctx.emit({ type: "message-annotation", subtype: "status", thought: `⛏️ node ⟪${node.name}⟫ — fresh isolated prover (${node.deps.length} parent(s)).` })
         const r = await architectProveNode(node, graph, prelude, urls, ctx, state)
         results.set(node.name, r)
@@ -4383,7 +4476,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     }
 
     if (iter === ARCHITECT_MAX_ITERS) break
-    if (deadlinePassed(ctx) || ctx.signal?.aborted) break
+    if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
 
     // ---- Blueprint refinement on the annotated graph.
     const stillUnsolved = provable.filter((n) => !proofs.has(n.name))
