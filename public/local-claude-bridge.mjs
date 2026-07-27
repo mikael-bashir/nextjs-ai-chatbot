@@ -2672,17 +2672,35 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     // it could be a long think, a wedged subprocess, or a hung MCP call, and
     // there is no way to tell them apart from outside. Say so on a timer.
     // Observability only: it never stops or changes anything.
+    // Measured against the last thing that reached the TRANSCRIPT, not the last
+    // raw CLI object. The first cut used raw objects and never fired once: the
+    // CLI streams continuously while it thinks, so `idleS` sat at 1 second
+    // forever even as the user watched a blank screen for ten minutes. The
+    // silence being diagnosed is the user's, not the subprocess's.
+    //
+    // Reporting both is what makes the notice worth having: a live object count
+    // with an empty transcript means the CLI is thinking, while a frozen object
+    // count means it is wedged, and those want opposite responses.
     let lastObjectAt = Date.now()
+    let lastVisibleAt = Date.now()
     let objectCount = 0
+    const say = (o) => {
+      lastVisibleAt = Date.now()
+      emit?.(o)
+    }
     const idleTimer = setInterval(() => {
-      const idleS = Math.round((Date.now() - lastObjectAt) / 1000)
-      if (idleS < ARCHITECT_IDLE_NOTICE_S) return
+      const quietS = Math.round((Date.now() - lastVisibleAt) / 1000)
+      if (quietS < ARCHITECT_IDLE_NOTICE_S) return
+      const objAgoS = Math.round((Date.now() - lastObjectAt) / 1000)
+      const alive =
+        objAgoS <= ARCHITECT_IDLE_NOTICE_S
+          ? `the CLI is alive and streaming (${objectCount} objects, last ${objAgoS}s ago) — it is thinking, not stuck`
+          : `the CLI has produced NOTHING for ${objAgoS}s (${objectCount} objects total) — it may be wedged`
+      lastVisibleAt = Date.now()
       emit?.({
         type: "message-annotation",
         subtype: "status",
-        thought:
-          `⏳${stage ? ` ${stage}` : ""} still running — ${idleS}s since the CLI last produced output ` +
-          `(${objectCount} message(s) so far). Nothing is capped here; the run deadline is the only bound.`,
+        thought: `⏳${stage ? ` ${stage}` : ""} ${quietS}s with nothing to show: ${alive}. Nothing is capped here; the run deadline is the only bound.`,
       })
     }, ARCHITECT_IDLE_NOTICE_S * 1000)
     idleTimer.unref?.()
@@ -2737,7 +2755,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
                 if (verifyTextIsSyntaxError(t) && isRealProofScript(verifyCalls.get(c.tool_use_id))) {
                   grantSearch(governor, "verify syntax error")
                   if (emit)
-                    emit({
+                    say({
                       type: "message-annotation",
                       subtype: "status",
                       thought: `${stage ? stage + " " : ""}🔎 Compiler flagged an unknown name — search budget +${GOV_GRANT} (now ${governor.budget}).`,
@@ -2789,7 +2807,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
       if (governor.searchCount)
-        emit?.({
+        say({
           type: "message-annotation",
           subtype: "status",
           thought: `${stage ? stage + " " : ""}🔎 Search used ${governor.searchCount}× (${governor.blockedCount} blocked, ${governor.grantCount} refills).`,
