@@ -290,6 +290,27 @@ ok(
 ok("non-lemma nodes are passed through unannotated", M.architectAnnotate([{ name: "d", kind: "def", declText: "def d : Nat := 7" }], new Map(), new Map()) === "def d : Nat := 7")
 
 // ---------------------------------------------------------------------------
+console.log("\n== target pre-flight is advisory (source invariant) ==")
+// ---------------------------------------------------------------------------
+// Source invariant, not a unit test — the pre-flight lives inside
+// proveArchitect. It is pinned because the first cut was FATAL on any Lean
+// error, which contradicted the other half of the same feature: supporting
+// declarations exist so a target that does not elaborate alone can be made to.
+// insane_lamp_circle needs an `instance : NeZero N`; the fatal gate rejected
+// the problem one second in, before the model was ever asked to supply it.
+{
+  const src = readFileSync(bridgePath(), "utf8")
+  const start = src.indexOf("Pre-flight: does the TARGET elaborate")
+  ok("pre-flight block is present", start > 0)
+  const block = src.slice(start, start + 2600)
+  ok("pre-flight never aborts the run", !/return \{ verified: false/.test(block))
+  ok("pre-flight builds a note for the blueprint stage", /targetPreflightNote\s*=/.test(block))
+  ok("the note tells the model to write it WITHOUT @[blueprint]", /WITHOUT an .{0,3}@\[blueprint\]/.test(block))
+  ok("the note actually reaches the blueprint user prompt",
+     /const bpUser = [\s\S]{0,400}\$\{targetPreflightNote\}/.test(src))
+}
+
+// ---------------------------------------------------------------------------
 console.log("\n== blueprint capture guard (source invariant) ==")
 // ---------------------------------------------------------------------------
 // Not a unit test — the capture lives inside architectBlueprintStage's closure

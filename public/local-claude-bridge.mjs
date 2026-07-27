@@ -5784,37 +5784,47 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.metrics.driver = driver
   }
 
-  // ---- Pre-flight: the TARGET itself must elaborate ------------------------
-  // Nothing downstream can succeed if the goal does not typecheck, and the
-  // blueprint stage cannot tell the difference between "my graph is wrong" and
-  // "the target is unusable" — every attempt fails on the same Lean error, and
-  // with retries effectively unbounded it re-attempts until the clock or the
-  // cost cap ends the run. `insane_lamp_circle` burned its whole budget on
-  //     failed to synthesize instance of type class Fintype (ZMod N)
-  // and never emitted a single iteration marker, because an iteration is only
-  // announced once a graph validates.
+  // ---- Pre-flight: does the TARGET elaborate on its own? -------------------
+  // ADVISORY, never fatal. The first cut of this killed the run outright on any
+  // Lean error, which was wrong: supporting declarations exist precisely so a
+  // target that does NOT elaborate alone can be made to. `insane_lamp_circle`
+  // needs an `instance : NeZero N` before `Fintype (ZMod N)` exists — a
+  // blueprint can supply that, and the fatal gate rejected the problem one
+  // second in, before the model was ever asked. Killing a run on the exact
+  // condition the other half of the feature was built to repair.
   //
-  // Five seconds here converts that into a legible failure. This is NOT a cap
-  // on the prover: it rejects an input that provably cannot be proved, and it
-  // is fatal ONLY on real Lean errors. A backend fault, a timeout or a cold
-  // service warns and proceeds, so an infrastructure hiccup can never cost a
-  // runnable problem.
+  // What the check is actually for is the SILENCE: the blueprint stage cannot
+  // distinguish "my graph is wrong" from "the target needs an instance", so it
+  // re-attempted the same failure until the budget ran out and never announced
+  // an iteration. So: surface the error at second one, and hand it to the
+  // blueprint stage as its first task. The model can then fix it, and if it
+  // truly cannot, the failure is at least legible from the transcript.
+  let targetPreflightNote = ""
   try {
     const pre = await architectMcpCall(urls.xii, "lean_compile", {
       mode: "explore",
       code: `${state.targetSignature.trim()} := by sorry`,
     }, Number(NODE_TIMEOUT_MS))
     if (Array.isArray(pre?.errors) && pre.errors.length) {
+      const detail = String(pre.report || "").slice(0, 1200)
       ctx.emit({
         type: "message-annotation",
-        subtype: "error",
+        subtype: "status",
         thought:
-          `🚫 The target theorem does not elaborate — stopping before the blueprint stage.\n` +
-          `Nothing can be proved about a statement Lean cannot typecheck, and every blueprint ` +
-          `attempt would fail on this same error until the run's budget ran out.\n\n` +
-          String(pre.report || "").slice(0, 1200),
+          `🔎 The target does not elaborate on its own — the blueprint must supply what it needs ` +
+          `(an \`instance\`, a helper \`def\`) as a supporting declaration, i.e. WITHOUT an ` +
+          `\`@[blueprint]\` attribute. Handing this to the blueprint stage:\n\n${detail}`,
       })
-      return { verified: false, proof: "" }
+      targetPreflightNote =
+        `\n\n## The target does not elaborate on its own — fix this FIRST\n` +
+        `Compiling the targeted theorem by itself, with no other declarations, Lean reports:\n\n` +
+        `${detail}\n\n` +
+        `Your blueprint must therefore open with whatever declarations the signature needs in order ` +
+        `to typecheck at all — typically an \`instance\`. Write them WITHOUT an \`@[blueprint]\` ` +
+        `attribute so they are supporting declarations rather than graph nodes: they then need no ` +
+        `\`statement\` field, they are exempt from the reachability check, and they are carried into ` +
+        `every node prover and into the final assembled file. Until the file compiles, no graph you ` +
+        `write can be validated.`
     }
   } catch (e) {
     ctx.emit({
@@ -5853,7 +5863,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${nlText.slice(0, 8000)}`
     : ""
   if (ctx.metrics) ctx.metrics.nl_seed_used = !!nlSeed
-  const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${nlSeed}`
+  const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${nlSeed}${targetPreflightNote}`
 
   let admitted = await architectAdmitBlueprint(ctx, state, urls, {
     system: architectBlueprintSystem(),
