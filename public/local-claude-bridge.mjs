@@ -5653,7 +5653,11 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
           target_signature: state.targetSignature,
         }, Number(BLUEPRINT_TIMEOUT_MS))
         lastReport = String(r.report || "").slice(0, 1200)
-        if (r.ok) {
+        // `ok` alone is not enough to end the stage: an exploration compile also
+        // reports ok (it means "Lean found no errors") and carries no graph.
+        // Capturing that finished the blueprint stage on a bare `#eval` and the
+        // run died downstream on `bp.graph is not iterable`. Require the graph.
+        if (r.ok && Array.isArray(r.graph)) {
           captured = { graph: r.graph, code: String(args.code || "") }
           return { report: r.report, __done: captured }
         }

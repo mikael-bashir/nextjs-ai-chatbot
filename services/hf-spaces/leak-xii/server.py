@@ -157,6 +157,12 @@ async def _compile_blueprint(code: str, target_name: str, target_signature: str)
     # guessed the constant instead of checking it.
     if bp.is_exploration_only(code):
         r = await _compile_explore(code)
+        # `ok` is the blueprint stage's ACCEPTANCE signal — the bridge reads it as
+        # "a validated graph is attached" and finishes the stage. _compile_explore
+        # sets ok=True to mean "Lean reported no errors", which is a different
+        # claim and carries no `graph`. Leaving it True ended the blueprint stage
+        # on a bare #eval and crashed the run with `bp.graph is not iterable`.
+        r["ok"] = False
         r["report"] = ("[exploration compile — no blueprint submitted, nothing validated; "
                        "resubmit the full annotated graph to finish]\n" + r.get("report", ""))
         return r

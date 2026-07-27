@@ -290,6 +290,25 @@ ok(
 ok("non-lemma nodes are passed through unannotated", M.architectAnnotate([{ name: "d", kind: "def", declText: "def d : Nat := 7" }], new Map(), new Map()) === "def d : Nat := 7")
 
 // ---------------------------------------------------------------------------
+console.log("\n== blueprint capture guard (source invariant) ==")
+// ---------------------------------------------------------------------------
+// Not a unit test — the capture lives inside architectBlueprintStage's closure
+// and cannot be extracted. But the invariant is worth pinning: an exploration
+// compile ALSO reports ok (it means "Lean found no errors") and carries no
+// graph. Capturing on `ok` alone ended the blueprint stage on a bare `#eval`
+// and killed the run with `bp.graph is not iterable`. Live on
+// ferris_wheel_colorings, minutes after the #eval hatch shipped.
+{
+  const src = readFileSync(bridgePath(), "utf8")
+  const captures = [...src.matchAll(/captured = \{ graph:/g)]
+  ok("blueprint graph is captured in exactly one place", captures.length === 1, `${captures.length}`)
+  for (const m of captures) {
+    const before = src.slice(Math.max(0, m.index - 300), m.index)
+    ok("capture is gated on an actual array graph, not on ok alone", /Array\.isArray\(r\.graph\)/.test(before))
+  }
+}
+
+// ---------------------------------------------------------------------------
 console.log("\n== architectAssemble ==")
 // ---------------------------------------------------------------------------
 const asmGraph = [
