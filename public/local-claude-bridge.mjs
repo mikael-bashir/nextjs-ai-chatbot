@@ -4631,24 +4631,28 @@ function architectAssemble(graph, prelude, proofs) {
   return parts.join("\n")
 }
 
-// --- Hallucinated-name forcing nudge -----------------------------------------
+// --- Hallucinated-name enforcement --------------------------------------------
 // Grok's failure mode here is the mirror of Claude's on Stronghold/Ultra:
-// Claude over-searches (hence the rationed search budget on that path), Grok
-// under-searches and instead guesses plausible-sounding Mathlib names that
-// don't exist ("Nat.modEq_of_coprime_three", "Nat.ModEq.exists_mul_add", ...),
-// burning a whole attempt on invented API surface instead of one real lookup.
-// Observed live: 8+ consecutive "Unknown constant/identifier" errors on one
-// node before it searched again. This forces the issue: once a lean_compile
-// reply cites an unknown name ARCHITECT_HALLUCINATION_STREAK times in a row
-// with no mathlib_search in between, the next tool result carries a directive
-// to search before compiling again. No search-call rationing (Grok's problem
-// is the opposite of Claude's) -- just a nudge, same mechanism as the
-// existing "reply had no tool call" steer in grokLoop.
-const ARCHITECT_HALLUCINATION_STREAK = 2
+// Claude over-searches (hence governedSearchCall's rationed search budget,
+// which BLOCKS the tool call once budget hits 0 rather than merely asking
+// nicely), Grok under-searches and instead guesses plausible-sounding Mathlib
+// names that don't exist ("Nat.modEq_of_coprime_three",
+// "Nat.ModEq.exists_mul_add", ...), burning a whole turn on invented API
+// surface instead of one real lookup. Observed live: 8+ consecutive "Unknown
+// constant/identifier" errors on one node before it searched again.
+//
+// Same enforcement shape as governedSearchCall, mirrored: gate the ACTION
+// itself, not just the text around it. Once lean_compile has replied with an
+// unknown-name error ARCHITECT_HALLUCINATION_LOCK times in a row with no
+// mathlib_search in between, lean_compile is LOCKED -- the next call is
+// refused outright (architectMcpCall never runs) until a mathlib_search call
+// resets the streak. This is a hard gate, not a prompt nudge: the model
+// cannot get a real compile result while locked, exactly like a Grok-driven
+// search call cannot go through once governedSearchCall's budget is spent.
+const ARCHITECT_HALLUCINATION_LOCK = 3
 const UNKNOWN_NAME_RE = /unknown (constant|identifier)/i
-function architectHallucinationNudge(report, streakCount) {
-  if (streakCount < ARCHITECT_HALLUCINATION_STREAK) return report
-  return `${report}\n\n⚠️ That's ${streakCount} compile errors in a row citing an unknown Mathlib name — you're guessing lemma names instead of looking them up, and every guess costs a full turn. STOP guessing. Call mathlib_search now with a specific, narrow query for the exact fact you need before your next lean_compile attempt.`
+function architectHallucinationBlockedReport(streakCount) {
+  return `🛑 lean_compile is LOCKED — that's ${streakCount} compile errors in a row citing an unknown Mathlib name, with no search in between. You are guessing lemma names instead of looking them up. This call was refused (no compile ran). Call mathlib_search now with a specific, narrow query for the exact fact you need -- lean_compile unlocks the instant you do.`
 }
 
 // --- Node prover (fresh, isolated conversation per attempt) -----------------
@@ -4710,6 +4714,8 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
         return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
       }
       if (name === "lean_compile") {
+        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
+          return { report: architectHallucinationBlockedReport(hallucinationStreak) }
         const r = await architectMcpCall(urls.xii, "lean_compile", {
           mode: "node",
           code: String(args.code || ""),
@@ -4730,9 +4736,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
         // state.ledger is null for the control).
         ledgerHarvest(state.ledger, r.report, node.name)
         hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
-        const report = architectHallucinationNudge(r.report, hallucinationStreak)
-        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_STREAK) hallucinationStreak = 0
-        return { report }
+        return { report: r.report }
       }
       return { report: `unknown tool ${name}` }
     }
@@ -4776,6 +4780,8 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
         return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
       }
       if (name === "lean_compile") {
+        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
+          return { report: architectHallucinationBlockedReport(hallucinationStreak) }
         const r = await architectMcpCall(urls.xii, "lean_compile", {
           mode: "blueprint",
           code: String(args.code || ""),
@@ -4788,9 +4794,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
           return { report: r.report, __done: captured }
         }
         hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
-        const report = architectHallucinationNudge(r.report, hallucinationStreak)
-        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_STREAK) hallucinationStreak = 0
-        return { report }
+        return { report: r.report }
       }
       return { report: `unknown tool ${name}` }
     }
