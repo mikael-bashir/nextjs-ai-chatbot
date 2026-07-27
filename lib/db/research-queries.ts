@@ -276,6 +276,14 @@ export async function listRiverRuns(limit = 500): Promise<Record<string, unknown
   return rows;
 }
 
+// Row-level cleanup for bad data (e.g. rows recorded by a bridge build with a
+// since-fixed contamination bug). Deletes are permanent — the UI confirms.
+export async function deleteRiverRun(id: string): Promise<boolean> {
+  await ensureTables();
+  const { rowCount } = await sql`DELETE FROM leak_river_runs WHERE id = ${id};`;
+  return (rowCount ?? 0) > 0;
+}
+
 // ── Leak Ultra ───────────────────────────────────────────────────────────────
 export interface UltraRunInput {
   generatedItemId?: string | null;
@@ -352,6 +360,12 @@ export async function listUltraRuns(
   return rows;
 }
 
+export async function deleteUltraRun(id: string): Promise<boolean> {
+  await ensureTables();
+  const { rowCount } = await sql`DELETE FROM leak_ultra_runs WHERE id = ${id};`;
+  return (rowCount ?? 0) > 0;
+}
+
 export interface StrongholdRunInput {
   generatedItemId?: string | null;
   problemTitle?: string | null;
@@ -414,6 +428,12 @@ export async function listStrongholdRuns(
     SELECT * FROM leak_stronghold_runs ORDER BY created_at DESC LIMIT ${limit};
   `;
   return rows;
+}
+
+export async function deleteStrongholdRun(id: string): Promise<boolean> {
+  await ensureTables();
+  const { rowCount } = await sql`DELETE FROM leak_stronghold_runs WHERE id = ${id};`;
+  return (rowCount ?? 0) > 0;
 }
 
 // Minimal CSV serializer (no external dep): comma-separated, double-quote

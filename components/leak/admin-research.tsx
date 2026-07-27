@@ -7,6 +7,7 @@ import {
   ShieldCheck,
   ShieldAlert,
   Skull,
+  Trash2,
 } from 'lucide-react';
 
 interface RiverRow {
@@ -178,6 +179,7 @@ function ResearchTable<T extends { id: string; created_at: string }>({
 }) {
   const [rows, setRows] = useState<T[]>([]);
   const [loading, setLoading] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -192,6 +194,27 @@ function ResearchTable<T extends { id: string; created_at: string }>({
   useEffect(() => {
     load();
   }, [load]);
+
+  const handleDelete = useCallback(
+    async (id: string, label: string) => {
+      if (!confirm(`Delete this row permanently?\n\n${label}`)) return;
+      setDeletingId(id);
+      try {
+        const res = await fetch(`${endpoint}?id=${encodeURIComponent(id)}`, {
+          method: 'DELETE',
+        });
+        if (res.ok) {
+          setRows((prev) => prev.filter((r) => r.id !== id));
+        } else {
+          const body = await res.json().catch(() => ({}));
+          alert(`Delete failed: ${body.error ?? res.status}`);
+        }
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [endpoint],
+  );
 
   return (
     <div className="rounded-lg border bg-card">
@@ -259,6 +282,20 @@ function ResearchTable<T extends { id: string; created_at: string }>({
                   <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground/70">
                     {new Date(r.created_at).toLocaleString()}
                   </span>
+                  <button
+                    type="button"
+                    disabled={deletingId === r.id}
+                    onClick={() =>
+                      handleDelete(
+                        r.id,
+                        row.theorem_name || row.problem_title || r.id,
+                      )
+                    }
+                    title="Delete this row permanently"
+                    className="shrink-0 rounded p-0.5 text-muted-foreground/60 hover:bg-rose-500/10 hover:text-rose-500 disabled:opacity-40"
+                  >
+                    <Trash2 className="size-3" />
+                  </button>
                 </div>
                 <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[10px] text-muted-foreground">
                   <span title="Actual dollar cost">
