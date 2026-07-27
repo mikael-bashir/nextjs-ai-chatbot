@@ -419,6 +419,39 @@ def parse_decl(chunk: str, span: tuple[int, int]) -> Node | None:
 
 
 # ---------------------------------------------------------------------------
+# Exploration escape hatch for the blueprint/refinement stages
+# ---------------------------------------------------------------------------
+
+INFO_CMD_RE = re.compile(r"^\s*(#eval|#check|#print|#reduce|example\b)", re.M)
+
+
+def is_exploration_only(code: str) -> bool:
+    """True when a submission is a scratch computation rather than a blueprint.
+
+    Both the generation and refinement prompts tell the model that a concrete
+    number must be CHECKED, not recalled, and that the way to check it is a
+    bare `#eval` with no import line. That instruction was a lie in blueprint
+    mode: every submission went through `precheck_blueprint`, so `#eval
+    (Nat.factorial 2026).factorization 2` came back as "missing import
+    Mathlib / missing import Architect / missing main theorem". Observed live
+    on `factorial_base12_trailing_zeros`: the generator tried twice, gave up,
+    and guessed 2023 and 1009 -- both wrong, both disproved by node provers,
+    costing the first two refinement iterations outright.
+
+    So a submission that declares nothing and only asks the compiler a
+    question is routed to the exploration path instead, exactly as node mode
+    already does. A malformed blueprint still fails the pre-checks: the
+    escape hatch requires an actual info command AND no parsed declaration,
+    so a broken declaration is reported as a broken declaration.
+    """
+    src = code or ""
+    if not INFO_CMD_RE.search(strip_comments(src)):
+        return False
+    chunks, spans = split_decls(src)
+    return not any(parse_decl(c, s) for c, s in zip(chunks, spans))
+
+
+# ---------------------------------------------------------------------------
 # Safeguard pre-checks (before Lean is invoked)  — Appendix C.1
 # ---------------------------------------------------------------------------
 

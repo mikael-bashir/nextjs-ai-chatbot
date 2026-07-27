@@ -152,6 +152,15 @@ def _fmt_errors(errs: list[dict], limit: int = 30) -> str:
 
 
 async def _compile_blueprint(code: str, target_name: str, target_signature: str) -> dict:
+    # --- Phase 0: a scratch computation is not a blueprint. Both stage prompts
+    # promise a bare `#eval` works here; without this it did not, and the model
+    # guessed the constant instead of checking it.
+    if bp.is_exploration_only(code):
+        r = await _compile_explore(code)
+        r["report"] = ("[exploration compile — no blueprint submitted, nothing validated; "
+                       "resubmit the full annotated graph to finish]\n" + r.get("report", ""))
+        return r
+
     # --- Phase 1: structural pre-checks (file never reaches Lean on failure).
     violations = bp.precheck_blueprint(code, target_name, target_signature)
     if violations:

@@ -239,6 +239,31 @@ n = parse_one(node("main_t", deps="a, a, b"))
 check("deps de-duplicated", n.deps, ["a", "b"])
 
 # ---------------------------------------------------------------------------
+print("\n== is_exploration_only (the #eval escape hatch) ==")
+# ---------------------------------------------------------------------------
+# Both stage prompts tell the model to CHECK a constant with a bare `#eval`.
+# In blueprint mode that submission used to hit precheck_blueprint and come
+# back as "missing import Mathlib / missing import Architect / missing main
+# theorem". Live consequence on `factorial_base12_trailing_zeros`: the
+# generator tried twice, gave up, and guessed 2023 and 1009 — both wrong, both
+# disproved by node provers, two refinement iterations burned.
+ok("the exact submission that was rejected live",
+   bp.is_exploration_only("#eval (Nat.factorial 2026).factorization 2\n#eval Nat.digits 3 2026"))
+ok("#check", bp.is_exploration_only("#check padicValNat.mul"))
+ok("example with no blueprint decl", bp.is_exploration_only("example : 1 = 1 := by rfl\n#eval 2+2"))
+ok("a real blueprint is NOT exploration",
+   not bp.is_exploration_only(bpfile(node("main_t"))))
+ok("a blueprint that also evals is still a blueprint",
+   not bp.is_exploration_only(bpfile(node("main_t")) + "\n#eval 1"))
+# The escape hatch must not swallow a broken blueprint: no info command means
+# it still goes through the pre-checks and gets a structural error.
+ok("malformed decl with no info command still prechecked",
+   not bp.is_exploration_only("theorem broken : True :="))
+ok("#eval inside a comment does not count",
+   not bp.is_exploration_only("-- #eval 1\ntheorem t : True := by trivial"))
+ok("empty input", not bp.is_exploration_only(""))
+
+# ---------------------------------------------------------------------------
 print()
 if FAILS:
     print(f"{len(FAILS)} FAILING: {', '.join(FAILS)}")
