@@ -1493,21 +1493,15 @@ export function AdminPipeline() {
           const seed = resumeSeedRef.current[item.id];
           delete resumeSeedRef.current[item.id];
           seedUsed = !!seed;
-          // Architect strategy: seed blueprint generation with the item's own
-          // natural-language solution material (the paper's §4.2 NL guidance —
-          // "on these problems natural-language guidance is decisive"). The
-          // generator already produced the informal argument; hand it over.
-          const nlProof =
-            isArchitectStrategy(verifyStrategyRef.current)
-              ? [
-                  item.problem ? `Problem: ${item.problem}` : '',
-                  typeof item.answer === 'number' ? `Answer: ${item.answer}` : '',
-                  item.insight ? `Key idea / solution sketch: ${item.insight}` : '',
-                ]
-                  .filter(Boolean)
-                  .join('\n\n') || undefined
-              : undefined;
-          nlSeedUsed = !!nlProof;
+          // NL guidance is NOT injected here. This used to hand every architect
+          // run the item's own problem statement, answer and solution sketch,
+          // which wrecked the whole comparison: Stone stopped being a control,
+          // and Delta's local Sonnet seed never fired (the bridge only generates
+          // one when none was supplied), so Delta was silently identical to Gate.
+          // Whether a variant gets an informal proof — and where it comes from —
+          // is now decided solely by the variant (see architectConfigFor).
+          const nlProof = undefined;
+          nlSeedUsed = false;
           // Mirrors proveStream's own decompose check exactly (a resumed seed
           // always runs the tree path, even with the toggle off).
           computeBudgetMsAtStart = verifyDecomposeRef.current || seedUsed

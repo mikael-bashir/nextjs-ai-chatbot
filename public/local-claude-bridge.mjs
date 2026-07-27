@@ -4863,10 +4863,26 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${driver === "claude" ? "claude CLI" : "grok API"}:${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}\n   toolchain=${TOOLCHAINS.architect.lean} · Mathlib ${TOOLCHAINS.architect.mathlib} (${TOOLCHAINS.architect.group})`,
   })
 
-  // NL guidance: river-delta generates it locally with Sonnet 5; any variant will
-  // use one handed in by the caller (opts.nlProof) if present.
-  let nlText = typeof opts.nlProof === "string" && opts.nlProof.trim() ? opts.nlProof.trim() : ""
-  if (variant.nlSeedLocal && !nlText) nlText = await architectNlSeed(theorem, ctx, state)
+  // NL guidance is a VARIANT property, not a caller option. Honouring a supplied
+  // nlProof on stone/gate would silently hand the "control" a natural-language
+  // solution the paper's pipeline never sees — which is exactly what the ACG
+  // pipeline was doing, making Stone not a control and leaving Delta's local seed
+  // dead code (nlText was always pre-filled, so architectNlSeed never ran).
+  // Variants without nlSeedLocal now ignore opts.nlProof outright, so no caller
+  // can contaminate the control by accident.
+  let nlText = ""
+  if (variant.nlSeedLocal) {
+    nlText = typeof opts.nlProof === "string" && opts.nlProof.trim() ? opts.nlProof.trim() : ""
+    // river-delta's defining intervention: when no informal proof was handed in,
+    // generate one locally with Sonnet from the SIGNATURE ALONE.
+    if (!nlText) nlText = await architectNlSeed(theorem, ctx, state)
+  } else if (typeof opts.nlProof === "string" && opts.nlProof.trim()) {
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🚫 Ignoring the caller's natural-language proof — ${pickStrategy(ctx.strategy).label.split("—")[0].trim()} runs without NL guidance by design.`,
+    })
+  }
   const nlSeed = nlText
     ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${nlText.slice(0, 8000)}`
     : ""
@@ -4933,7 +4949,11 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.metrics.blueprint_iterations = iter + 1
     ctx.metrics.max_iters = maxIters()
     ctx.metrics.nodes_total = provable.length
-    ctx.metrics.nodes_solved = proofs.size
+    // Count solves WITHIN the current graph. `proofs` is keyed by node name and
+    // deliberately carries entries across refinements (proof reuse), including
+    // nodes a later blueprint dropped — so proofs.size could exceed the node
+    // count and print nonsense like "nodes 9/4".
+    ctx.metrics.nodes_solved = provable.filter((n) => proofs.has(n.name)).length
     ctx.metrics.nodes_negated = Array.from(results.values()).filter((r) => r.negated).length
     ctx.metrics.nodes_forfeited = Array.from(results.values()).filter((r) => !r.solved && !r.negated).length
     // Gate/delta only: how many dead-end facts were injected into node prompts,
