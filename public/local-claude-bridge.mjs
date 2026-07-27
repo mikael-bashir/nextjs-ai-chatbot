@@ -3866,6 +3866,8 @@ Submit these WITHOUT an \`import\` line — the compile environment already has 
 
 A guessed number is the most expensive mistake available to you: it sends every downstream node prover after a false lemma, and the whole refinement iteration that follows is spent undoing it. Two \`#eval\` calls now are cheaper than one wasted iteration.
 
+Be aware that a compiling blueprint is not an accepted one. Compiling proves your nodes are well-TYPED; it says nothing about whether they are TRUE, because \`sorry_using\` accepts any well-typed statement. After validation, every node of yours with no binders is put to the compiler as \`example : ¬ (conclusion) := by ...\`, and if Lean proves that negation the whole blueprint is rejected and you are asked again, with the counterexample. So check your closed statements yourself before you emit them.
+
 Every natural language \`statement\` field is a closed, typed, standalone proposition: every variable carries an explicit quantifier and domain; every hypothesis the proof uses appears as a premise. Do not reach into ambient context -- restate every theorem-level typing and hypothesis your lemma uses. Every natural language \`proof\` field is a complete sketch citing each declared dep by backticked name (e.g. "by \`lemma_a\`", "from \`def_b\`"); show every key equation, and do not write "by algebra", "obviously", or "one can check".
 
 ## Mapping graph nodes to Lean declarations
@@ -4891,7 +4893,7 @@ function architectSplitSig(signature) {
 // Try to REFUTE a closed proposition with the compiler. Returns true only on a
 // compiler-corroborated refutation; every other outcome (including "the tactic
 // gave up") returns false, so uncertainty never reads as falsity.
-async function architectRefute(concl, prefix, prelude, urls, ctx) {
+async function architectRefute(concl, prefix, prelude, urls, ctx, timeoutMs = NODE_TIMEOUT_MS) {
   if (!concl || !urls.xii) return false
   try {
     const r = await architectMcpCall(
@@ -4905,12 +4907,114 @@ async function architectRefute(concl, prefix, prelude, urls, ctx) {
         prefix,
         prelude,
       },
-      Number(NODE_TIMEOUT_MS),
+      Number(timeoutMs),
     )
     return !!r.ok && !(r.errors || []).length
   } catch {
     return false
   }
+}
+
+// --- Blueprint admission: compiling is not the same as true -----------------
+// The paper's blueprint gate (§2.1) certifies that the file "parses, every node
+// is well-typed, and the graph is well-formed". None of that is a claim about
+// TRUTH. `sorry_using` is `sorry` carrying dependency metadata, so a well-typed
+// false lemma sails through, and so does a graph whose parents do not entail
+// their child. On factorial_base12_trailing_zeros the very first blueprint
+// asserted v₂(2026!) = 2023 and v₃(2026!) = 1011 — both wrong — and Leak XII
+// answered "Compilation SUCCESSFUL. Validation SUCCESSFUL." Three node provers
+// were then dispatched at false lemmas, and a whole refinement iteration went
+// on discovering what one `native_decide` settles in seconds.
+//
+// Entailment is undecidable in general (checking that the parents suffice IS
+// the proving problem, which is why the paper defers it to the node prover).
+// Falsity of a CLOSED statement is not: it is one compile. So sweep every
+// binder-free node before the blueprint is admitted. This is only affordable
+// now that `native_decide` is permitted and the resource floor is raised —
+// `decide` alone cannot touch anything factorial-sized.
+const ARCHITECT_SANITY_TIMEOUT_MS = Number(process.env.ARCHITECT_SANITY_TIMEOUT_MS || 90000)
+const ARCHITECT_SANITY_MAX_NODES = Number(process.env.ARCHITECT_SANITY_MAX_NODES || 14)
+const ARCHITECT_SANITY_ROUNDS = Number(process.env.ARCHITECT_SANITY_ROUNDS || 3)
+
+async function architectBlueprintSanity(bp, prelude, urls, ctx, targetName) {
+  const out = { refuted: [], targetRefuted: false, checked: 0 }
+  if (!urls.xii) return out
+  const closed = []
+  for (const n of bp.graph) {
+    if (!["lemma", "theorem"].includes(n.kind)) continue
+    const split = architectSplitSig(n.signature)
+    if (split && !split.binders) closed.push({ node: n, concl: split.concl })
+  }
+  const batch = closed.slice(0, ARCHITECT_SANITY_MAX_NODES)
+  if (!batch.length) return out
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔎 Blueprint sanity: testing ${batch.length} closed node statement(s) for refutation before dispatching any prover.` })
+  let cur = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(ARCHITECT_NODE_CONCURRENCY, batch.length)) }, async () => {
+    while (cur < batch.length) {
+      const { node, concl } = batch[cur++]
+      if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return
+      out.checked++
+      // The node's own prefix: earlier defs real, earlier lemmas sorried — the
+      // same context the node prover would see, so a statement mentioning a
+      // blueprint definition still elaborates.
+      const prefix = architectNodePrefix(bp.graph, node.name)
+      if (await architectRefute(concl, prefix, prelude, urls, ctx, ARCHITECT_SANITY_TIMEOUT_MS)) {
+        if (node.name === targetName) out.targetRefuted = true
+        else out.refuted.push({ name: node.name, signature: node.signature.trim(), concl })
+      }
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+// Generate (or refine) a blueprint, then admit it only if no closed node in it
+// is machine-refutable. A refuted node means the graph is KNOWN wrong, so the
+// stage is re-run with the counterexamples as context rather than sending
+// provers after statements the compiler has already disproved.
+async function architectAdmitBlueprint(ctx, state, urls, { system, user, retries, stageLabel }) {
+  let extra = ""
+  let last = null
+  for (let round = 0; round < Math.max(1, ARCHITECT_SANITY_ROUNDS); round++) {
+    const bp = await architectBlueprintStage(ctx, state, urls, {
+      system,
+      user: user + extra,
+      retries,
+      stageLabel: round ? `${stageLabel} · regenerate ${round}` : stageLabel,
+    })
+    if (!bp) return last ? { bp: last, refuted: [] } : null
+    last = bp
+    const sanity = await architectBlueprintSanity(bp, architectPrelude(bp.code), urls, ctx, state.targetName)
+    if (sanity.targetRefuted) {
+      // The TARGET itself is false. Regenerating cannot help — its signature is
+      // immutable — and the honest outcome is a disproof, not a proof.
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "error",
+        thought: `🧨 The TARGET theorem is machine-refutable — the problem statement itself is false. No blueprint can prove it; the correct outcome here is a disproof of the target.`,
+      })
+      return { bp, refuted: sanity.refuted }
+    }
+    if (!sanity.refuted.length) {
+      if (sanity.checked)
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✔️ Blueprint sanity: ${sanity.checked} closed statement(s) checked, none refutable — admitted.` })
+      return { bp, refuted: [] }
+    }
+    const list = sanity.refuted.map((r) => `- \`${r.signature}\`\n  The compiler proves \`¬ (${r.concl})\`. This statement is FALSE.`).join("\n")
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `🧨 Blueprint REJECTED: ${sanity.refuted.length} node statement(s) machine-refuted (${sanity.refuted.map((r) => r.name).join(", ")}). Regenerating with the counterexamples (round ${round + 1}/${ARCHITECT_SANITY_ROUNDS}).`,
+    })
+    if (round + 1 >= ARCHITECT_SANITY_ROUNDS) {
+      // Out of regeneration rounds. Admit it rather than failing the run, but
+      // hand the refuted set back so those nodes are pre-marked DISPROVED and
+      // no prover is spent rediscovering what the compiler already showed.
+      return { bp, refuted: sanity.refuted }
+    }
+    extra = `\n\n## Statements the compiler REFUTED in your previous graph — do not re-emit them\nEach of these was emitted as a node, and Lean proved its negation. They are false, not merely unproved. Recompute any number they contain before writing a replacement — \`lean_compile\` returns \`#eval\` output, so \`#eval <term>\` (no \`import\` line) gives you the true value.\n\n${list}`
+  }
+  return last ? { bp: last, refuted: [] } : null
 }
 
 function architectDiagnosticSystem() {
@@ -5546,16 +5650,22 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   if (ctx.metrics) ctx.metrics.nl_seed_used = !!nlSeed
   const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${nlSeed}`
 
-  let bp = await architectBlueprintStage(ctx, state, urls, {
+  let admitted = await architectAdmitBlueprint(ctx, state, urls, {
     system: architectBlueprintSystem(),
     user: bpUser,
     retries: ARCHITECT_BLUEPRINT_RETRIES,
     stageLabel: "blueprint generation",
   })
-  if (!bp) {
+  if (!admitted) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: no compiling blueprint within the retry budget." })
     return { verified: false, proof: "" }
   }
+  let bp = admitted.bp
+  // Nodes the compiler refuted at admission time. They are skipped by the
+  // prover pool and handed to refinement as DISPROVED with a real witness —
+  // spending a fresh isolated prover on a statement Lean has already
+  // disproved is pure waste (three of them, in the run that motivated this).
+  let preRefuted = new Set(admitted.refuted.map((r) => r.name))
 
   const proofs = new Map() // name -> proof body ("by ...") for solved nodes
   const sigOfProof = new Map() // name -> signatureNorm at solve time
@@ -5597,11 +5707,30 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         depsOfProof.delete(n.name)
       }
     }
-    const todo = provable.filter((n) => !proofs.has(n.name))
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Blueprint iteration ${iter}: ${graph.length} nodes (${provable.length} provable, ${todo.length} open, ${proofs.size} carried forward).` })
+    const todo = provable.filter((n) => !proofs.has(n.name) && !preRefuted.has(n.name))
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Blueprint iteration ${iter}: ${graph.length} nodes (${provable.length} provable, ${todo.length} open, ${proofs.size} carried forward${preRefuted.size ? `, ${preRefuted.size} pre-refuted — not dispatched` : ""}).` })
 
     // ---- Theorem proving: isolated node conversations, capped parallel pool.
     const results = new Map()
+    // Statements the compiler refuted at blueprint-admission time need no
+    // prover: the disproof already exists. Seed them as machine-witnessed
+    // failures so classification sees DISPROVED and refinement gets the truth.
+    for (const n of provable) {
+      if (!preRefuted.has(n.name) || proofs.has(n.name)) continue
+      results.set(n.name, {
+        solved: false,
+        negated: true,
+        harnessLimit: false,
+        lastError: "",
+        parentsRendered: "",
+        forfeit: {
+          diagnosis: "STATEMENT_WRONG",
+          analysis: "Refuted by the compiler during blueprint admission, before any prover was dispatched: Lean proved the negation of this statement.",
+          fix: "",
+        },
+      })
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${n.name}⟫ pre-refuted at blueprint admission — no prover dispatched.` })
+    }
     let cursor = 0
     const workers = Array.from({ length: Math.max(1, Math.min(ARCHITECT_NODE_CONCURRENCY, todo.length)) }, async () => {
       while (cursor < todo.length) {
@@ -5804,7 +5933,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters()}: ${stillUnsolved.length} unsolved node(s)${classSummary ? ` (${classSummary})` : ""} — rewriting the graph around the failures.` })
     const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
     const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks, verdicts)}`
-    const refined = await architectBlueprintStage(ctx, state, urls, {
+    const refined = await architectAdmitBlueprint(ctx, state, urls, {
       system: architectRefineSystem(),
       user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,
       retries: ARCHITECT_REFINE_RETRIES,
@@ -5814,7 +5943,8 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Refinement failed to produce a validated revised blueprint." })
       break
     }
-    bp = refined
+    bp = refined.bp
+    preRefuted = new Set(refined.refuted.map((r) => r.name))
   }
 
   ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: iteration budget exhausted without a certified proof." })
