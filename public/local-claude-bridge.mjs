@@ -4646,6 +4646,72 @@ function architectNodePrefix(graph, nodeName) {
     .join("\n\n")
 }
 
+// Strip a declaration's proof body, leaving the signature.
+//
+// The target arrives WITH a placeholder proof (`... := by\n  norm_num`), and
+// four consumers need it gone: the blueprint precheck's verbatim signature
+// comparison, Leak XII's node rebuild (`target_signature := <submitted body>`
+// — a retained `:= by norm_num` would rebuild as `... := by norm_num := by
+// ...`), Leak XIV's drift check, and architectNegSignature.
+//
+// This used to be `theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry
+// [\s\S]*$/, "")`, which had two holes, both of which produce an UNWINNABLE
+// safeguard loop rather than a visible error:
+//   * it cuts at the earliest `:= by`, so a statement containing one — e.g.
+//     `let f : ℕ → ℕ := by exact id` — loses everything after it. Same failure
+//     class as the `parse_decl` bug on the Leak XII side.
+//   * it only recognises `by` and `sorry` bodies. A term-mode proof (`:= rfl`,
+//     `:= fun h => h`, `:= trivial`) is not stripped at all, so the expected
+//     signature carries a proof the model cannot reproduce — it must emit
+//     `:= by sorry_using []` — and the gate rejects every attempt forever.
+//
+// Same rule as the Python splitter: find the top-level `:=` that starts the
+// body, skipping the one each `let`/`have` binder in the statement consumes.
+function architectSignatureOf(text) {
+  const src = String(text || "")
+  const m = src.match(
+    /(?:^|\n)[ \t]*(?:private\s+|protected\s+|noncomputable\s+|public\s+)*(?:theorem|lemma)\s+[A-Za-z_][A-Za-z0-9_'.]*/,
+  )
+  if (!m) return src.trim()
+  const isIdent = (c) => !!c && /[A-Za-z0-9_'.]/.test(c)
+  let depth = 0
+  let pending = 0
+  let i = m.index + m[0].length
+  while (i < src.length - 1) {
+    const two = src.slice(i, i + 2)
+    if (two === "--") {
+      const nl = src.indexOf("\n", i)
+      i = nl < 0 ? src.length : nl
+      continue
+    }
+    if (two === "/-") {
+      const end = src.indexOf("-/", i + 2)
+      i = end < 0 ? src.length : end + 2
+      continue
+    }
+    const c = src[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (depth === 0) {
+      if (two === ":=") {
+        if (pending) {
+          pending--
+          i += 2
+          continue
+        }
+        return src.slice(0, i).trim()
+      }
+      for (const kw of ["let", "have"]) {
+        if (!src.startsWith(kw, i)) continue
+        if (!isIdent(src[i - 1]) && !isIdent(src[i + kw.length])) pending++
+        break
+      }
+    }
+    i++
+  }
+  return src.trim()
+}
+
 function architectNegSignature(signature) {
   const m = signature.match(/^\s*(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/)
   if (!m) return null
@@ -5611,7 +5677,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     // the control, so its nodes stay exactly as isolated as the paper's.
     ledger: variant.shareDeadEnds ? makeDeadEndLedger() : null,
     targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
-    targetSignature: theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry[\s\S]*$/, "").trim(),
+    targetSignature: architectSignatureOf(theorem),
   }
   if (ctx.metrics) {
     ctx.metrics.max_iters = maxIters()
