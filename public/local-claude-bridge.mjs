@@ -4631,6 +4631,26 @@ function architectAssemble(graph, prelude, proofs) {
   return parts.join("\n")
 }
 
+// --- Hallucinated-name forcing nudge -----------------------------------------
+// Grok's failure mode here is the mirror of Claude's on Stronghold/Ultra:
+// Claude over-searches (hence the rationed search budget on that path), Grok
+// under-searches and instead guesses plausible-sounding Mathlib names that
+// don't exist ("Nat.modEq_of_coprime_three", "Nat.ModEq.exists_mul_add", ...),
+// burning a whole attempt on invented API surface instead of one real lookup.
+// Observed live: 8+ consecutive "Unknown constant/identifier" errors on one
+// node before it searched again. This forces the issue: once a lean_compile
+// reply cites an unknown name ARCHITECT_HALLUCINATION_STREAK times in a row
+// with no mathlib_search in between, the next tool result carries a directive
+// to search before compiling again. No search-call rationing (Grok's problem
+// is the opposite of Claude's) -- just a nudge, same mechanism as the
+// existing "reply had no tool call" steer in grokLoop.
+const ARCHITECT_HALLUCINATION_STREAK = 2
+const UNKNOWN_NAME_RE = /unknown (constant|identifier)/i
+function architectHallucinationNudge(report, streakCount) {
+  if (streakCount < ARCHITECT_HALLUCINATION_STREAK) return report
+  return `${report}\n\n⚠️ That's ${streakCount} compile errors in a row citing an unknown Mathlib name — you're guessing lemma names instead of looking them up, and every guess costs a full turn. STOP guessing. Call mathlib_search now with a specific, narrow query for the exact fact you need before your next lean_compile attempt.`
+}
+
 // --- Node prover (fresh, isolated conversation per attempt) -----------------
 async function architectProveNode(node, graph, prelude, urls, ctx, state) {
   const parents = node.deps
@@ -4682,8 +4702,10 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
         : `\n\n(Attempt ${attempt + 1} of ${ARCHITECT_NODE_RETRIES}. A previous fresh attempt failed.${
             lastError ? ` Its final compiler feedback was:\n${lastError}\nThat approach hit a wall — take a structurally different route.` : " Do not repeat the same failing tactic line verbatim."
           })`
+    let hallucinationStreak = 0
     const exec = async (name, args) => {
       if (name === "mathlib_search") {
+        hallucinationStreak = 0
         if (!urls.xi) return { report: "mathlib_search is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback." }
         return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
       }
@@ -4707,7 +4729,10 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
         // Pool environment-level facts for sibling nodes (gate/delta only —
         // state.ledger is null for the control).
         ledgerHarvest(state.ledger, r.report, node.name)
-        return { report: r.report }
+        hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
+        const report = architectHallucinationNudge(r.report, hallucinationStreak)
+        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_STREAK) hallucinationStreak = 0
+        return { report }
       }
       return { report: `unknown tool ${name}` }
     }
@@ -4743,8 +4768,10 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
   for (let attempt = 0; attempt < retries; attempt++) {
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return null
     let captured = null
+    let hallucinationStreak = 0
     const exec = async (name, args) => {
       if (name === "mathlib_search") {
+        hallucinationStreak = 0
         if (!urls.xi) return { report: "mathlib_search is unavailable; proceed from Mathlib knowledge." }
         return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
       }
@@ -4760,7 +4787,10 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
           captured = { graph: r.graph, code: String(args.code || "") }
           return { report: r.report, __done: captured }
         }
-        return { report: r.report }
+        hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
+        const report = architectHallucinationNudge(r.report, hallucinationStreak)
+        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_STREAK) hallucinationStreak = 0
+        return { report }
       }
       return { report: `unknown tool ${name}` }
     }
