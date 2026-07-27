@@ -1,5 +1,10 @@
 import type { ProverMcpServer } from '@/lib/mcp/fetch-prover-servers';
-import type { ProverEvent, ProverEventKind, ProverOutcome } from './types';
+import type {
+  ProverEvent,
+  ProverEventKind,
+  ProverMetrics,
+  ProverOutcome,
+} from './types';
 
 // ── Bridge connection (same localStorage contract AdminPipeline uses) ────────
 export function bridgeConnection(): { bridgeUrl?: string; token?: string } {
@@ -349,7 +354,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
           // bridge and carried on the terminal metrics. `d.cost_usd` is accepted
           // as a fallback in case a future bridge lifts it to the top level.
           const doneMetrics = (metrics ?? d.metrics) as
-            | { cost_usd?: number }
+            | ProverMetrics
             | undefined;
           const costUsd =
             typeof d.cost_usd === 'number'
@@ -364,6 +369,7 @@ export async function runProverStream(opts: RunOpts): Promise<ProverOutcome> {
             counterexample: d.counterexample,
             disproof: d.disproof,
             costUsd,
+            metrics: doneMetrics,
           };
           emit(
             d.verified ? 'verified' : 'rejected',

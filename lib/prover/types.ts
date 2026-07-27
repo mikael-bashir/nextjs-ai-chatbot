@@ -26,6 +26,20 @@ export interface ProverMetrics {
   cost_usd?: number;
   /** Running total tokens across all sub-runs. */
   tokens?: number;
+  /** Architect (Leak River) only: latest blueprint iteration reached. */
+  blueprint_iterations?: number;
+  /** Architect only: provable node count in the current/final blueprint. */
+  nodes_total?: number;
+  /** Architect only: nodes with a registered solve (proof or negation). */
+  nodes_solved?: number;
+  /** Architect only: nodes that ran out of budget without solving/disproving. */
+  nodes_forfeited?: number;
+  /** Architect only: nodes machine-disproved (negation registered). */
+  nodes_negated?: number;
+  /** Architect only: true once the run stopped because it hit the hard dollar cap. */
+  cost_cap_hit?: boolean;
+  /** Free-text tag identifying the bridge build/experiment batch (BRIDGE_BUILD_TAG). */
+  bridge_build?: string;
 }
 
 export interface ProverEvent {
@@ -63,4 +77,8 @@ export interface ProverOutcome {
   counterexample?: string;
   /** The machine-checked `¬theorem` disproof script. */
   disproof?: string;
+  /** Terminal metrics snapshot from the `done` frame (llm/tool counts, time
+   *  elapsed, and — architect runs only — blueprint/node stats). Used to
+   *  populate the Leak River / Leak Stronghold research tables. */
+  metrics?: ProverMetrics;
 }

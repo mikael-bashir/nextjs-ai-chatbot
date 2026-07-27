@@ -17,7 +17,11 @@ import {
   extendProverRun,
 } from '@/lib/prover/run-prover-stream';
 import { ProverConsole } from '@/components/prover/prover-console';
-import type { ProverEvent, ProverEventKind } from '@/lib/prover/types';
+import type {
+  ProverEvent,
+  ProverEventKind,
+  ProverMetrics,
+} from '@/lib/prover/types';
 import {
   estimateCost,
   extractFeatures,
@@ -1208,6 +1212,98 @@ export function AdminPipeline() {
     }
   };
 
+  // Research telemetry: one row per verification ATTEMPT into whichever table
+  // matches the strategy that ran — Leak River (architect) or Leak Stronghold
+  // (every Claude-driven strategy: hacker/pantograph/librarian/sketch/brute/
+  // have/have-tree, or the plain single-agent CLI with decompose off). Fire-
+  // and-forget: recording must never affect the verify loop.
+  const recordResearchRun = useCallback(
+    (args: {
+      item: GeneratedItem;
+      strategy: string;
+      model: string;
+      verified: boolean;
+      refuted: boolean;
+      costUsd?: number;
+      computeBudgetMs?: number;
+      metrics?: ProverMetrics;
+      finalProof: string;
+      error: string | null;
+      nlSeedUsed: boolean;
+      seedUsed: boolean;
+    }) => {
+      const {
+        item,
+        strategy,
+        model,
+        verified,
+        refuted,
+        costUsd,
+        computeBudgetMs,
+        metrics,
+        finalProof,
+        error,
+        nlSeedUsed,
+        seedUsed,
+      } = args;
+      const theoremName =
+        /(?:theorem|lemma)\s+([A-Za-z_][\w'.]*)/.exec(item.lean || '')?.[1] ??
+        null;
+      const common = {
+        generatedItemId: item.id,
+        problemTitle: item.questionTitle ?? item.problem?.slice(0, 80) ?? null,
+        difficulty: item.difficulty ?? null,
+        points: item.points ?? null,
+        theoremName,
+        sorriedTheorem: item.lean || '',
+        model: model || null,
+        verified,
+        refuted,
+        costUsd: costUsd ?? null,
+        computeBudgetMs: computeBudgetMs ?? null,
+        timeElapsedS: metrics?.time_elapsed ?? null,
+        llmCalls: metrics?.llm_invocations ?? null,
+        toolCalls: metrics?.tools_invoked ?? null,
+        finalProof: finalProof || null,
+        error,
+        bridgeBuild: metrics?.bridge_build ?? null,
+      };
+      const path =
+        strategy === 'architect'
+          ? '/api/admin/research/river'
+          : '/api/admin/research/stronghold';
+      const body =
+        strategy === 'architect'
+          ? {
+              ...common,
+              nlSeedUsed,
+              costCapHit: metrics?.cost_cap_hit ?? null,
+              blueprintIterations: metrics?.blueprint_iterations ?? null,
+              nodesTotal: metrics?.nodes_total ?? null,
+              nodesSolved: metrics?.nodes_solved ?? null,
+              nodesForfeited: metrics?.nodes_forfeited ?? null,
+              nodesNegated: metrics?.nodes_negated ?? null,
+            }
+          : {
+              ...common,
+              strategy,
+              haveCaseCount: finalProof
+                ? (finalProof.match(/\bhave\b/g) || []).length
+                : null,
+              checkpointUsed: seedUsed,
+            };
+      fetch(path, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+        keepalive: true,
+      }).catch(() => {
+        /* research logging must never affect the verify loop */
+      });
+    },
+    [],
+  );
+
   // The single verifier: pulls the head of the queue, proves it on the shared
   // bridge, persists the outcome (clearing the DB `queued` flag), and moves on.
   // A connectivity/protocol failure PAUSES the loop and leaves the item queued —
@@ -1235,6 +1331,13 @@ export function AdminPipeline() {
         let refuted = false;
         let counterexample = '';
         let actualUsd: number | undefined;
+        // Captured for the research row regardless of outcome (verified or not).
+        const strategyAtStart = verifyStrategyRef.current;
+        const modelAtStart = verifyModelRef.current;
+        let outMetrics: ProverMetrics | undefined;
+        let nlSeedUsed = false;
+        let seedUsed = false;
+        let computeBudgetMsAtStart: number | undefined;
         try {
           const mcpServers = await fetchMcp();
           // If this item was enqueued via "Resume from saved", hand its checkpoint
@@ -1242,6 +1345,7 @@ export function AdminPipeline() {
           // so a later plain re-verify starts fresh.
           const seed = resumeSeedRef.current[item.id];
           delete resumeSeedRef.current[item.id];
+          seedUsed = !!seed;
           // Architect strategy: seed blueprint generation with the item's own
           // natural-language solution material (the paper's §4.2 NL guidance —
           // "on these problems natural-language guidance is decisive"). The
@@ -1256,6 +1360,14 @@ export function AdminPipeline() {
                   .filter(Boolean)
                   .join('\n\n') || undefined
               : undefined;
+          nlSeedUsed = !!nlProof;
+          // Mirrors proveStream's own decompose check exactly (a resumed seed
+          // always runs the tree path, even with the toggle off).
+          computeBudgetMsAtStart = verifyDecomposeRef.current || seedUsed
+            ? strategyAtStart === 'architect'
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : VERIFY_COMPUTE_BUDGET_MS
+            : undefined;
           const out = await proveStream(
             item.lean as string,
             mcpServers,
@@ -1271,6 +1383,7 @@ export function AdminPipeline() {
           proof = out.refuted ? out.disproof || '' : out.proof;
           refuted = !!out.refuted;
           counterexample = out.counterexample || '';
+          outMetrics = out.metrics;
         } catch (e) {
           const title =
             item.questionTitle || item.problem?.slice(0, 60) || item.id;
@@ -1370,6 +1483,26 @@ export function AdminPipeline() {
             item.questionTitle || item.problem?.slice(0, 60) || item.id
           }`,
         );
+        // Research telemetry: one row per attempt into Leak River or Leak
+        // Stronghold, whichever strategy actually ran this attempt.
+        recordResearchRun({
+          item,
+          strategy: strategyAtStart,
+          model: modelAtStart,
+          verified,
+          refuted,
+          costUsd: actualUsd,
+          computeBudgetMs: computeBudgetMsAtStart,
+          metrics: outMetrics,
+          finalProof: proof,
+          error: verified
+            ? null
+            : refuted
+              ? `REFUTED — ${counterexample || 'counterexample verified by Lean'}`
+              : 'Lean proof did not verify',
+          nlSeedUsed,
+          seedUsed,
+        });
         // Record the actual cost against this item's estimate. The estimate
         // runs concurrently, so join its promise for the history row id, then
         // PATCH the actual and refresh the scoreboard.
@@ -1411,7 +1544,7 @@ export function AdminPipeline() {
       setVerifyStartedAt(null);
       runningRef.current = false;
     }
-  }, [proveStream, pushLog, pauseForLimit]);
+  }, [proveStream, pushLog, pauseForLimit, recordResearchRun]);
 
   const terminateVerification = () => verifyAbortRef.current?.abort();
 

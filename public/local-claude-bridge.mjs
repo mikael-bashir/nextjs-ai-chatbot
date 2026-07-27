@@ -66,6 +66,10 @@ process.on("uncaughtException", (err) => {
 
 const PORT = Number(process.env.PORT || 4123)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"
+// Free-text tag for the research tables (Leak River / Leak Stronghold) — set it
+// when launching the bridge to label a batch of runs as belonging to a
+// particular experiment/fix version, so before/after data isn't conflated.
+const BRIDGE_BUILD = process.env.BRIDGE_BUILD_TAG || null
 // When the proof gate confirms mid-stream we interrupt the CLI (SIGINT) so it
 // flushes its final `result` frame — the sole carrier of total_cost_usd. This is
 // the grace window before we hard-kill a CLI that didn't exit after flushing.
@@ -2128,7 +2132,7 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
   })
 
   const start = Date.now()
-  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0, bridge_build: BRIDGE_BUILD }
   const stripName = (n) => String(n || "").replace(/^mcp__[a-z0-9-]+__/i, "")
 
   // System gate: the ONE enforced restriction. We only accept a proof that the
@@ -3533,6 +3537,7 @@ function architectCostCapHit(ctx) {
 // the run must stop because the dollar cap is spent.
 function architectCapStop(ctx) {
   if (!architectCostCapHit(ctx)) return false
+  if (ctx.metrics) ctx.metrics.cost_cap_hit = true
   if (!ctx._costCapNoted) {
     ctx._costCapNoted = true
     ctx.emit?.({
@@ -4436,6 +4441,16 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     })
     await Promise.all(workers)
 
+    // Research telemetry (Leak River table): snapshot after every pass so the
+    // FINAL values — whatever they are when this function returns, success or
+    // not — reflect the state at that point. Same `ctx.metrics` object every
+    // SSE frame carries, so this reaches the client's terminal `done` frame for free.
+    ctx.metrics.blueprint_iterations = iter + 1
+    ctx.metrics.nodes_total = provable.length
+    ctx.metrics.nodes_solved = proofs.size
+    ctx.metrics.nodes_negated = Array.from(results.values()).filter((r) => r.negated).length
+    ctx.metrics.nodes_forfeited = Array.from(results.values()).filter((r) => !r.solved && !r.negated).length
+
     const unsolved = provable.filter((n) => !proofs.has(n.name))
     if (unsolved.length === 0) {
       // ---- Assembly + certification (Leak XIV is the only exit).
@@ -4515,7 +4530,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     }
   }
   const start = Date.now()
-  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0, bridge_build: BRIDGE_BUILD }
   const emit = (obj) => {
     metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
     send({ ...obj, metrics })

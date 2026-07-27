@@ -1,0 +1,262 @@
+'use client';
+
+import { useCallback, useEffect, useState } from 'react';
+import {
+  RefreshCw,
+  Download,
+  ShieldCheck,
+  ShieldAlert,
+  Skull,
+} from 'lucide-react';
+
+interface RiverRow {
+  id: string;
+  created_at: string;
+  problem_title: string | null;
+  difficulty: string | null;
+  theorem_name: string | null;
+  sorried_theorem: string;
+  model: string | null;
+  nl_seed_used: boolean | null;
+  verified: boolean | null;
+  refuted: boolean | null;
+  cost_usd: number | null;
+  cost_cap_hit: boolean | null;
+  compute_budget_ms: number | null;
+  time_elapsed_s: number | null;
+  llm_calls: number | null;
+  tool_calls: number | null;
+  blueprint_iterations: number | null;
+  nodes_total: number | null;
+  nodes_solved: number | null;
+  nodes_forfeited: number | null;
+  nodes_negated: number | null;
+  error: string | null;
+  bridge_build: string | null;
+}
+
+interface StrongholdRow {
+  id: string;
+  created_at: string;
+  problem_title: string | null;
+  difficulty: string | null;
+  theorem_name: string | null;
+  sorried_theorem: string;
+  model: string | null;
+  strategy: string | null;
+  verified: boolean | null;
+  refuted: boolean | null;
+  cost_usd: number | null;
+  compute_budget_ms: number | null;
+  time_elapsed_s: number | null;
+  llm_calls: number | null;
+  tool_calls: number | null;
+  have_case_count: number | null;
+  checkpoint_used: boolean | null;
+  error: string | null;
+  bridge_build: string | null;
+}
+
+function fmtNum(v: number | null | undefined, digits = 0): string {
+  return v == null ? '—' : v.toFixed(digits);
+}
+
+function fmtMs(v: number | null | undefined): string {
+  if (v == null) return '—';
+  const m = v / 60_000;
+  return m >= 1 ? `${m.toFixed(1)}m` : `${Math.round(v / 1000)}s`;
+}
+
+function Outcome({
+  verified,
+  refuted,
+}: {
+  verified: boolean | null;
+  refuted: boolean | null;
+}) {
+  if (verified)
+    return <ShieldCheck className="size-3.5 shrink-0 text-emerald-500" />;
+  if (refuted) return <Skull className="size-3.5 shrink-0 text-violet-500" />;
+  return <ShieldAlert className="size-3.5 shrink-0 text-amber-500" />;
+}
+
+// One research table's viewer: refresh, export-CSV, and a compact scrollable
+// row list. Both Leak River and Leak Stronghold reuse this shell with
+// system-specific extra columns rendered per row.
+function ResearchTable<T extends { id: string; created_at: string }>({
+  title,
+  subtitle,
+  endpoint,
+  renderExtra,
+}: {
+  title: string;
+  subtitle: string;
+  endpoint: string;
+  renderExtra: (row: T) => React.ReactNode;
+}) {
+  const [rows, setRows] = useState<T[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await fetch(endpoint);
+      if (res.ok) setRows((await res.json()).rows ?? []);
+    } finally {
+      setLoading(false);
+    }
+  }, [endpoint]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex items-center gap-2 border-b bg-muted/40 px-3 py-2">
+        <span className="text-xs font-semibold">{title}</span>
+        <span className="text-[11px] text-muted-foreground">{subtitle}</span>
+        <span className="ml-auto font-mono text-[10px] text-muted-foreground">
+          {rows.length} row{rows.length === 1 ? '' : 's'}
+        </span>
+        <a
+          href={`${endpoint}?format=csv`}
+          className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+          title="Download every recorded row as CSV, for plotting"
+        >
+          <Download className="size-3" />
+          Export CSV
+        </a>
+        <button
+          type="button"
+          onClick={load}
+          className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+        >
+          <RefreshCw className={`size-3 ${loading ? 'animate-spin' : ''}`} />
+          Refresh
+        </button>
+      </div>
+      <div className="max-h-[28rem] divide-y divide-border/50 overflow-y-auto">
+        {rows.length === 0 ? (
+          <p className="px-3 py-6 text-center text-xs text-muted-foreground">
+            No attempts recorded yet — every verify run on this system will
+            log a row here automatically.
+          </p>
+        ) : (
+          rows.map((r) => {
+            const row = r as unknown as {
+              theorem_name: string | null;
+              sorried_theorem: string;
+              problem_title: string | null;
+              difficulty: string | null;
+              verified: boolean | null;
+              refuted: boolean | null;
+              cost_usd: number | null;
+              time_elapsed_s: number | null;
+              llm_calls: number | null;
+              tool_calls: number | null;
+              model: string | null;
+              error: string | null;
+            };
+            return (
+              <div key={r.id} className="px-3 py-1.5">
+                <div className="flex items-center gap-2 text-xs">
+                  <Outcome verified={row.verified} refuted={row.refuted} />
+                  <span
+                    className="truncate font-mono text-[11px]"
+                    title={row.sorried_theorem}
+                  >
+                    {row.theorem_name || row.problem_title || '(untitled)'}
+                  </span>
+                  {row.difficulty && (
+                    <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                      {row.difficulty}
+                    </span>
+                  )}
+                  <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground/70">
+                    {new Date(r.created_at).toLocaleString()}
+                  </span>
+                </div>
+                <div className="mt-0.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 font-mono text-[10px] text-muted-foreground">
+                  <span title="Actual dollar cost">
+                    ${fmtNum(row.cost_usd, 3)}
+                  </span>
+                  <span title="Wall-clock time elapsed">
+                    {fmtMs((row.time_elapsed_s ?? 0) * 1000)}
+                  </span>
+                  <span title="LLM calls">{row.llm_calls ?? '—'} llm</span>
+                  <span title="Tool calls">{row.tool_calls ?? '—'} tools</span>
+                  <span title="Driver model">{row.model || '—'}</span>
+                  {renderExtra(r)}
+                  {row.error && (
+                    <span
+                      className="truncate text-rose-500"
+                      title={row.error}
+                    >
+                      {row.error}
+                    </span>
+                  )}
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
+
+// Leak River — the Goedel-Architect-style blueprint pipeline (Grok driver).
+export function AdminLeakRiver() {
+  return (
+    <ResearchTable<RiverRow>
+      title="Leak River — research log"
+      subtitle="blueprint pipeline (Grok), one row per attempt"
+      endpoint="/api/admin/research/river"
+      renderExtra={(r) => (
+        <>
+          <span title="Blueprint iterations reached">
+            iter {r.blueprint_iterations ?? '—'}
+          </span>
+          <span title="Nodes solved / total in the final blueprint">
+            nodes {r.nodes_solved ?? '—'}/{r.nodes_total ?? '—'}
+          </span>
+          {!!r.nodes_forfeited && (
+            <span title="Nodes forfeited">🏳️ {r.nodes_forfeited}</span>
+          )}
+          {!!r.nodes_negated && (
+            <span title="Nodes machine-disproved">🧨 {r.nodes_negated}</span>
+          )}
+          {r.nl_seed_used && <span title="NL proof seed used">NL-seeded</span>}
+          {r.cost_cap_hit && (
+            <span className="text-amber-500" title="Hit the dollar cap">
+              💸 cap hit
+            </span>
+          )}
+        </>
+      )}
+    />
+  );
+}
+
+// Leak Stronghold — the existing Claude-driven strategies.
+export function AdminLeakStronghold() {
+  return (
+    <ResearchTable<StrongholdRow>
+      title="Leak Stronghold — research log"
+      subtitle="Claude strategies, one row per attempt"
+      endpoint="/api/admin/research/stronghold"
+      renderExtra={(r) => (
+        <>
+          {r.strategy && <span title="Strategy">{r.strategy}</span>}
+          <span title="have-tactic count in the final proof">
+            {r.have_case_count ?? '—'} have
+          </span>
+          {r.checkpoint_used && (
+            <span title="Resumed from a saved checkpoint">resumed</span>
+          )}
+        </>
+      )}
+    />
+  );
+}
