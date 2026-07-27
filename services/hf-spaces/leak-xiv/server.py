@@ -59,18 +59,23 @@ async def verify_full_script(code: str, target_name: str = "", target_signature:
     """
     Compile a FULLY ASSEMBLED Lean 4 file end-to-end and certify it. This is
     the final gate: certification succeeds only if the file has no compiler
-    errors, no `sorry` anywhere, no `axiom`/`native_decide`, and (when
+    errors, no `sorry` anywhere, no `axiom`, and (when
     target_name/target_signature are given) actually declares that exact
     theorem. This is the ONLY way a proof gets certified -- nothing else in
     the pipeline can register success.
+
+    `native_decide` is permitted (it decides closed propositions by running
+    them; it cannot assume anything). The certificate records the proof's
+    actual axiom dependencies and a `kernelOnly` flag, so an oracle-backed
+    proof is distinguishable from a kernel-only one.
     """
     logger.info(f"verify_full_script target={target_name!r} len={len(code)}")
     stripped = bp.strip_comments(code)
 
     violations: list[str] = []
-    fb = bp.FORBIDDEN.search(stripped)
-    if fb:
-        violations.append(f"forbidden construct '{fb.group(1)}'")
+    violations += bp.forbidden_violations(stripped)
+    _, opt_violations = bp.extract_set_options(code)
+    violations += opt_violations
     if re.search(r"(?<![A-Za-z0-9_'])sorry(_using)?(?![A-Za-z0-9_'])", stripped):
         violations.append("assembled proof still contains 'sorry'")
     if target_name and target_signature:
@@ -108,8 +113,46 @@ async def verify_full_script(code: str, target_name: str = "", target_signature:
                   "report": "Certification FAILED — the assembled proof still elaborates a sorry."}
         return json.dumps(result, ensure_ascii=False)
 
+    # --- Axiom provenance -----------------------------------------------------
+    # A clean compile is not, by itself, a claim about HOW the proof was
+    # checked. `native_decide` is permitted here (it is the pipeline's numeric
+    # oracle — see blueprint.forbidden_violations), and it discharges goals by
+    # running compiled code rather than by kernel reduction, which shows up as
+    # a dependency on `Lean.ofReduceBool` / `Lean.trustCompiler`.
+    #
+    # So ask Lean directly what the finished theorem rests on and put the
+    # answer on the certificate. A kernel-only proof and an oracle-backed one
+    # both certify, but they are no longer indistinguishable downstream — the
+    # certificate says which one this is instead of letting the reader assume.
+    axioms, kernel_only = [], None
+    if target_name:
+        try:
+            ax = await pool.run(f"{body}\n\n#print axioms {target_name}",
+                                timeout=VERIFY_TIMEOUT_S)
+            for m in ax.get("messages", []) or []:
+                data = m.get("data") or ""
+                if "depends on axioms" in data or "does not depend on any axioms" in data:
+                    axioms = re.findall(r"[A-Za-z_][A-Za-z0-9_.']*", data.split(":", 1)[-1]) \
+                        if "depends on axioms" in data else []
+                    axioms = [a for a in axioms if "." in a or a.startswith("Lean")]
+                    break
+            kernel_only = not any(
+                a.startswith(("Lean.ofReduceBool", "Lean.trustCompiler")) for a in axioms)
+        except Exception as e:  # provenance is advisory — never fail a good proof on it
+            logger.warning(f"axiom provenance unavailable: {e}")
+
+    note = ""
+    if kernel_only is False:
+        note = ("\n⚠️ This proof depends on the compiled evaluator (native_decide): "
+                f"{', '.join(a for a in axioms if a.startswith('Lean.'))}. "
+                "It is machine-checked but NOT kernel-only.")
+    elif kernel_only is True:
+        note = "\n✓ Kernel-only: no compiled-evaluator axioms."
+
     result = {"ok": True, "phase": "certified",
-              "report": "CERTIFIED: assembled proof compiles clean — no errors, no sorry.",
+              "report": "CERTIFIED: assembled proof compiles clean — no errors, no sorry." + note,
+              "axioms": axioms, "kernelOnly": kernel_only,
+              "usesNativeDecide": bp.uses_native_decide(stripped),
               "certificate": code}
     return json.dumps(result, ensure_ascii=False)
 

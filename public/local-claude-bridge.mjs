@@ -3855,6 +3855,17 @@ The node provers prove against Mathlib, and much of the "standard theory" a text
 - Type-ascribe ring-valued expressions whose elaboration is ambiguous (e.g. \`((X : Polynomial ℤ) ^ n - 1)\`), and state hypotheses in the form library lemmas consume (\`n ≠ 0\` rather than only \`n ≥ 1\`; carry both when helpful).
 - Match the phrasing of the nearest Mathlib lemmas found in search -- idiomatic signatures compile; bespoke rephrasings fight the elaborator.
 
+## Numeric facts are CHECKED, never recalled
+Every concrete number you write into a node — a p-adic valuation, a digit list, a factorial exponent, a plain arithmetic identity — is machine-checkable, and you must check it before you emit it. \`lean_compile\` returns the output of \`#eval\`/\`#check\`/\`#print\`, so submit the computation and read the value back:
+
+    #eval Nat.digits 3 2026
+    #eval (Nat.factorial 2026).factorization 2
+    #eval (4 * 9 : ℕ)
+
+Submit these WITHOUT an \`import\` line — the compile environment already has Mathlib, and an added import is a safeguard violation. \`decide\`, \`norm_num\` and \`native_decide\` are all available to node provers too, and \`set_option maxRecDepth\`/\`maxHeartbeats\` survive into their proofs, so a large closed computation is not out of reach.
+
+A guessed number is the most expensive mistake available to you: it sends every downstream node prover after a false lemma, and the whole refinement iteration that follows is spent undoing it. Two \`#eval\` calls now are cheaper than one wasted iteration.
+
 Every natural language \`statement\` field is a closed, typed, standalone proposition: every variable carries an explicit quantifier and domain; every hypothesis the proof uses appears as a premise. Do not reach into ambient context -- restate every theorem-level typing and hypothesis your lemma uses. Every natural language \`proof\` field is a complete sketch citing each declared dep by backticked name (e.g. "by \`lemma_a\`", "from \`def_b\`"); show every key equation, and do not write "by algebra", "obviously", or "one can check".
 
 ## Mapping graph nodes to Lean declarations
@@ -3877,7 +3888,7 @@ Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotate
 ## Tool use
 You also have \`mathlib_search\` -- use it DURING graph design as described above (query the target's head constants and each candidate lemma's content), not only after compile errors. A hit that states a planned node kills that node; a near-miss tells you the idiomatic signature to adopt.
 
-Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; forbidden constructs (\`axiom\`, \`native_decide\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a Lemma/Theorem body that is bare \`sorry\` or a real proof -- every body must be exactly \`:= by sorry_using [...]\`, since proofs belong to the next stage and bare \`sorry\` breaks dependency tracking.
+Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; the forbidden construct \`axiom\`; a \`set_option\` other than a resource limit (\`maxRecDepth\`, \`maxHeartbeats\`, \`synthInstance.*\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a Lemma/Theorem body that is bare \`sorry\` or a real proof -- every body must be exactly \`:= by sorry_using [...]\`, since proofs belong to the next stage and bare \`sorry\` breaks dependency tracking.
 
 If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed \`@[blueprint]\` decls: every node must have a non-empty \`(statement := /-- ... -/)\` field; every Lemma and the Theorem must have a non-empty \`(proof := /-- ... -/)\` field; every name in \`sorry_using [...]\` must resolve to a declared \`@[blueprint]\` node, with no self-loops; the \`sorry_using\` graph must be acyclic; exactly one main Theorem must exist with the targeted name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
 
@@ -3893,8 +3904,16 @@ You are a Lean 4 theorem prover. Given a formal statement, produce a complete, c
 You have two tools, \`lean_compile\` and \`mathlib_search\`. Commit to a concrete proof plan up front and execute it against the Lean compiler -- iterating on compiler feedback is how proofs get done, not silent reasoning or repeated searching. The compiler is a stronger signal source than search.
 
 Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial proof: use \`sorry\` as a placeholder for sub-goals you cannot yet discharge, and iterate (compile -> read errors / open goals -> patch -> compile). The system handles two cases automatically based on what you submit:
-- If your code includes the MAIN theorem with the canonical statement followed by \`:= by ...\`, the system rebuilds it under the original theorem statement: only your \`:= by\` proof body is kept from your submission; the imports, \`set_option\`, and \`open\` lines come from the canonical formal statement, and any other top-level declarations are dropped. Only this case can register a solve. Do not use \`axiom\` or \`native_decide\`; use \`have\` for helper lemmas inside your proof, not top-level declarations; and do not add \`import\` or \`open\` lines that are not already in the canonical formal statement -- any extras will be flagged as a safeguard violation, not silently kept.
-- If your code does NOT include the main theorem (e.g. \`#check\`, \`example\`, \`#print\`, helper-lemma prototypes), the system compiles the snippet as-given and returns the raw feedback. This is exploration only -- it cannot register a solve, so resubmit with the main theorem once you have a full proof. Use this sparingly: every turn against the compiler costs budget, and the only way to finish is to submit the main theorem.
+- If your code includes the MAIN theorem with the canonical statement followed by \`:= by ...\`, the system rebuilds it under the original theorem statement: only your \`:= by\` proof body is kept from your submission; the imports and \`open\` lines come from the canonical formal statement, and any other top-level declarations are dropped. Only this case can register a solve. Do not use \`axiom\`; use \`have\` for helper lemmas inside your proof, not top-level declarations; and do not add \`import\` or \`open\` lines that are not already in the canonical formal statement -- any extras will be flagged as a safeguard violation, not silently kept.
+- If your code does NOT include the main theorem (e.g. \`#check\`, \`example\`, \`#print\`, \`#eval\`, helper-lemma prototypes), the system compiles the snippet as-given and returns the raw feedback, INCLUDING the output of any \`#eval\`/\`#check\`/\`#print\`. This is exploration only -- it cannot register a solve, so resubmit with the main theorem once you have a full proof. Use this sparingly: every turn against the compiler costs budget, and the only way to finish is to submit the main theorem.
+
+## Computation is available -- use it instead of guessing
+\`decide\`, \`norm_num\` and \`native_decide\` are all permitted in a registered proof, and a \`set_option maxRecDepth N\` / \`maxHeartbeats N\` line you write is KEPT (resource limits survive the canonical rebuild; other \`set_option\`s do not). So when a goal is a closed computation that hits "maximum recursion depth has been reached", raise the limit and resubmit rather than abandoning the route:
+
+    set_option maxRecDepth 8000 in
+    ${"theorem"} <target> := by native_decide
+
+To check a number before you build a proof around it, submit a bare \`#eval\` (no \`import\` line — the environment already has Mathlib) and read the value back from the report. A number you verified beats a number you remembered.
 
 Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. For named mathematical objects (cyclotomic polynomials, totients, binomial coefficients, ...) Mathlib frequently already contains the exact fact you are proving, or a lemma that closes it in one application: if a search hit states your goal or subsumes it, APPLY IT AND SUBMIT immediately -- one lookup is cheaper than re-deriving standard theory, and a library one-liner is a perfectly good registered solve. What search will NOT find is a bespoke bound or numeric identity invented for this problem, so do not query for the goal's exact numbers verbatim.
 
@@ -3919,24 +3938,41 @@ function architectRefineSystem() {
 You are revising a Lean 4 dependency graph for a single mathematical problem. The input is a sequence of \`@[blueprint ...]\`-annotated declarations -- definitions, lemmas, and one main theorem -- each lemma or theorem with body \`:= by sorry_using [deps]\`. Your job is to emit a revised dependency graph -- again all \`sorry_using\` declarations -- that, when handed back to the same Lean 4 theorem prover, is more likely to close the previously-unsolved nodes while still proving the same main theorem.
 
 ## Input format
-Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when the prover failed -- a follow-up review block describing what went wrong. There are two markers.
+Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when the prover failed -- a follow-up review block describing what went wrong.
 
-A \`-- PROVED\` marker means the prover proved the node.
+A \`-- PROVED\` marker means a verified proof is banked for that node's exact signature and parent set.
 
-A \`-- UNPROVED\` marker indicates that the prover failed on the node, and is followed by exactly one \`/- Diagnosis ... -/\` review block. The block has three sections. \`## Diagnosis\` is exactly one of \`STATEMENT_WRONG\` (the lemma is false under its hypotheses -- possibly established by a machine-checked disproof of the statement) or \`PROOF_TOO_HARD\` (the prover believes the goal is provable but could not chain the available parents to it). \`## Analysis\` is a forensic account of what the prover tried, what compiled, what errors remained, and where the gap is. \`## Suggested Fix\` is conditional on the diagnosis: for \`STATEMENT_WRONG\`, why the statement is false and how to repair it; for \`PROOF_TOO_HARD\`, a helper-lemma decomposition.
+A \`-- UNPROVED\` marker is followed by exactly one \`/- Diagnosis ... -/\` review block, whose first two lines are the ones that bind on you:
+
+- \`## Class\` is the harness's classification of the failure. It is not a suggestion.
+- \`## Harness directive\` states what you MAY and MAY NOT do to that node. Follow it. It exists because the single most expensive failure mode in this pipeline is applying the wrong repair to a node — adding helpers to a node that was never given its parents, or deleting a true lemma because a prover asserted it was false without proof.
+
+The remaining sections are evidence, in descending order of reliability:
+- \`## Machine-verified facts\` — computed by Lean during this pass. These are ground truth and OVERRIDE any number appearing in a natural-language sketch, including sketches you wrote yourself in an earlier iteration.
+- \`## Names that DO NOT EXIST\` — declarations checked against this Mathlib and absent. Never cite them.
+- \`## Proposals the harness REJECTED\` — helper lemmas that failed to typecheck or that the compiler outright refuted. Do not reinstate them in any form.
+- \`## Verified helper lemmas\` — proposals that typecheck here and were not refuted. These are safe to adopt as new nodes.
+- \`## Analysis\` — the diagnostician's prose account. Useful, but weaker evidence than anything above it.
 
 These markers and review blocks are input-only -- do NOT copy them into your revised dependency graph.
 
+## The classes
+\`DISPROVED\` — machine-checked false. Change the statement or drop it, and re-examine every node depending on it. This is the ONLY class that licenses deleting or restating a node on grounds of falsity.
+
+\`SUSPECT_STATEMENT\` — a prover claimed the node was false but produced no disproof, and the harness could not refute it either. The claim is unsupported. Do not act on it; treat the node as \`PROOF_TOO_HARD\`.
+
+\`PARENTS_MISSING\` — the node was dispatched with unproved parents, so its decomposition was never actually tested. Change nothing about it; put this revision's effort into the parents.
+
+\`HARNESS_LIMIT\` — an elaborator resource limit, not mathematics. Leave the node completely unchanged.
+
+\`PROOF_TOO_HARD\` — a genuine decomposition need. Add the verified helpers as fresh \`@[blueprint ...]\` nodes with bodies \`:= by sorry_using [...]\`, and wire the failing node's \`sorry_using\` to include them.
+
 ## Guidance
-Each \`-- UNPROVED\` node falls into one of two buckets, decided by the \`## Diagnosis\` label.
-
-When the diagnosis is \`STATEMENT_WRONG\`, the lemma's formal statement is false under its hypotheses. Fix the statement (strengthen hypotheses, weaken the conclusion, fix a quantifier or coercion, etc.) and re-emit it. If the lemma is structurally unfixable, drop it and re-route the nodes that depended on it.
-
-When the diagnosis is \`PROOF_TOO_HARD\`, the prover believes the goal is provable but could not chain the available parents to it. Read the \`## Suggested Fix\` for the prover's proposed helper-lemma decomposition and add new parent lemmas (each as a fresh \`@[blueprint ...]\` declaration with body \`:= by sorry_using [...]\`) that bridge the gap. Wire the failing node's \`sorry_using [...]\` to include the new helpers. If the analysis instead reads as though the statement itself is suspect, treat it as \`STATEMENT_WRONG\` instead -- fix or drop the statement.
-
 Refinement is library-aware: you have \`mathlib_search\` -- before adding a helper, check whether Mathlib already contains it (or the failing node itself), and use search hits to phrase revised signatures idiomatically. Prefer DELETING nodes over stacking helpers: when a node fails repeatedly on glue (coercions, Finset membership packaging, ℕ/ℤ division side conditions) rather than on mathematics, the cure is usually re-anchoring the graph on library lemmas and REMOVING re-derived intermediate theory, not a deeper helper stack. Across iterations the graph should shrink toward the library, not grow away from it. Apply the same statement ergonomics as generation: multiplicative forms instead of ℕ/ℤ division (\`a * b = n\`, not \`n / b = a\`), explicit type ascriptions on ring-valued expressions, hypotheses stated the way library lemmas consume them (\`n ≠ 0\` alongside \`1 ≤ n\`).
 
-Leave \`-- PROVED\` nodes untouched unless a downstream revision forces a signature change: their proof bodies will carry forward automatically as long as the signature stays byte-identical.
+A \`-- PROVED\` node carries a real, verified proof. It survives your revision only while BOTH its signature and its \`sorry_using\` parent set stay unchanged — touching either discards the proof and the node must be re-proved from scratch. So leave proved nodes alone, and when a revision would leave one unreachable from the main theorem (which the graph-validity gate forbids), RE-WIRE it into the new structure rather than deleting it. Deleting a proved node throws away work that was already paid for.
+
+Numbers in your own natural-language sketches are not evidence. If a \`## Machine-verified facts\` line contradicts a constant you previously wrote, the machine is right. If a node hinges on a concrete number that has never been verified, you can check it yourself: \`lean_compile\` returns \`#eval\` output, so submit \`#eval <term>\` (no \`import\` line) and read the value back before you commit a constant to a signature.
 
 After every edit, call \`lean_compile\`. The tool reports pre-compile safeguard violations, real Lean compile errors, the skeleton-out invariant (every theorem/lemma body must remain \`:= by sorry_using [...]\`), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\`
 
@@ -4045,6 +4081,21 @@ function architectCompact(messages, keep = 2) {
     if (c.length > 400)
       messages[i].content = c.slice(0, 300) + `\n... [stale tool output elided — ${c.length} chars; rely on the newest compile report]`
   }
+}
+
+// --- Resource failures vs. reasoning failures --------------------------------
+// A compile can fail because the proof is wrong, or because the elaborator ran
+// out of room. These need opposite handling everywhere in this pipeline: a
+// wrong proof should be rewritten, a resource failure should be RETRIED with a
+// bigger ceiling. Leak XII reports `resourceLimit` when EVERY error in a
+// submission is of the resource family; the text match is the fallback for
+// backend errors and for services not yet redeployed with that field.
+const ARCHITECT_RESOURCE_RE =
+  /maximum recursion depth|deterministic\)? timeout|maximum number of heartbeats|maxHeartbeats|Compile backend error|timed out/i
+function architectIsResourceFailure(out, text) {
+  if (out && out.resourceLimit === true) return true
+  if (out && out.solve) return false
+  return ARCHITECT_RESOURCE_RE.test(String(text || ""))
 }
 
 // Generic tool loop for one stage attempt: fresh conversation, budgeted,
@@ -4169,7 +4220,15 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         }
       }
       const outText = String(out.report ?? JSON.stringify(out))
-      if (!seen.has(sig)) seen.set(sig, outText.slice(0, 4000))
+      // Resource failures are NOT cached. The guard's premise — "identical
+      // input can only produce the identical result" — holds for a reasoning
+      // error and fails for a resource one: the same submission compiles once
+      // maxRecDepth is raised or the daemon is warm. Caching them turned a
+      // fixable limit into a dead end (observed on
+      // factorial_base12_trailing_zeros, where a node whose only error was
+      // "maximum recursion depth has been reached" spent its remaining turns
+      // being told it had already asked).
+      if (!seen.has(sig) && !architectIsResourceFailure(out, outText)) seen.set(sig, outText.slice(0, 4000))
       ctx.emit({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
       messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
       if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
@@ -4521,8 +4580,33 @@ async function architectSearchCall(url, query, k, timeoutMs) {
   return { report: text }
 }
 
-// Prelude = open/set_option lines between the imports and the first decl.
-function architectPrelude(code) {
+// Resource ceilings applied to EVERY architect compile (node proving, final
+// assembly) unless the blueprint already set them itself.
+//
+// Lean's stock maxRecDepth (512) and maxHeartbeats (200000) are sized for
+// ordinary elaboration, not for `decide`/`norm_num`/`native_decide` over
+// competition-sized numerals. On factorial_base12_trailing_zeros that ceiling
+// alone decided the run: goals as small as `4 ^ 1009 = 2 ^ 2018` and
+// `Nat.factorial_ne_zero 2026` failed with "maximum recursion depth has been
+// reached", the prover wrote `set_option maxRecDepth 2000 in` six times, the
+// canonical rebuild silently discarded it every time (only the `:= by` body
+// survives), and nodes were forfeited whose sole defect was the limit. Leak
+// XII now passes whitelisted resource options through that rebuild, and the
+// floor below means the model usually does not have to ask.
+//
+// Scoped to the architect stack (Leak River / Leak Ultra on XI/XII/XIV) — the
+// legacy Leak I/II/IV paths are untouched. These are resource knobs only: none
+// of them can make a false proof typecheck, and the per-node wall clock
+// (NODE_TIMEOUT_MS) still bounds what a runaway computation can cost.
+const ARCHITECT_MAX_REC_DEPTH = Number(process.env.ARCHITECT_MAX_REC_DEPTH || 8000)
+const ARCHITECT_MAX_HEARTBEATS = Number(process.env.ARCHITECT_MAX_HEARTBEATS || 1000000)
+
+// Prelude = open/set_option lines between the imports and the first decl,
+// plus the resource floor above.
+// `boost` multiplies the floor. Raised by the loop when a whole proving pass
+// failed on nothing but resource ceilings — see the resource-retry branch in
+// proveArchitect.
+function architectPrelude(code, boost = 1) {
   const lines = []
   for (const ln of String(code || "").split("\n")) {
     const t = ln.trim()
@@ -4533,7 +4617,15 @@ function architectPrelude(code) {
     }
     break
   }
-  return lines.join("\n")
+  const b = Math.max(1, Number(boost) || 1)
+  // A boosted pass overrides the blueprint's own ceiling too: the point of the
+  // retry is that the previous ceiling — whoever set it — was too low.
+  const keep = b > 1 ? lines.filter((l) => !/^set_option\s+(maxRecDepth|maxHeartbeats)\b/.test(l)) : lines
+  const has = (opt) => keep.some((l) => new RegExp(`^set_option\\s+${opt}\\b`).test(l))
+  const floor = []
+  if (ARCHITECT_MAX_REC_DEPTH > 0 && !has("maxRecDepth")) floor.push(`set_option maxRecDepth ${ARCHITECT_MAX_REC_DEPTH * b}`)
+  if (ARCHITECT_MAX_HEARTBEATS > 0 && !has("maxHeartbeats")) floor.push(`set_option maxHeartbeats ${ARCHITECT_MAX_HEARTBEATS * b}`)
+  return [...floor, ...keep].join("\n")
 }
 
 // Compile context for one node: every earlier node in topological order —
@@ -4707,6 +4799,341 @@ function architectParseForfeit(text) {
   }
 }
 
+// ===========================================================================
+// FAILURE CLASSIFICATION + DIAGNOSTICIAN
+// ---------------------------------------------------------------------------
+// The paper gives refinement exactly one signal shape — the failing node's own
+// self-written forfeit — and exactly one response to it: adopt the suggested
+// helper decomposition. Two things go wrong with that in practice, both seen
+// on factorial_base12_trailing_zeros:
+//
+//   1. The forfeit is written by the agent that just failed, out of budget,
+//      with no way to check anything it says. It confabulates. That run
+//      produced a STATEMENT_WRONG verdict on a lemma that was TRUE (the
+//      prover reasoned 12^1009 = 4^1009·9^1009, which is false), and a
+//      proposed helper `12 = 4 * 9`. Refinement adopted both verbatim.
+//   2. Every failure gets the same response — "add helpers" — regardless of
+//      whether the node was refuted, never given its parents, or merely hit a
+//      recursion limit. The graph grew 3 → 17 nodes across 8 iterations while
+//      the actual proof needs about four.
+//
+// So: classify the failure first, route on the class, and let a SEPARATE
+// diagnostician model enrich only the classes where enrichment helps — with
+// every factual claim it makes checked against Lean before refinement is
+// allowed to see it. The diagnostician cannot assert a lemma is false, cannot
+// cite a Mathlib name, and cannot propose a helper without the harness
+// verifying it first; unsupported claims are stripped, not forwarded.
+// ===========================================================================
+
+const ARCHITECT_CLASSES = {
+  // Machine-checked negation, or a harness refutation of the node's own
+  // conclusion. The only class permitted to delete or restate a node.
+  DISPROVED: {
+    label: "DISPROVED",
+    directive:
+      "This statement is FALSE — machine-checked, not opinion. You MUST change it or drop it, and you MUST re-examine every node that lists it in `sorry_using` (their sketches may depend on the false claim). Do not re-emit this signature unchanged.",
+  },
+  // The prover BELIEVED the node false but produced no witness. Downgraded on
+  // purpose: acting on an unverified falsity claim is how a true lemma gets
+  // deleted and a whole branch re-planned around nothing.
+  SUSPECT_STATEMENT: {
+    label: "SUSPECT_STATEMENT",
+    directive:
+      "The prover asserted this statement is false but produced NO disproof, and the harness could not refute it either. Treat that assertion as UNSUPPORTED. Do NOT delete, weaken, or renumber this statement on the strength of it. Handle the node as PROOF_TOO_HARD instead; if you genuinely believe it is false, the node prover can be asked for a disproof next pass.",
+  },
+  // The node never had its inputs. Adding helpers here is pure waste — the
+  // decomposition it already has was never tested.
+  PARENTS_MISSING: {
+    label: "PARENTS_MISSING",
+    directive:
+      "This node was dispatched with unproved parents, so its own decomposition was never actually tested. Do NOT add helper lemmas to it and do NOT restate it. Leave it as-is and spend this revision on the unproved parents named below.",
+  },
+  // Not a mathematical failure at all.
+  HARNESS_LIMIT: {
+    label: "HARNESS_LIMIT",
+    directive:
+      "This failed on an elaborator resource limit (recursion depth / heartbeats / timeout), not on mathematics. The statement and the decomposition are not implicated. Leave this node COMPLETELY UNCHANGED — the harness raises the ceiling and retries it.",
+  },
+  // The paper's case: genuine decomposition need.
+  PROOF_TOO_HARD: {
+    label: "PROOF_TOO_HARD",
+    directive:
+      "The goal is believed provable but the prover could not chain its parents to it. Add the verified helper lemmas below as fresh nodes and wire this node's `sorry_using` to include them. Prefer a Mathlib lemma over a new node wherever one is offered.",
+  },
+}
+
+// Which nodes are worth a diagnostician call. PARENTS_MISSING and
+// HARNESS_LIMIT already have a known, correct response — spending a model call
+// to restate it would be exactly the bloat this is meant to avoid.
+const ARCHITECT_DIAGNOSE_CLASSES = new Set(["DISPROVED", "SUSPECT_STATEMENT", "PROOF_TOO_HARD"])
+
+const ARCHITECT_DIAGNOSTIC_TOKENS = Number(process.env.ARCHITECT_DIAGNOSTIC_TOKENS || 24576)
+const ARCHITECT_MAX_HELPERS = 3
+const ARCHITECT_MAX_EVALS = 6
+const ARCHITECT_MAX_NAMES = 12
+
+// Split "theorem foo (a : ℕ) : concl" into its binder and conclusion parts.
+function architectSplitSig(signature) {
+  const m = String(signature || "").match(/^\s*(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/)
+  if (!m) return null
+  const rest = String(signature).slice(m[0].length)
+  let depth = 0
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (c === ":" && depth === 0 && rest.slice(i, i + 2) !== ":=")
+      return { name: m[1], binders: rest.slice(0, i).trim(), concl: rest.slice(i + 1).trim() }
+  }
+  return null
+}
+
+// Try to REFUTE a closed proposition with the compiler. Returns true only on a
+// compiler-corroborated refutation; every other outcome (including "the tactic
+// gave up") returns false, so uncertainty never reads as falsity.
+async function architectRefute(concl, prefix, prelude, urls, ctx) {
+  if (!concl || !urls.xii) return false
+  try {
+    const r = await architectMcpCall(
+      urls.xii,
+      "lean_compile",
+      {
+        mode: "node",
+        code: `example : ¬ (${concl}) := by first | norm_num | decide | native_decide`,
+        target_name: "__architect_refute__",
+        target_signature: "",
+        prefix,
+        prelude,
+      },
+      Number(NODE_TIMEOUT_MS),
+    )
+    return !!r.ok && !(r.errors || []).length
+  } catch {
+    return false
+  }
+}
+
+function architectDiagnosticSystem() {
+  return `## Task
+You are the DIAGNOSTICIAN for a Lean 4 blueprint pipeline. A node prover failed to close one lemma of a dependency graph. You are given that lemma, its declared parents, and the evidence from the failed attempt. Produce a structured diagnosis that the blueprint-refinement stage can act on.
+
+You are NOT proving anything and you are NOT writing tactics. You are deciding what actually went wrong and what the graph should do about it.
+
+## The one rule that matters
+Everything factual you assert is CHECKED against Lean before the refinement stage sees it, and anything that fails its check is DELETED from your diagnosis. A deleted claim is worse than a claim you never made: it costs a verification round-trip and leaves your analysis referring to something the refiner cannot see. So assert only what the evidence in front of you supports, and route anything you are unsure of through the check fields below instead of stating it as fact.
+
+In particular:
+- Do NOT state that the lemma is false unless a machine-checked disproof is shown in the evidence. "I could not prove it" is not "it is false" — that confusion has deleted true lemmas from this graph before.
+- Do NOT cite a Mathlib declaration from memory. Put every name you want to rely on in \`citedNames\`; each is \`#check\`ed and the ones that do not exist are struck out.
+- Do NOT assert an arithmetic or numeric fact. Put the expression in \`evalChecks\`; it is \`#eval\`ed and the true value is what reaches the refiner.
+- Every helper lemma you propose is typechecked, and closed ones are also tested for refutation. A helper that does not typecheck, or that is refuted, is dropped.
+
+## Output
+Reply with STRICT JSON and nothing else — no prose before or after, no markdown fence:
+
+{
+  "diagnosis": "STATEMENT_WRONG" | "PROOF_TOO_HARD" | "LIBRARY_GAP" | "HARNESS_LIMIT",
+  "analysis": "<= 900 chars. What the evidence shows: what was attempted, where it stalled, and why. Concrete and specific. No speculation presented as fact.",
+  "citedNames": ["Mathlib.Declaration.Name", ...],
+  "evalChecks": ["<Lean term whose value settles a numeric question>", ...],
+  "helpers": [
+    { "signature": "theorem helper_name (binders) : conclusion", "why": "<= 160 chars: what gap this bridges" }
+  ]
+}
+
+Field notes:
+- \`diagnosis\`: use \`LIBRARY_GAP\` when the attempt failed mainly because the prover could not find the right library lemma (repeated unknown-constant errors), \`HARNESS_LIMIT\` when it failed on recursion depth / heartbeats / timeout, \`STATEMENT_WRONG\` only with a disproof in evidence, otherwise \`PROOF_TOO_HARD\`.
+- \`helpers\`: at most ${ARCHITECT_MAX_HELPERS}, each a COMPLETE Lean signature starting with \`theorem\`. Each should be near-trivial given its own premises, and together they should make the failing node routine. Emit \`[]\` when the node does not need decomposition (a resource limit or a missing parent never does).
+- \`evalChecks\`: at most ${ARCHITECT_MAX_EVALS} closed Lean terms, e.g. \`Nat.digits 3 2026\`, \`(4 * 9 : ℕ)\`, \`padicValNat 2 (Nat.factorial 100)\`. Use these aggressively when the node contains a concrete number — a guessed constant is the most expensive error available here.
+- \`citedNames\`: at most ${ARCHITECT_MAX_NAMES}.`
+}
+
+// One diagnostician pass over a failed node: model call, then every claim it
+// made is put to the compiler before any of it reaches refinement.
+async function architectDiagnose(node, cls, ctx, state, urls, evidence, prefix, prelude) {
+  const base = {
+    class: cls,
+    analysis: evidence.selfAnalysis || "",
+    directive: ARCHITECT_CLASSES[cls].directive,
+    helpers: [],
+    facts: [],
+    deadNames: [],
+    rejected: [],
+  }
+  if (!ARCHITECT_DIAGNOSE_CLASSES.has(cls) || !urls.xii) return base
+  if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return base
+
+  const user = `## Failing node
+${node.signature.trim()}
+
+Natural-language statement: ${node.statement || "(none)"}
+Blueprint proof sketch: ${node.proofSketch || "(none)"}
+
+## Declared parents
+${evidence.parents || "(none)"}
+
+## Harness classification
+${cls} — ${ARCHITECT_CLASSES[cls].label}
+
+## Evidence from the failed attempt
+${evidence.disproof ? `MACHINE-CHECKED DISPROOF: the prover proved the NEGATION of this statement. It is definitively false.\n\n` : ""}Prover's own forfeit (UNVERIFIED — it is the failing agent's self-report, treat as a lead, not as fact):
+${evidence.selfAnalysis || "(none)"}
+
+Prover's own suggested fix (UNVERIFIED):
+${evidence.selfFix || "(none)"}
+
+Last compiler feedback:
+${evidence.lastError || "(none)"}`
+
+  let raw = ""
+  try {
+    if (state.driver === "claude") {
+      // One shot, no tools — the same shape claudeArchitectLoop uses for its
+      // forfeit turn. The diagnostician never needs a tool loop: every check
+      // it might want is run by the harness afterwards, not by the model.
+      const fr = await runClaude(
+        buildArgs(user, {
+          model: state.model,
+          systemPrompt: architectDiagnosticSystem(),
+          disallowedTools: "Bash Read Write Edit Glob Grep WebFetch WebSearch Task",
+          strictMcpConfig: true,
+          excludeDynamicSections: true,
+        }),
+        { cwd: process.cwd(), timeoutMs: 180000 },
+      )
+      if (typeof fr.costUsd === "number") {
+        state.driverCostUsd = Number(state.driverCostUsd || 0) + fr.costUsd
+        architectRecost(ctx, state)
+      }
+      raw = fr.ok ? String(fr.text || "") : ""
+    } else {
+      const msg = await grokCall(
+        state,
+        [
+          { role: "system", content: architectDiagnosticSystem() },
+          { role: "user", content: user },
+        ],
+        [],
+        ctx,
+        { grace: true },
+      )
+      raw = String(msg?.content || "")
+    }
+  } catch (e) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `🩺 diagnostician ⟪${node.name}⟫ unavailable: ${String(e?.message || e)}` })
+    return base
+  }
+
+  let parsed = null
+  try {
+    const m = raw.match(/\{[\s\S]*\}/)
+    parsed = m ? JSON.parse(m[0]) : null
+  } catch {
+    parsed = null
+  }
+  if (!parsed) return base
+
+  if (typeof parsed.analysis === "string" && parsed.analysis.trim())
+    base.analysis = parsed.analysis.trim().slice(0, 900)
+
+  // ---- Verification pass 1: do the cited Mathlib names exist? ----------------
+  const names = (Array.isArray(parsed.citedNames) ? parsed.citedNames : [])
+    .map((s) => String(s || "").trim())
+    .filter((s) => /^[A-Za-z_][A-Za-z0-9_'.]*$/.test(s))
+    .slice(0, ARCHITECT_MAX_NAMES)
+  if (names.length) {
+    try {
+      const r = await architectMcpCall(
+        urls.xii,
+        "lean_compile",
+        { mode: "explore", code: names.map((n) => `#check @${n}`).join("\n") },
+        Number(NODE_TIMEOUT_MS),
+      )
+      // The error text names the offending identifier, so no line mapping.
+      const txt = String(r.report || "")
+      base.deadNames = names.filter((n) =>
+        new RegExp(`unknown (?:constant|identifier) '?${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'?`, "i").test(txt),
+      )
+    } catch {}
+  }
+
+  // ---- Verification pass 2: evaluate the numeric questions ------------------
+  const evals = (Array.isArray(parsed.evalChecks) ? parsed.evalChecks : [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean)
+    .slice(0, ARCHITECT_MAX_EVALS)
+  if (evals.length) {
+    try {
+      const r = await architectMcpCall(
+        urls.xii,
+        "lean_compile",
+        {
+          mode: "node",
+          code: evals.map((e) => `#eval ${e}`).join("\n"),
+          target_name: "__architect_eval__",
+          target_signature: "",
+          prefix,
+          prelude,
+        },
+        Number(NODE_TIMEOUT_MS),
+      )
+      const info = Array.isArray(r.info) ? r.info : []
+      base.facts =
+        info.length === evals.length
+          ? evals.map((e, i) => `#eval ${e}  ⇒  ${String(info[i]).replace(/\s+/g, " ").slice(0, 200)}`)
+          : info.map((v) => String(v).replace(/\s+/g, " ").slice(0, 200))
+    } catch {}
+  }
+
+  // ---- Verification pass 3: typecheck + refute the proposed helpers ---------
+  const helpers = (Array.isArray(parsed.helpers) ? parsed.helpers : []).slice(0, ARCHITECT_MAX_HELPERS)
+  for (const h of helpers) {
+    const sig = String(h?.signature || "").trim()
+    const why = String(h?.why || "").trim().slice(0, 160)
+    const split = architectSplitSig(sig)
+    if (!split) {
+      base.rejected.push(`${sig.slice(0, 90)} — not a parseable \`theorem\` signature`)
+      continue
+    }
+    if (deadlinePassed(ctx) || ctx.signal?.aborted) break
+    let ok = false
+    try {
+      const r = await architectMcpCall(
+        urls.xii,
+        "lean_compile",
+        {
+          mode: "node",
+          code: `${sig} := by sorry`,
+          target_name: "__architect_helper__",
+          target_signature: "",
+          prefix,
+          prelude,
+        },
+        Number(NODE_TIMEOUT_MS),
+      )
+      ok = !(r.errors || []).length
+      if (!ok) base.rejected.push(`${split.name} — does not typecheck: ${String(r.report || "").replace(/\s+/g, " ").slice(0, 160)}`)
+    } catch {
+      continue
+    }
+    if (!ok) continue
+    // Closed helper: is it actually FALSE? This is the check that would have
+    // caught `12 = 4 * 9` before refinement built a branch on top of it.
+    if (!split.binders && (await architectRefute(split.concl, prefix, prelude, urls, ctx))) {
+      base.rejected.push(`${split.name} — REFUTED by the compiler: \`${split.concl.slice(0, 100)}\` is false`)
+      continue
+    }
+    base.helpers.push({ signature: sig, why })
+  }
+
+  // The diagnostician may only DOWNGRADE severity, never escalate to a falsity
+  // claim: STATEMENT_WRONG requires a witness, which only the harness produces.
+  if (cls === "SUSPECT_STATEMENT" && /HARNESS_LIMIT|LIBRARY_GAP/i.test(String(parsed.diagnosis || "")))
+    base.class = String(parsed.diagnosis).toUpperCase() === "HARNESS_LIMIT" ? "HARNESS_LIMIT" : "PROOF_TOO_HARD"
+
+  return base
+}
+
 // The annotated graph the refinement stage consumes: decl + verdict marker
 // (+ Diagnosis block for failures). Compact signals, never transcripts.
 //
@@ -4722,19 +5149,36 @@ const architectStripVerdicts = (text) =>
     .replace(/^\s*--\s*(?:PROVED|UNPROVED)\s*$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd()
-function architectAnnotate(graph, results) {
+function architectAnnotate(graph, results, verdicts) {
+  const section = (title, body) => (body && String(body).trim() ? `\n## ${title}: ${String(body).trim()}` : "")
   return graph
     .map((rawNode) => {
       const n = { ...rawNode, declText: architectStripVerdicts(rawNode.declText) }
       if (!["lemma", "theorem"].includes(n.kind)) return n.declText
       const r = results.get(n.name)
-      if (r?.solved) return `${n.declText}\n-- PROVED`
-      const f = r?.forfeit || { diagnosis: "PROOF_TOO_HARD", analysis: "Node was not attempted (an upstream failure consumed the budget).", fix: "" }
-      const diag = r?.negated ? "STATEMENT_WRONG" : f.diagnosis
-      const analysis = r?.negated
-        ? `MACHINE-CHECKED DISPROOF: the prover formally proved the NEGATION of this statement. ${f.analysis}`
-        : f.analysis
-      return `${n.declText}\n-- UNPROVED\n/- Diagnosis\n## Diagnosis: ${diag}\n## Analysis: ${analysis}\n## Suggested Fix: ${f.fix}\n-/`
+      if (r?.solved) return `${n.declText}\n-- PROVED (verified proof banked for this exact signature + parent set)`
+      const v = verdicts?.get(n.name)
+      const cls = v?.class || (r?.negated ? "DISPROVED" : "PROOF_TOO_HARD")
+      const meta = ARCHITECT_CLASSES[cls] || ARCHITECT_CLASSES.PROOF_TOO_HARD
+      const analysis =
+        v?.analysis ||
+        r?.forfeit?.analysis ||
+        "Node was not attempted (an upstream failure consumed the budget)."
+      const helpers = (v?.helpers || [])
+        .map((h) => `\n    ${h.signature}${h.why ? `\n      -- ${h.why}` : ""}`)
+        .join("")
+      return (
+        `${n.declText}\n-- UNPROVED\n/- Diagnosis` +
+        `\n## Class: ${cls}` +
+        `\n## Harness directive: ${meta.directive}` +
+        section("Analysis", analysis) +
+        section("Note", v?.note) +
+        section("Machine-verified facts (computed by Lean — these override any number in the sketches above)", (v?.facts || []).join("\n  ")) +
+        section("Names that DO NOT EXIST in this Mathlib (do not use them)", (v?.deadNames || []).join(", ")) +
+        section("Proposals the harness REJECTED (do not reinstate)", (v?.rejected || []).join("\n  ")) +
+        (helpers ? `\n## Verified helper lemmas (each typechecks here and was not refuted):${helpers}` : "") +
+        `\n-/`
+      )
     })
     .join("\n\n")
 }
@@ -4811,7 +5255,19 @@ Proof sketch from the blueprint: ${node.proofSketch || "(none)"}
 ${parents || "(none — this node has no parents)"}
 ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its hypotheses, prove instead exactly:\n\n${negSig} := by\n  <your disproof>\n` : ""}`
 
-  const result = { solved: false, negated: false, proofBody: null, forfeit: null, attempts: 0 }
+  const result = {
+    solved: false,
+    negated: false,
+    proofBody: null,
+    forfeit: null,
+    attempts: 0,
+    // Set when the LAST compile of the node failed purely on an elaborator
+    // resource ceiling. Classification treats that as "not a mathematical
+    // failure" — the node is retried, not rewritten.
+    harnessLimit: false,
+    lastError: "",
+    parentsRendered: parents,
+  }
   // The last compiler feedback of the previous fresh attempt. Fed into the
   // next attempt's retry note so "fresh" never means "amnesiac": observed
   // live, a node repeated the exact same broken tactic skeleton across every
@@ -4867,6 +5323,8 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           return { report: r.report, __done: { negated: !!r.negated, body: rebuilt.slice(at + 2).trim() } }
         }
         lastError = String(r.report || "").slice(0, 900)
+        result.lastError = lastError
+        result.harnessLimit = architectIsResourceFailure(r, r.report)
         // A submission that elaborates with only sorries left is the node's
         // most valuable non-solve artifact — keep the latest for the retry note.
         if (/Compiles, but the proof still contains sorry/.test(r.report || ""))
@@ -5115,12 +5573,17 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   // is read, before any proving or assembly is attempted on it.
   const depsOfProof = new Map()
   const depsKey = (n) => [...n.deps].sort().join(",")
+  // Multiplier on the elaborator resource floor, raised only by the
+  // resource-retry branch below (never lowered within a run).
+  let resourceBoost = 1
+  let resourceRetries = 0
+  const ARCHITECT_MAX_RESOURCE_RETRIES = 2
 
   // Unbounded loop with a LIVE cap check at the bottom — the budget can grow
   // mid-iteration, so it can't be baked into the loop condition.
   for (let iter = 0; ; iter++) {
     const graph = bp.graph
-    const prelude = architectPrelude(bp.code)
+    const prelude = architectPrelude(bp.code, resourceBoost)
     const provable = graph.filter((n) => ["lemma", "theorem"].includes(n.kind))
     // Proof reuse: byte-identical (whitespace-normalised) signatures AND an
     // unchanged parent set keep the proof; either changing invalidates it.
@@ -5160,6 +5623,86 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       }
     })
     await Promise.all(workers)
+
+    // ---- Failure classification + diagnosis -------------------------------
+    // Decide WHAT KIND of failure each unproved node suffered before deciding
+    // what to do about it. The class is the harness's own judgement, derived
+    // from machine-observable facts (was a negation registered? were the
+    // parents proved? was the last error a resource ceiling?) — never from
+    // the failing prover's self-assessment, which is the least reliable
+    // signal in the loop and the one the paper leans on hardest.
+    const verdicts = new Map()
+    const failed = provable.filter((n) => !proofs.has(n.name) && results.has(n.name))
+    for (const n of failed) {
+      const r = results.get(n.name)
+      const unprovedParents = n.deps.filter(
+        (d) => provable.some((p) => p.name === d) && !proofs.has(d),
+      )
+      let cls
+      if (r.negated) cls = "DISPROVED"
+      else if (unprovedParents.length) cls = "PARENTS_MISSING"
+      else if (r.harnessLimit) cls = "HARNESS_LIMIT"
+      else if (r.forfeit?.diagnosis === "STATEMENT_WRONG") cls = "SUSPECT_STATEMENT"
+      else cls = "PROOF_TOO_HARD"
+
+      // A prover's bare assertion of falsity is not evidence — but the
+      // compiler can settle it. Try to refute the node's own conclusion; a
+      // success promotes the claim to a real DISPROVED, a failure leaves it
+      // SUSPECT so refinement cannot delete a true lemma on a hunch. (On
+      // factorial_base12_trailing_zeros this is exactly the missing step: one
+      // node was declared STATEMENT_WRONG and rewritten away while being
+      // true, and another — `¬ 3^1010 ∣ 2026!` — was genuinely false and
+      // could have been settled here in one compile.)
+      if (cls === "SUSPECT_STATEMENT") {
+        const split = architectSplitSig(n.signature)
+        if (split && !split.binders && (await architectRefute(split.concl, architectNodePrefix(graph, n.name), prelude, urls, ctx))) {
+          cls = "DISPROVED"
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${n.name}⟫ — harness refuted the statement; the prover's STATEMENT_WRONG claim is confirmed.` })
+        } else {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛡️ node ⟪${n.name}⟫ — prover claimed STATEMENT_WRONG with no disproof and the harness could not refute it; downgraded to SUSPECT_STATEMENT (refinement may not delete it on that basis).` })
+        }
+      }
+      verdicts.set(n.name, {
+        class: cls,
+        analysis: r.forfeit?.analysis || "",
+        directive: ARCHITECT_CLASSES[cls].directive,
+        helpers: [],
+        facts: [],
+        deadNames: [],
+        rejected: [],
+        note: unprovedParents.length ? `unproved parents: ${unprovedParents.join(", ")}` : "",
+      })
+    }
+
+    // Enrich only the classes where a diagnosis changes what refinement does.
+    const toDiagnose = failed.filter((n) => ARCHITECT_DIAGNOSE_CLASSES.has(verdicts.get(n.name).class))
+    if (toDiagnose.length) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🩺 Diagnosing ${toDiagnose.length} failed node(s) — every claim is checked against Lean before refinement sees it.` })
+      let dcur = 0
+      const dworkers = Array.from({ length: Math.max(1, Math.min(2, toDiagnose.length)) }, async () => {
+        while (dcur < toDiagnose.length) {
+          const n = toDiagnose[dcur++]
+          if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return
+          const r = results.get(n.name)
+          const base = verdicts.get(n.name)
+          const v = await architectDiagnose(n, base.class, ctx, state, urls, {
+            parents: r.parentsRendered || "",
+            selfAnalysis: r.forfeit?.analysis || "",
+            selfFix: r.forfeit?.fix || "",
+            lastError: r.lastError || "",
+            disproof: !!r.negated,
+          }, architectNodePrefix(graph, n.name), prelude)
+          verdicts.set(n.name, { ...base, ...v, note: base.note })
+          const bits = []
+          if (v.facts?.length) bits.push(`${v.facts.length} verified fact(s)`)
+          if (v.helpers?.length) bits.push(`${v.helpers.length} helper(s) accepted`)
+          if (v.rejected?.length) bits.push(`${v.rejected.length} rejected`)
+          if (v.deadNames?.length) bits.push(`${v.deadNames.length} nonexistent name(s)`)
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🩺 ⟪${n.name}⟫ ${v.class}${bits.length ? ` — ${bits.join(", ")}` : ""}` })
+        }
+      })
+      await Promise.all(dworkers)
+    }
 
     // Research telemetry (Leak River table): snapshot after every pass so the
     // FINAL values — whatever they are when this function returns, success or
@@ -5226,11 +5769,41 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     if (iter >= maxIters()) break
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
 
-    // ---- Blueprint refinement on the annotated graph.
     const stillUnsolved = provable.filter((n) => !proofs.has(n.name))
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters()}: ${stillUnsolved.length} unsolved node(s) — rewriting the graph around the failures.` })
+
+    // ---- Signal-dependent routing ------------------------------------------
+    // Refinement is the response to a MATHEMATICAL failure. When every node
+    // that failed did so on an elaborator ceiling, nothing about the graph is
+    // implicated — rewriting it would churn a blueprint that was never the
+    // problem, and (worse) hand a refinement model a set of perfectly good
+    // statements with an invitation to "fix" them. Raise the ceiling and
+    // re-prove the SAME graph instead. Bounded, so a genuinely impossible
+    // computation cannot loop.
+    if (
+      stillUnsolved.length &&
+      stillUnsolved.every((n) => verdicts.get(n.name)?.class === "HARNESS_LIMIT") &&
+      resourceRetries < ARCHITECT_MAX_RESOURCE_RETRIES
+    ) {
+      resourceRetries++
+      resourceBoost *= 4
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `⚙️ Every unsolved node failed on an elaborator resource ceiling, not on mathematics — skipping refinement and re-proving the same graph with maxRecDepth ${ARCHITECT_MAX_REC_DEPTH * resourceBoost} / maxHeartbeats ${ARCHITECT_MAX_HEARTBEATS * resourceBoost} (retry ${resourceRetries}/${ARCHITECT_MAX_RESOURCE_RETRIES}).`,
+      })
+      continue
+    }
+
+    // ---- Blueprint refinement on the annotated graph.
+    const byClass = new Map()
+    for (const n of stillUnsolved) {
+      const c = verdicts.get(n.name)?.class || "PROOF_TOO_HARD"
+      byClass.set(c, (byClass.get(c) || 0) + 1)
+    }
+    const classSummary = [...byClass.entries()].map(([c, k]) => `${k}×${c}`).join(", ")
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters()}: ${stillUnsolved.length} unsolved node(s)${classSummary ? ` (${classSummary})` : ""} — rewriting the graph around the failures.` })
     const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
-    const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks)}`
+    const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks, verdicts)}`
     const refined = await architectBlueprintStage(ctx, state, urls, {
       system: architectRefineSystem(),
       user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,

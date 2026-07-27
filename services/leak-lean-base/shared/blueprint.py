@@ -17,6 +17,7 @@ is what makes text-level parsing here sound: anything the parser cannot
 recognise is itself a safeguard violation, never silently accepted.
 """
 
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -24,7 +25,113 @@ DECL_KINDS = ("theorem", "lemma", "def", "abbrev", "structure", "instance", "ind
 DECL_START = re.compile(
     r"^\s*(?:@\[|(?:private\s+|protected\s+|noncomputable\s+|public\s+)*(?:theorem|lemma|def|abbrev|structure|instance|inductive)\b)"
 )
-FORBIDDEN = re.compile(r"(?<![A-Za-z0-9_'.])(axiom|native_decide)(?![A-Za-z0-9_'])")
+
+# ---------------------------------------------------------------------------
+# Forbidden constructs — `axiom` and `native_decide` are NOT the same hazard
+# ---------------------------------------------------------------------------
+# The paper (App. C.1) lists both together, and this stack originally banned
+# them with one regex. They are different things and deserve different rules.
+#
+#   `axiom`         is a HOLE. It lets a model assume its way to the target
+#                   ("axiom foo : <the goal>") and produce a file that compiles
+#                   while proving nothing. Never allowed, in any mode.
+#
+#   `native_decide` is an ORACLE. It decides a closed decidable proposition by
+#                   compiling and RUNNING it. It cannot be pointed at an open
+#                   goal, and it cannot assume anything the evaluator does not
+#                   actually compute. What it costs is kernel purity: the
+#                   resulting proof term depends on `Lean.ofReduceBool` /
+#                   `Lean.trustCompiler` rather than being checked by the
+#                   kernel alone.
+#
+# Banning the oracle left this pipeline with NO way to check a number. With
+# `decide`/`norm_num` also walled off by maxRecDepth on anything the size of
+# `2026!`, every numeric claim in a blueprint was the backbone model's mental
+# arithmetic — and it was repeatedly wrong (`12 = 4 * 9`, a little-endian
+# `Nat.digits` list, `2^2018 ≤ …` for `2018 ≤ …`), each error costing a whole
+# refinement iteration. So `native_decide` is allowed by default here, and the
+# purity it costs is not hidden: Leak XIV records the certified proof's actual
+# axiom dependencies (see `verify_full_script`), so a native_decide-backed
+# certificate is distinguishable from a kernel-only one instead of silently
+# passing as the same thing.
+#
+# Set ARCHITECT_ALLOW_NATIVE_DECIDE=0 to restore strict paper fidelity.
+FORBIDDEN_AXIOM = re.compile(r"(?<![A-Za-z0-9_'.])axiom(?![A-Za-z0-9_'])")
+FORBIDDEN_NATIVE = re.compile(r"(?<![A-Za-z0-9_'.])native_decide(?![A-Za-z0-9_'])")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def allow_native_decide() -> bool:
+    """Read live so a redeploy-free env change takes effect on the next call."""
+    return _env_flag("ARCHITECT_ALLOW_NATIVE_DECIDE", True)
+
+
+def forbidden_violations(stripped: str) -> list[str]:
+    """Violations for a COMMENT-STRIPPED source. `axiom` always; the oracle
+    only when explicitly disabled."""
+    v: list[str] = []
+    if FORBIDDEN_AXIOM.search(stripped):
+        v.append("forbidden construct 'axiom' (it assumes rather than proves — never permitted)")
+    if not allow_native_decide() and FORBIDDEN_NATIVE.search(stripped):
+        v.append("forbidden construct 'native_decide' (ARCHITECT_ALLOW_NATIVE_DECIDE=0)")
+    return v
+
+
+def uses_native_decide(stripped: str) -> bool:
+    return bool(FORBIDDEN_NATIVE.search(stripped))
+
+
+# ---------------------------------------------------------------------------
+# set_option whitelist — resource knobs are not soundness knobs
+# ---------------------------------------------------------------------------
+# The canonical node rebuild keeps only the submitted `:= by` body, so a
+# `set_option ... in` the prover wrote was silently discarded. That made
+# maxRecDepth walls unclimbable: on `factorial_base12_trailing_zeros` the
+# prover wrote `set_option maxRecDepth 2000 in` six separate times, watched it
+# vanish, and forfeited nodes whose ONLY failure was the recursion limit.
+#
+# These options change how much work the elaborator is willing to do. None of
+# them can make a false proof typecheck, so they pass through the rebuild.
+# Anything else still does not: `set_option` can also disable safety-relevant
+# checks, and an open whitelist would be a real hole.
+SET_OPTION_WHITELIST = (
+    "maxRecDepth",
+    "maxHeartbeats",
+    "synthInstance.maxHeartbeats",
+    "synthInstance.maxSize",
+)
+SET_OPTION_RE = re.compile(
+    r"^[ \t]*set_option[ \t]+([A-Za-z_][A-Za-z0-9_.']*)[ \t]+(true|false|[0-9]+)[ \t]*(\bin\b)?[ \t]*$",
+    re.M,
+)
+
+
+def extract_set_options(code: str) -> tuple[list[str], list[str]]:
+    """Scan a submission for `set_option` commands.
+
+    Returns (accepted-as-standalone-commands, violations). Accepted options are
+    re-emitted by the caller ahead of the rebuilt declaration, so a prover can
+    raise a resource ceiling without being able to smuggle anything else in."""
+    accepted: list[str] = []
+    violations: list[str] = []
+    for m in SET_OPTION_RE.finditer(strip_comments(code)):
+        name, value = m.group(1), m.group(2)
+        if name in SET_OPTION_WHITELIST:
+            cmd = f"set_option {name} {value}"
+            if cmd not in accepted:
+                accepted.append(cmd)
+        else:
+            violations.append(
+                f"set_option '{name}' is not permitted (only resource limits pass through: "
+                f"{', '.join(SET_OPTION_WHITELIST)})"
+            )
+    return accepted, violations
 
 
 @dataclass
@@ -268,9 +375,9 @@ def precheck_blueprint(code: str, target_name: str, target_signature: str) -> li
         v.append("missing 'import Mathlib'")
     if not re.search(r"^\s*import\s+Architect\s*$", stripped, re.M):
         v.append("missing 'import Architect'")
-    fb = FORBIDDEN.search(stripped)
-    if fb:
-        v.append(f"forbidden construct '{fb.group(1)}'")
+    v += forbidden_violations(stripped)
+    _, opt_violations = extract_set_options(code)
+    v += opt_violations
 
     chunks, spans = split_decls(code)
     nodes = [n for n in (parse_decl(c, s) for c, s in zip(chunks, spans)) if n]

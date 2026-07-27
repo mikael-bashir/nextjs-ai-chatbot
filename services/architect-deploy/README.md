@@ -132,6 +132,46 @@ decompose/tree mode ON.
   iterations while their signature stays byte-identical (whitespace-norm).
 * Safeguards + graph validation (App. C.1): implemented in Leak XII exactly
   as listed, including the `Safeguard rejected` pre-Lean path.
+
+## Deliberate divergences from the paper
+
+Four, all for the same reason: the paper's gates assume a Lean-specialised
+backbone, and on a general reasoning model they removed capability the
+pipeline needed without removing any failure mode.
+
+* **`native_decide` is permitted; `axiom` is not.** App. C.1 forbids both
+  together. They are different things: `axiom` is a hole (it lets a model
+  assume the target), `native_decide` is an oracle (it decides a *closed*
+  proposition by running it, and cannot be pointed at an open goal). Banning
+  the oracle left no way to check a number — and with `decide`/`norm_num`
+  also walled off by `maxRecDepth` on anything factorial-sized, every numeric
+  claim became the backbone's mental arithmetic. It was repeatedly wrong.
+  What the oracle costs is kernel purity, so Leak XIV now records the
+  certified proof's real axiom dependencies and a `kernelOnly` flag: an
+  oracle-backed certificate is *distinguishable*, not silently equated with a
+  kernel one. `ARCHITECT_ALLOW_NATIVE_DECIDE=0` restores strict fidelity.
+* **Resource `set_option`s survive the canonical node rebuild.** Only
+  `maxRecDepth`, `maxHeartbeats`, `synthInstance.*` — resource knobs cannot
+  make a false proof typecheck. The bridge also applies a floor
+  (`ARCHITECT_MAX_REC_DEPTH`, `ARCHITECT_MAX_HEARTBEATS`) to every architect
+  compile, and quadruples it for a pass that failed on nothing else.
+* **`#eval`/`#check`/`#print` output is returned.** Lean emits these at
+  severity `info`, which XII previously collected and never reported — so an
+  exploration `#eval` came back as the literal string "No errors." with the
+  value discarded. Surfacing it is what makes `#eval` an oracle rather than a
+  no-op, and it is the cheapest fix in this stack.
+* **Failures are classified before they are refined.** §2.3 gives refinement
+  one signal (the failing node's own forfeit) and one response (adopt its
+  helper decomposition). The forfeit is written by the agent that just
+  failed, out of budget, and nothing checks it. The bridge now classifies
+  each failure from machine-observable facts — `DISPROVED`,
+  `SUSPECT_STATEMENT`, `PARENTS_MISSING`, `HARNESS_LIMIT`, `PROOF_TOO_HARD` —
+  and routes on the class, with a separate **diagnostician** model enriching
+  only the classes where that changes the outcome. Every claim the
+  diagnostician makes is put to Lean before refinement sees it: cited names
+  are `#check`ed, numeric questions are `#eval`ed, proposed helpers are
+  typechecked and (when closed) tested for refutation, and a bare falsity
+  claim with no witness is downgraded rather than acted on.
 * Exit condition: only Leak XIV's certificate of the fully assembled,
   attribute-stripped, sorry-free file counts — node solves and model prose
   are advisory (the house rule since the Gen-1 role-hijack incident).
