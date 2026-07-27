@@ -402,6 +402,8 @@ const MODE_BLOCKS: Record<
 
 const RESPONSE_FORMAT = `
 
+LEAN SELF-CONTAINMENT (hard requirement, no exceptions): "lean" must be ONE single declaration — the theorem itself. NEVER split it into a separate top-level \`def\`/\`abbrev\`/\`structure\`/etc. that the theorem then references (e.g. a helper recursive function \`f\`). Any auxiliary function, sequence, or recurrence the statement needs must be folded INTO the theorem's own signature instead — as a bound variable plus hypotheses stating its defining equations, e.g. \`theorem foo (f : ℕ → ℕ) (hf0 : f 0 = 0) (hf : ∀ n, f (n + 1) = n + 1 + f ((n + 1) / 2)) : f 2026 = 9769\`. The verifier that later checks a submitted proof compares the target's signature verbatim against nothing but this one declaration — a leading def makes the problem permanently unprovable, not just harder.
+
 Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
 {"questionTitle":"<curious, alluring hook — a question / scenario / teaser; NEVER 'The <Adjective> <Noun>'>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
@@ -839,6 +841,21 @@ function certifiableProof(target: string, proof: string): string | null {
     return `proof's declaration does not match the target signature byte-for-byte`;
   if (/\bsorry\b/.test(proof)) return 'proof still contains `sorry`';
   return null;
+}
+
+// A generated "lean" field must be exactly one declaration — the theorem
+// itself. If the generator split it into a separate top-level def/abbrev/etc.
+// (typically to define a helper recursive sequence) the problem is
+// permanently unprovable downstream: every verifier compares the target
+// signature verbatim against that ONE declaration's own parsed signature,
+// never the surrounding file — a leading def can never match, no matter what
+// gets submitted. Prompt instructions alone aren't a reliable enough gate
+// (models improvise this shape when a statement genuinely needs a helper
+// function), so this is caught here, deterministically, before it's queued.
+const LEADING_DECL_RE =
+  /^\s*(?:private\s+|protected\s+|noncomputable\s+|public\s+)*(?:def|abbrev|structure|instance|inductive)\b/m;
+function leanSplitsIntoSeparateDecl(lean: string): boolean {
+  return LEADING_DECL_RE.test(lean);
 }
 
 export function AdminPipeline() {
@@ -2327,6 +2344,14 @@ export function AdminPipeline() {
           stderr ? `\n\n----- stderr -----\n${stderr}` : ''
         }\n\n----- raw output (${raw.length} chars) -----\n${raw || '(empty)'}`;
         throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
+      }
+      if (leanSplitsIntoSeparateDecl(gen.lean)) {
+        throw Object.assign(
+          new Error(
+            `Discarded — Lean statement splits into a separate def + theorem; the formalization must condense everything into the theorem's own signature`,
+          ),
+          { detail: gen.lean },
+        );
       }
       setStats((s) => ({ ...s, generated: s.generated + 1 }));
       pushGenEvent('text', `Generated: ${gen.questionTitle ?? 'untitled'}`, {

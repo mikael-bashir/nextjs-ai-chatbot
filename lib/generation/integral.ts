@@ -119,6 +119,8 @@ BUILD PROCEDURE — do ALL symbolic work in ONE consolidated python3 script via 
 
 TITLE RULES: curious and alluring, 2-6 words; never the "The <Adjective> <Noun>" template; never hint at the answer.
 
+LEAN SELF-CONTAINMENT: "lean" must be ONE single theorem declaration — the integrand written out fully inline, never a separate top-level \`def\` the theorem then references. The verifier compares the target signature verbatim against exactly this one declaration.
+
 Respond with ONLY this JSON object, nothing else:
 {"questionTitle":"<hook>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement with the displayed integral and the exact extraction convention>","answer":<integer>,"difficulty":"Hard","points":150,"level":<1-5 prerequisite-knowledge estimate>,"insight":"<the certificate: F(x) = <antiderivative>, value V = <exact value>, and the key disguise ideas — 1-3 sentences>","integrand":"<f in sympy syntax>","antiderivative":"<F in sympy syntax>","lowerBound":"<a, sympy syntax>","upperBound":"<b, sympy syntax>","exactValue":"<V in sympy syntax>","lean":"theorem name : ∫ x in (<a>:ℝ)..<b>, <f x> = <V> := by sorry"}`;
 }
