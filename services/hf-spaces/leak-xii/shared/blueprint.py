@@ -423,6 +423,9 @@ def parse_decl(chunk: str, span: tuple[int, int]) -> Node | None:
 # ---------------------------------------------------------------------------
 
 INFO_CMD_RE = re.compile(r"^\s*(#eval|#check|#print|#reduce|example\b)", re.M)
+# `@[blueprint`, `@[simp, blueprint`, ... — the marker that this is meant as a
+# graph. Every valid blueprint has at least one (the main theorem must).
+BLUEPRINT_ATTR_RE = re.compile(r"@\[\s*(?:[\w'.]+\s*,\s*)*blueprint\b")
 
 
 def is_exploration_only(code: str) -> bool:
@@ -438,17 +441,25 @@ def is_exploration_only(code: str) -> bool:
     and guessed 2023 and 1009 -- both wrong, both disproved by node provers,
     costing the first two refinement iterations outright.
 
-    So a submission that declares nothing and only asks the compiler a
-    question is routed to the exploration path instead, exactly as node mode
-    already does. A malformed blueprint still fails the pre-checks: the
-    escape hatch requires an actual info command AND no parsed declaration,
-    so a broken declaration is reported as a broken declaration.
+    So a submission that only asks the compiler a question is routed to the
+    exploration path instead, exactly as node mode already does.
+
+    Scratch DEFINITIONS are part of asking a question. The first cut keyed on
+    "declares nothing", which forced a model that wanted a modular-exponent
+    helper to either smuggle its `def`s into the blueprint (where they were
+    correctly rejected as dead nodes with no `statement` field) or inline the
+    whole computation into one enormous `#eval` full of `let`s. It did the
+    latter, on `shuffled_tables_mod`, after burning three attempts on the
+    former. So the test is the `@[blueprint]` attribute instead: that marker
+    is what says "this is meant as a graph", and a valid blueprint always
+    carries at least one because the main theorem must. Scratch code never
+    does, and a real blueprint is still fully pre-checked.
     """
     src = code or ""
-    if not INFO_CMD_RE.search(strip_comments(src)):
+    stripped = strip_comments(src)
+    if not INFO_CMD_RE.search(stripped):
         return False
-    chunks, spans = split_decls(src)
-    return not any(parse_decl(c, s) for c, s in zip(chunks, spans))
+    return not BLUEPRINT_ATTR_RE.search(stripped)
 
 
 # ---------------------------------------------------------------------------

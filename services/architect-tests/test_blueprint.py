@@ -255,6 +255,15 @@ ok("a real blueprint is NOT exploration",
    not bp.is_exploration_only(bpfile(node("main_t"))))
 ok("a blueprint that also evals is still a blueprint",
    not bp.is_exploration_only(bpfile(node("main_t")) + "\n#eval 1"))
+# Scratch definitions are part of asking the compiler a question. Requiring
+# "declares nothing" forced shuffled_tables_mod's driver to inline an entire
+# modular-exponentiation routine into one `#eval` full of `let`s, after three
+# rejected attempts at smuggling the `def`s into the blueprint.
+ok("scratch defs alongside an eval are exploration",
+   bp.is_exploration_only("def powMod (b e m : Nat) : Nat := b\n#eval powMod 2 10 1000"))
+ok("@[simp, blueprint] still reads as a blueprint",
+   not bp.is_exploration_only("@[simp, blueprint (statement := /-- s -/) (proof := /-- p -/)]\n"
+                              "theorem t : True := by sorry_using []\n#eval 1"))
 # The escape hatch must not swallow a broken blueprint: no info command means
 # it still goes through the pre-checks and gets a structural error.
 ok("malformed decl with no info command still prechecked",

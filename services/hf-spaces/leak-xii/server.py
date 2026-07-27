@@ -181,17 +181,24 @@ async def _compile_blueprint(code: str, target_name: str, target_signature: str)
     except RuntimeError as e:
         return {"ok": False, "phase": "compile", "errors": [],
                 "report": f"Compile backend error: {e}"}
-    errs, _warns = _messages(resp)
+    errs, warns = _messages(resp)
+    # `#eval`/`#check`/`#print` output arrives as info messages. Node mode has
+    # surfaced them since the numeric-oracle work; blueprint mode threw them
+    # away, so a blueprint file carrying an `#eval` compiled, validated, and
+    # returned nothing the model could read the value back from. Observed live
+    # on shuffled_tables_mod: "The `#eval` output got suppressed."
+    infos = _info_output(warns)
     if errs:
-        return {"ok": False, "phase": "compile", "errors": errs,
-                "report": "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs)}
+        return {"ok": False, "phase": "compile", "errors": errs, "info": infos,
+                "report": "Compilation FAILED. Lean errors:\n" + _fmt_errors(errs) + _fmt_info(infos)}
 
     # --- Phase 3: graph validity.
     violations, nodes = bp.validate_graph(code, target_name)
     if violations:
         report = "Compilation SUCCESSFUL. Validation FAILED:\n" + \
-            "\n".join(f"  - {x}" for x in violations)
-        return {"ok": False, "phase": "validation", "violations": violations, "report": report}
+            "\n".join(f"  - {x}" for x in violations) + _fmt_info(infos)
+        return {"ok": False, "phase": "validation", "violations": violations,
+                "info": infos, "report": report}
 
     ordered = bp.topo_order(nodes)
     graph = [{
@@ -206,8 +213,8 @@ async def _compile_blueprint(code: str, target_name: str, target_signature: str)
         "deps": n.deps,
     } for n in ordered]
     return {
-        "ok": True, "phase": "validated",
-        "report": "Compilation SUCCESSFUL. Validation SUCCESSFUL.",
+        "ok": True, "phase": "validated", "info": infos,
+        "report": "Compilation SUCCESSFUL. Validation SUCCESSFUL." + _fmt_info(infos),
         "graph": graph,
     }
 
