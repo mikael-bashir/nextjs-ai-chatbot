@@ -865,6 +865,41 @@ function theoremSignature(src) {
   return m ? canonicalSig(m[0]) : ""
 }
 
+// Extract ONLY the named theorem/lemma's own signature out of a larger raw
+// problem statement — i.e. from its `theorem <name>`/`lemma <name>` keyword up
+// to the first top-level `:=` (bracket-depth aware, since a signature can
+// legitimately contain its own `:=` inside a `let`/binder), or to the end of
+// the string if the statement is given bare (no proof body, the normal case
+// for a target prompt). Unlike `theoremSignature`, this does NOT include any
+// preceding declarations (e.g. a helper `def` the theorem depends on) — those
+// are separate blueprint nodes, and the architect gateways' safeguard compares
+// against the theorem NODE's own parsed signature alone, never the whole blob.
+// Sending the whole blob as `target_signature` made the safeguard un-passable
+// for any problem whose statement has a leading def (e.g. a recursive `f`).
+function mainDeclSignature(src, name) {
+  const s = String(src == null ? "" : src)
+  if (!name) return ""
+  const re = new RegExp(`\\b(?:theorem|lemma)\\s+${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g")
+  let start = -1
+  let m
+  while ((m = re.exec(s)) !== null) start = m.index // last match wins (the real decl, not a stray mention)
+  if (start < 0) return ""
+  let depth = 0
+  let end = s.length
+  for (let i = start; i < s.length - 1; i++) {
+    const c = s[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (depth === 0 && c === ":" && s[i + 1] === "=") { end = i; break }
+  }
+  // Plain whitespace collapse ONLY — mirrors the Python gateway's own
+  // `normalize_sig` (which just does `\s+` -> " "), not `canonicalSig`'s
+  // word-boundary-only spacing (that's for a different, client-side script
+  // match and would strip spaces the Python side's normalizer preserves,
+  // reintroducing the exact mismatch this function exists to fix).
+  return s.slice(start, end).replace(/\s+/g, " ").trim()
+}
+
 // True if `script` contains a theorem/lemma whose signature equals targetSig.
 // Scans every declaration in the script (a proof may define helper lemmas too).
 function scriptProvesTarget(script, targetSig) {
@@ -4823,7 +4858,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
           mode: "blueprint",
           code: String(args.code || ""),
           target_name: state.targetName,
-          target_signature: state.targetSignature,
+          target_signature: state.targetPrecheckSignature,
         }, Number(BLUEPRINT_TIMEOUT_MS))
         lastReport = String(r.report || "").slice(0, 1200)
         if (r.ok) {
@@ -4913,6 +4948,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     return { verified: false, proof: "" }
   }
   const variant = architectConfigFor(ctx.strategy)
+  const targetName = (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target"
   // Refinement budget for THIS run, read LIVE off the run state (the UI's
   // "+1 iter" button raises it via /extend, exactly like "+5 min" raises the
   // deadline) so a bump lands even while the final iteration is running. Falls
@@ -4943,8 +4979,14 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     // Shared environment facts across node provers — gate/delta only. Null for
     // the control, so its nodes stay exactly as isolated as the paper's.
     ledger: variant.shareDeadEnds ? makeDeadEndLedger() : null,
-    targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
+    targetName,
+    // Full blob (any leading defs + the theorem), body stripped — for PROMPTS
+    // only, since the model needs the leading defs to write correct helpers.
     targetSignature: theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry[\s\S]*$/, "").trim(),
+    // The main theorem's OWN signature alone (no leading defs) — this is what
+    // the leak-xii/leak-xiv safeguards actually compare a submission against,
+    // so it's the only correct value for `target_signature` in those calls.
+    targetPrecheckSignature: mainDeclSignature(theorem, targetName),
   }
   if (ctx.metrics) {
     ctx.metrics.max_iters = maxIters()
@@ -5067,7 +5109,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         cert = await architectMcpCall(urls.xiv, "verify_full_script", {
           code: finalCode,
           target_name: state.targetName,
-          target_signature: state.targetSignature,
+          target_signature: state.targetPrecheckSignature,
         }, Number(VERIFY_TIMEOUT_MS))
       } catch (e) {
         cert = { ok: false, report: String(e?.message || e) }
