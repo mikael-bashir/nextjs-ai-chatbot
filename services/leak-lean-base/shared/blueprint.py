@@ -153,12 +153,36 @@ class Node:
 # Lexical helpers
 # ---------------------------------------------------------------------------
 
+def _skip_string(src: str, i: int) -> int:
+    """Index of `src[i] == '\"'` -> index just past the closing quote.
+
+    Lean string literals can contain anything, including `--`, `/-` and `:=`.
+    Every scanner in this file used to walk straight through them, so
+    `theorem t : "a := b".length = 6 := by ...` split at the `:=` INSIDE the
+    string and produced the signature `theorem t : "a`. Same failure class as
+    the `let`-binder bug, third occurrence."""
+    n = len(src)
+    j = i + 1
+    while j < n:
+        if src[j] == "\\":
+            j += 2
+            continue
+        if src[j] == '"':
+            return j + 1
+        j += 1
+    return n
+
+
 def strip_comments(src: str) -> str:
-    """Replace comments with spaces (preserving newlines/offsets)."""
+    """Replace comments with spaces (preserving newlines/offsets). String
+    literals are stepped over intact — a `--` or `/-` inside one is text."""
     out = list(src)
     i, n = 0, len(src)
     depth = 0
     while i < n:
+        if depth == 0 and src[i] == '"':
+            i = _skip_string(src, i)
+            continue
         c2 = src[i : i + 2]
         if depth == 0 and c2 == "--":
             j = src.find("\n", i)
@@ -334,6 +358,9 @@ def parse_decl(chunk: str, span: tuple[int, int]) -> Node | None:
     n = len(srest)
     while i < n - 1:
         c = srest[i]
+        if c == '"':
+            i = _skip_string(srest, i)
+            continue
         if c in "([{⟨":
             depth += 1
         elif c in ")]}⟩":

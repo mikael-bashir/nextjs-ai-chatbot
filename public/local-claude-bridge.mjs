@@ -4678,6 +4678,18 @@ function architectSignatureOf(text) {
   let pending = 0
   let i = m.index + m[0].length
   while (i < src.length - 1) {
+    // Lean string literals can contain `--`, `/-` and `:=`; step over them
+    // intact rather than lexing their contents.
+    if (src[i] === '"') {
+      let j = i + 1
+      while (j < src.length) {
+        if (src[j] === "\\") { j += 2; continue }
+        if (src[j] === '"') break
+        j++
+      }
+      i = j + 1
+      continue
+    }
     const two = src.slice(i, i + 2)
     if (two === "--") {
       const nl = src.indexOf("\n", i)
