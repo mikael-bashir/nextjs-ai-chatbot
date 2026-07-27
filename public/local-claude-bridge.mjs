@@ -2566,7 +2566,7 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
@@ -2603,6 +2603,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       "--disallowedTools", ...(Array.isArray(disallowedTools) ? disallowedTools : PROVER_DISALLOWED_TOOLS),
     ]
     if (model) args.push("--model", model)
+    if (typeof effort === "string" && effort.trim()) args.push("--effort", effort.trim())
     if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
     // The architect stage contract (blueprint rules / prover rules / refinement
     // rules) rides as a system prompt so it outranks the conversation, matching
@@ -3726,6 +3727,21 @@ const NODE_TIMEOUT_MS = 300000
 const VERIFY_TIMEOUT_MS = 600000
 // How long the CLI may produce nothing before the bridge says so. Purely a
 // notice: it never stops anything.
+// Effort for Leak Ultra's BLUEPRINT stage only. Blueprint generation is a
+// structuring task -- read the target, maybe search, emit a `sorry_using`
+// skeleton -- and it proves nothing, so maximum deliberation is spent on
+// mathematics it has not been asked to do yet. Measured on insane_lamp_circle,
+// three concurrent arms on the same bridge:
+//
+//   baseline (CLI default effort)                375s, 0 tool calls
+//   + "explore-compile FIRST" added to C.1       375s, 0 tool calls
+//   + --effort low                               214s, 7 tool calls
+//
+// The prompt lever did nothing; this is the one that works. Node proving keeps
+// the default -- that stage is real proof search and the deliberation earns its
+// keep. Override with ARCHITECT_BLUEPRINT_EFFORT to try another level without a
+// code change.
+const ARCHITECT_BLUEPRINT_EFFORT = process.env.ARCHITECT_BLUEPRINT_EFFORT || "low"
 const ARCHITECT_IDLE_NOTICE_S = 45
 const ARCHITECT_BLUEPRINT_RETRIES = 9999
 const ARCHITECT_NODE_RETRIES = 9999
@@ -4302,7 +4318,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
 //     claimed success in prose (the failure mode that wasted whole Grok attempts);
 //   * cost is the CLI's own reported total_cost_usd, so Ultra needs no price
 //     table and cannot drift when published prices change.
-async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "" }) {
+async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "", effort = "" }) {
   const tag = label ? `[${label}] ` : ""
   ctx.emit({
     type: "system",
@@ -4351,6 +4367,7 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
       // Architect` for a real package and searching the local filesystem
       // for it). See ARCHITECT_DISALLOWED_TOOLS.
       disallowedTools: ARCHITECT_DISALLOWED_TOOLS,
+      effort,
     },
     {
       // Stop the CLI the moment a stage's gate is satisfied; SIGINT (not kill) so
@@ -5137,7 +5154,7 @@ async function architectBlueprintSanity(bp, prelude, urls, ctx, targetName) {
 // is machine-refutable. A refuted node means the graph is KNOWN wrong, so the
 // stage is re-run with the counterexamples as context rather than sending
 // provers after statements the compiler has already disproved.
-async function architectAdmitBlueprint(ctx, state, urls, { system, user, retries, stageLabel }) {
+async function architectAdmitBlueprint(ctx, state, urls, { system, user, retries, stageLabel, effort = "" }) {
   let extra = ""
   let last = null
   for (let round = 0; round < Math.max(1, ARCHITECT_SANITY_ROUNDS); round++) {
@@ -5146,6 +5163,7 @@ async function architectAdmitBlueprint(ctx, state, urls, { system, user, retries
       user: user + extra,
       retries,
       stageLabel: round ? `${stageLabel} · regenerate ${round}` : stageLabel,
+      effort,
     })
     if (!bp) return last ? { bp: last, refuted: [] } : null
     last = bp
@@ -5679,7 +5697,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
 }
 
 // --- Blueprint / refinement conversation (shared shape) ----------------------
-async function architectBlueprintStage(ctx, state, urls, { system, user, retries, stageLabel = "blueprint" }) {
+async function architectBlueprintStage(ctx, state, urls, { system, user, retries, stageLabel = "blueprint", effort = "" }) {
   let lastReport = ""
   for (let attempt = 0; attempt < retries; attempt++) {
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return null
@@ -5722,6 +5740,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
       exec,
       tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
       label: `${stageLabel} · attempt ${attempt + 1}/${retries}`,
+      effort,
     })
     if (out.done) return out.done
   }
@@ -5917,6 +5936,8 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     user: bpUser,
     retries: ARCHITECT_BLUEPRINT_RETRIES,
     stageLabel: "blueprint generation",
+    // Ultra only — the Grok driver has no CLI and ignores this.
+    effort: driver === "claude" ? ARCHITECT_BLUEPRINT_EFFORT : "",
   })
   if (!admitted) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: no compiling blueprint within the retry budget." })
