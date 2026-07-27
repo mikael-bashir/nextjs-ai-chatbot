@@ -2653,6 +2653,12 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     let buf = ""
     let stderr = ""
     let finalText = ""
+    // This call's OWN cost, isolated from the shared `metrics` object below —
+    // needed because ARCHITECT_NODE_CONCURRENCY runs several spawnProverStream
+    // calls at once against the SAME ctx.metrics, so a caller that diffs
+    // metrics.cost_usd before/after its own call double-counts every sibling
+    // call that lands in between (see claudeArchitectLoop).
+    let costUsd = 0
     child.stdout.on("data", (chunk) => {
       buf += chunk.toString("utf8")
       let nl
@@ -2709,7 +2715,10 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           finalText = o.result || finalText
           // Sum this sub-run's cost into the shared tree metrics (ctx.metrics),
           // so the tree's final `done` reports the whole item's actual cost.
-          if (metrics && typeof o.total_cost_usd === "number") metrics.cost_usd = (metrics.cost_usd || 0) + o.total_cost_usd
+          if (typeof o.total_cost_usd === "number") {
+            costUsd += o.total_cost_usd
+            if (metrics) metrics.cost_usd = (metrics.cost_usd || 0) + o.total_cost_usd
+          }
           if (metrics && o.usage) metrics.tokens = (metrics.tokens || 0) + usageTokens(o.usage)
         }
         if (stop && !stopped) {
@@ -2735,7 +2744,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
       destroyGovernor(governor)
-      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message })
+      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message, costUsd })
     })
     child.on("close", (code) => {
       clearTimers()
@@ -2747,7 +2756,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           thought: `${stage ? stage + " " : ""}🔎 Search used ${governor.searchCount}× (${governor.blockedCount} blocked, ${governor.grantCount} refills).`,
         })
       destroyGovernor(governor)
-      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr })
+      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr, costUsd })
     })
   })
 }
@@ -4162,10 +4171,6 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
     })
   }
 
-  // Cost: read the delta on ctx.metrics.cost_usd, which spawnProverStream sums
-  // from each sub-run's result frame. architectRecost then republishes it as the
-  // driver share, so the two never double-count.
-  const costBefore = Number(ctx.metrics?.cost_usd || 0)
   // The CLI namespaces MCP tools (mcp__architect__lean_compile), while the shared
   // stage contracts name them bare — say so once rather than forking the prompts,
   // which would break the "same prompts as Stone" property this branch rests on.
@@ -4197,7 +4202,14 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
     },
   )
   state.models?.add(state.model)
-  state.driverCostUsd = Number(state.driverCostUsd || 0) + Math.max(0, Number(ctx.metrics?.cost_usd || 0) - costBefore)
+  // r.costUsd is THIS call's own isolated cost (see spawnProverStream). Diffing
+  // the shared ctx.metrics.cost_usd instead double(+)-counts under concurrency:
+  // ARCHITECT_NODE_CONCURRENCY runs several of these calls at once against the
+  // same ctx.metrics, so a "before/after" snapshot here would also capture
+  // whatever concurrent sibling calls added in between — and each sibling would
+  // do the same, compounding. Observed live: a single Medium problem "cost"
+  // $37 across just 38 LLM calls before this fix.
+  state.driverCostUsd = Number(state.driverCostUsd || 0) + Number(r.costUsd || 0)
   architectRecost(ctx, state)
 
   if (done) return { finalText: r.finalText || "", exhausted: false, done }
