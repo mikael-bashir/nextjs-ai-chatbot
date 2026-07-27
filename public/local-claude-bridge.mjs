@@ -3636,20 +3636,23 @@ const ARCHITECT_MODEL_LADDER = [
   "grok-4.1",
   "grok-3-mini",
 ]
-const ARCHITECT_BLUEPRINT_TOKENS = 262144
-// The UI's wall clock (default 5 min for this strategy — see
-// ARCHITECT_COMPUTE_BUDGET_MS in admin-pipeline.tsx) is now the ONLY governor
-// that's meant to actually bind on a normal run; every ceiling below is sized
-// so it never truncates a node/blueprint attempt before the deadline does.
-const ARCHITECT_NODE_TOKENS = 131072
+// The wall clock (UI compute budget) and the refinement iteration budget
+// (maxIters) are the ONLY governors meant to bind on a run. The per-attempt
+// token/retry/turn ceilings below used to be independent caps that could
+// forfeit a node or fail a blueprint stage well before either of those two
+// ran out — observed live on medium-difficulty problems. They're now sized
+// so large that deadlinePassed()/architectCapStop() (checked at the top of
+// every attempt loop) is what actually ends an attempt, never these numbers.
+const ARCHITECT_BLUEPRINT_TOKENS = 8000000
+const ARCHITECT_NODE_TOKENS = 8000000
 // MCP tools/call timeouts — match the Python services' own defaults
 // (BLUEPRINT_TIMEOUT_S/NODE_TIMEOUT_S/VERIFY_TIMEOUT_S).
 const BLUEPRINT_TIMEOUT_MS = 600000
 const NODE_TIMEOUT_MS = 300000
 const VERIFY_TIMEOUT_MS = 600000
-const ARCHITECT_BLUEPRINT_RETRIES = 8
-const ARCHITECT_NODE_RETRIES = 6
-const ARCHITECT_REFINE_RETRIES = 8
+const ARCHITECT_BLUEPRINT_RETRIES = 9999
+const ARCHITECT_NODE_RETRIES = 9999
+const ARCHITECT_REFINE_RETRIES = 9999
 // Default refinement-iteration budget. The UI sends a per-run value (its own
 // default is 5, +1 per click) as opts.maxIters, so this is only the fallback
 // for callers that don't specify one.
@@ -3996,7 +3999,7 @@ const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal with
 ## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
 ## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
 
-async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "" }) {
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 9999, forfeitPrompt, label = "" }) {
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
@@ -4128,7 +4131,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
 //     claimed success in prose (the failure mode that wasted whole Grok attempts);
 //   * cost is the CLI's own reported total_cost_usd, so Ultra needs no price
 //     table and cannot drift when published prices change.
-async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "" }) {
+async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 9999, forfeitPrompt, label = "" }) {
   const tag = label ? `[${label}] ` : ""
   ctx.emit({
     type: "system",
