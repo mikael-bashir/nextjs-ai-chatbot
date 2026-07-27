@@ -3844,6 +3844,17 @@ Plan a graph that captures the structure of the proof. Use Definitions for any h
 
 Each Lemma should be (nearly) trivial once its parent nodes are taken as given: it should require at most 1-2 new logical ideas beyond its declared dependencies and its own inlined premises. If a step needs more, split it into intermediate lemmas -- use as many components as the proof requires. Independent branches stay independent: if two parts of the proof do not share reasoning, their lemmas should not depend on each other.
 
+## Library-aware decomposition
+The node provers prove against Mathlib, and much of the "standard theory" a textbook proof leans on is already a named Mathlib lemma. Before designing the graph, call \`mathlib_search\` on the target's main objects and on each intermediate fact you are about to emit as a Lemma. What comes back shapes the graph:
+- If a planned lemma already exists in Mathlib (exactly, or up to trivial rephrasing), do NOT emit a node for it -- the node provers can invoke the library directly; cite the Mathlib name in the dependent node's \`proof\` sketch instead.
+- Emit nodes only for content Mathlib does not already have: the problem-specific reasoning, numeric side conditions, and the glue the target actually needs.
+- The smallest correct graph wins. If search shows the target itself is within direct reach of a library lemma plus routine side conditions, emit a MINIMAL blueprint -- the main Theorem plus only the helper nodes those side conditions genuinely need (a single-node blueprint is valid). A graph that is harder to formalize than the target it decomposes is a failed decomposition.
+
+## Statement ergonomics (write signatures the prover can actually close)
+- Prefer multiplicative/product forms over division or subtraction on ℕ/ℤ: state \`a * b = n\`, not \`n / b = a\` -- ℕ/ℤ division truncates and generates side conditions that stall proofs.
+- Type-ascribe ring-valued expressions whose elaboration is ambiguous (e.g. \`((X : Polynomial ℤ) ^ n - 1)\`), and state hypotheses in the form library lemmas consume (\`n ≠ 0\` rather than only \`n ≥ 1\`; carry both when helpful).
+- Match the phrasing of the nearest Mathlib lemmas found in search -- idiomatic signatures compile; bespoke rephrasings fight the elaborator.
+
 Every natural language \`statement\` field is a closed, typed, standalone proposition: every variable carries an explicit quantifier and domain; every hypothesis the proof uses appears as a premise. Do not reach into ambient context -- restate every theorem-level typing and hypothesis your lemma uses. Every natural language \`proof\` field is a complete sketch citing each declared dep by backticked name (e.g. "by \`lemma_a\`", "from \`def_b\`"); show every key equation, and do not write "by algebra", "obviously", or "one can check".
 
 ## Mapping graph nodes to Lean declarations
@@ -3864,6 +3875,8 @@ Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotate
 - The file starts with \`import Mathlib\` and \`import Architect\` (both required), then any \`open\`/\`set_option\` lines, then the declarations.
 
 ## Tool use
+You also have \`mathlib_search\` -- use it DURING graph design as described above (query the target's head constants and each candidate lemma's content), not only after compile errors. A hit that states a planned node kills that node; a near-miss tells you the idiomatic signature to adopt.
+
 Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; forbidden constructs (\`axiom\`, \`native_decide\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a Lemma/Theorem body that is bare \`sorry\` or a real proof -- every body must be exactly \`:= by sorry_using [...]\`, since proofs belong to the next stage and bare \`sorry\` breaks dependency tracking.
 
 If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed \`@[blueprint]\` decls: every node must have a non-empty \`(statement := /-- ... -/)\` field; every Lemma and the Theorem must have a non-empty \`(proof := /-- ... -/)\` field; every name in \`sorry_using [...]\` must resolve to a declared \`@[blueprint]\` node, with no self-loops; the \`sorry_using\` graph must be acyclic; exactly one main Theorem must exist with the targeted name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
@@ -3883,7 +3896,7 @@ Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial 
 - If your code includes the MAIN theorem with the canonical statement followed by \`:= by ...\`, the system rebuilds it under the original theorem statement: only your \`:= by\` proof body is kept from your submission; the imports, \`set_option\`, and \`open\` lines come from the canonical formal statement, and any other top-level declarations are dropped. Only this case can register a solve. Do not use \`axiom\` or \`native_decide\`; use \`have\` for helper lemmas inside your proof, not top-level declarations; and do not add \`import\` or \`open\` lines that are not already in the canonical formal statement -- any extras will be flagged as a safeguard violation, not silently kept.
 - If your code does NOT include the main theorem (e.g. \`#check\`, \`example\`, \`#print\`, helper-lemma prototypes), the system compiles the snippet as-given and returns the raw feedback. This is exploration only -- it cannot register a solve, so resubmit with the main theorem once you have a full proof. Use this sparingly: every turn against the compiler costs budget, and the only way to finish is to submit the main theorem.
 
-Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. Mathlib does NOT contain the solution to your problem directly, so do not use this tool to "find the proof" or to search for an exact bound stated in the goal -- such queries return nothing useful and waste turns.
+Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. For named mathematical objects (cyclotomic polynomials, totients, binomial coefficients, ...) Mathlib frequently already contains the exact fact you are proving, or a lemma that closes it in one application: if a search hit states your goal or subsumes it, APPLY IT AND SUBMIT immediately -- one lookup is cheaper than re-deriving standard theory, and a library one-liner is a perfectly good registered solve. What search will NOT find is a bespoke bound or numeric identity invented for this problem, so do not query for the goal's exact numbers verbatim.
 
 ## Other outcomes
 If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.`
@@ -3920,6 +3933,8 @@ Each \`-- UNPROVED\` node falls into one of two buckets, decided by the \`## Dia
 When the diagnosis is \`STATEMENT_WRONG\`, the lemma's formal statement is false under its hypotheses. Fix the statement (strengthen hypotheses, weaken the conclusion, fix a quantifier or coercion, etc.) and re-emit it. If the lemma is structurally unfixable, drop it and re-route the nodes that depended on it.
 
 When the diagnosis is \`PROOF_TOO_HARD\`, the prover believes the goal is provable but could not chain the available parents to it. Read the \`## Suggested Fix\` for the prover's proposed helper-lemma decomposition and add new parent lemmas (each as a fresh \`@[blueprint ...]\` declaration with body \`:= by sorry_using [...]\`) that bridge the gap. Wire the failing node's \`sorry_using [...]\` to include the new helpers. If the analysis instead reads as though the statement itself is suspect, treat it as \`STATEMENT_WRONG\` instead -- fix or drop the statement.
+
+Refinement is library-aware: you have \`mathlib_search\` -- before adding a helper, check whether Mathlib already contains it (or the failing node itself), and use search hits to phrase revised signatures idiomatically. Prefer DELETING nodes over stacking helpers: when a node fails repeatedly on glue (coercions, Finset membership packaging, ℕ/ℤ division side conditions) rather than on mathematics, the cure is usually re-anchoring the graph on library lemmas and REMOVING re-derived intermediate theory, not a deeper helper stack. Across iterations the graph should shrink toward the library, not grow away from it. Apply the same statement ergonomics as generation: multiplicative forms instead of ℕ/ℤ division (\`a * b = n\`, not \`n / b = a\`), explicit type ascriptions on ring-valued expressions, hypotheses stated the way library lemmas consume them (\`n ≠ 0\` alongside \`1 ≤ n\`).
 
 Leave \`-- PROVED\` nodes untouched unless a downstream revision forces a signature change: their proof bodies will carry forward automatically as long as the signature stays byte-identical.
 
@@ -4569,12 +4584,21 @@ function architectNegSignature(signature) {
 // tactic that worked, a proof body, or any node's approach, so node independence
 // (and the paper's parallel-attempt semantics) is preserved.
 //
+// The ledger is TWO-SIDED: alongside dead ends it records the Mathlib lemma
+// NAMES that appeared in siblings' ACCEPTED proofs (ledgerHarvestProven). A bare
+// name that provably resolves is the same class of knowledge as a search result
+// — environment fact, not strategy — and it is exactly the half the ledger was
+// missing: observed live, one node discovered `Nat.Prime.primeFactors` by
+// search while a sibling was still burning turns on the recorded-dead
+// `Nat.primeFactors_prime` with no way to learn the correct name.
+//
 // Bounded by construction: deduped by key, capped at LEDGER_MAX entries, each
 // entry one short line. Run-scoped rather than iteration-scoped because "this
 // name is not in Mathlib" stays true across refinements.
 const LEDGER_MAX = 40
+const LEDGER_GOOD_MAX = 24
 function makeDeadEndLedger() {
-  return { entries: new Map(), shared: 0 }
+  return { entries: new Map(), good: new Map(), shared: 0 }
 }
 // Pull environment-level dead ends out of one compiler report.
 function ledgerHarvest(ledger, report, nodeName) {
@@ -4588,8 +4612,22 @@ function ledgerHarvest(ledger, report, nodeName) {
   for (const m of text.matchAll(/Unknown (?:identifier|constant)\s+`([^`]+)`/g))
     add(`name:${m[1]}`, `\`${m[1]}\` does not exist — do not use it (or any close guess at it).`)
   // Typeclass instances that aren't derivable for the types in play.
-  for (const m of text.matchAll(/failed to synthesize(?:\s+instance of type class)?\s*\n?\s*([A-Za-z_][\w'.]*(?:\s+[^\n]{0,60})?)/g))
-    add(`inst:${m[1].trim()}`, `typeclass \`${m[1].trim()}\` is not available here — avoid lemmas that require it.`)
+  //
+  // Entries containing metavariables (`?m.109`, `?a`) are SKIPPED here too, and
+  // for a stronger reason than noise: `HSub ?m.109[X] ℕ ?m.129` is not a fact
+  // about the environment at all — it is one submission's incomplete
+  // elaboration (usually a missing type ascription), and each recurrence mints
+  // a "new" entry because the metavariable numbers differ. Observed live: one
+  // missing `(X : ℤ[X])` ascription minted EIGHT distinct \"avoid lemmas that
+  // require HSub ?m.NNN\" entries that steered every sibling away from the
+  // correct (ascribed) approach.
+  for (const m of text.matchAll(/failed to synthesize(?:\s+instance of type class)?\s*\n?\s*([A-Za-z_][\w'.]*(?:\s+[^\n]{0,60})?)/g)) {
+    const inst = m[1].trim()
+    if (/\?\w/.test(inst)) continue
+    add(`inst:${inst}`, `typeclass \`${inst}\` is not available here — avoid lemmas that require it.`)
+  }
+  // (Head identifier only — `Fact`, `Semiring` — so a metavariable-riddled
+  // instance argument can never leak into the note.)
   for (const m of text.matchAll(/typeclass instance problem is stuck\s*\n?\s*([A-Za-z_][\w'.]*)/g))
     add(`stuck:${m[1]}`, `typeclass \`${m[1]}\` gets stuck (needs its type pinned by an explicit ascription).`)
   // Elaboration / coercion traps: record the mismatched pair compactly. This is
@@ -4607,21 +4645,55 @@ function ledgerHarvest(ledger, report, nodeName) {
     const want = m[2].trim()
     if (!got || !want || got === want) continue
     if (/\?\w/.test(got) || /\?\w/.test(want)) continue
-    add(`coe:${got}=>${want}`, `type mismatch seen: \`${got}\` where \`${want}\` was expected — ascribe the numeral/type explicitly.`)
+    // Prop-shaped mismatches (`n ≥ 1` supplied where `n ≠ 0` was expected) are
+    // hypothesis-FORM gaps, not elaboration gaps — "ascribe the numeral" is
+    // wrong advice there (observed live: nodes kept re-ascribing while the fix
+    // was a one-call bridge like `by omega`). Route the note by shape.
+    const proppy = /[≥≤<>=∣¬∀∃→↔]/.test(got) || /[≥≤<>=∣¬∀∃→↔]/.test(want)
+    add(
+      `coe:${got}=>${want}`,
+      proppy
+        ? `hypothesis-form mismatch: a proof of \`${got}\` was supplied where \`${want}\` was expected — convert it explicitly (\`by omega\` closes most ℕ/ℤ order-form gaps; otherwise the matching \`.mp\`/\`.mpr\` or bridging lemma), do not just retype the tactic.`
+        : `type mismatch seen: \`${got}\` where \`${want}\` was expected — ascribe the numeral/type explicitly.`,
+    )
+  }
+}
+// The POSITIVE side of the ledger: harvest dotted Mathlib identifiers out of a
+// node's ACCEPTED proof body. Bare names only — never the proof, never tactics,
+// never which goal they closed — so sibling independence is preserved while
+// "this name exists and resolves in this environment" propagates. (A name from
+// an accepted proof cannot conflict with a `name:` dead end: dead ends failed
+// to compile, these compiled.)
+function ledgerHarvestProven(ledger, proofBody, nodeName) {
+  if (!ledger || !proofBody) return
+  for (const m of String(proofBody).matchAll(/\b[A-Z][A-Za-z0-9_']*(?:\.[A-Za-z0-9_'][A-Za-z0-9_']*)+/g)) {
+    if (ledger.good.size >= LEDGER_GOOD_MAX) return
+    if (!ledger.good.has(m[0])) ledger.good.set(m[0], { from: nodeName })
   }
 }
 // Render the ledger for a node's prompt. `excludeNode` drops facts the node
 // found itself (its own context already has those errors verbatim).
 function ledgerRender(ledger, excludeNode) {
-  if (!ledger || ledger.entries.size === 0) return ""
+  if (!ledger || (ledger.entries.size === 0 && (!ledger.good || ledger.good.size === 0))) return ""
   const lines = []
   for (const [, v] of ledger.entries) {
     if (v.from && v.from === excludeNode) continue
     lines.push(`- ${v.note}`)
   }
-  if (!lines.length) return ""
+  const goodNames = []
+  for (const [name, v] of ledger.good || []) {
+    if (v.from && v.from === excludeNode) continue
+    goodNames.push(`\`${name}\``)
+  }
+  if (!lines.length && !goodNames.length) return ""
   ledger.shared += lines.length
-  return `\n\n## Known dead ends (established by the compiler on sibling nodes of this same problem — treat as facts, not suggestions)\n${lines.join("\n")}\n\nThese are environment facts only; no proof strategy is implied. Do not spend turns rediscovering them.`
+  const dead = lines.length
+    ? `\n\n## Known dead ends (established by the compiler on sibling nodes of this same problem — treat as facts, not suggestions)\n${lines.join("\n")}`
+    : ""
+  const good = goodNames.length
+    ? `\n\n## Verified library names (each appeared in a sibling node's ACCEPTED proof on this same problem — they exist and resolve here; how you use them is up to you)\n${goodNames.join(", ")}`
+    : ""
+  return `${dead}${good}\n\nThese are environment facts only; no proof strategy is implied. Do not spend turns rediscovering them.`
 }
 
 function architectParseForfeit(text) {
@@ -4637,9 +4709,23 @@ function architectParseForfeit(text) {
 
 // The annotated graph the refinement stage consumes: decl + verdict marker
 // (+ Diagnosis block for failures). Compact signals, never transcripts.
+//
+// Decl text is SANITIZED first: refinement models sometimes echo the previous
+// round's `-- PROVED`/`-- UNPROVED` markers (or a whole `/- Diagnosis -/`
+// block) into their revised graph despite the do-not-copy instruction, and the
+// parser keeps trailing comments with the decl — so without stripping, markers
+// stack up round over round (observed live as `-- PROVED\n-- PROVED`, and a
+// stale UNPROVED next to a fresh PROVED would be actively misleading).
+const architectStripVerdicts = (text) =>
+  String(text || "")
+    .replace(/\/-\s*Diagnosis[\s\S]*?-\/\s*/g, "")
+    .replace(/^\s*--\s*(?:PROVED|UNPROVED)\s*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd()
 function architectAnnotate(graph, results) {
   return graph
-    .map((n) => {
+    .map((rawNode) => {
+      const n = { ...rawNode, declText: architectStripVerdicts(rawNode.declText) }
       if (!["lemma", "theorem"].includes(n.kind)) return n.declText
       const r = results.get(n.name)
       if (r?.solved) return `${n.declText}\n-- PROVED`
@@ -4731,6 +4817,12 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
   // live, a node repeated the exact same broken tactic skeleton across every
   // fresh attempt because nothing carried the wall it kept hitting.
   let lastError = ""
+  // The best artifact of any previous attempt: the most recent submission that
+  // COMPILED cleanly with only `sorry` placeholders left. Feeding it to the
+  // next attempt turns "fresh" into a warm start on the node's OWN prior work
+  // — observed live, the blanket "take a structurally different route" note
+  // pushed a retry away from a proof that was one deleted line from complete.
+  let bestPartial = ""
   for (let attempt = 0; attempt < ARCHITECT_NODE_RETRIES; attempt++) {
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
     result.attempts = attempt + 1
@@ -4741,7 +4833,13 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       attempt === 0
         ? ""
         : `\n\n(Attempt ${attempt + 1} of ${ARCHITECT_NODE_RETRIES}. A previous fresh attempt failed.${
-            lastError ? ` Its final compiler feedback was:\n${lastError}\nThat approach hit a wall — take a structurally different route.` : " Do not repeat the same failing tactic line verbatim."
+            lastError ? ` Its final compiler feedback was:\n${lastError}\n` : " "
+          }${
+            bestPartial
+              ? `Its best submission COMPILED cleanly with only sorry placeholders left. Start from this skeleton and close its holes — do not rebuild from zero:\n\`\`\`lean\n${bestPartial}\n\`\`\``
+              : lastError
+                ? "That approach hit a wall — take a structurally different route."
+                : "Do not repeat the same failing tactic line verbatim."
           })`
     let hallucinationStreak = 0
     const exec = async (name, args) => {
@@ -4769,6 +4867,10 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           return { report: r.report, __done: { negated: !!r.negated, body: rebuilt.slice(at + 2).trim() } }
         }
         lastError = String(r.report || "").slice(0, 900)
+        // A submission that elaborates with only sorries left is the node's
+        // most valuable non-solve artifact — keep the latest for the retry note.
+        if (/Compiles, but the proof still contains sorry/.test(r.report || ""))
+          bestPartial = String(args.code || "").slice(0, 1600)
         // Pool environment-level facts for sibling nodes (gate/delta only —
         // state.ledger is null for the control).
         ledgerHarvest(state.ledger, r.report, node.name)
@@ -4790,6 +4892,9 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       result.solved = !out.done.negated
       result.negated = !!out.done.negated
       result.proofBody = out.done.body
+      // Positive side of the ledger: names in an ACCEPTED (or formally negated)
+      // proof provably resolve — share them with siblings still searching.
+      ledgerHarvestProven(state.ledger, out.done.body, node.name)
       return result
     }
     // No solve this attempt: keep the best structured forfeit we saw.
@@ -4863,7 +4968,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
 // Cost: the CLI's own reported total_cost_usd, added to the run's total.
 async function architectNlSeed(theorem, ctx, state) {
   const system =
-    "You are a research mathematician. Given a Lean 4 theorem signature, write the natural-language proof of the mathematical statement it expresses. Plain mathematical prose only — no Lean code, no tactics, no Mathlib lemma names. State every intermediate claim you rely on explicitly, as a numbered chain of steps a formaliser could turn one-for-one into named lemmas. If you believe the statement is FALSE, say so plainly and give the counterexample. Be complete but do not pad."
+    "You are a research mathematician. Given a Lean 4 theorem signature, write the natural-language proof of the mathematical statement it expresses. Plain mathematical prose only — no Lean code, no tactics, no Mathlib lemma names. State every intermediate claim you rely on explicitly, as a numbered chain of steps a formaliser could turn one-for-one into named lemmas. CITE standard results instead of re-proving them: when a step is a known theorem of the literature (e.g. 'the value of the n-th cyclotomic polynomial at 1', 'Fermat's little theorem', 'the divisor-sum formula for the totient'), state it in ONE line by its standard name and move on — the formalisation stage proves against a large library of standard results, and re-derived textbook theory bloats the lemma graph with steps that are harder to formalise than the target itself. Spell out in full only the reasoning specific to THIS problem: its numeric facts, case analyses, and how the standard results chain together. If you believe the statement is FALSE, say so plainly and give the counterexample. Be complete but do not pad."
   const prompt = `Write the natural-language proof of this Lean 4 theorem's mathematical content:\n\n${state.targetSignature}\n\nAnswer with the proof only.`
   ctx.emit({
     type: "message-annotation",
