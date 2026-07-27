@@ -5101,6 +5101,20 @@ async function proveArchitect(theorem, ctx, opts = {}) {
 
   const proofs = new Map() // name -> proof body ("by ...") for solved nodes
   const sigOfProof = new Map() // name -> signatureNorm at solve time
+  // name -> sorted-deps key at solve time. Paper Fig. 1: a banked proof is only
+  // reused "while signatures AND PARENTS are unchanged" — signature-only reuse
+  // is unsound. Observed live (factorial_base12_trailing_zeros): refinement
+  // dropped a parent (`v12_eq_min`) from an already-PROVED node's sorry_using
+  // list while leaving its signature untouched; the theorem's stale cached
+  // proof body still called `rw [v12_eq_min, ...]`, so it carried forward as
+  // green for two more iterations, "all nodes solved" fired, assembly emitted
+  // a reference to a name no longer in the file, and Leak XIV's certification
+  // rejected it — costing a full extra refinement round to recover. Comparing
+  // the declared parent SET (order-independent — the refiner may reorder
+  // sorry_using harmlessly) below catches this the instant the revised graph
+  // is read, before any proving or assembly is attempted on it.
+  const depsOfProof = new Map()
+  const depsKey = (n) => [...n.deps].sort().join(",")
 
   // Unbounded loop with a LIVE cap check at the bottom — the budget can grow
   // mid-iteration, so it can't be baked into the loop condition.
@@ -5108,11 +5122,16 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     const graph = bp.graph
     const prelude = architectPrelude(bp.code)
     const provable = graph.filter((n) => ["lemma", "theorem"].includes(n.kind))
-    // Proof reuse: byte-identical (whitespace-normalised) signatures keep their proofs.
+    // Proof reuse: byte-identical (whitespace-normalised) signatures AND an
+    // unchanged parent set keep the proof; either changing invalidates it.
     for (const n of provable) {
-      if (proofs.has(n.name) && sigOfProof.get(n.name) !== n.signatureNorm) {
+      if (
+        proofs.has(n.name) &&
+        (sigOfProof.get(n.name) !== n.signatureNorm || depsOfProof.get(n.name) !== depsKey(n))
+      ) {
         proofs.delete(n.name)
         sigOfProof.delete(n.name)
+        depsOfProof.delete(n.name)
       }
     }
     const todo = provable.filter((n) => !proofs.has(n.name))
@@ -5131,6 +5150,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         if (r.solved) {
           proofs.set(node.name, r.proofBody)
           sigOfProof.set(node.name, node.signatureNorm)
+          depsOfProof.set(node.name, depsKey(node))
           ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ node ⟪${node.name}⟫ solved (attempt ${r.attempts}).` })
         } else if (r.negated) {
           ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${node.name}⟫ DISPROVED — machine-checked negation registered (STATEMENT_WRONG).` })
@@ -5189,6 +5209,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         if (errText.includes(n.name) && proofs.has(n.name)) {
           proofs.delete(n.name)
           sigOfProof.delete(n.name)
+          depsOfProof.delete(n.name)
           results.set(n.name, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `The node's proof passed in isolation but failed during final assembly: ${errText.slice(0, 800)}`, fix: "Adjust this node (or its parents) so the proof also elaborates in the assembled file." } })
           demoted++
         }
@@ -5197,6 +5218,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         // Nothing attributable — demote the main theorem as the safest restart point.
         proofs.delete(state.targetName)
         sigOfProof.delete(state.targetName)
+        depsOfProof.delete(state.targetName)
         results.set(state.targetName, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `Final assembly failed: ${errText.slice(0, 800)}`, fix: "Re-derive the main theorem's closing argument." } })
       }
     }
