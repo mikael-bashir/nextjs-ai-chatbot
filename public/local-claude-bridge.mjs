@@ -3747,16 +3747,33 @@ function architectRecost(ctx, state) {
 // clock, more parallel node attempts is what actually buys more coverage per
 // minute (deadlinePassed() still cuts every stage off the instant time is up).
 const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 4)
-// HARD dollar ceiling for one architect run — the paper (Appendix A) governs
-// by token budgets, never wall clock, and the operator's real fear is an
-// unbounded bill, not a long run. Cost is computed live after every Grok call
-// (ctx.metrics.cost_usd), so this is enforceable exactly: once crossed, no
-// further LLM call is issued anywhere in the pipeline. 0 disables.
+// HARD dollar ceiling for one architect run — but ONLY for the Grok driver
+// (River). Grok is billed per-token against a real xAI API key, so an
+// unbounded bill is a genuine operator fear (the paper (Appendix A) governs
+// by token budgets, never wall clock, but that's not the risk that matters
+// here). Cost is computed live after every Grok call (ctx.metrics.cost_usd),
+// so this is enforceable exactly: once crossed, no further Grok call is
+// issued anywhere in the pipeline. 0 disables.
+//
+// Leak Ultra (Claude driver) runs on the operator's Claude Max subscription,
+// a flat-rate plan with NO per-token bill — total_cost_usd there is a
+// notional API-equivalent figure the CLI reports for visibility, not a real
+// charge. Gating Ultra on it was a bug: it silently repurposed a financial
+// guardrail as an arbitrary compute cap, cutting off perfectly good runs for
+// no real reason (worse before the cost-accounting fix, which made the
+// notional number wildly inflated; still wrong after the fix, since $5 of
+// notional cost still isn't $5 of real spend). Ultra's actual Max-plan
+// constraint (5-hour rolling window / weekly caps) is already handled by the
+// CLI's own usage-limit detection (detectSessionLimit/pauseForLimit on the
+// client) — that's the correct backstop, not a fake dollar cap. Time limit
+// and iteration budget remain Ultra's real governors, same as everything
+// else in this pipeline.
 const ARCHITECT_MAX_COST_USD = Number(process.env.ARCHITECT_MAX_COST_USD ?? 5)
 // Fallback driver model for Leak Ultra when the operator left the dropdown on
 // "bridge default". Normally the dropdown value wins — inheriting it is the point.
 const ARCHITECT_ULTRA_MODEL = process.env.ARCHITECT_ULTRA_MODEL || "claude-opus-5"
 function architectCostCapHit(ctx) {
+  if (ctx?.metrics?.driver === "claude") return false
   return ARCHITECT_MAX_COST_USD > 0 && (ctx?.metrics?.cost_usd || 0) >= ARCHITECT_MAX_COST_USD
 }
 // Guard used at every stage boundary: true (and emits a one-time notice) when
