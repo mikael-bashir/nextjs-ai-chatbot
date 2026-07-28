@@ -155,7 +155,7 @@ function readBody(req) {
 // stays in the compiler. Tune here (e.g. add "Bash" to also cut numeric probing).
 const PROVER_DISALLOWED_TOOLS = ["WebSearch", "WebFetch"]
 // The architect pipeline (Leak Ultra) is stricter: EVERY real action must go
-// through the bridge-served lean_compile/mathlib_search, by design (that's
+// through the bridge-served lean_compile/loogle_search/moogle_search (that's
 // what keeps the compile gate bridge-side instead of trusting the model's
 // self-report). Bash/Read/Write/Edit/Glob/Grep/Task buy nothing there — a
 // Bash-computed value still has to round-trip through lean_compile to count
@@ -1955,7 +1955,7 @@ const STRATEGIES = {
   // so its numbers belong in their own table.
   //
   // The driver swap is real work, not a model string: the CLI calls MCP tools
-  // itself, so the bridge serves `lean_compile`/`mathlib_search` to it from a
+  // itself, so the bridge serves `lean_compile` + the two search tools from a
   // LOCAL MCP server (the governor) whose handlers are the very same `exec`
   // closures the Grok loop uses. That keeps the compile gate and the blueprint
   // capture on the bridge, where they have to be — the CLI is never trusted to
@@ -3926,7 +3926,7 @@ Plan a graph that captures the structure of the proof. Use Definitions for any h
 Each Lemma should be (nearly) trivial once its parent nodes are taken as given: it should require at most 1-2 new logical ideas beyond its declared dependencies and its own inlined premises. If a step needs more, split it into intermediate lemmas -- use as many components as the proof requires. Independent branches stay independent: if two parts of the proof do not share reasoning, their lemmas should not depend on each other.
 
 ## Library-aware decomposition
-The node provers prove against Mathlib, and much of the "standard theory" a textbook proof leans on is already a named Mathlib lemma. Before designing the graph, call \`mathlib_search\` on the target's main objects and on each intermediate fact you are about to emit as a Lemma. What comes back shapes the graph:
+The node provers prove against Mathlib, and much of the "standard theory" a textbook proof leans on is already a named Mathlib lemma. Before designing the graph, search for the target's main objects and for each intermediate fact you are about to emit as a Lemma — \`moogle_search\` when you know the mathematics in English, \`loogle_search\` when you have a name or a type shape. What comes back shapes the graph:
 - If a planned lemma already exists in Mathlib (exactly, or up to trivial rephrasing), do NOT emit a node for it -- the node provers can invoke the library directly; cite the Mathlib name in the dependent node's \`proof\` sketch instead.
 - Emit nodes only for content Mathlib does not already have: the problem-specific reasoning, numeric side conditions, and the glue the target actually needs.
 - The smallest correct graph wins. If search shows the target itself is within direct reach of a library lemma plus routine side conditions, emit a MINIMAL blueprint -- the main Theorem plus only the helper nodes those side conditions genuinely need (a single-node blueprint is valid). A graph that is harder to formalize than the target it decomposes is a failed decomposition.
@@ -3970,7 +3970,7 @@ Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotate
 - The file starts with \`import Mathlib\` and \`import Architect\` (both required), then any \`open\`/\`set_option\` lines, then the declarations.
 
 ## Tool use
-You also have \`mathlib_search\` -- use it DURING graph design as described above (query the target's head constants and each candidate lemma's content), not only after compile errors. A hit that states a planned node kills that node; a near-miss tells you the idiomatic signature to adopt.
+You also have \`loogle_search\` (exact: names and Lean type patterns; zero hits PROVES a name is absent) and \`moogle_search\` (semantic: English concepts; always returns its nearest guesses, so it can never prove absence). Use them DURING graph design as described above, not only after compile errors. A hit that states a planned node kills that node; a near-miss tells you the idiomatic signature to adopt.
 
 Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; the forbidden construct \`axiom\`; a \`set_option\` other than a resource limit (\`maxRecDepth\`, \`maxHeartbeats\`, \`synthInstance.*\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a Lemma/Theorem body that is bare \`sorry\` or a real proof -- every body must be exactly \`:= by sorry_using [...]\`, since proofs belong to the next stage and bare \`sorry\` breaks dependency tracking.
 
@@ -3985,7 +3985,7 @@ function architectProverSystem() {
 You are a Lean 4 theorem prover. Given a formal statement, produce a complete, correct Lean 4 proof with no \`sorry\`.
 
 ## Tool use
-You have two tools, \`lean_compile\` and \`mathlib_search\`. Commit to a concrete proof plan up front and execute it against the Lean compiler -- iterating on compiler feedback is how proofs get done, not silent reasoning or repeated searching. The compiler is a stronger signal source than search.
+You have three tools: \`lean_compile\`, \`loogle_search\` and \`moogle_search\`. Commit to a concrete proof plan up front and execute it against the Lean compiler -- iterating on compiler feedback is how proofs get done, not silent reasoning or repeated searching. The compiler is a stronger signal source than search.
 
 Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial proof: use \`sorry\` as a placeholder for sub-goals you cannot yet discharge, and iterate (compile -> read errors / open goals -> patch -> compile). The system handles two cases automatically based on what you submit:
 - If your code includes the MAIN theorem with the canonical statement followed by \`:= by ...\`, the system rebuilds it under the original theorem statement: only your \`:= by\` proof body is kept from your submission; the imports and \`open\` lines come from the canonical formal statement, and any other top-level declarations are dropped. Only this case can register a solve. Do not use \`axiom\`; use \`have\` for helper lemmas inside your proof, not top-level declarations; and do not add \`import\` or \`open\` lines that are not already in the canonical formal statement -- any extras will be flagged as a safeguard violation, not silently kept.
@@ -3999,14 +3999,17 @@ Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial 
 
 To check a number before you build a proof around it, submit a bare \`#eval\` (no \`import\` line — the environment already has Mathlib) and read the value back from the report. A number you verified beats a number you remembered.
 
-Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. For named mathematical objects (cyclotomic polynomials, totients, binomial coefficients, ...) Mathlib frequently already contains the exact fact you are proving, or a lemma that closes it in one application: if a search hit states your goal or subsumes it, APPLY IT AND SUBMIT immediately -- one lookup is cheaper than re-deriving standard theory, and a library one-liner is a perfectly good registered solve. What search will NOT find is a bespoke bound or numeric identity invented for this problem, so do not query for the goal's exact numbers verbatim.
+Use the search tools as lookup helpers for *specific* Mathlib lemmas you need while executing your plan, or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. For named mathematical objects (cyclotomic polynomials, totients, binomial coefficients, ...) Mathlib frequently already contains the exact fact you are proving, or a lemma that closes it in one application: if a search hit states your goal or subsumes it, APPLY IT AND SUBMIT immediately -- one lookup is cheaper than re-deriving standard theory, and a library one-liner is a perfectly good registered solve. What search will NOT find is a bespoke bound or numeric identity invented for this problem, so do not query for the goal's exact numbers verbatim.
 
 ## Never submit a name you have not confirmed exists
-An invented lemma name is the cheapest mistake to prevent and one of the most expensive to make: it burns a full compile turn, teaches you nothing about the goal, and \`lean_compile\` LOCKS after ${ARCHITECT_HALLUCINATION_LOCK} unknown-name errors in a row with no search between them. Two tools settle existence, and they answer different questions:
-- \`mathlib_search\` — "what is the lemma FOR this fact?" Query the mathematical content, not the name you hope exists. Search is fuzzy and always returns its best guesses, so a result set that does not contain your name is NOT a near-miss telling you to try a variant -- it is evidence the name is not there.
-- \`#check <name>\` — "does THIS name exist?" A bare \`#check Nat.div_eq_zero_of_dvd\` (no \`import\` line) is a definitive yes/no, and you can batch several in one exploration compile. When you are about to build a rewrite chain on three or four remembered names, \`#check\` all of them in a single call FIRST.
+An invented lemma name is the cheapest mistake to prevent and one of the most expensive to make: it burns a full compile turn, teaches you nothing about the goal, and \`lean_compile\` LOCKS after ${ARCHITECT_HALLUCINATION_LOCK} unknown-name errors in a row with no search between them.
 
-A name that failed is usually a whole naming CONVENTION that failed, not one typo -- so after \`Nat.foo_of_bar\` comes back unknown, do not immediately try \`Nat.foo_of_baz\`. Search for the fact instead.
+Three tools settle existence, and the difference between them is WHAT THEIR SILENCE MEANS:
+- \`loogle_search\` — "does this NAME or SHAPE exist?" Searches the elaborated environment with Lean syntax: a constant (\`Nat.mul_div_assoc\`), a quoted name substring (\`"div_eq_zero"\`), a type pattern (\`?n / ?d = 0\`), a conclusion (\`|- _ = _ * _\`). **Zero hits is a PROOF of absence, not a near-miss.** Anchor every query with a concrete constant or metavariable; unanchored patterns scan the library and time out.
+- \`moogle_search\` — "what is this CONCEPT called?" Plain English ('difference of squares', 'a number divided by something that divides it'). It always returns its nearest neighbours, so **a moogle result set is never evidence that anything is absent** — it is a source of candidate names, which you then confirm.
+- \`#check <name>\` — "does THIS exact name exist?" A bare \`#check Nat.div_eq_zero_of_dvd\` (no \`import\` line) is a definitive yes/no, and you can batch several in one exploration compile. When you are about to build a rewrite chain on three or four remembered names, \`#check\` all of them in a single call FIRST.
+
+A name that failed is usually a whole naming CONVENTION that failed, not one typo -- so after \`Nat.foo_of_bar\` comes back unknown, do not immediately try \`Nat.foo_of_baz\`. Search for the FACT instead: \`moogle_search\` the mathematics, then \`loogle_search\` or \`#check\` the candidate it gives you.
 
 ## Other outcomes
 If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.`
@@ -4059,7 +4062,7 @@ These markers and review blocks are input-only -- do NOT copy them into your rev
 \`PROOF_TOO_HARD\` — a genuine decomposition need. Add the verified helpers as fresh \`@[blueprint ...]\` nodes with bodies \`:= by sorry_using [...]\`, and wire the failing node's \`sorry_using\` to include them.
 
 ## Guidance
-Refinement is library-aware: you have \`mathlib_search\` -- before adding a helper, check whether Mathlib already contains it (or the failing node itself), and use search hits to phrase revised signatures idiomatically. Prefer DELETING nodes over stacking helpers: when a node fails repeatedly on glue (coercions, Finset membership packaging, ℕ/ℤ division side conditions) rather than on mathematics, the cure is usually re-anchoring the graph on library lemmas and REMOVING re-derived intermediate theory, not a deeper helper stack. Across iterations the graph should shrink toward the library, not grow away from it. Apply the same statement ergonomics as generation: multiplicative forms instead of ℕ/ℤ division (\`a * b = n\`, not \`n / b = a\`), explicit type ascriptions on ring-valued expressions, hypotheses stated the way library lemmas consume them (\`n ≠ 0\` alongside \`1 ≤ n\`).
+Refinement is library-aware: you have \`loogle_search\` (exact -- zero hits proves a name is absent) and \`moogle_search\` (semantic -- always guesses, never proves absence). Before adding a helper, check whether Mathlib already contains it (or the failing node itself), and use search hits to phrase revised signatures idiomatically. Prefer DELETING nodes over stacking helpers: when a node fails repeatedly on glue (coercions, Finset membership packaging, ℕ/ℤ division side conditions) rather than on mathematics, the cure is usually re-anchoring the graph on library lemmas and REMOVING re-derived intermediate theory, not a deeper helper stack. Across iterations the graph should shrink toward the library, not grow away from it. Apply the same statement ergonomics as generation: multiplicative forms instead of ℕ/ℤ division (\`a * b = n\`, not \`n / b = a\`), explicit type ascriptions on ring-valued expressions, hypotheses stated the way library lemmas consume them (\`n ≠ 0\` alongside \`1 ≤ n\`).
 
 A \`-- PROVED\` node carries a real, verified proof. It survives your revision only while BOTH its signature and its \`sorry_using\` parent set stay unchanged — touching either discards the proof and the node must be re-proved from scratch. So leave proved nodes alone, and when a revision would leave one unreachable from the main theorem (which the graph-validity gate forbids), RE-WIRE it into the new structure rather than deleting it. Deleting a proved node throws away work that was already paid for.
 
@@ -4413,7 +4416,7 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
   // The CLI namespaces MCP tools (mcp__architect__lean_compile), while the shared
   // stage contracts name them bare — say so once rather than forking the prompts,
   // which would break the "same prompts as Stone" property this branch rests on.
-  const toolNote = `\n\n## Tool names in this session\nThe tools named in these instructions are served over MCP and appear namespaced: \`lean_compile\` is \`mcp__architect__lean_compile\`, \`mathlib_search\` is \`mcp__architect__mathlib_search\`. They are the same tools with the same arguments. Nothing is registered or checked unless you actually CALL the tool — never paste Lean code as chat text.`
+  const toolNote = `\n\n## Tool names in this session\nThe tools named in these instructions are served over MCP and appear namespaced: \`lean_compile\` is \`mcp__architect__lean_compile\`, \`loogle_search\` is \`mcp__architect__loogle_search\`, \`moogle_search\` is \`mcp__architect__moogle_search\`. They are the same tools with the same arguments. Nothing is registered or checked unless you actually CALL the tool — never paste Lean code as chat text.`
 
   const r = await spawnProverStream(
     {
@@ -4429,7 +4432,7 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
       metrics: ctx.metrics,
       signal: ctx.signal,
       searchBudget: 0,
-      // Every real action here must go through lean_compile/mathlib_search
+      // Every real action here must go through lean_compile / the search tools
       // (served above via bridgeHandlers) — Bash/filesystem/Task access buys
       // nothing for this pipeline and has caused real derailments (shelling
       // out to Python instead of writing a direct proof; mistaking `import
@@ -4520,21 +4523,53 @@ const ARCHITECT_COMPILE_TOOL = {
     },
   },
 }
-const ARCHITECT_SEARCH_TOOL = {
+// Retrieval is TWO tools, because they answer different questions and only one
+// of them can answer "no".
+//
+// loogle searches the elaborated environment: zero hits for a name is proof the
+// name is absent. moogle is a vector index that always returns its nearest
+// neighbours: an unhelpful result set is not evidence about anything. Merging
+// them — which is what the single `mathlib_search` tool did — hands the model
+// an answer whose evidential weight depends on which engine happened to serve
+// it, invisibly. That is precisely how a prover reads "no such lemma" as "close,
+// try a variant" and spends a run on names that never existed.
+//
+// The descriptions below are the contract. They are deliberately blunt about
+// which tool's silence means something.
+const ARCHITECT_LOOGLE_TOOL = {
   type: "function",
   function: {
-    name: "mathlib_search",
-    description: "Look up specific Mathlib lemmas by name, signature fragment, or hypothesis pattern. Returns name, kind, signature, docstring, module.",
+    name: "loogle_search",
+    description:
+      "EXACT search of the Mathlib environment by name or Lean type pattern. This tool can say NO: zero results for a name is definitive evidence that the name does not exist — treat it as fact, not as a hint to try a variant. Syntax is Lean, not English: a constant (`Nat.mul_div_assoc`), a quoted name substring (\"add_comm\"), a type pattern (`?n / ?d = 0`), a conclusion (`|- _ = _ * _`), or several comma-separated filters. Always anchor with a concrete constant or metavariable.",
     parameters: {
       type: "object",
-      properties: {
-        query: { type: "string" },
-        k: { type: "number", description: "max results (default 12)" },
-      },
+      properties: { query: { type: "string" } },
       required: ["query"],
     },
   },
 }
+
+const ARCHITECT_MOOGLE_TOOL = {
+  type: "function",
+  function: {
+    name: "moogle_search",
+    description:
+      "SEMANTIC search of Mathlib by natural-language concept, for when you know the mathematics in English but not the Lean name. This tool CANNOT say no — it always returns its nearest neighbours, so an unhelpful result set is not evidence that anything is absent. Use it to discover naming conventions, then confirm the candidate with loogle_search.",
+    parameters: {
+      type: "object",
+      properties: {
+        concept: { type: "string" },
+        k: { type: "number", description: "max results (default 10)" },
+      },
+      required: ["concept"],
+    },
+  },
+}
+
+// Both stages offer both tools; kept as one array so a stage can never be
+// handed a lopsided pair by accident.
+const ARCHITECT_SEARCH_TOOLS = [ARCHITECT_LOOGLE_TOOL, ARCHITECT_MOOGLE_TOOL]
 
 // ---------------------------------------------------------------------------
 // Minimal hand-rolled MCP client (SSE transport). XI/XII/XIV are real
@@ -4723,11 +4758,15 @@ async function architectMcpCall(url, toolName, args, timeoutMs) {
   }
 }
 
-// mathlib_search's tool already returns fully-formatted, citeable text
-// server-side (matching Leak-I's own moogle_search/loogle_search pattern) --
+// Leak XI's search tools return fully-formatted, citeable text server-side --
 // no client-side JSON parsing/formatting needed, just pass it through.
-async function architectSearchCall(url, query, k, timeoutMs) {
-  const text = await getMcpClient(url).callTool("mathlib_search", { query, k }, timeoutMs)
+//
+// `args` is forwarded verbatim rather than normalised into a common shape: the
+// two tools take DIFFERENT parameters on purpose (loogle takes a Lean `query`,
+// moogle takes an English `concept`), and flattening that here would quietly
+// re-merge the distinction the split exists to preserve.
+async function architectSearchCall(url, toolName, args, timeoutMs) {
+  const text = await getMcpClient(url).callTool(toolName, args, timeoutMs)
   return { report: text }
 }
 
@@ -5124,7 +5163,7 @@ function deadNameRender(state) {
       .map((n) => `\`${n}\``)
       .join(", ")}.\n` +
     `These are settled facts, not warnings. Do not submit them, and do not submit a near-variant of one — a name that failed is usually a whole naming CONVENTION that failed, not one typo. ` +
-    `When you need a name you are not certain of, settle it before you build on it: \`mathlib_search\` for the FACT you want, or a bare \`#check <name>\` exploration compile for a definitive yes/no on a specific name (several \`#check\`s fit in one call).`
+    `When you need a name you are not certain of, settle it before you build on it: \`loogle_search\` or a bare \`#check <name>\` exploration compile for a definitive yes/no on a specific name (several \`#check\`s fit in one call), or \`moogle_search\` for the FACT you want when you do not have a candidate name yet.`
   )
 }
 
@@ -5135,7 +5174,7 @@ function deadNameRender(state) {
 // real run was undiagnosable from its own log.
 //
 // What that run looked like: three node provers ran CONCURRENTLY, every one of
-// them labelled "attempt 1/9999", and their lean_compile/mathlib_search calls
+// them labelled "attempt 1/9999", and their lean_compile/search calls
 // interleaved into one flat stream with nothing saying which agent made which
 // call. Underneath that, one prover submitted NINE proofs whose first half was
 // byte-identical every time — the half carrying the error the compiler reported
@@ -5903,15 +5942,15 @@ function architectAssemblyDefects(graph, proofs) {
 // Same enforcement shape as governedSearchCall, mirrored: gate the ACTION
 // itself, not just the text around it. Once lean_compile has replied with an
 // unknown-name error ARCHITECT_HALLUCINATION_LOCK times in a row with no
-// mathlib_search in between, lean_compile is LOCKED -- the next call is
-// refused outright (architectMcpCall never runs) until a mathlib_search call
+// search in between, lean_compile is LOCKED -- the next call is
+// refused outright (architectMcpCall never runs) until a search call
 // resets the streak. This is a hard gate, not a prompt nudge: the model
 // cannot get a real compile result while locked, exactly like a Grok-driven
 // search call cannot go through once governedSearchCall's budget is spent.
 const ARCHITECT_HALLUCINATION_LOCK = 3
 const UNKNOWN_NAME_RE = /unknown (constant|identifier)/i
 function architectHallucinationBlockedReport(streakCount) {
-  return `🛑 lean_compile is LOCKED — that's ${streakCount} compile errors in a row citing an unknown Mathlib name, with no search in between. You are guessing lemma names instead of looking them up. This call was refused (no compile ran). Call mathlib_search now with a specific, narrow query for the exact fact you need -- lean_compile unlocks the instant you do.`
+  return `🛑 lean_compile is LOCKED — that's ${streakCount} compile errors in a row citing an unknown Mathlib name, with no search in between. You are guessing lemma names instead of looking them up. This call was refused (no compile ran). Search now and lean_compile unlocks instantly: \`loogle_search\` if you have a candidate name or a type shape (zero hits there PROVES the name is absent), \`moogle_search\` if you only know the mathematics in English.`
 }
 
 // --- Node prover (fresh, isolated conversation per attempt) -----------------
@@ -5995,10 +6034,18 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           })`
     let hallucinationStreak = 0
     const exec = async (name, args) => {
-      if (name === "mathlib_search") {
+      // Either search tool clears the hallucination lock: the lock's premise is
+      // "you are guessing names instead of looking them up", and both of these
+      // are looking it up. loogle is the one that can prove absence, but a
+      // moogle call is still a lookup, not another guess.
+      if (name === "loogle_search" || name === "moogle_search") {
         hallucinationStreak = 0
-        if (!urls.xi) return { report: "mathlib_search is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback." }
-        return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
+        if (!urls.xi) return { report: `${name} is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback.` }
+        const searchArgs =
+          name === "loogle_search"
+            ? { query: String(args.query || "") }
+            : { concept: String(args.concept || args.query || ""), k: Number(args.k) || 10 }
+        return architectSearchCall(urls.xi, name, searchArgs, 60000)
       }
       if (name === "lean_compile") {
         if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
@@ -6058,7 +6105,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
         "dead ends (sibling ledger)": deadEnds,
         "retry note": retryNote,
       },
-      tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
+      tools: [ARCHITECT_COMPILE_TOOL, ...ARCHITECT_SEARCH_TOOLS],
       exec,
       tokenBudget: ARCHITECT_NODE_TOKENS,
       forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
@@ -6092,10 +6139,14 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
     let captured = null
     let hallucinationStreak = 0
     const exec = async (name, args) => {
-      if (name === "mathlib_search") {
+      if (name === "loogle_search" || name === "moogle_search") {
         hallucinationStreak = 0
-        if (!urls.xi) return { report: "mathlib_search is unavailable; proceed from Mathlib knowledge." }
-        return architectSearchCall(urls.xi, String(args.query || ""), Number(args.k) || 12, 60000)
+        if (!urls.xi) return { report: `${name} is unavailable; proceed from Mathlib knowledge.` }
+        const searchArgs =
+          name === "loogle_search"
+            ? { query: String(args.query || "") }
+            : { concept: String(args.concept || args.query || ""), k: Number(args.k) || 10 }
+        return architectSearchCall(urls.xi, name, searchArgs, 60000)
       }
       if (name === "lean_compile") {
         if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
@@ -6130,7 +6181,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
       system,
       user: user + deadNames + retryNote,
       promptBlocks: { "stage prompt": user, "dead names (run ledger)": deadNames, "retry note": retryNote },
-      tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
+      tools: [ARCHITECT_COMPILE_TOOL, ...ARCHITECT_SEARCH_TOOLS],
       exec,
       tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
       label: `${stageLabel} · attempt ${attempt + 1}/${retries}`,
