@@ -6502,12 +6502,35 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   // an iteration. So: surface the error at second one, and hand it to the
   // blueprint stage as its first task. The model can then fix it, and if it
   // truly cannot, the failure is at least legible from the transcript.
-  let targetPreflightNote = ""
-  try {
-    const pre = await architectMcpCall(urls.xii, "lean_compile", {
+  // Two independent Leak XII round-trips happen here, before the model is ever
+  // called: the pre-flight compile (does the target elaborate alone?) and the
+  // elaboration echo (what does it elaborate TO?). Both used to be silent —
+  // the pre-flight only emits on error, and the echo never emitted at all —
+  // so a slow XII (cold REPL worker, a busy pool) produced a run that looked
+  // hung with no explanation. Observed live: a river-stone run with nothing in
+  // the log for over a minute after "Full agent context captured", which is
+  // emitted at run start and proves nothing about whether the model has been
+  // reached yet. Run them CONCURRENTLY (they don't depend on each other) and
+  // report elapsed time on both, so a slow XII is visible and attributable
+  // instead of indistinguishable from grok itself being slow.
+  const preflightStart = Date.now()
+  const [preflightResult, elabResult] = await Promise.allSettled([
+    architectMcpCall(urls.xii, "lean_compile", {
       mode: "explore",
       code: `${state.targetSignature.trim()} := by sorry`,
-    }, Number(NODE_TIMEOUT_MS))
+    }, Number(NODE_TIMEOUT_MS)),
+    architectElaborateOne(urls, "", state.targetSignature, state.targetName),
+  ])
+  const preflightMs = Date.now() - preflightStart
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🔎 Target pre-flight + elaboration echo against Leak XII: ${preflightMs}ms.`,
+  })
+
+  let targetPreflightNote = ""
+  if (preflightResult.status === "fulfilled") {
+    const pre = preflightResult.value
     if (Array.isArray(pre?.errors) && pre.errors.length) {
       const detail = String(pre.report || "").slice(0, 1200)
       ctx.emit({
@@ -6529,23 +6552,23 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         `every node prover and into the final assembled file. Until the file compiles, no graph you ` +
         `write can be validated.`
     }
-  } catch (e) {
+  } else {
     ctx.emit({
       type: "message-annotation",
       subtype: "status",
-      thought: `⚠️ Target pre-flight could not run (${String(e?.message || e).slice(0, 160)}) — continuing anyway.`,
+      thought: `⚠️ Target pre-flight could not run (${String(preflightResult.reason?.message || preflightResult.reason).slice(0, 160)}) — continuing anyway.`,
     })
   }
   // The target as Lean ELABORATES it — numeric-literal types explicit. This is
   // the single source of type truth the whole graph must be stated against:
   // on sum_quartic_telescope the `(k:ℤ)` ascription forced the Icc over ℤ
   // while every helper was written over the ℕ-Icc that the default rendering
-  // made look identical, and the run was decided at iteration 0. Absent (the
-  // empty string) whenever the target needs blueprint-supplied declarations
-  // to elaborate at all — the preflight note above covers that case.
-  const targetElab = targetPreflightNote
-    ? ""
-    : await architectElaborateOne(urls, "", state.targetSignature, state.targetName)
+  // made look identical, and the run was decided at iteration 0. Discarded (the
+  // empty string) whenever the target needs blueprint-supplied declarations to
+  // elaborate at all — the preflight note above already covers that case, and
+  // an elaboration computed against a target that doesn't compile alone is not
+  // trustworthy anyway.
+  const targetElab = targetPreflightNote || elabResult.status !== "fulfilled" ? "" : elabResult.value
   const targetElabNote = targetElab
     ? `\n\n## The target as Lean elaborates it (numeric-literal types explicit)\n${targetElab}\n\nState every node at THESE types. A lemma whose sums, intervals or casts elaborate at a different type than the target's cannot be rewritten or chained into it, however similar the surface syntax looks — and your assembly will fail to compile until the types agree.`
     : ""

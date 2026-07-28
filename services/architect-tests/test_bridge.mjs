@@ -401,12 +401,22 @@ console.log("\n== target pre-flight is advisory (source invariant) ==")
   const src = readFileSync(bridgePath(), "utf8")
   const start = src.indexOf("Pre-flight: does the TARGET elaborate")
   ok("pre-flight block is present", start > 0)
-  const block = src.slice(start, start + 2600)
+  const block = src.slice(start, start + 3600)
   ok("pre-flight never aborts the run", !/return \{ verified: false/.test(block))
   ok("pre-flight builds a note for the blueprint stage", /targetPreflightNote\s*=/.test(block))
   ok("the note tells the model to write it WITHOUT @[blueprint]", /WITHOUT an .{0,3}@\[blueprint\]/.test(block))
   ok("the note actually reaches the blueprint user prompt",
      /const bpUser = [\s\S]{0,400}\$\{targetPreflightNote\}/.test(src))
+  // The pre-flight compile and the elaboration echo are two independent Leak
+  // XII round-trips. They used to run serially and silently — a slow XII (cold
+  // REPL worker) produced a run that looked hung with zero explanation, and
+  // the second (added later) call doubled the worst-case wait on top of that.
+  // Pinned: they run concurrently (Promise.allSettled, not two `await`s in
+  // sequence) and elapsed time is always reported, not just on error.
+  ok("pre-flight and elaboration echo run concurrently, not sequentially",
+     /Promise\.allSettled\(\[/.test(block))
+  ok("elapsed time on the XII round-trip is always reported",
+     /preflightMs/.test(block) && /ctx\.emit/.test(block))
 }
 
 // ---------------------------------------------------------------------------
