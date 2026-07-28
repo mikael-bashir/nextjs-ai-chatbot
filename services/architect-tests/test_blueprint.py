@@ -129,10 +129,13 @@ check("de-duplicates", acc, ["set_option maxRecDepth 10"])
 print("\n== precheck_blueprint ==")
 # ---------------------------------------------------------------------------
 TARGET = "theorem main_t : 1 = 1"
+# The main theorem is the ASSEMBLY: a real, sorry-free glue proof. Interior
+# nodes default to `sorry_using [...]` (a node for the prover) and MAY instead
+# carry sorry-free glue of their own.
 GOOD = (
     "import Mathlib\nimport Architect\n\n"
     "@[blueprint\n  (statement := /-- s -/)\n  (proof := /-- p -/)]\n"
-    "theorem main_t : 1 = 1 := by sorry_using []\n"
+    "theorem main_t : 1 = 1 := by rfl\n"
 )
 check("clean blueprint passes", bp.precheck_blueprint(GOOD, "main_t", TARGET), [])
 
@@ -147,8 +150,24 @@ ok("missing main theorem", "missing main theorem" in viol(GOOD, name="other_t"))
 ok("signature mismatch", "does not match" in viol(GOOD, target="theorem main_t : 2 = 2"))
 ok("unbalanced block comment", "unbalanced" in viol(GOOD + "\n/- oops\n"))
 ok("axiom rejected", "axiom" in viol(GOOD + "\naxiom bad : True\n"))
-ok("bare sorry body rejected", "body must be exactly" in viol(GOOD.replace("sorry_using []", "sorry")))
-ok("real proof body rejected", "body must be exactly" in viol(GOOD.replace("by sorry_using []", "by rfl")))
+ok("main with sorry_using rejected", "real ASSEMBLY" in viol(GOOD.replace("by rfl", "by sorry_using []")))
+ok("main with bare sorry rejected", "may not contain 'sorry'" in viol(GOOD.replace("by rfl", "by sorry")))
+ok(
+    "main glue hiding a sorry rejected",
+    "may not contain 'sorry'" in viol(GOOD.replace("by rfl", "by have h : True := by sorry\n  rfl")),
+)
+ok(
+    "interior sorry_using node passes",
+    viol(GOOD + "\n@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\nlemma extra : True := by sorry_using []\n") == "",
+)
+ok(
+    "interior glue node passes",
+    viol(GOOD + "\n@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\nlemma extra : True := by trivial\n") == "",
+)
+ok(
+    "interior bare sorry rejected",
+    "bare 'sorry' is neither" in viol(GOOD + "\n@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\nlemma extra : True := by sorry\n"),
+)
 ok(
     "lemma without @[blueprint]",
     "without an '@[blueprint]'" in viol(GOOD + "\nlemma extra : True := by sorry_using []\n"),
@@ -163,9 +182,41 @@ ok("bad set_option rejected", "not permitted" in viol("set_option pp.all true\n"
 LET_TARGET = "theorem lt :\n    let a : Nat := 3\n    a = 3"
 LET_CODE = (
     "import Mathlib\nimport Architect\n\n"
-    "@[blueprint\n  (statement := /-- s -/)\n  (proof := /-- p -/)]\n" + LET_TARGET + " := by sorry_using []\n"
+    "@[blueprint\n  (statement := /-- s -/)\n  (proof := /-- p -/)]\n" + LET_TARGET + " := by decide\n"
 )
 check("let-bearing target passes precheck", bp.precheck_blueprint(LET_CODE, "lt", LET_TARGET), [])
+
+# ---------------------------------------------------------------------------
+print("\n== glue parsing + dep scan ==")
+# ---------------------------------------------------------------------------
+n = parse_one("@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\ntheorem t : True := by sorry_using [a]")
+ok("sorry_using body is not glue", n is not None and not n.glue)
+n = parse_one("@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\ntheorem t : True := by trivial")
+ok("real proof body is glue", n is not None and n.glue)
+n = parse_one("def d : Nat := 3")
+ok("a def is never glue", n is not None and not n.glue)
+
+GLUE_FILE = (
+    "import Mathlib\nimport Architect\n\n"
+    "@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\n"
+    "lemma helper_h (n : Nat) : n = n := by sorry_using []\n\n"
+    "@[blueprint (statement := /-- s -/) (proof := /-- p -/)]\n"
+    "theorem main_t : 1 = 1 := by exact helper_h 1\n"
+)
+v, nodes = bp.validate_graph(GLUE_FILE, "main_t")
+check("glue graph valid (no dead helper)", v, [])
+main_node = next(n for n in nodes if n.name == "main_t")
+check("glue deps scanned from the body", main_node.deps, ["helper_h"])
+# A name cited only in a comment is NOT a dependency.
+v, nodes = bp.validate_graph(
+    GLUE_FILE.replace("by exact helper_h 1", "by rfl -- helper_h is unrelated"), "main_t")
+ok("comment mention is not a dep", any("reachable" in x for x in v))
+# Explicit (uses := [...]) still counts for glue nodes.
+v, nodes = bp.validate_graph(
+    GLUE_FILE.replace("(statement := /-- s -/) (proof := /-- p -/)]\ntheorem main_t : 1 = 1 := by exact helper_h 1",
+                      "(statement := /-- s -/) (proof := /-- p -/) (uses := [helper_h])]\ntheorem main_t : 1 = 1 := by norm_num"),
+    "main_t")
+check("explicit uses on glue node valid", v, [])
 
 # ---------------------------------------------------------------------------
 print("\n== validate_graph ==")

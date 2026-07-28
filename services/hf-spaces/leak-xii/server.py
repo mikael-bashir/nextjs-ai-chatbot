@@ -211,6 +211,11 @@ async def _compile_blueprint(code: str, target_name: str, target_signature: str)
         "statement": n.statement_doc,
         "proofSketch": n.proof_doc,
         "deps": n.deps,
+        # Glue nodes carry their real proof body: the compile above already
+        # verified it against sorried parents, so the bridge never dispatches
+        # a prover at them — they are proved the moment their parents are.
+        "glue": bool(n.glue),
+        "body": n.body if n.glue else "",
     } for n in ordered]
     return {
         "ok": True, "phase": "validated", "info": infos,
@@ -450,6 +455,65 @@ async def lean_compile(
     # (ok/solve/graph/...) too, so ship the full result as a JSON string the
     # bridge parses, with `report` as the human-readable summary up top.
     return json.dumps(result, ensure_ascii=False)
+
+
+# --- Structured elaboration: the daemon states what Lean actually sees -------
+# The sum_quartic_telescope failure class: a target whose `(k:ℤ)` ascription
+# forces `Finset.Icc (1:ℤ) 2026` next to a helper stated over
+# `Finset.Icc (1:ℕ) n` — parallel on the page, unreachable in the elaborator,
+# and invisible to every model in the pipeline because default pretty-printing
+# renders both as `Finset.Icc 1 …`. The bridge was starting to reconstruct
+# these facts from error text with regexes; this tool is the replacement.
+# One warm-REPL round-trip returns each declaration's statement as Lean
+# elaborates it, numeric-literal types explicit.
+CHECK_LINE = re.compile(r"^@?([A-Za-z_][A-Za-z0-9_'.]*)\s*:\s*([\s\S]*)$")
+
+
+@mcp.tool()
+async def lean_elaborate(code: str, names: str = "") -> str:
+    """
+    Elaborate declarations and return each statement AS LEAN SEES IT, with
+    numeric-literal types made explicit (`Finset.Icc (1 : ℤ) 2026`, not
+    `Finset.Icc 1 2026`). `code` is the declarations to elaborate (bodies may
+    be `sorry`/`sorry_using`); `names` is an optional comma-separated list of
+    declaration names — when omitted, every theorem/lemma found in `code` is
+    reported. Returns JSON: {ok, elaborated: {name: statement}, report}.
+    """
+    logger.info(f"lean_elaborate names={names!r} code={code[:120]!r}...")
+    body, _ = _strip_imports(code)
+    name_list = [n.strip() for n in (names or "").split(",") if n.strip()]
+    if not name_list:
+        chunks, spans = bp.split_decls(body)
+        parsed = [d for d in (bp.parse_decl(c, s) for c, s in zip(chunks, spans)) if d]
+        name_list = [d.name for d in parsed if d.kind in ("theorem", "lemma")]
+    if not name_list:
+        return json.dumps({"ok": False, "elaborated": {},
+                           "report": "no declarations to elaborate"}, ensure_ascii=False)
+    snippet = (body + "\n\nset_option pp.numericTypes true\n"
+               + "\n".join(f"#check @{n}" for n in name_list))
+    try:
+        resp = await pool.run(snippet, timeout=NODE_TIMEOUT_S)
+    except RuntimeError as e:
+        return json.dumps({"ok": False, "elaborated": {},
+                           "report": f"Compile backend error: {e}"}, ensure_ascii=False)
+    errs, warns = _messages(resp)
+    elaborated: dict[str, str] = {}
+    for txt in _info_output(warns):
+        m = CHECK_LINE.match(txt.strip())
+        if not m or m.group(1) not in name_list:
+            continue
+        # Collapse the pretty-printer's continuation indentation: these strings
+        # are spliced into prompts as single facts, not rendered as code. The
+        # leading `@` (printed when the decl has implicit binders) is dropped
+        # so every entry reads uniformly as `name : statement`.
+        elaborated.setdefault(m.group(1), re.sub(r"\s+", " ", f"{m.group(1)} : {m.group(2)}").strip())
+    report = ("\n".join(f"{k} — as elaborated (types explicit): {v}"
+                        for k, v in elaborated.items())
+              or "no declarations could be elaborated")
+    if errs:
+        report += "\nLean errors during elaboration:\n" + _fmt_errors(errs)
+    return json.dumps({"ok": bool(elaborated), "elaborated": elaborated,
+                       "report": report}, ensure_ascii=False)
 
 
 async def main_serve():

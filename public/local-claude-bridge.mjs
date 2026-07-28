@@ -3918,7 +3918,7 @@ function architectUrls(opts = {}, mcpServers = []) {
 // --- Appendix C.1 — blueprint generation (behavioral prompt, cached) --------
 function architectBlueprintSystem() {
   return `## Task
-You are a Lean 4 formalizer producing a dependency graph decomposition for a Lean theorem. The input is the targeted Lean theorem signature. Design a dependency graph of named Definitions, Lemmas, and exactly one Theorem (the main target), then translate the graph into one Lean 4 file in which every node is a \`@[blueprint]\`-annotated declaration. You do not prove anything in this stage -- every theorem and lemma body is \`:= by sorry_using [...]\`.
+You are a Lean 4 formalizer producing a dependency graph decomposition for a Lean theorem. The input is the targeted Lean theorem signature. Design a dependency graph of named Definitions, Lemmas, and exactly one Theorem (the main target), then translate the graph into one Lean 4 file in which every node is a \`@[blueprint]\`-annotated declaration. Lemma bodies are \`:= by sorry_using [...]\` -- proving them is the next stage's job. The ONE proof you do write here is the main Theorem's ASSEMBLY: its body is a real, sorry-free tactic proof deriving the target from your lemma nodes, which the compiler checks with those lemmas taken as given. This is deliberate: if your decomposition cannot even be CHAINED into the target (a helper stated over ℕ where the goal elaborates over ℤ, a cast that blocks every rewrite), the assembly fails to compile NOW, in your hands, instead of after a prover pool has burned its budget discovering it.
 
 ## Decomposition guidelines
 Plan a graph that captures the structure of the proof. Use Definitions for any helper functions, sets, structures, or notation the proof needs. Use Lemmas for intermediate facts that require justification. Use the Theorem for the final claim -- its name MUST equal the targeted theorem identifier given in the user prompt.
@@ -3959,12 +3959,17 @@ Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotate
     def name (binders) : type := body
   (or \`noncomputable def\`, \`abbrev\`, \`structure\`, \`instance\` as fits.) Definitions get a real Lean body, not \`sorry_using\`.
 - A SUPPORTING declaration — one the signatures need only in order to ELABORATE, such as an \`instance\` supplying a typeclass the target's own statement requires — is written WITHOUT an \`@[blueprint]\` attribute. It is then not a graph node: it needs no \`statement\` field, it is exempt from the reachability check, and it is still carried into every node prover's prefix and into the final assembled file. Use this when the target does not typecheck on its own; do NOT use it to smuggle in a lemma (a theorem or lemma always has to be a real node).
-- For a Lemma or Theorem, emit:
+- For a Lemma, emit:
     @[blueprint
       (statement := /-- closed, typed, standalone natural language proposition -/)
       (proof := /-- complete natural language sketch citing parent declarations by backticked name -/)]
-    lemma|theorem name (binders) : conclusion := by sorry_using [p1, p2, ...]
-  where \`sorry_using [...]\` lists each parent declaration as a bare Lean identifier (or \`sorry_using []\` if it has no parents).
+    lemma name (binders) : conclusion := by sorry_using [p1, p2, ...]
+  where \`sorry_using [...]\` lists each parent declaration as a bare Lean identifier (or \`sorry_using []\` if it has no parents). A lemma whose derivation from its own parents is purely mechanical (an \`rw\`/\`simp\`/\`norm_num\`/\`exact\` chain) MAY instead carry that real sorry-free proof as its body — it is then verified right here at admission and never costs a prover; keep \`sorry_using\` for every step with real mathematical content.
+- For the main Theorem, emit the same \`@[blueprint (statement := ...) (proof := ...)]\` annotation, but its body is your real ASSEMBLY — a sorry-free tactic proof deriving the target from your lemma nodes, e.g.:
+    theorem target_name ... : conclusion := by
+      rw [Finset.sum_congr rfl (fun k _ ↦ (step_one k).symm), step_two]
+      norm_num
+  The lemma nodes it cites compile as available facts, so this proof is checked at admission. It may NOT contain \`sorry\` or \`sorry_using\` — every unproved step must be its own lemma node, so all uncertainty lives in the graph, never in the glue. If the assembly will not compile, your decomposition does not reach the target: restate the lemmas at the target's elaborated types (compare against "the target as Lean elaborates it" in the user prompt) rather than fighting the glue.
 - The main Theorem's \`name\` MUST equal the targeted theorem identifier given in the user prompt, and you must emit it with the original Lean signature (same binders, same conclusion). Do not retype the statement informally.
 - Declare nodes in topological order: Definitions first, then Lemmas in dependency order, then the main Theorem last.
 - The file starts with \`import Mathlib\` and \`import Architect\` (both required), then any \`open\`/\`set_option\` lines, then the declarations.
@@ -3972,9 +3977,9 @@ Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotate
 ## Tool use
 You also have \`loogle_search\` (exact: names and Lean type patterns; zero hits PROVES a name is absent) and \`moogle_search\` (semantic: English concepts; always returns its nearest guesses, so it can never prove absence). Use them DURING graph design as described above, not only after compile errors. A hit that states a planned node kills that node; a near-miss tells you the idiomatic signature to adopt.
 
-Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; the forbidden construct \`axiom\`; a \`set_option\` other than a resource limit (\`maxRecDepth\`, \`maxHeartbeats\`, \`synthInstance.*\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a Lemma/Theorem body that is bare \`sorry\` or a real proof -- every body must be exactly \`:= by sorry_using [...]\`, since proofs belong to the next stage and bare \`sorry\` breaks dependency tracking.
+Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; the forbidden construct \`axiom\`; a \`set_option\` other than a resource limit (\`maxRecDepth\`, \`maxHeartbeats\`, \`synthInstance.*\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a main theorem whose body is \`sorry_using\` or contains \`sorry\` (the main body must be the real assembly); a Lemma body containing bare \`sorry\` (a lemma is either \`:= by sorry_using [...]\` or a complete sorry-free proof).
 
-If the pre-checks pass, the code is compiled by Lean. After Lean returns no errors, a post-compile graph-validity check runs against the parsed \`@[blueprint]\` decls: every node must have a non-empty \`(statement := /-- ... -/)\` field; every Lemma and the Theorem must have a non-empty \`(proof := /-- ... -/)\` field; every name in \`sorry_using [...]\` must resolve to a declared \`@[blueprint]\` node, with no self-loops; the \`sorry_using\` graph must be acyclic; exactly one main Theorem must exist with the targeted name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
+If the pre-checks pass, the code is compiled by Lean — INCLUDING your assembly proof, against the sorried lemmas. A compile error inside the main theorem means the decomposition does not reach the target; fix the LEMMA STATEMENTS (usually their types), not just the tactic line. After Lean returns no errors, a post-compile graph-validity check runs against the parsed \`@[blueprint]\` decls: every node must have a non-empty \`(statement := /-- ... -/)\` field; every Lemma and the Theorem must have a non-empty \`(proof := /-- ... -/)\` field; every name in \`sorry_using [...]\` must resolve to a declared \`@[blueprint]\` node, with no self-loops; the dependency graph (\`sorry_using\` lists ∪ the node names each real proof references) must be acyclic; exactly one main Theorem must exist with the targeted name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
 
 If any gate fails, fix the reported issue and call \`lean_compile\` again. Sorries from \`sorry_using\` are expected and do not count as errors. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\``
 }
@@ -4029,7 +4034,7 @@ If you become convinced the statement is FALSE, prove its negation instead: the 
 // --- Appendix C.3 — blueprint refinement (behavioral prompt, cached) --------
 function architectRefineSystem() {
   return `## Task
-You are revising a Lean 4 dependency graph for a single mathematical problem. The input is a sequence of \`@[blueprint ...]\`-annotated declarations -- definitions, lemmas, and one main theorem -- each lemma or theorem with body \`:= by sorry_using [deps]\`. Your job is to emit a revised dependency graph -- again all \`sorry_using\` declarations -- that, when handed back to the same Lean 4 theorem prover, is more likely to close the previously-unsolved nodes while still proving the same main theorem.
+You are revising a Lean 4 dependency graph for a single mathematical problem. The input is a sequence of \`@[blueprint ...]\`-annotated declarations -- definitions, lemmas with body \`:= by sorry_using [deps]\`, and one main theorem whose body is its real ASSEMBLY (a sorry-free tactic proof deriving the target from the lemma nodes, checked by the compiler with those lemmas taken as given; nodes marked \`-- ASSEMBLY\` are in the same situation). Your job is to emit a revised dependency graph that, when handed back to the same Lean 4 theorem prover, is more likely to close the previously-unsolved nodes while still proving the same main theorem. Whenever your revision touches a node an assembly cites — renames it, restates it, rewires it — update that assembly body so it still compiles; a revision whose glue no longer compiles is rejected whole.
 
 ## Input format
 Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when the prover failed -- a follow-up review block describing what went wrong.
@@ -4068,10 +4073,10 @@ A \`-- PROVED\` node carries a real, verified proof. It survives your revision o
 
 Numbers in your own natural-language sketches are not evidence. If a \`## Machine-verified facts\` line contradicts a constant you previously wrote, the machine is right. If a node hinges on a concrete number that has never been verified, you can check it yourself: \`lean_compile\` returns \`#eval\` output, so submit \`#eval <term>\` (no \`import\` line) and read the value back before you commit a constant to a signature.
 
-After every edit, call \`lean_compile\`. The tool reports pre-compile safeguard violations, real Lean compile errors, the skeleton-out invariant (every theorem/lemma body must remain \`:= by sorry_using [...]\`), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\`
+After every edit, call \`lean_compile\`. The tool reports pre-compile safeguard violations, real Lean compile errors (including an assembly that no longer derives the target from the revised lemmas — fix the lemma STATEMENTS, usually their types, not just the tactic line), the body invariant (lemmas are \`:= by sorry_using [...]\` or a complete sorry-free proof; the main theorem is always its sorry-free assembly), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\`
 
 ## Output
-Emit a revised dependency graph. Every theorem and lemma is \`@[blueprint (statement := /-- ... -/) (proof := /-- ... -/)]\`-annotated and ends in \`:= by sorry_using [deps]\`. Definitions are \`@[blueprint (statement := /-- ... -/)]\`-annotated with a real Lean body. Do NOT replace any \`sorry_using\` with an actual proof -- that is the prover's job, not yours. Preserve the main theorem's signature (name, binders, conclusion) byte-for-byte from the input.`
+Emit a revised dependency graph. Every theorem and lemma is \`@[blueprint (statement := /-- ... -/) (proof := /-- ... -/)]\`-annotated; lemma bodies are \`:= by sorry_using [deps]\` (or a complete sorry-free glue proof for purely mechanical steps), and the main theorem's body is always its sorry-free assembly. Do NOT replace a \`sorry_using\` with an actual proof unless that proof is genuinely mechanical -- closing hard nodes is the prover's job, not yours. Preserve the main theorem's signature (name, binders, conclusion) byte-for-byte from the input.`
 }
 
 // --- Grok driver -------------------------------------------------------------
@@ -4220,7 +4225,7 @@ const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal with
 ## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
 ## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
 
-async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "", trace = null }) {
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "", trace = null, consultContext = "" }) {
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
@@ -4312,6 +4317,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       }
       return { finalText, exhausted: false }
     }
+    let pendingConsult = ""
     for (const tc of toolCalls) {
       let args = {}
       try {
@@ -4359,9 +4365,48 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       // (4b) Has the compiler's FIRST complaint moved? If not, whatever the
       // model just edited is not the thing blocking it.
       const resLog = traceResult(trace, outText)
-      if (resLog) ctx.emit({ type: "message-annotation", subtype: "status", thought: resLog })
+      if (resLog) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: resLog })
+        // The streak has a consumer now: a consultant with a fresh context.
+        // Fired at the 3rd identical first-error, again 3 submissions later,
+        // capped per conversation — a teammate's nudge, not a chaperone.
+        if (
+          consultContext &&
+          trace.consults < ARCHITECT_CONSULT_MAX &&
+          trace.repeatedFirstError >= ARCHITECT_CONSULT_STREAK &&
+          (trace.repeatedFirstError - ARCHITECT_CONSULT_STREAK) % 3 === 0
+        )
+          pendingConsult = outText
+      }
       messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
       if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
+    }
+    // Injected AFTER every tool reply of this turn, so the assistant→tool
+    // message alternation the API requires stays intact.
+    if (pendingConsult) {
+      trace.consults += 1
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `🧑‍⚖️ ${trace.agentId} · first error unmoved for ${trace.repeatedFirstError + 1} submissions — asking a consultant (fresh context, no stake in the current approach) for an outside view (${trace.consults}/${ARCHITECT_CONSULT_MAX}).`,
+      })
+      try {
+        const note = await architectConsult(ctx, state, {
+          agentId: trace.agentId,
+          taskContext: consultContext,
+          history: trace.history,
+          errorText: pendingConsult,
+        })
+        if (note) {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant's review:\n${note}` })
+          messages.push({
+            role: "user",
+            content: `## Outside review\nA second model was shown your recent submissions and the compiler error that has not moved, with no other context. Its review:\n\n${note}\n\nAddress this before your next submission. If it identifies a type or coercion mismatch with a declared fact, do NOT retry the same rewrite — restructure or forfeit with that diagnosis.`,
+          })
+        }
+      } catch (e) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant unavailable (${String(e?.message || e).slice(0, 120)}) — continuing without it.` })
+      }
     }
     architectCompact(messages)
   }
@@ -5230,6 +5275,10 @@ function makeAgentTrace(agentId) {
     frozen: null, // Set<string> | null (null = no submission yet)
     lastFirstError: "",
     repeatedFirstError: 0,
+    // Ring of the most recent submitted code blocks — the consultant's raw
+    // material for "what has this agent actually been changing".
+    history: [],
+    consults: 0,
   }
 }
 
@@ -5270,6 +5319,10 @@ function traceSubmission(trace, toolName, args) {
     const code = typeof args?.code === "string" ? args.code : ""
     if (!code) return ""
     trace.submissions += 1
+    if (Array.isArray(trace.history)) {
+      trace.history.push(code)
+      if (trace.history.length > 4) trace.history.shift()
+    }
     const n = trace.submissions
     const lines = code.split("\n").map((l) => l.trim()).filter(Boolean)
     trace.frozen = trace.frozen === null ? new Set(lines) : new Set([...trace.frozen].filter((l) => lines.includes(l)))
@@ -5304,6 +5357,44 @@ function traceSubmission(trace, toolName, args) {
   } catch {
     return ""
   }
+}
+
+// --- The consultant: a second model, called when the first is stuck ---------
+// A prover deep in a failing attempt reads its 20th pattern-mismatch error
+// with the same eyes that wrote the pattern. The telemetry already DETECTS
+// the loop ("first compiler error UNCHANGED for N submissions"); this gives
+// the detection a consumer that isn't the stuck agent itself: one fresh
+// context whose only job is to compare the attempts and the unmoved error
+// and say what actually has to change. Its note is injected into the stuck
+// conversation as machine-attributed advice — a teammate looking over the
+// shoulder, not a takeover.
+const ARCHITECT_CONSULT_STREAK = 2 // repeatedFirstError value → 3rd identical error
+const ARCHITECT_CONSULT_MAX = Number(process.env.ARCHITECT_CONSULT_MAX || 2)
+
+async function architectConsult(ctx, state, { agentId, taskContext, history, errorText }) {
+  const system = `You are a Lean 4 expert reviewing a STUCK colleague's proof attempts cold. You did not write these attempts and you have no stake in their approach. You are given the task, the last few submissions, and the one compiler error that has not moved across them. Answer in under 200 words, no code blocks longer than 3 lines:
+1. WHY the error is not moving — name the exact mismatch (compare the failing pattern and the goal character by character: a ↑ coercion in one and not the other, a differing binder or literal type, a wrong lemma orientation).
+2. What the submissions keep CHANGING that cannot matter, if anything.
+3. The ONE structural change to make next — a different fact to rewrite with, a cast transport (zify/push_cast/norm_cast) before the rewrite, a restated have, or the honest conclusion that the declared facts cannot reach this goal and the node should be forfeited with that diagnosis.`
+  const shown = (history || []).slice(-3)
+  const user = `## The task the stuck prover was given
+${String(taskContext || "").slice(0, 3000)}
+
+## Its last ${shown.length} submission(s), oldest first
+${shown.map((c, i) => `### Submission ${i + 1}\n\`\`\`lean\n${String(c).slice(0, 1600)}\n\`\`\``).join("\n\n")}
+
+## The compiler error that has NOT moved across them
+${String(errorText || "").slice(0, 2000)}`
+  const msg = await grokCall(
+    state,
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    [],
+    ctx,
+  )
+  return String(msg?.content || "").trim().slice(0, 2200)
 }
 
 // Called with the tool's report AFTER dispatch. Surfaces the case where the
@@ -5464,7 +5555,7 @@ const ARCHITECT_CLASSES = {
   PROOF_TOO_HARD: {
     label: "PROOF_TOO_HARD",
     directive:
-      "The goal is believed provable but the prover could not chain its parents to it. Add the verified helper lemmas below as fresh nodes and wire this node's `sorry_using` to include them. Prefer a Mathlib lemma over a new node wherever one is offered.",
+      "The goal is believed provable but the prover could not chain its parents to it. Add the verified helper lemmas below as fresh nodes and wire this node's `sorry_using` to include them. Prefer a Mathlib lemma over a new node wherever one is offered. If the elaborated statements show a parent's literal types differ from this node's (a ↑cast or a `(1 : ℕ)` where the goal has `(1 : ℤ)`), the fix is to RESTATE that parent at this node's types — a helper repeating the mismatched shape can never apply, however true it is.",
   },
 }
 
@@ -5516,6 +5607,45 @@ async function architectRefute(concl, prefix, prelude, urls, ctx, timeoutMs = NO
     return !!r.ok && !(r.errors || []).length
   } catch {
     return false
+  }
+}
+
+// --- Elaborated statements: what Lean actually sees -------------------------
+// The sum_quartic_telescope class: target and helper both print as
+// `Finset.Icc 1 …` while elaborating over ℤ and ℕ respectively — parallel on
+// the page, unreachable in the elaborator, and invisible to every model in
+// the pipeline. lean_elaborate (Leak XII, warm REPL) returns each statement
+// with numeric-literal types explicit; attaching that to the graph makes the
+// mismatch literal text in every downstream prompt. Purely additive: on any
+// failure the graph keeps its source signatures and nothing else changes.
+async function architectAttachElaborated(bp, urls, ctx) {
+  if (!bp?.graph?.length || !urls.xii) return
+  try {
+    const names = bp.graph.filter((n) => ["lemma", "theorem"].includes(n.kind)).map((n) => n.name)
+    if (!names.length) return
+    const r = await architectMcpCall(urls.xii, "lean_elaborate", { code: bp.code, names: names.join(",") }, Number(NODE_TIMEOUT_MS))
+    const map = r && r.elaborated && typeof r.elaborated === "object" ? r.elaborated : {}
+    let attached = 0
+    for (const n of bp.graph)
+      if (map[n.name]) {
+        n.elaborated = String(map[n.name])
+        attached++
+      }
+    if (attached)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔬 Elaborated ${attached}/${names.length} node statement(s) — literal types made explicit for every downstream prompt.` })
+  } catch {}
+}
+
+// One-off variant for statements not yet in any graph (the target before C.1,
+// a proposed helper): returns the elaborated string or "".
+async function architectElaborateOne(urls, contextCode, signature, name) {
+  if (!urls.xii) return ""
+  try {
+    const code = `${contextCode ? contextCode + "\n\n" : ""}${signature.trim()} := by sorry`
+    const r = await architectMcpCall(urls.xii, "lean_elaborate", { code, names: name }, Number(NODE_TIMEOUT_MS))
+    return String(r?.elaborated?.[name] || "")
+  } catch {
+    return ""
   }
 }
 
@@ -5674,7 +5804,7 @@ async function architectDiagnose(node, cls, ctx, state, urls, evidence, prefix, 
 
   const user = `## Failing node
 ${node.signature.trim()}
-
+${node.elaborated ? `As Lean elaborates it (literal types explicit): ${node.elaborated}\n` : ""}
 Natural-language statement: ${node.statement || "(none)"}
 Blueprint proof sketch: ${node.proofSketch || "(none)"}
 
@@ -5832,7 +5962,18 @@ ${evidence.lastError || "(none)"}`
       base.rejected.push(`${split.name} — REFUTED by the compiler: \`${split.concl.slice(0, 100)}\` is false`)
       continue
     }
-    base.helpers.push({ signature: sig, why })
+    // Elaborate the accepted helper so the refiner sees its literal types next
+    // to the failing node's. This is the check that would have caught
+    // `sum_eq_n4 (n : ℕ)` — well-typed, TRUE, and stated over the ℕ-Icc that
+    // can never rewrite the target's ℤ-Icc goal — before refinement rebuilt
+    // the graph around a helper exactly as unreachable as its predecessor.
+    const helperElab = await architectElaborateOne(
+      urls,
+      `${prelude ? prelude + "\n\n" : ""}${prefix || ""}`,
+      sig,
+      split.name,
+    )
+    base.helpers.push({ signature: sig, why, elaborated: helperElab || undefined })
   }
 
   // The diagnostician may only DOWNGRADE severity, never escalate to a falsity
@@ -5855,7 +5996,7 @@ ${evidence.lastError || "(none)"}`
 const architectStripVerdicts = (text) =>
   String(text || "")
     .replace(/\/-\s*Diagnosis[\s\S]*?-\/\s*/g, "")
-    .replace(/^\s*--\s*(?:PROVED|UNPROVED)\s*$/gm, "")
+    .replace(/^\s*--\s*(?:PROVED|UNPROVED|ASSEMBLY)\b.*$/gm, "")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd()
 function architectAnnotate(graph, results, verdicts) {
@@ -5865,6 +6006,8 @@ function architectAnnotate(graph, results, verdicts) {
       const n = { ...rawNode, declText: architectStripVerdicts(rawNode.declText) }
       if (!["lemma", "theorem"].includes(n.kind)) return n.declText
       const r = results.get(n.name)
+      if (r?.solved && rawNode.glue)
+        return `${n.declText}\n-- ASSEMBLY (its body IS its proof, verified at admission against sorried parents; if you change its parents, update the body so it still compiles)`
       if (r?.solved) return `${n.declText}\n-- PROVED (verified proof banked for this exact signature + parent set)`
       const v = verdicts?.get(n.name)
       const cls = v?.class || (r?.negated ? "DISPROVED" : "PROOF_TOO_HARD")
@@ -5874,7 +6017,7 @@ function architectAnnotate(graph, results, verdicts) {
         r?.forfeit?.analysis ||
         "Node was not attempted (an upstream failure consumed the budget)."
       const helpers = (v?.helpers || [])
-        .map((h) => `\n    ${h.signature}${h.why ? `\n      -- ${h.why}` : ""}`)
+        .map((h) => `\n    ${h.signature}${h.elaborated ? `\n      -- as Lean elaborates it: ${h.elaborated}` : ""}${h.why ? `\n      -- ${h.why}` : ""}`)
         .join("")
       return (
         `${n.declText}\n-- UNPROVED\n/- Diagnosis` +
@@ -5984,7 +6127,7 @@ async function architectProveNode(node, graph, prelude, urls, ctx, state) {
         .replace(/^\s*(?:noncomputable\s+|private\s+|protected\s+)*(?:theorem|lemma|def|abbrev|structure|instance|inductive)\s+[A-Za-z0-9_'.]+\s*/, "")
         .replace(/^:\s*/, "")
         .trim()
-      return `- ${p.kind} ${p.name} : ${sig}${p.statement ? `\n    (${String(p.statement).slice(0, 240)})` : ""}`
+      return `- ${p.kind} ${p.name} : ${sig}${p.statement ? `\n    (${String(p.statement).slice(0, 240)})` : ""}${p.elaborated ? `\n    as Lean elaborates it: ${p.elaborated}` : ""}`
     })
     .join("\n")
   const negSig = architectNegSignature(node.signature)
@@ -5995,7 +6138,7 @@ Prove this EXACT statement (the signature is immutable — your submission is re
 
 ${node.signature.trim()} := by
   <your proof>
-
+${node.elaborated ? `\nAs Lean elaborates it (numeric-literal types explicit — your proof must work at THESE types; compare them against each fact below before writing a rewrite):\n${node.elaborated}\n` : ""}
 ## Blueprint context
 Natural-language statement: ${node.statement || "(none)"}
 Proof sketch from the blueprint: ${node.proofSketch || "(none)"}
@@ -6127,6 +6270,10 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       tokenBudget: ARCHITECT_NODE_TOKENS,
       forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
       label: `node ⟪${node.name}⟫ · attempt ${attempt + 1}/${ARCHITECT_NODE_RETRIES}`,
+      // What the consultant sees when this prover stalls: the node, its
+      // elaborated form, and the facts it was given — enough to judge the
+      // attempts cold, nothing about the current tactic fixation.
+      consultContext: `${node.signature.trim()}${node.elaborated ? `\nAs Lean elaborates it: ${node.elaborated}` : ""}\n\nDeclared facts available to the prover:\n${parents || "(none)"}`,
     })
     if (out.done) {
       result.solved = !out.done.negated
@@ -6363,6 +6510,19 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       thought: `⚠️ Target pre-flight could not run (${String(e?.message || e).slice(0, 160)}) — continuing anyway.`,
     })
   }
+  // The target as Lean ELABORATES it — numeric-literal types explicit. This is
+  // the single source of type truth the whole graph must be stated against:
+  // on sum_quartic_telescope the `(k:ℤ)` ascription forced the Icc over ℤ
+  // while every helper was written over the ℕ-Icc that the default rendering
+  // made look identical, and the run was decided at iteration 0. Absent (the
+  // empty string) whenever the target needs blueprint-supplied declarations
+  // to elaborate at all — the preflight note above covers that case.
+  const targetElab = targetPreflightNote
+    ? ""
+    : await architectElaborateOne(urls, "", state.targetSignature, state.targetName)
+  const targetElabNote = targetElab
+    ? `\n\n## The target as Lean elaborates it (numeric-literal types explicit)\n${targetElab}\n\nState every node at THESE types. A lemma whose sums, intervals or casts elaborate at a different type than the target's cannot be rewritten or chained into it, however similar the surface syntax looks — and your assembly will fail to compile until the types agree.`
+    : ""
   ctx.emit({
     type: "message-annotation",
     subtype: "status",
@@ -6393,7 +6553,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${nlText.slice(0, 8000)}`
     : ""
   if (ctx.metrics) ctx.metrics.nl_seed_used = !!nlSeed
-  const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${nlSeed}${targetPreflightNote}`
+  const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${targetElabNote}${nlSeed}${targetPreflightNote}`
 
   let admitted = await architectAdmitBlueprint(ctx, state, urls, {
     system: architectBlueprintSystem(),
@@ -6408,6 +6568,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     return { verified: false, proof: "" }
   }
   let bp = admitted.bp
+  await architectAttachElaborated(bp, urls, ctx)
   // Nodes the compiler refuted at admission time. They are skipped by the
   // prover pool and handed to refinement as DISPROVED with a real witness —
   // spending a fresh isolated prover on a statement Lean has already
@@ -6457,6 +6618,18 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         proofs.delete(n.name)
         sigOfProof.delete(n.name)
         depsOfProof.delete(n.name)
+      }
+    }
+    // Glue nodes (the main theorem always; interior nodes optionally) carry
+    // their proof AS their body, and the admission compile already verified it
+    // against sorried parents — so no prover is ever dispatched at one.
+    // Re-seeded from the CURRENT graph every iteration, after the invalidation
+    // above, so a refined body is never shadowed by a stale entry.
+    for (const n of provable) {
+      if (n.glue && String(n.body || "").trim()) {
+        proofs.set(n.name, n.body)
+        sigOfProof.set(n.name, n.signatureNorm)
+        depsOfProof.set(n.name, depsKey(n))
       }
     }
     const todo = provable.filter((n) => !proofs.has(n.name) && !preRefuted.has(n.name))
@@ -6632,9 +6805,15 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     // the certification call pins target_name + target_signature, so a pass here
     // is exactly as strong as a pass on the full assembly. A failure changes
     // nothing and the normal loop continues untouched.
+    // A glue target with parents can never stand alone — its body references
+    // them by name, so the minimal file is missing declarations by
+    // construction. Skip the probe instead of spending a certification call
+    // discovering that. (A glue target with NO parents legitimately passes.)
+    const targetGraphNode = graph.find((n) => n.name === state.targetName)
     if (
       unsolved.length > 0 &&
       proofs.has(state.targetName) &&
+      !(targetGraphNode?.glue && (targetGraphNode.deps || []).length) &&
       graph.some((n) => n.name === state.targetName && ["lemma", "theorem"].includes(n.kind))
     ) {
       const minimalGraph = graph.filter(
@@ -6759,9 +6938,18 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters()}: ${stillUnsolved.length} unsolved node(s)${classSummary ? ` (${classSummary})` : ""} — rewriting the graph around the failures.` })
     const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
     const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks, verdicts)}`
+    // Placed OUTSIDE the graph text so a refiner echoing declarations cannot
+    // drag these lines into its revised file.
+    const elabBlock = graph
+      .filter((n) => n.elaborated)
+      .map((n) => `- ${n.elaborated}`)
+      .join("\n")
+    const elabSection = elabBlock
+      ? `\n\n## Statements as Lean elaborates them (numeric-literal types explicit)\nA node whose sums, intervals or casts elaborate at a DIFFERENT type than the node it must feed cannot be chained into it — restate it at the consumer's types rather than adding helpers that repeat the mismatched shape.\n${elabBlock}`
+      : ""
     const refined = await architectAdmitBlueprint(ctx, state, urls, {
       system: architectRefineSystem(),
-      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}`,
+      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}${elabSection}`,
       retries: ARCHITECT_REFINE_RETRIES,
       stageLabel: `refinement ${iter + 1}/${maxIters()}`,
     })
@@ -6770,6 +6958,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       break
     }
     bp = refined.bp
+    await architectAttachElaborated(bp, urls, ctx)
     preRefuted = new Set(refined.refuted.map((r) => r.name))
   }
 

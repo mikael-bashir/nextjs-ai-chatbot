@@ -81,7 +81,10 @@ export function extract(names) {
 
   // Emit in source order so a `const` helper is never used before it is defined.
   included.sort((a, b) => at.get(a) - at.get(b))
-  return included.map(sliceOf).join("\n\n") + `\n\nexport { ${names.join(", ")} }\n`
+  // The bridge's own node imports, re-supplied for extracted helpers that use
+  // them (shortHash → createHash). Unused imports are harmless in ESM.
+  const preamble = `import { createHash } from "node:crypto"\n\n`
+  return preamble + included.map(sliceOf).join("\n\n") + `\n\nexport { ${names.join(", ")} }\n`
 }
 
 export async function loadBridgeSymbols(names) {

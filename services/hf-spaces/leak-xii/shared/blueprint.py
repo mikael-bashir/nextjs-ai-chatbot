@@ -144,9 +144,26 @@ class Node:
     body: str                      # text after the top-level ":="
     statement_doc: str | None
     proof_doc: str | None
-    deps: list[str] = field(default_factory=list)  # sorry_using ∪ (uses := [...])
+    deps: list[str] = field(default_factory=list)  # sorry_using ∪ (uses := [...]) ∪ glue refs
     start_line: int = 0            # 1-based, in the stripped-of-imports code
     end_line: int = 0
+    # A theorem/lemma whose body is a REAL tactic proof instead of
+    # `sorry_using [...]`. Its derivation from its parents is checked by the
+    # blueprint compile itself (parents elaborate as sorried facts), so it
+    # needs no node prover — it is proved the moment its parents are.
+    glue: bool = False
+
+
+# The two body shapes a theorem/lemma node may take, and the hole detector
+# that separates them from everything illegal. `sorry_using [...]` is a node
+# for the prover; a sorry-free real proof is GLUE (assembly the compile itself
+# verifies); a bare `sorry` is neither and stays forbidden.
+SORRY_USING_BODY = re.compile(r"by\s+sorry_using\s*\[[^\]]*\]\s*\Z")
+SORRY_ANYWHERE = re.compile(r"(?<![A-Za-z0-9_'.])sorry(_using)?(?![A-Za-z0-9_'])")
+
+
+def is_sorry_using_body(stripped_body: str) -> bool:
+    return bool(SORRY_USING_BODY.fullmatch(stripped_body.strip()))
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +432,9 @@ def parse_decl(chunk: str, span: tuple[int, int]) -> Node | None:
         deps=uniq,
         start_line=span[0],
         end_line=span[1],
+        glue=(kind in ("theorem", "lemma")
+              and bool(body.strip())
+              and not is_sorry_using_body(strip_comments(body))),
     )
 
 
@@ -501,11 +521,36 @@ def precheck_blueprint(code: str, target_name: str, target_signature: str) -> li
         if n.kind in ("theorem", "lemma"):
             if "blueprint" not in n.attr_text:
                 v.append(f"'{n.name}': Lemma/Theorem without an '@[blueprint]' attribute")
-            if not re.fullmatch(r"by\s+sorry_using\s*\[[^\]]*\]\s*", sbody.strip()):
-                v.append(
-                    f"'{n.name}': body must be exactly ':= by sorry_using [...]' "
-                    "(bare 'sorry' or a real proof breaks dependency tracking)"
-                )
+            if n.name == target_name:
+                # The main theorem is the ASSEMBLY. Its body is a real tactic
+                # proof deriving the target from its parent nodes — which the
+                # compile itself then verifies, since parents elaborate as
+                # sorried facts. This is the reachability gate: a parent stated
+                # at the wrong type fails HERE, at admission, instead of
+                # burning a prover pool on rewrites that can never match.
+                if not sbody.strip() or is_sorry_using_body(sbody):
+                    v.append(
+                        f"'{n.name}': the MAIN theorem's body must be its real ASSEMBLY — an "
+                        "actual tactic proof deriving the target from its parent nodes (they "
+                        "compile as available facts) — not 'sorry_using'. Put every unproved "
+                        "step in a parent node and write the glue that chains them."
+                    )
+                elif SORRY_ANYWHERE.search(sbody):
+                    v.append(
+                        f"'{n.name}': the main theorem's assembly may not contain 'sorry' — "
+                        "every unproved step must be its own parent node, so all uncertainty "
+                        "lives in the graph, not in the glue."
+                    )
+            elif not is_sorry_using_body(sbody):
+                # Interior nodes: `sorry_using [...]` (a node for the prover) or
+                # a complete sorry-free proof (a glue node, verified right here
+                # by the compile and needing no prover). Bare `sorry` is neither.
+                if not sbody.strip() or SORRY_ANYWHERE.search(sbody):
+                    v.append(
+                        f"'{n.name}': body must be ':= by sorry_using [...]' (a node for the "
+                        "prover) or a complete sorry-free proof (glue verified at admission) — "
+                        "bare 'sorry' is neither"
+                    )
         else:  # def / abbrev / structure / instance / inductive
             if re.search(r"(?<![A-Za-z0-9_'])sorry(_using)?(?![A-Za-z0-9_'])", sbody):
                 v.append(f"'{n.name}': Definitions get a real Lean body, not 'sorry_using'/'sorry'")
@@ -523,6 +568,22 @@ def validate_graph(code: str, target_name: str) -> tuple[list[str], list[Node]]:
     chunks, spans = split_decls(code)
     nodes = [n for n in (parse_decl(c, s) for c, s in zip(chunks, spans)) if n]
     byname = {n.name: n for n in nodes}
+
+    # A glue node's dependencies are the sibling nodes its proof actually
+    # references (∪ any explicit `(uses := [...])`). Scanning the body is sound
+    # here because node names are machine-generated identifiers under the
+    # format contract — and it means a forgotten `uses` annotation cannot
+    # surface as a bogus "isolated/dead node" violation against a parent the
+    # glue plainly cites.
+    for n in nodes:
+        if not n.glue:
+            continue
+        sbody = strip_comments(n.body)
+        for other in nodes:
+            if other.name == n.name or other.name in n.deps:
+                continue
+            if re.search(rf"(?<![A-Za-z0-9_'.]){re.escape(other.name)}(?![A-Za-z0-9_'])", sbody):
+                n.deps.append(other.name)
 
     if len(byname) != len(nodes):
         names = [n.name for n in nodes]

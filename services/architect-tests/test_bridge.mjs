@@ -31,6 +31,13 @@ const M = await loadBridgeSymbols([
   "architectAssemble",
   "architectProofBody",
   "architectAssemblyDefects",
+  "makeAgentTrace",
+  "traceSubmission",
+  "shortHash",
+  "normaliseLean",
+  "diffLines",
+  "ARCHITECT_CONSULT_STREAK",
+  "ARCHITECT_CONSULT_MAX",
 ])
 
 const fails = []
@@ -288,6 +295,33 @@ ok(
   [...M.ARCHITECT_DIAGNOSE_CLASSES].join(","),
 )
 ok("non-lemma nodes are passed through unannotated", M.architectAnnotate([{ name: "d", kind: "def", declText: "def d : Nat := 7" }], new Map(), new Map()) === "def d : Nat := 7")
+
+// ---------------------------------------------------------------------------
+console.log("\n== glue nodes (assembly verified at admission) ==")
+// ---------------------------------------------------------------------------
+const gGlue = [{ name: "t", kind: "theorem", glue: true, body: "by exact h", declText: "theorem t : True := by exact h" }]
+const asmMark = M.architectAnnotate(gGlue, new Map([["t", { solved: true }]]), new Map())
+ok("glue node marked ASSEMBLY, not banked-PROVED", /-- ASSEMBLY/.test(asmMark) && !/-- PROVED/.test(asmMark))
+ok("ASSEMBLY marker stripped on round-trip", !M.architectStripVerdicts(asmMark).includes("ASSEMBLY"))
+ok("full PROVED line stripped on round-trip", !M.architectStripVerdicts(proved).includes("PROVED"))
+ok("the glue declaration itself survives the strip", M.architectStripVerdicts(asmMark).includes("theorem t : True := by exact h"))
+const helperElab = M.architectAnnotate(
+  g1,
+  new Map([["a", { solved: false }]]),
+  new Map([["a", { ...blank, class: "PROOF_TOO_HARD", helpers: [{ signature: "theorem h3 : 3 = 3", why: "w", elaborated: "h3 : (3 : ℤ) = (3 : ℤ)" }] }]]),
+)
+ok("helper's elaborated form carried to the refiner", /as Lean elaborates it: h3 : \(3 : ℤ\)/.test(helperElab))
+ok("PROOF_TOO_HARD directive teaches the type-mismatch rule", /RESTATE that parent/.test(M.ARCHITECT_CLASSES.PROOF_TOO_HARD.directive))
+
+// ---------------------------------------------------------------------------
+console.log("\n== consultant plumbing ==")
+// ---------------------------------------------------------------------------
+const tr = M.makeAgentTrace("A1")
+ok("trace opens with an empty history and no consults", Array.isArray(tr.history) && tr.history.length === 0 && tr.consults === 0)
+for (let i = 1; i <= 6; i++) M.traceSubmission(tr, "lean_compile", { code: `by v${i}` })
+eq("history is a ring of the last 4 submissions", tr.history, ["by v3", "by v4", "by v5", "by v6"])
+ok("non-code tool calls do not enter the history", (M.traceSubmission(tr, "loogle_search", { query: "x" }), tr.history.length === 4))
+ok("consult fires at the 3rd identical error, bounded per conversation", M.ARCHITECT_CONSULT_STREAK === 2 && M.ARCHITECT_CONSULT_MAX >= 1)
 
 // ---------------------------------------------------------------------------
 console.log("\n== target pre-flight is advisory (source invariant) ==")
