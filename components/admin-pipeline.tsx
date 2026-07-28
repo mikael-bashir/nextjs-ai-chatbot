@@ -45,6 +45,10 @@ import {
   type GauntletMeta,
 } from '@/lib/generation/trapdoor';
 import {
+  ElaborationUnavailableError,
+  checkStatementElaborates,
+} from '@/lib/generation/elaboration';
+import {
   INTEGRAL_VERIFIER_SYSTEM_PROMPT,
   integralSetterPrompt,
   integralVerifierPrompt,
@@ -303,6 +307,17 @@ type GenMode =
   | 'trapdoor'
   | 'integral'
   | 'mirage';
+
+// Whether a generated Lean statement is compiled before we spend anything on
+// it. 'leak' runs it on the connected Lean daemon via the MCP connection
+// manager; 'off' skips the check entirely, for generating problems without any
+// verification. See lib/generation/elaboration.ts for why this gate exists.
+type StatementCheck = 'leak' | 'off';
+
+const STATEMENT_CHECK_LABEL: Record<StatementCheck, string> = {
+  leak: 'Leak IV',
+  off: 'Off',
+};
 
 const MODE_LABEL: Record<GenMode, string> = {
   easy: 'Easy',
@@ -861,7 +876,13 @@ function leanSplitsIntoSeparateDecl(lean: string): boolean {
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
   const [genStage, setGenStage] = useState<
-    'idle' | 'generating' | 'validating' | 'gauntlet' | 'assessing' | 'saving'
+    | 'idle'
+    | 'generating'
+    | 'elaborating'
+    | 'validating'
+    | 'gauntlet'
+    | 'assessing'
+    | 'saving'
   >('idle');
   const [stats, setStats] = useState({
     generated: 0,
@@ -925,6 +946,12 @@ export function AdminPipeline() {
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [previewIds, setPreviewIds] = useState<string[]>([]);
   const [mode, setMode] = useState<GenMode>('medium');
+  // Statement pre-check + the banner shown when it can't run (Leak IV not
+  // connected). The banner is separate from the activity console because a
+  // missing daemon is an infrastructure problem the user must act on, not a
+  // verdict scrolling past in a log.
+  const [statementCheck, setStatementCheck] = useState<StatementCheck>('leak');
+  const [checkError, setCheckError] = useState<string | null>(null);
   // Generation model — independent from the verification model. '' = default.
   const [genModel, setGenModel] = useState('');
   const genModelRef = useRef(genModel);
@@ -1083,6 +1110,7 @@ export function AdminPipeline() {
   // Refs so generateOne reads the latest mode + existing problems for the prompt
   // without depending on that state (which would restart the Work loop).
   const modeRef = useRef<GenMode>('medium');
+  const statementCheckRef = useRef<StatementCheck>('leak');
   const generatedRef = useRef<GeneratedItem[]>([]);
   const liveRef = useRef<LiveProblem[]>([]);
 
@@ -1091,6 +1119,9 @@ export function AdminPipeline() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+  useEffect(() => {
+    statementCheckRef.current = statementCheck;
+  }, [statementCheck]);
   useEffect(() => {
     generatedRef.current = generated;
   }, [generated]);
@@ -2055,6 +2086,11 @@ export function AdminPipeline() {
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
     const savedMode = localStorage.getItem('lca.genMode') as GenMode | null;
     if (savedMode && savedMode in MODE_LABEL) setMode(savedMode);
+    const savedCheck = localStorage.getItem(
+      'lca.statementCheck',
+    ) as StatementCheck | null;
+    if (savedCheck && savedCheck in STATEMENT_CHECK_LABEL)
+      setStatementCheck(savedCheck);
     // Pull already-live CompeteMath problems so generation can avoid them.
     fetch('/api/admin/live-problems')
       .then((r) => (r.ok ? r.json() : { problems: [] }))
@@ -2071,6 +2107,13 @@ export function AdminPipeline() {
   const persistMode = (m: GenMode) => {
     setMode(m);
     localStorage.setItem('lca.genMode', m);
+  };
+
+  const persistStatementCheck = (c: StatementCheck) => {
+    setStatementCheck(c);
+    localStorage.setItem('lca.statementCheck', c);
+    // Turning the check off clears a stale "not connected" banner.
+    if (c === 'off') setCheckError(null);
   };
 
   const persistWorkBridgeUrl = (value: string) => {
@@ -2371,6 +2414,49 @@ export function AdminPipeline() {
         throw Object.assign(new Error(`Discarded — pre-filter: ${preReason}`), {
           detail: JSON.stringify(gen, null, 2),
         });
+      }
+
+      // STATEMENT PRE-CHECK: does the Lean theorem actually ELABORATE?
+      // Runs before every paid stage below, because a statement that doesn't
+      // typecheck is unprovable no matter how good the mathematics is — the
+      // prover's target signature is immutable, so blueprint refinement can
+      // never repair the theorem's own opening line and burns its whole
+      // iteration budget rediscovering an edit it isn't allowed to make.
+      // One Lean compile here replaces a full forfeited prover run.
+      if (statementCheckRef.current !== 'off') {
+        setGenStage('elaborating');
+        let verdict: Awaited<ReturnType<typeof checkStatementElaborates>>;
+        try {
+          verdict = await checkStatementElaborates(gen.lean);
+        } catch (e) {
+          if (e instanceof ElaborationUnavailableError) {
+            // Infrastructure, not a verdict — surface it in the UI and stop.
+            // Discarding the problem here would blame the generator for a
+            // disconnected daemon.
+            setCheckError(e.message);
+            pushGenEvent('error', 'Statement check unavailable', {
+              detail: e.message,
+            });
+            throw new Error(`Statement check unavailable — ${e.message}`);
+          }
+          throw e;
+        }
+        setCheckError(null);
+        pushGenEvent(
+          verdict.elaborates ? 'verified' : 'rejected',
+          `Statement check (${verdict.serverName ?? 'Leak'}): ${
+            verdict.elaborates ? 'elaborates' : `${verdict.errors.length} error(s)`
+          }`,
+          { detail: verdict.raw },
+        );
+        if (!verdict.elaborates) {
+          throw Object.assign(
+            new Error(
+              `Discarded — Lean statement does not elaborate: ${verdict.errors[0] ?? 'unknown error'}`,
+            ),
+            { detail: `${gen.lean}\n\n----- compiler -----\n${verdict.raw}` },
+          );
+        }
       }
 
       // Integral mode: HARD verification (VHG Appendix E.3) before anything
@@ -2833,6 +2919,47 @@ export function AdminPipeline() {
               ),
             )}
           </div>
+          <div className="mt-3">
+            <Label className="text-xs">Statement check</Label>
+            <div className="mt-1 flex flex-wrap items-center gap-1 text-xs">
+              {(['leak', 'off'] as StatementCheck[]).map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => persistStatementCheck(c)}
+                  className={cn(
+                    'rounded border px-2 py-1',
+                    statementCheck === c
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {STATEMENT_CHECK_LABEL[c]}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              {statementCheck === 'leak'
+                ? 'Compiles each generated Lean statement on the connected Lean daemon before anything is spent on it. A statement that does not elaborate is unprovable — the prover cannot edit its own target signature — so it is discarded here instead of forfeiting a full prover run.'
+                : 'No statement check. Problems are generated and queued without compiling their Lean, so a statement that does not elaborate will only surface once the prover forfeits on it.'}
+            </p>
+          </div>
+          {checkError && (
+            <div className="mt-2 rounded border border-destructive/50 bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive">
+              <div className="flex items-start justify-between gap-2">
+                <span>
+                  <strong>Statement check unavailable.</strong> {checkError}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCheckError(null)}
+                  className="shrink-0 underline opacity-70 hover:opacity-100"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
           <label className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
             Generation model
             <select

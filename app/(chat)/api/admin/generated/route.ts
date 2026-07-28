@@ -178,6 +178,10 @@ export async function PATCH(request: NextRequest) {
     if ('proof' in body) patch.proof = body.proof ?? '';
     if ('error' in body) patch.error = body.error ?? null;
     if ('queued' in body) patch.queued = !!body.queued;
+    // Hand-corrected Lean text (e.g. an elaboration bug found post-generation).
+    // Editing this invalidates any prior verdict, so callers should also clear
+    // verified/proof/error in the same PATCH when fixing a broken statement.
+    if ('lean' in body && typeof body.lean === 'string') patch.lean = body.lean;
     // Cost-estimator display fields — persisted so the estimate/actual survive a
     // refresh (they mirror the proof_cost_history row driving the scoreboard).
     for (const k of [
