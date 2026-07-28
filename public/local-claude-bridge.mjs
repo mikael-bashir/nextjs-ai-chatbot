@@ -5538,6 +5538,31 @@ function architectLocalScopeCaveat(queryText, localNames) {
   }
 }
 
+// --- Shared syntax reference for the watchers (NOT the main engine prompts) --
+// The main C.1/C.2/C.3 prompts stay problem-agnostic and free of one-off
+// patches — that's deliberate, they must generalize. This is the opposite
+// kind of fix: durable, general Lean/Mathlib syntax facts that keep tripping
+// agents up across DIFFERENT problems, given to the watchers so a caught
+// syntax loop gets the literal corrected line instead of a vague "fix the
+// syntax" note that a stuck agent has already failed to act on repeatedly.
+// Observed live (milestone_pairwise_distance): a blueprint generator burned
+// its ENTIRE token budget (~30 submissions) toggling between five wrong
+// doc-comment delimiter variants because neither watcher could name the
+// correct one; a node prover independently lost several more submissions to
+// the second trap below, from a completely fresh context. Extend this list
+// only from things actually observed live — it earns its keep by staying
+// short and correct, not by trying to be exhaustive.
+const ARCHITECT_SYNTAX_HINTS = `## Known Lean/Mathlib syntax traps — when you spot one, quote the EXACT fix
+A vague note ("fix the delimiters", "use proper syntax") has already failed to break these loops live — the agent needs the literal corrected line to copy, not another description of the symptom.
+
+1. **@[blueprint] doc-comment delimiters.** The ONLY correct form opens with THREE characters \`/--\` and closes with TWO characters \`-/\`:
+   \`(statement := /-- exactly this shape -/)\`
+   WRONG (all seen live, all rejected with "unbalanced '/- ... -/' block comments"): \`/- text -/\`, \`/-- text /-\`, \`/-- text /--)\`, \`/-- text --/\`, plain string literals \`"text"\`. If you see that error, tell the agent to replace EVERY statement/proof field with the exact \`/-- ... -/\` shape — nothing else compiles.
+
+2. **Big-operator binder notation.** This Mathlib pins \`∑ x ∈ s, f x\` / \`∏ x ∈ s, f x\` (using \`∈\`). The older \`∑ x in s, f x\` (using \`in\`) is REJECTED here with "unexpected token 'in'; expected ','". If an agent hits that error, tell it either to switch every \`in\` to \`∈\` in sum/product binders, OR — the form that sidesteps the notation question entirely — rewrite as \`Finset.sum s (fun x => f x)\` / \`s.sum (fun x => f x)\`.
+
+When you flag either of these (or another syntax convention you recognize with confidence), reproduce the corrected snippet verbatim in your note, not just a description of what's wrong.`
+
 // --- The interceptor: a per-agent semantic watcher ---------------------------
 // The consultant fires on a LITERAL streak (same first error, string-identical,
 // 3 times) and the agent waits for its reply. The interceptor is the other
@@ -5586,6 +5611,8 @@ What needs a NOTE (action "note"):
 - A misread tool contract. Especially: loogle_search/moogle_search see ONLY the published Mathlib environment — never declarations local to this problem (the target, its parents, blueprint \`def\`s). A zero-hit on a LOCAL name is meaningless; treating it as evidence the statement is ill-formed is a critical misread. Local names are checked with \`#check\` via lean_compile.
 - Building multiple submissions on an unverified numeric or naming assumption a single #eval/#check would settle.
 - Ignoring an explicit hint already present in a tool reply (e.g. a search result that directly states the needed lemma).
+
+${ARCHITECT_SYNTAX_HINTS}
 
 When to ABORT (action "abort" — rare, high confidence only):
 - The agent is committed to disproving a statement on grounds you can see are false (e.g. the local-name misread above) and is spending its remaining budget on it.
@@ -5652,8 +5679,8 @@ You are the MECHANIC of a multi-agent Lean 4 theorem-proving pipeline (the Goede
 ## The team you are watching
 - BLUEPRINT GENERATOR (C.1): one agent per iteration; decomposes the target theorem into a dependency graph of @[blueprint] declarations and must compile the main theorem's ASSEMBLY against sorried lemmas. Tools: lean_compile, loogle_search, moogle_search.
 - NODE PROVERS (C.2): one FRESH, ISOLATED agent per unproved node (ids A1, A2, ...). Each sees only its own node, its parents' proved facts, and a run-wide dead-names ledger. Isolation is DELIBERATE — many independent lasers cover more ground than a shared beam. Never suggest sharing strategies or lemmas between live sibling nodes.
-- CONSULTANT: fires inside a node when its literal first error is unchanged 3 submissions running; fresh context, reads the node's full log, the node WAITS for its reply.
-- INTERCEPTOR: per-node async watcher over that node's own recent window; can note or abort. The node never waits for it.
+- CONSULTANT: fires inside any agent (node prover, blueprint generation, or refinement) when its literal first error is unchanged 3 submissions running; fresh context, reads the agent's full log, the agent WAITS for its reply.
+- INTERCEPTOR: per-agent async watcher over that agent's own recent window — covers node provers AND blueprint generation/refinement; can note or abort. The agent never waits for it.
 - DIAGNOSTICIAN: after a node fails, classifies the failure (DISPROVED / SUSPECT_STATEMENT / PARENTS_MISSING / HARNESS_LIMIT / PROOF_TOO_HARD); every factual claim it makes is machine-checked before refinement sees it.
 - DOWNGRADE GUARD (deterministic): a prover claiming its statement is false WITHOUT a compiled disproof is downgraded to SUSPECT_STATEMENT so refinement may not delete a true lemma on a hunch.
 - REFINEMENT (C.3): the one graph-aware stage; reads every verdict and rewrites the graph between iterations. Your notes targeted "refinement" land in its evidence for the next iteration.
@@ -5663,6 +5690,8 @@ You are the MECHANIC of a multi-agent Lean 4 theorem-proving pipeline (the Goede
 - lean_compile: compiles against Mathlib + this run's blueprint prelude; #eval/#check output is returned; ONLY a lean_compile solve registers.
 - loogle_search: exact name/type search over the PUBLISHED Mathlib environment. Zero hits proves a MATHLIB name absent — it says NOTHING about names declared locally in this run's blueprint (loogle cannot see those; \`#check\` can). An agent treating a local-name zero-hit as evidence its statement is ill-formed is making a critical misread — flag it immediately.
 - moogle_search: semantic search; always returns nearest neighbours; never evidence of absence.
+
+${ARCHITECT_SYNTAX_HINTS}
 
 ## Epistemic limits (hard rules)
 - You cannot compute, and nothing you assert is machine-checked. NEVER state that a lemma or the TARGET is true or false from your own arithmetic or from inference over partial stream evidence — only the harness's refutation gates and Lean itself settle truth, and the target's non-refutability is already machine-tested at blueprint admission. Watchers before you have fabricated "eval shows X" claims that no eval in the stream actually showed; a confident false note to refinement is worse than silence.
@@ -6807,6 +6836,17 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
       tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
       label: `${stageLabel} · attempt ${attempt + 1}/${retries}`,
       effort,
+      // Interceptor coverage — river-vintage only (state.watchers). BUG FIXED:
+      // this was previously wired only into node proving (architectProveNode),
+      // so blueprint generation/refinement ran completely unwatched by the
+      // interceptor. Observed live (milestone_pairwise_distance): a blueprint
+      // generator burned its ENTIRE token budget (~30 submissions, several
+      // minutes) looping on one doc-comment delimiter typo before the mechanic
+      // — the only watcher actually attached — finally intervened. The
+      // interceptor's tighter 3-submission cadence would have caught this far
+      // earlier had it been watching this stage at all.
+      intercept: !!state.watchers,
+      consultContext: `${stageLabel} for the target:\n${state.targetSignature}`,
     })
     if (out.done) return out.done
   }
