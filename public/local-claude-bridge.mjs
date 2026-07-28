@@ -5649,6 +5649,11 @@ You are the MECHANIC of a multi-agent Lean 4 theorem-proving pipeline (the Goede
 - loogle_search: exact name/type search over the PUBLISHED Mathlib environment. Zero hits proves a MATHLIB name absent — it says NOTHING about names declared locally in this run's blueprint (loogle cannot see those; \`#check\` can). An agent treating a local-name zero-hit as evidence its statement is ill-formed is making a critical misread — flag it immediately.
 - moogle_search: semantic search; always returns nearest neighbours; never evidence of absence.
 
+## Epistemic limits (hard rules)
+- You cannot compute, and nothing you assert is machine-checked. NEVER state that a lemma or the TARGET is true or false from your own arithmetic or from inference over partial stream evidence — only the harness's refutation gates and Lean itself settle truth, and the target's non-refutability is already machine-tested at blueprint admission. Watchers before you have fabricated "eval shows X" claims that no eval in the stream actually showed; a confident false note to refinement is worse than silence.
+- If you SUSPECT a statement is false, you may say so ONCE, as a suspicion ("worth a #eval of <exact term>"), severity at most "warn", citing the exact stream entry (its #seq) that grounds it. Never repeat a falsity suspicion in later windows, even reworded.
+- Cite evidence by #seq for any factual claim; a claim you cannot anchor to a specific entry does not belong in a note.
+
 ## What is GOOD (stay silent)
 - An agent whose compile errors CHANGE submission to submission — unique errors mean the model is trying things. This is the healthy baseline; do not interrupt it.
 - Search → confirm → apply chains; partial proofs narrowing; forfeits with honest structured diagnoses.
@@ -5713,6 +5718,15 @@ ${window.map((f) => `[${f.t}s #${f.seq}] ${f.text}`).join("\n\n")}`
     mech.seen.add(key)
     const target = String(v?.target || "log").trim()
     if (target === "refinement") {
+      // Rate limit: refinement-routed notes proved the spam channel (a false
+      // "target is false" claim was re-sent 6× across ticks, reworded past the
+      // content dedup). One refinement note per window-and-a-half; overflow is
+      // logged, not queued as evidence.
+      if (Date.now() - (mech.lastRefAt || 0) < 90000) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic [${sev}] (re: refinement; note-rate cooldown — logged only):\n${note}`, watcher: "mechanic" })
+        continue
+      }
+      mech.lastRefAt = Date.now()
       state.mechanicNotes.push(`[${sev}] ${note}`)
       if (state.mechanicNotes.length > 12) state.mechanicNotes.shift()
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic → refinement [${sev}]:\n${note}`, watcher: "mechanic" })
