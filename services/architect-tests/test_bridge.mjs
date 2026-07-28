@@ -44,6 +44,8 @@ const M = await loadBridgeSymbols([
   "diffLines",
   "ARCHITECT_CONSULT_STREAK",
   "ARCHITECT_CONSULT_MAX",
+  "ARCHITECT_NODE_HARD_TURNS",
+  "ARCHITECT_NODE_TOKENS_BY_DRIVER",
   "PROOF_BANK_PATH",
   "proofBankRead",
   "proofBankWrite",
@@ -334,6 +336,24 @@ for (let i = 1; i <= 6; i++) M.traceSubmission(tr, "lean_compile", { code: `by v
 eq("history is a ring of the last 4 submissions", tr.history, ["by v3", "by v4", "by v5", "by v6"])
 ok("non-code tool calls do not enter the history", (M.traceSubmission(tr, "loogle_search", { query: "x" }), tr.history.length === 4))
 ok("consult fires at the 3rd identical error, bounded per conversation", M.ARCHITECT_CONSULT_STREAK === 2 && M.ARCHITECT_CONSULT_MAX >= 1)
+
+// ---------------------------------------------------------------------------
+console.log("\n== per-driver node-proving caps (tweakable, independent) ==")
+// ---------------------------------------------------------------------------
+// Default (unset env) shape: Ultra's turn cap is lower than River's by design
+// — Claude CLI turns are minutes-expensive round-trips, grok's are near-instant
+// API calls, so a shared cap makes the slower driver wait far longer per node
+// before a stuck attempt hands off toward refinement. Grok's defaults must be
+// byte-identical to the prior shared constants (60 turns / 131072 tokens) —
+// this ships a lower default for Ultra without silently changing River.
+ok(
+  "claude's default turn cap is lower than grok's (faster hand-off to refinement)",
+  M.ARCHITECT_NODE_HARD_TURNS.claude > 0 && M.ARCHITECT_NODE_HARD_TURNS.claude < M.ARCHITECT_NODE_HARD_TURNS.grok,
+  JSON.stringify(M.ARCHITECT_NODE_HARD_TURNS),
+)
+eq("grok's turn cap default is unchanged from the prior shared value", M.ARCHITECT_NODE_HARD_TURNS.grok, 60)
+eq("claude's token budget default is unchanged from the prior shared value", M.ARCHITECT_NODE_TOKENS_BY_DRIVER.claude, 131072)
+eq("grok's token budget default is unchanged from the prior shared value", M.ARCHITECT_NODE_TOKENS_BY_DRIVER.grok, 131072)
 
 // ---------------------------------------------------------------------------
 console.log("\n== proof bank (a verified proof survives later failed runs) ==")

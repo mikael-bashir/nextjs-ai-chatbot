@@ -3737,7 +3737,29 @@ const ARCHITECT_MODEL_LADDER = [
 // proof, never getting the reset that helps it escape a rut. Kept at their
 // original sizes.
 const ARCHITECT_BLUEPRINT_TOKENS = 262144
-const ARCHITECT_NODE_TOKENS = 131072
+// Per-attempt caps that force ONE node-proving attempt to give up and hand off
+// -- to a fresh attempt, or (once the model actually produces a `## Diagnosis`)
+// to blueprint-level refinement. See the note above on why hardTurns/token
+// budgets exist at all: they're what turns a stuck attempt into a forfeit.
+//
+// River's grok turns are near-instant xAI API calls; Ultra's are full local
+// Claude CLI round-trips that can each take minutes. The SAME turn cap for
+// both therefore means Ultra waits far longer in real wall-clock time before
+// a stuck node ever hands off — observed live (ultra-fleeting,
+// sum_gcd_pow_two): three nodes still on submission #1-#2 of "attempt 1/9999"
+// after 45+ minutes, refinement never reached in that time. Keyed by driver so
+// each can be tuned to how expensive ITS OWN turns actually are, independently
+// and without a code change. Grok's defaults are exactly the prior shared
+// values (60 turns / 131072 tokens) -- River's behavior is unchanged unless
+// these are explicitly overridden.
+const ARCHITECT_NODE_HARD_TURNS = {
+  claude: Number(process.env.ARCHITECT_NODE_HARD_TURNS_CLAUDE || 20),
+  grok: Number(process.env.ARCHITECT_NODE_HARD_TURNS_GROK || 60),
+}
+const ARCHITECT_NODE_TOKENS_BY_DRIVER = {
+  claude: Number(process.env.ARCHITECT_NODE_TOKENS_CLAUDE || 131072),
+  grok: Number(process.env.ARCHITECT_NODE_TOKENS_GROK || 131072),
+}
 // MCP tools/call timeouts — match the Python services' own defaults
 // (BLUEPRINT_TIMEOUT_S/NODE_TIMEOUT_S/VERIFY_TIMEOUT_S).
 const BLUEPRINT_TIMEOUT_MS = 600000
@@ -6267,7 +6289,11 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       },
       tools: [ARCHITECT_COMPILE_TOOL, ...ARCHITECT_SEARCH_TOOLS],
       exec,
-      tokenBudget: ARCHITECT_NODE_TOKENS,
+      // Driver-specific: see ARCHITECT_NODE_HARD_TURNS above for why a shared
+      // cap makes Ultra wait far longer per node than River before a stuck
+      // attempt hands off toward refinement.
+      hardTurns: ARCHITECT_NODE_HARD_TURNS[state.driver] || ARCHITECT_NODE_HARD_TURNS.grok,
+      tokenBudget: ARCHITECT_NODE_TOKENS_BY_DRIVER[state.driver] || ARCHITECT_NODE_TOKENS_BY_DRIVER.grok,
       forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
       label: `node ⟪${node.name}⟫ · attempt ${attempt + 1}/${ARCHITECT_NODE_RETRIES}`,
       // What the consultant sees when this prover stalls: the node, its
