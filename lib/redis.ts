@@ -278,6 +278,58 @@ function serializeGeneratedWrite<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
+// A verified proof is about to be REPLACED with an unverified/blank one.
+// Recognizes both an explicit `verified: false` (a failed re-verify PATCH
+// always sends this) and a patch that blanks `proof` outright. A `lean` edit
+// in the SAME patch is a deliberate, legitimate invalidation (the statement
+// itself changed — the old proof no longer applies to anything), so that case
+// is excluded rather than backed up.
+function isDestructiveVerifyPatch(
+  rec: GeneratedRecord,
+  patch: Partial<GeneratedRecord>,
+): boolean {
+  if (!rec.verified || !rec.proof?.trim()) return false;
+  if ('lean' in patch && patch.lean !== rec.lean) return false;
+  const goingUnverified = patch.verified === false;
+  const blankingProof = 'proof' in patch && !patch.proof?.trim();
+  return goingUnverified || blankingProof;
+}
+
+// Snapshot every certificate this record currently carries — the flat
+// verified/proof/toolchain fields (always present when `verified`) plus any
+// additional toolchains already accumulated in `certs[]` — before a patch is
+// allowed to blank the flat fields. Fire-and-forget: a backup failure must
+// never block or fail the actual re-verify PATCH the operator is waiting on.
+function backupBeforeOverwrite(rec: GeneratedRecord): void {
+  void (async () => {
+    try {
+      const { backupProof } = await import('./db/proof-backup-queries');
+      const seen = new Set<string>();
+      const attempts = [
+        { toolchain: rec.toolchain, proof: rec.proof, strategy: rec.enforcer },
+        ...(rec.certs ?? []).map((c) => ({
+          toolchain: c.toolchain,
+          proof: c.proof,
+          strategy: c.enforcer,
+        })),
+      ];
+      for (const a of attempts) {
+        if (!a.toolchain || !a.proof?.trim() || seen.has(a.toolchain)) continue;
+        seen.add(a.toolchain);
+        await backupProof({
+          lean: rec.lean,
+          toolchain: a.toolchain,
+          proof: a.proof,
+          questionTitle: rec.questionTitle ?? null,
+          strategy: a.strategy ?? null,
+        });
+      }
+    } catch {
+      /* best-effort — see comment above */
+    }
+  })();
+}
+
 export async function updateGenerated(
   id: string,
   patch: Partial<GeneratedRecord>,
@@ -289,6 +341,7 @@ export async function updateGenerated(
       try {
         const rec = JSON.parse(raws[i]) as GeneratedRecord;
         if (rec.id === id) {
+          if (isDestructiveVerifyPatch(rec, patch)) backupBeforeOverwrite(rec);
           const updated = { ...rec, ...patch, id: rec.id };
           await redis.lset(GENERATED_STORE_KEY, i, JSON.stringify(updated));
           return updated;
