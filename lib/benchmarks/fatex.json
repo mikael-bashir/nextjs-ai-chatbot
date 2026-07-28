@@ -94,14 +94,17 @@
     "id": "fatex_008",
     "index": 8,
     "name": "quaternionAlgebra_isomorphic_to_matrix_ring_or_quaternion_ring",
-    "statement": "open Quaternion\n\ntheorem quaternionAlgebra_isomorphic_to_matrix_ring_or_quaternion_ring\n    (A B : ℚ) (ha : A ≠ 0) (hb : B ≠ 0) :\n    ((Nonempty (ℍ[ℝ, A, B] ≃ₐ[ℝ] ℍ[ℝ, -1, -1])) ∨ (Nonempty (ℍ[ℝ, A, B] ≃ₐ[ℝ] Matrix (Fin 2) (Fin 2) ℝ)))\n    ∧ IsEmpty (Matrix (Fin 2) (Fin 2) ℝ ≃ₐ[ℝ] ℍ[ℝ, -1, -1]) := by\n  sorry",
+    "statement": "theorem fatex_008_compact (A B : ℚ) (ha : A ≠ 0) (hb : B ≠ 0) :\n    ((Nonempty (QuaternionAlgebra ℝ (A : ℝ) 0 (B : ℝ) ≃ₐ[ℝ] QuaternionAlgebra ℝ (-1 : ℝ) 0 (-1 : ℝ)))\n      ∨ (Nonempty (QuaternionAlgebra ℝ (A : ℝ) 0 (B : ℝ) ≃ₐ[ℝ] Matrix (Fin 2) (Fin 2) ℝ)))\n    ∧ IsEmpty (Matrix (Fin 2) (Fin 2) ℝ ≃ₐ[ℝ] QuaternionAlgebra ℝ (-1 : ℝ) 0 (-1 : ℝ)) := by sorry",
     "informal": "Let $A, B \\in \\mathbb{Q}^\\times$ be rational numbers. Consider the quaternion ring\n$$\nD_{A, B, \\mathbb{R}} = \\{a+b\\boldsymbol{i} +c\\boldsymbol{j}+d\\boldsymbol{k}\\;|\\; a,b,c,d \\in \\mathbb{R}\\}\n$$\nin which the multiplication satisfies relations: $\\boldsymbol{i}^2 = A$, $\\boldsymbol{j}^ 2 = B$, and $\\boldsymbol{i}\\boldsymbol{j}= -\\boldsymbol{j}\\boldsymbol{i} = \\boldsymbol{k}$.\n\nShow that $D_{A, B, \\mathbb{R}}$ is either isomorphic to $\\mathbb{H}$ (Hamilton quaternion) or isomorphic to $\\mathrm{Mat}_{2\\times 2}(\\mathbb{R})$ as $\\mathbb{R}$-algebras.",
     "tags": [
       "Abstract Algebra",
       "Group Theory",
       "Group Actions and Sylow theorems"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open Quaternion\n\ntheorem quaternionAlgebra_isomorphic_to_matrix_ring_or_quaternion_ring\n    (A B : ℚ) (ha : A ≠ 0) (hb : B ≠ 0) :\n    ((Nonempty (ℍ[ℝ, A, B] ≃ₐ[ℝ] ℍ[ℝ, -1, -1])) ∨ (Nonempty (ℍ[ℝ, A, B] ≃ₐ[ℝ] Matrix (Fin 2) (Fin 2) ℝ)))\n    ∧ IsEmpty (Matrix (Fin 2) (Fin 2) ℝ ≃ₐ[ℝ] ℍ[ℝ, -1, -1]) := by\n  sorry",
+    "strengthProof": "exact fatex_008_compact A B ha hb",
+    "compactRewrite": true
   },
   {
     "id": "fatex_009",
@@ -114,7 +117,8 @@
       "Ring Theory",
       "Polynomials"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "toolchainIncompatible": "line 5, col 19: Invalid field notation: `Subgroup.normalizer` does not have a usable parameter of type `Subgroup ...` for which to substitute `↑S ⊓ ↑T` (Mathlib API drift v4.28→v4.32)"
   },
   {
     "id": "fatex_010",
@@ -133,14 +137,17 @@
     "id": "fatex_011",
     "index": 11,
     "name": "not_isomorphic_euclideanDomain",
-    "statement": "class EuclideanNormNat (R : Type) [CommRing R] extends Nontrivial R where\n  quotient : R → R → R\n  quotient_zero : ∀ a, quotient a 0 = 0\n  remainder : R → R → R\n  quotient_mul_add_remainder_eq : ∀ a b, b * quotient a b + remainder a b = a\n  norm : R → ℕ\n  remainder_lt : ∀ (a) {b}, b ≠ 0 → norm (remainder a b) < norm b\n  mul_left_not_lt : ∀ (a) {b}, b ≠ 0 → ¬ norm (a * b) < norm a\n\ntheorem not_isomorphic_euclideanDomain : IsEmpty <| EuclideanNormNat (((MvPolynomial (Fin 2) ℝ) ⧸\n    Ideal.span {(.X 0 ^ 2 + .X 1 ^ 2 + .C 1: MvPolynomial (Fin 2) ℝ)})) := by\n  sorry",
+    "statement": "theorem fatex_011_compact (A : Type) [CommRing A]\n    (e : A ≃+* (MvPolynomial (Fin 2) ℝ ⧸ Ideal.span {(.X 0 ^ 2 + .X 1 ^ 2 + .C 1 : MvPolynomial (Fin 2) ℝ)})) :\n    ¬ ∃ (quotient : A → A → A) (remainder : A → A → A) (norm : A → ℕ),\n      (∀ a, quotient a 0 = 0) ∧\n      (∀ a b, b * quotient a b + remainder a b = a) ∧\n      (∀ a b, b ≠ 0 → norm (remainder a b) < norm b) ∧\n      (∀ a b, b ≠ 0 → ¬ norm (a * b) < norm a) := by sorry",
     "informal": "Let \\( A = \\mathbb{R}[X, Y]/(X^2 + Y^2 + 1) \\). Then it is not a Euclidean domain.",
     "tags": [
       "Abstract Algebra",
       "Ring Theory",
       "Basic Definitions and Examples"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "class EuclideanNormNat (R : Type) [CommRing R] extends Nontrivial R where\n  quotient : R → R → R\n  quotient_zero : ∀ a, quotient a 0 = 0\n  remainder : R → R → R\n  quotient_mul_add_remainder_eq : ∀ a b, b * quotient a b + remainder a b = a\n  norm : R → ℕ\n  remainder_lt : ∀ (a) {b}, b ≠ 0 → norm (remainder a b) < norm b\n  mul_left_not_lt : ∀ (a) {b}, b ≠ 0 → ¬ norm (a * b) < norm a\n\ntheorem not_isomorphic_euclideanDomain : IsEmpty <| EuclideanNormNat (((MvPolynomial (Fin 2) ℝ) ⧸\n    Ideal.span {(.X 0 ^ 2 + .X 1 ^ 2 + .C 1: MvPolynomial (Fin 2) ℝ)})) := by\n  sorry",
+    "strengthProof": "constructor\nintro h\nexact fatex_011_compact _ (RingEquiv.refl _)\n  ⟨h.quotient, h.remainder, h.norm, h.quotient_zero,\n   h.quotient_mul_add_remainder_eq, fun a b hb => h.remainder_lt a hb,\n   fun a b hb => h.mul_left_not_lt a hb⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_012",
@@ -185,27 +192,33 @@
     "id": "fatex_015",
     "index": 15,
     "name": "exists_swap_stepwiseQuotient",
-    "statement": "structure Subgroup.IsMaximalNormal {G : Type} [Group G] (H₁ H₂ : Subgroup G) : Prop where\n  le : H₁ ≤ H₂\n  subgroupOf_normal : (H₁.subgroupOf H₂).Normal\n  is_maximal : ∀ H : Subgroup G, H₁ ≤ H → H ≤ H₂ → (H.subgroupOf H₂).Normal → (H = H₁ ∨ H = H₂)\n\ndef Subgroup.IsMaximalNormal.setRel {G : Type} [Group G] : SetRel (Subgroup G) (Subgroup G) :=\n  fun (H₁, H₂) ↦ Subgroup.IsMaximalNormal H₁ H₂\n\nstructure NormalSubgroupCompositionSeries (G : Type) [Group G] : Type where\n  toRelSeries : RelSeries (Subgroup.IsMaximalNormal.setRel (G := G))\n  maximal : ∀ s : RelSeries (Subgroup.IsMaximalNormal.setRel (G := G)),\n      s.length ≤ toRelSeries.length\n\ndef StepwiseQuotient {G : Type} [Group G] (s : NormalSubgroupCompositionSeries G)\n    (i : Fin s.toRelSeries.length) : Type :=\n  s.toRelSeries i.succ ⧸ (s.toRelSeries i.castSucc).subgroupOf _\n\ninstance {G : Type} [Group G] (s : NormalSubgroupCompositionSeries G)\n    (i : Fin s.toRelSeries.length) : Group (StepwiseQuotient s i) :=\n  QuotientGroup.Quotient.group _ (nN := (s.toRelSeries.step i).subgroupOf_normal)\n\ntheorem exists_swap_stepwiseQuotient {p q r t : ℕ} (hp : p.Prime) (hq : q.Prime) (hr : r.Prime)\n    (ht : 0 < t) (G : Type) [Group G] [Fintype G] (H : Subgroup G) [H.Normal]\n    (hH : Nat.card (G ⧸ H) = r ^ t) (Hs : NormalSubgroupCompositionSeries H)\n    (hHs: Hs.toRelSeries.length = 2) (hHs0 : StepwiseQuotient Hs ⟨0, by omega⟩ ≃* ZMod p)\n    (hHs1 : StepwiseQuotient Hs ⟨1, by omega⟩ ≃* ZMod q)\n    (Gs : NormalSubgroupCompositionSeries G) (i j : Fin Gs.toRelSeries.length) (hij : i < j)\n    (hGi : StepwiseQuotient Gs i ≃* ZMod q) (hGj : StepwiseQuotient Gs j ≃* ZMod p) :\n    ∃ (Hs' : NormalSubgroupCompositionSeries H) (hlen : Hs'.toRelSeries.length = 2),\n    Nonempty (StepwiseQuotient Hs' ⟨0, by omega⟩  ≃* ZMod q) ∧\n    Nonempty (StepwiseQuotient Hs' ⟨1, by omega⟩  ≃* ZMod p) := by\n  sorry",
+    "statement": "theorem fatex_015_compact {p q r t : ℕ} (hp : p.Prime) (hq : q.Prime) (hr : r.Prime)\n    (ht : 0 < t) (G : Type) [Group G] [Fintype G] (H : Subgroup G) [H.Normal]\n    (hH : Nat.card (G ⧸ H) = r ^ t)\n    (relG : SetRel (Subgroup G) (Subgroup G))\n    (hrelG : ∀ K : Subgroup G × Subgroup G, K ∈ relG ↔\n      (K.1 ≤ K.2 ∧ (K.1.subgroupOf K.2).Normal ∧\n        ∀ N : Subgroup G, K.1 ≤ N → N ≤ K.2 → (N.subgroupOf K.2).Normal → (N = K.1 ∨ N = K.2)))\n    (relH : SetRel (Subgroup ↥H) (Subgroup ↥H))\n    (hrelH : ∀ K : Subgroup ↥H × Subgroup ↥H, K ∈ relH ↔\n      (K.1 ≤ K.2 ∧ (K.1.subgroupOf K.2).Normal ∧\n        ∀ N : Subgroup ↥H, K.1 ≤ N → N ≤ K.2 → (N.subgroupOf K.2).Normal → (N = K.1 ∨ N = K.2)))\n    (s : RelSeries relH) (hsmax : ∀ u : RelSeries relH, u.length ≤ s.length)\n    (hslen : s.length = 2) (hz : 0 < s.length) (ho : 1 < s.length)\n    (hn0 : ((s (Fin.castSucc ⟨0, hz⟩)).subgroupOf (s (Fin.succ ⟨0, hz⟩))).Normal)\n    (hn1 : ((s (Fin.castSucc ⟨1, ho⟩)).subgroupOf (s (Fin.succ ⟨1, ho⟩))).Normal)\n    (hs0 : (s (Fin.succ ⟨0, hz⟩) ⧸\n      (s (Fin.castSucc ⟨0, hz⟩)).subgroupOf (s (Fin.succ ⟨0, hz⟩))) ≃* ZMod p)\n    (hs1 : (s (Fin.succ ⟨1, ho⟩) ⧸\n      (s (Fin.castSucc ⟨1, ho⟩)).subgroupOf (s (Fin.succ ⟨1, ho⟩))) ≃* ZMod q)\n    (sG : RelSeries relG) (hsGmax : ∀ u : RelSeries relG, u.length ≤ sG.length)\n    (i j : Fin sG.length) (hij : i < j)\n    (hni : ((sG (Fin.castSucc i)).subgroupOf (sG (Fin.succ i))).Normal)\n    (hnj : ((sG (Fin.castSucc j)).subgroupOf (sG (Fin.succ j))).Normal)\n    (hGi : (sG (Fin.succ i) ⧸ (sG (Fin.castSucc i)).subgroupOf (sG (Fin.succ i))) ≃* ZMod q)\n    (hGj : (sG (Fin.succ j) ⧸ (sG (Fin.castSucc j)).subgroupOf (sG (Fin.succ j))) ≃* ZMod p) :\n    ∃ (s' : RelSeries relH) (_ : ∀ u : RelSeries relH, u.length ≤ s'.length)\n      (_ : s'.length = 2),\n      ∀ (hz' : 0 < s'.length) (ho' : 1 < s'.length)\n        (_ : ((s' (Fin.castSucc ⟨0, hz'⟩)).subgroupOf (s' (Fin.succ ⟨0, hz'⟩))).Normal)\n        (_ : ((s' (Fin.castSucc ⟨1, ho'⟩)).subgroupOf (s' (Fin.succ ⟨1, ho'⟩))).Normal),\n      Nonempty ((s' (Fin.succ ⟨0, hz'⟩) ⧸\n        (s' (Fin.castSucc ⟨0, hz'⟩)).subgroupOf (s' (Fin.succ ⟨0, hz'⟩))) ≃* ZMod q) ∧\n      Nonempty ((s' (Fin.succ ⟨1, ho'⟩) ⧸\n        (s' (Fin.castSucc ⟨1, ho'⟩)).subgroupOf (s' (Fin.succ ⟨1, ho'⟩))) ≃* ZMod p) := by sorry",
     "informal": "Let $p,q,r$ be three distinct prime numbers, $t$ a positive integer. Let $G$ be a finite group, $H$ a normal subgroup of $G$ such that the cardinality of $G/H$ is $r^{t}$. Suppose that there exists a composition series\n    \\[\n\\{e\\} = H_0 \\triangleleft H_1 \\triangleleft \\cdots \\triangleleft H_n = H,\n\\]\nof $H$ that satisfies $n=2$, $H_1/H_0 = \\mathbb{Z}/p\\mathbb{Z}$, $H_2/H_1 = \\mathbb{Z}/q\\mathbb{Z}$. Further suppose that there exists a composition series\n\\[\n\\{e\\} = G_0 \\triangleleft G_1 \\triangleleft \\cdots \\triangleleft G_n = G,\n\\]\nand positive integers $i<j\\leq n$ such that $G_{i}/G_{i-1} = \\mathbb{Z}/q\\mathbb{Z}$, $G_{j}/G_{j-1} = \\mathbb{Z}/p\\mathbb{Z}$. Show that there exists a composition series\n    \\[\n\\{e\\} = H_0 \\triangleleft H_1 \\triangleleft \\cdots \\triangleleft H_n = H,\n\\]\nof $H$ that satisfies $n=2$, $H_1/H_0 = \\mathbb{Z}/q\\mathbb{Z}$, $H_2/H_1 = \\mathbb{Z}/p\\mathbb{Z}$.",
     "tags": [
       "Abstract Algebra",
       "Field Theory",
       "Galois theory"
     ],
-    "declarations": 3
+    "declarations": 0,
+    "originalStatement": "structure Subgroup.IsMaximalNormal {G : Type} [Group G] (H₁ H₂ : Subgroup G) : Prop where\n  le : H₁ ≤ H₂\n  subgroupOf_normal : (H₁.subgroupOf H₂).Normal\n  is_maximal : ∀ H : Subgroup G, H₁ ≤ H → H ≤ H₂ → (H.subgroupOf H₂).Normal → (H = H₁ ∨ H = H₂)\n\ndef Subgroup.IsMaximalNormal.setRel {G : Type} [Group G] : SetRel (Subgroup G) (Subgroup G) :=\n  fun (H₁, H₂) ↦ Subgroup.IsMaximalNormal H₁ H₂\n\nstructure NormalSubgroupCompositionSeries (G : Type) [Group G] : Type where\n  toRelSeries : RelSeries (Subgroup.IsMaximalNormal.setRel (G := G))\n  maximal : ∀ s : RelSeries (Subgroup.IsMaximalNormal.setRel (G := G)),\n      s.length ≤ toRelSeries.length\n\ndef StepwiseQuotient {G : Type} [Group G] (s : NormalSubgroupCompositionSeries G)\n    (i : Fin s.toRelSeries.length) : Type :=\n  s.toRelSeries i.succ ⧸ (s.toRelSeries i.castSucc).subgroupOf _\n\ninstance {G : Type} [Group G] (s : NormalSubgroupCompositionSeries G)\n    (i : Fin s.toRelSeries.length) : Group (StepwiseQuotient s i) :=\n  QuotientGroup.Quotient.group _ (nN := (s.toRelSeries.step i).subgroupOf_normal)\n\ntheorem exists_swap_stepwiseQuotient {p q r t : ℕ} (hp : p.Prime) (hq : q.Prime) (hr : r.Prime)\n    (ht : 0 < t) (G : Type) [Group G] [Fintype G] (H : Subgroup G) [H.Normal]\n    (hH : Nat.card (G ⧸ H) = r ^ t) (Hs : NormalSubgroupCompositionSeries H)\n    (hHs: Hs.toRelSeries.length = 2) (hHs0 : StepwiseQuotient Hs ⟨0, by omega⟩ ≃* ZMod p)\n    (hHs1 : StepwiseQuotient Hs ⟨1, by omega⟩ ≃* ZMod q)\n    (Gs : NormalSubgroupCompositionSeries G) (i j : Fin Gs.toRelSeries.length) (hij : i < j)\n    (hGi : StepwiseQuotient Gs i ≃* ZMod q) (hGj : StepwiseQuotient Gs j ≃* ZMod p) :\n    ∃ (Hs' : NormalSubgroupCompositionSeries H) (hlen : Hs'.toRelSeries.length = 2),\n    Nonempty (StepwiseQuotient Hs' ⟨0, by omega⟩  ≃* ZMod q) ∧\n    Nonempty (StepwiseQuotient Hs' ⟨1, by omega⟩  ≃* ZMod p) := by\n  sorry",
+    "strengthProof": "have hz : 0 < Hs.toRelSeries.length := by omega\nhave ho : 1 < Hs.toRelSeries.length := by omega\nobtain ⟨s', hs'max, hs'len, hquot⟩ :=\n  fatex_015_compact hp hq hr ht G H hH\n    Subgroup.IsMaximalNormal.setRel\n    (fun ⟨A, B⟩ => ⟨fun h => ⟨h.le, h.subgroupOf_normal, h.is_maximal⟩,\n      fun h => ⟨h.1, h.2.1, h.2.2⟩⟩)\n    Subgroup.IsMaximalNormal.setRel\n    (fun ⟨A, B⟩ => ⟨fun h => ⟨h.le, h.subgroupOf_normal, h.is_maximal⟩,\n      fun h => ⟨h.1, h.2.1, h.2.2⟩⟩)\n    Hs.toRelSeries Hs.maximal hHs hz ho\n    (Hs.toRelSeries.step ⟨0, hz⟩).subgroupOf_normal\n    (Hs.toRelSeries.step ⟨1, ho⟩).subgroupOf_normal\n    hHs0 hHs1\n    Gs.toRelSeries Gs.maximal i j hij\n    (Gs.toRelSeries.step i).subgroupOf_normal\n    (Gs.toRelSeries.step j).subgroupOf_normal\n    hGi hGj\nrefine ⟨⟨s', hs'max⟩, hs'len, ?_⟩\nhave hz' : 0 < s'.length := by omega\nhave ho' : 1 < s'.length := by omega\nexact hquot hz' ho' (s'.step ⟨0, hz'⟩).subgroupOf_normal (s'.step ⟨1, ho'⟩).subgroupOf_normal",
+    "compactRewrite": true
   },
   {
     "id": "fatex_016",
     "index": 16,
     "name": "normalClosure_isPExtension_of_isPExtension",
-    "statement": "class IsPExtension (F E : Type) [Field F] [Field E] [Algebra F E]\n    (p : ℕ) : Prop extends IsGalois F E where\n    rank_eq_pow : ∃ (n : ℕ), Module.rank F E = p ^ n\n\ntheorem normalClosure_isPExtension_of_isPExtension (F E : Type) [Field F] [Field E]\n    [Algebra F E] (L : IntermediateField F E) (K : IntermediateField F L) (p : ℕ) (hp : p.Prime)\n    [IsPExtension F K p] [IsGalois K L] [IsPExtension K L p]\n    (h_normalClosure : IsNormalClosure F L E) : IsPExtension F E p := by\n  sorry",
+    "statement": "theorem fatex_016_compact (F E : Type) [Field F] [Field E] [Algebra F E]\n    (L : IntermediateField F E) (K : IntermediateField F L) (p : ℕ) (hp : p.Prime)\n    (hFK : IsGalois F K) (hFKr : ∃ (n : ℕ), Module.rank F K = p ^ n)\n    (hKL : IsGalois K L) (hKLr : ∃ (n : ℕ), Module.rank K L = p ^ n)\n    (h_normalClosure : IsNormalClosure F L E) :\n    IsGalois F E ∧ ∃ (n : ℕ), Module.rank F E = p ^ n := by sorry",
     "informal": "Let $p$ be a prime and let $F$ be a field. Let $K$ be a finite Galois extension of $F$ whose Galois group is a $p$-group (i.e., the degree $[K : F]$ is a power of $p$). Such an extension is called a \\emph{$p$-extension} (note that $p$-extensions are Galois by definition). Let $L$ be a $p$-extension of $K$. Prove that the Galois closure of $L$ over $F$ is a $p$-extension of $F$.",
     "tags": [
       "Abstract Algebra",
       "Field Theory",
       "Explicit Computations"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "class IsPExtension (F E : Type) [Field F] [Field E] [Algebra F E]\n    (p : ℕ) : Prop extends IsGalois F E where\n    rank_eq_pow : ∃ (n : ℕ), Module.rank F E = p ^ n\n\ntheorem normalClosure_isPExtension_of_isPExtension (F E : Type) [Field F] [Field E]\n    [Algebra F E] (L : IntermediateField F E) (K : IntermediateField F L) (p : ℕ) (hp : p.Prime)\n    [IsPExtension F K p] [IsGalois K L] [IsPExtension K L p]\n    (h_normalClosure : IsNormalClosure F L E) : IsPExtension F E p := by\n  sorry",
+    "strengthProof": "have h := fatex_016_compact F E L K p hp inferInstance\n  (IsPExtension.rank_eq_pow (F := F) (E := K) (p := p)) inferInstance\n  (IsPExtension.rank_eq_pow (F := K) (E := L) (p := p)) h_normalClosure\nexact { toIsGalois := h.1, rank_eq_pow := h.2 }",
+    "compactRewrite": true
   },
   {
     "id": "fatex_017",
@@ -224,27 +237,33 @@
     "id": "fatex_018",
     "index": 18,
     "name": "isEmpty_embedding_intermediateField_of_odd_degree_galois",
-    "statement": "def IsRadicalExtension (E F : Type) [CommRing E] [CommRing F] [Algebra E F] : Prop :=\n    ∃ (x : F), Algebra.adjoin E {x} = ⊤ ∧ (∃ (n : ℕ) (e : E), n ≥ 1 ∧ x ^ n - (algebraMap E F) e = 0)\n\ninductive IsRadicalTower : ∀ (E : Type) (F : Type) [CommRing E] [CommRing F] [Algebra E F], Prop\n  | of_isRadicalExtension (E : Type) (F : Type)\n      [CommRing E] [CommRing F] [Algebra E F] : IsRadicalExtension E F → IsRadicalTower E F\n  | of_composition (E : Type) (F : Type) [CommRing E] [CommRing F] [Algebra E F] (F' : Subalgebra E F) :\n      IsRadicalExtension F' F → IsRadicalTower E F' → IsRadicalTower E F\n\ntheorem isEmpty_embedding_intermediateField_of_odd_degree_galois (E : Subfield ℝ) (K : Type)\n    [Field K] [Algebra E K] [IsGalois E K] (n : ℕ) (h_odd : Odd n) (hn : n > 1) (h_deg_eq : Module.rank E K = n)\n    (K' : IntermediateField E ℝ) (h_radical : IsRadicalTower E K') :\n    IsEmpty (K →ₐ[E] K') := by\n  sorry",
+    "statement": "theorem fatex_018_compact\n    (P : ∀ (E F : Type) [CommRing E] [CommRing F] [Algebra E F], Prop)\n    (hP1 : ∀ (E F : Type) [CommRing E] [CommRing F] [Algebra E F],\n      (∃ (x : F), Algebra.adjoin E {x} = ⊤ ∧\n        (∃ (n : ℕ) (e : E), n ≥ 1 ∧ x ^ n - (algebraMap E F) e = 0)) → P E F)\n    (hP2 : ∀ (E F : Type) [CommRing E] [CommRing F] [Algebra E F] (F' : Subalgebra E F),\n      (∃ (x : F), Algebra.adjoin F' {x} = ⊤ ∧\n        (∃ (n : ℕ) (e : F'), n ≥ 1 ∧ x ^ n - (algebraMap F' F) e = 0)) → P E F' → P E F)\n    (E : Subfield ℝ) (K : Type) [Field K] [Algebra E K] [IsGalois E K] (n : ℕ) (h_odd : Odd n)\n    (hn : n > 1) (h_deg_eq : Module.rank E K = n)\n    (K' : IntermediateField E ℝ) (h_radical : P E K') :\n    IsEmpty (K →ₐ[E] K') := by sorry",
     "informal": "Let \\( E \\) be a subfield of \\( \\mathbb{R} \\) and let \\( K/E \\) be a finite Galois extension of odd degree \\( > 1 \\). Prove that \\( K \\) cannot be \\( E \\)-embedded into a radical tower that is a subfield of \\( \\mathbb{R} \\).",
     "tags": [
       "Abstract Algebra",
       "Field Theory",
       "Galois theory"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "def IsRadicalExtension (E F : Type) [CommRing E] [CommRing F] [Algebra E F] : Prop :=\n    ∃ (x : F), Algebra.adjoin E {x} = ⊤ ∧ (∃ (n : ℕ) (e : E), n ≥ 1 ∧ x ^ n - (algebraMap E F) e = 0)\n\ninductive IsRadicalTower : ∀ (E : Type) (F : Type) [CommRing E] [CommRing F] [Algebra E F], Prop\n  | of_isRadicalExtension (E : Type) (F : Type)\n      [CommRing E] [CommRing F] [Algebra E F] : IsRadicalExtension E F → IsRadicalTower E F\n  | of_composition (E : Type) (F : Type) [CommRing E] [CommRing F] [Algebra E F] (F' : Subalgebra E F) :\n      IsRadicalExtension F' F → IsRadicalTower E F' → IsRadicalTower E F\n\ntheorem isEmpty_embedding_intermediateField_of_odd_degree_galois (E : Subfield ℝ) (K : Type)\n    [Field K] [Algebra E K] [IsGalois E K] (n : ℕ) (h_odd : Odd n) (hn : n > 1) (h_deg_eq : Module.rank E K = n)\n    (K' : IntermediateField E ℝ) (h_radical : IsRadicalTower E K') :\n    IsEmpty (K →ₐ[E] K') := by\n  sorry",
+    "strengthProof": "exact fatex_018_compact (fun E F iE iF iA => @IsRadicalTower E F iE iF iA)\n  (fun E F iE iF iA h => @IsRadicalTower.of_isRadicalExtension E F iE iF iA h)\n  (fun E F iE iF iA F' h ih => @IsRadicalTower.of_composition E F iE iF iA F' h ih)\n  E K n h_odd hn h_deg_eq K' h_radical",
+    "compactRewrite": true
   },
   {
     "id": "fatex_019",
     "index": 19,
     "name": "galoisGroup_iso_quaternion_group",
-    "statement": "abbrev E : Type := (Algebra.adjoin ℚ {Real.sqrt ((2 + Real.sqrt 2) * (3 + Real.sqrt 3))})\n\ntheorem galoisGroup_iso_quaternion_group : Nonempty ((E ≃ₐ[ℚ] E) ≃* (QuaternionGroup 2)) := by\n  sorry",
+    "statement": "theorem fatex_019_compact :\n    Nonempty ((↥(Algebra.adjoin ℚ {Real.sqrt ((2 + Real.sqrt 2) * (3 + Real.sqrt 3))}) ≃ₐ[ℚ] ↥(Algebra.adjoin ℚ {Real.sqrt ((2 + Real.sqrt 2) * (3 + Real.sqrt 3))})) ≃* (QuaternionGroup 2)) := by sorry",
     "informal": "Let $\\alpha = \\sqrt{(2+\\sqrt 2)(3+\\sqrt 3)}$ and consider the extension $E =\\mathbb{Q}(\\alpha)$. Show that $\\mathrm{Gal}(E/\\mathbb{Q}) \\cong Q_8$, the quaternion group of order $8$.",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Algebraic Number Theory and Valuation Theory"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "abbrev E : Type := (Algebra.adjoin ℚ {Real.sqrt ((2 + Real.sqrt 2) * (3 + Real.sqrt 3))})\n\ntheorem galoisGroup_iso_quaternion_group : Nonempty ((E ≃ₐ[ℚ] E) ≃* (QuaternionGroup 2)) := by\n  sorry",
+    "strengthProof": "exact fatex_019_compact",
+    "compactRewrite": true
   },
   {
     "id": "fatex_020",
@@ -263,14 +282,17 @@
     "id": "fatex_021",
     "index": 21,
     "name": "intermediateField_rank_eq_ringChar",
-    "statement": "open Polynomial\n\ntheorem intermediateField_rank_eq_ringChar (F : Type) [Field F] (f : Polynomial F) (hf : Irreducible f)\n    (K : Type) [Field K] [Algebra F K] (hK : f.IsSplittingField F K) (α : K)\n    (hα : f.aeval α = 0) (hα1 : f.aeval (α + 1) = 0) :\n    ∃ (E : IntermediateField F K), Module.rank E K = ringChar F := by\n  sorry",
+    "statement": "theorem fatex_021_compact (F : Type) [Field F] (f : Polynomial F) (hf : Irreducible f)\n    (K : Type) [Field K] [Algebra F K] (hK : f.IsSplittingField F K) (α : K)\n    (hα : f.aeval α = 0) (hα1 : f.aeval (α + 1) = 0) :\n    ∃ (E : IntermediateField F K), Module.rank E K = ringChar F := by sorry",
     "informal": "Let $F$ be a field and let $f(x) \\in F[x]$ be an irreducible polynomial. Suppose that $K$ is a splitting field for $f(x)$ over $F$ and assume that there exists an element $\\alpha \\in K$ such that both $\\alpha$ and $\\alpha+1$ are roots of $f(x)$. Prove that there exists an intermediate field $E$ between $K$ and $F$ such that $[K:E]$ is equal to the characteristic of $F$. (In particular, the characteristic of $F$ is not zero)",
     "tags": [
       "Abstract Algebra",
       "Field Theory",
       "Galois theory"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open Polynomial\n\ntheorem intermediateField_rank_eq_ringChar (F : Type) [Field F] (f : Polynomial F) (hf : Irreducible f)\n    (K : Type) [Field K] [Algebra F K] (hK : f.IsSplittingField F K) (α : K)\n    (hα : f.aeval α = 0) (hα1 : f.aeval (α + 1) = 0) :\n    ∃ (E : IntermediateField F K), Module.rank E K = ringChar F := by\n  sorry",
+    "strengthProof": "exact fatex_021_compact F f hf K hK α hα hα1",
+    "compactRewrite": true
   },
   {
     "id": "fatex_022",
@@ -289,27 +311,33 @@
     "id": "fatex_023",
     "index": 23,
     "name": "ratio_tendsto_one_of_irreducible",
-    "statement": "local instance (p : Nat.Primes) : NeZero p.1 := ⟨p.2.ne_zero⟩\nlocal instance (p : Nat.Primes) : IsDomain (ZMod p) := @ZMod.instIsDomain p ⟨p.2⟩\n\ntheorem ratio_tendsto_one_of_irreducible (f : Polynomial ℤ) (h_irr : Irreducible f) :\n    Function.rightLim\n    (fun (s : ℝ) ↦\n    (tsum (fun p : Nat.Primes ↦ (f.rootSet (ZMod p)).ncard * ((p : ℝ) ^ (-s)))) /\n    (tsum (fun p : Nat.Primes ↦ (p : ℝ) ^ (-s)))) 1 = 1 := by\n  sorry",
+    "statement": "theorem fatex_023_compact (f : Polynomial ℤ) (h_irr : Irreducible f) :\n    Function.rightLim\n    (fun (s : ℝ) ↦\n    (tsum (fun p : Nat.Primes ↦\n      (@Polynomial.rootSet ℤ _ f (ZMod (p : ℕ)) _ (@ZMod.instIsDomain (p : ℕ) ⟨p.2⟩) _).ncard * ((p : ℝ) ^ (-s)))) /\n    (tsum (fun p : Nat.Primes ↦ (p : ℝ) ^ (-s)))) 1 = 1 := by sorry",
     "informal": "Let $f(X)\\in\\mathbb{Z}[X]$ be an irreducible polynomial, $n_p$ is the number of solutions of $f(X)$ in $\\mathbb{F}_p$, show that $$\\lim\\limits_{s\\rightarrow 1^{+}}\\frac{\\sum\\limits_{p\\textbf{ prime}}\\frac{n_p}{p^s}}{\\sum\\limits_{p\\textbf{ prime}}\\frac{1}{p^s}}=1$$.",
     "tags": [
       "Abstract Algebra",
       "Field Theory",
       "Galois theory"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "local instance (p : Nat.Primes) : NeZero p.1 := ⟨p.2.ne_zero⟩\nlocal instance (p : Nat.Primes) : IsDomain (ZMod p) := @ZMod.instIsDomain p ⟨p.2⟩\n\ntheorem ratio_tendsto_one_of_irreducible (f : Polynomial ℤ) (h_irr : Irreducible f) :\n    Function.rightLim\n    (fun (s : ℝ) ↦\n    (tsum (fun p : Nat.Primes ↦ (f.rootSet (ZMod p)).ncard * ((p : ℝ) ^ (-s)))) /\n    (tsum (fun p : Nat.Primes ↦ (p : ℝ) ^ (-s)))) 1 = 1 := by\n  sorry",
+    "strengthProof": "exact fatex_023_compact f h_irr",
+    "compactRewrite": true
   },
   {
     "id": "fatex_024",
     "index": 24,
     "name": "galoisGroup_iso_of_distinct_primes",
-    "statement": "abbrev RatAdjoinSqrt {I : Type} (p : I → ℕ) : Type :=\n  Algebra.adjoin ℚ (Set.range (fun i ↦ Real.sqrt (p i)))\n\ntheorem galoisGroup_iso_of_distinct_primes {I : Type} [Finite I] (p : I → ℕ)\n    (hp : ∀ (i : I), (p i).Prime) (h_inj : p.Injective) :\n    Nonempty ((RatAdjoinSqrt p ≃ₐ[ℚ] RatAdjoinSqrt p) ≃* (Multiplicative (I → (ZMod 2)))) := by\n  sorry",
+    "statement": "theorem fatex_024_compact {I : Type} [Finite I] (p : I → ℕ)\n    (hp : ∀ (i : I), (p i).Prime) (h_inj : Function.Injective p) :\n    Nonempty ((Algebra.adjoin ℚ (Set.range (fun i ↦ Real.sqrt (p i)))\n      ≃ₐ[ℚ] Algebra.adjoin ℚ (Set.range (fun i ↦ Real.sqrt (p i))))\n      ≃* (Multiplicative (I → (ZMod 2)))) := by sorry",
     "informal": "Let $p_1, \\dots, p_r$ be $r$ different prime numbers. Prove that the Galois group of $K =\\mathbb{Q}(\\sqrt{p_1}, \\dots, \\sqrt{p_r})$ over $\\mathbb{Q}$ is $(\\mathbb{Z}/2\\mathbb{Z})^r$, here $\\mathbb{Z}/2\\mathbb{Z}$ is the cyclic group of order 2.",
     "tags": [
       "Abstract Algebra",
       "Field Theory",
       "Galois theory"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "abbrev RatAdjoinSqrt {I : Type} (p : I → ℕ) : Type :=\n  Algebra.adjoin ℚ (Set.range (fun i ↦ Real.sqrt (p i)))\n\ntheorem galoisGroup_iso_of_distinct_primes {I : Type} [Finite I] (p : I → ℕ)\n    (hp : ∀ (i : I), (p i).Prime) (h_inj : p.Injective) :\n    Nonempty ((RatAdjoinSqrt p ≃ₐ[ℚ] RatAdjoinSqrt p) ≃* (Multiplicative (I → (ZMod 2)))) := by\n  sorry",
+    "strengthProof": "exact fatex_024_compact p hp h_inj",
+    "compactRewrite": true
   },
   {
     "id": "fatex_025",
@@ -393,27 +421,33 @@
     "id": "fatex_031",
     "index": 31,
     "name": "UFD_of_ge_5",
-    "statement": "open MvPolynomial\n\nabbrev R (n : ℕ) : Type :=\n  MvPolynomial (Fin n) ℂ ⧸ Ideal.span {(∑ i : Fin n, X i ^ 2 : MvPolynomial (Fin n) ℂ)}\n\ntheorem UFD_of_ge_5 (n : ℕ) (h : n ≥ 5) :\n    ∃ (h : IsDomain (R n)), UniqueFactorizationMonoid (R n) := by\n  sorry",
+    "statement": "theorem fatex_031_compact (n : ℕ) (h : n ≥ 5) :\n    ∃ (_ : IsDomain (MvPolynomial (Fin n) ℂ ⧸\n      Ideal.span {(∑ i : Fin n, MvPolynomial.X i ^ 2 : MvPolynomial (Fin n) ℂ)})),\n      UniqueFactorizationMonoid (MvPolynomial (Fin n) ℂ ⧸\n        Ideal.span {(∑ i : Fin n, MvPolynomial.X i ^ 2 : MvPolynomial (Fin n) ℂ)}) := by sorry",
     "informal": "Let \\( R = \\mathbb{C}[x_1, \\dots, x_n]/(x_1^2 + x_2^2 + \\dots + x_n^2) \\). Then \\( R \\) is a unique factorization domain for \\(n \\geq 5 \\).",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "open MvPolynomial\n\nabbrev R (n : ℕ) : Type :=\n  MvPolynomial (Fin n) ℂ ⧸ Ideal.span {(∑ i : Fin n, X i ^ 2 : MvPolynomial (Fin n) ℂ)}\n\ntheorem UFD_of_ge_5 (n : ℕ) (h : n ≥ 5) :\n    ∃ (h : IsDomain (R n)), UniqueFactorizationMonoid (R n) := by\n  sorry",
+    "strengthProof": "exact fatex_031_compact n h",
+    "compactRewrite": true
   },
   {
     "id": "fatex_032",
     "index": 32,
     "name": "UFD_of_adicCompletion_UFD",
-    "statement": "open IsLocalRing\n\ntheorem UFD_of_adicCompletion_UFD (R : Type) [CommRing R] [IsLocalRing R] [IsNoetherianRing R]\n    [IsDomain (AdicCompletion (maximalIdeal R) R)]\n    [UniqueFactorizationMonoid (AdicCompletion (maximalIdeal R) R)] :\n    ∃ (h : IsDomain R), UniqueFactorizationMonoid R := by\n  sorry",
+    "statement": "theorem fatex_032_compact (R : Type) [CommRing R] [IsLocalRing R] [IsNoetherianRing R]\n    [IsDomain (AdicCompletion (IsLocalRing.maximalIdeal R) R)]\n    [UniqueFactorizationMonoid (AdicCompletion (IsLocalRing.maximalIdeal R) R)] :\n    ∃ (h : IsDomain R), UniqueFactorizationMonoid R := by sorry",
     "informal": "Let \\( A \\) be a Noetherian local ring such that its completion \\( \\widehat{A} \\) is a unique factorization domain. Then \\( A \\) is a unique factorization domain.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open IsLocalRing\n\ntheorem UFD_of_adicCompletion_UFD (R : Type) [CommRing R] [IsLocalRing R] [IsNoetherianRing R]\n    [IsDomain (AdicCompletion (maximalIdeal R) R)]\n    [UniqueFactorizationMonoid (AdicCompletion (maximalIdeal R) R)] :\n    ∃ (h : IsDomain R), UniqueFactorizationMonoid R := by\n  sorry",
+    "strengthProof": "exact fatex_032_compact R",
+    "compactRewrite": true
   },
   {
     "id": "fatex_033",
@@ -432,14 +466,17 @@
     "id": "fatex_034",
     "index": 34,
     "name": "powerSeries_not_integrallyClosed_of_two_lt_ringKrullDim",
-    "statement": "open PowerSeries\n\ntheorem powerSeries_not_integrallyClosed_of_two_lt_ringKrullDim (R : Type) [CommRing R]\n    [IsDomain R] [ValuationRing R] (two_lt : 2 ≤ ringKrullDim R) :\n    ¬ (IsIntegrallyClosed R⟦X⟧) := by\n  sorry",
+    "statement": "theorem fatex_034_compact (R : Type) [CommRing R]\n    [IsDomain R] [ValuationRing R] (two_lt : 2 ≤ ringKrullDim R) :\n    ¬ (IsIntegrallyClosed (PowerSeries R)) := by sorry",
     "informal": "If \\( R \\) is a valuation ring of Krull dimension \\( \\geq 2 \\), then the formal power series ring \\( R[[X]] \\) is not integrally closed.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Tensor Product and Flatness"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open PowerSeries\n\ntheorem powerSeries_not_integrallyClosed_of_two_lt_ringKrullDim (R : Type) [CommRing R]\n    [IsDomain R] [ValuationRing R] (two_lt : 2 ≤ ringKrullDim R) :\n    ¬ (IsIntegrallyClosed R⟦X⟧) := by\n  sorry",
+    "strengthProof": "exact fatex_034_compact R two_lt",
+    "compactRewrite": true
   },
   {
     "id": "fatex_035",
@@ -471,27 +508,33 @@
     "id": "fatex_037",
     "index": 37,
     "name": "ufd_quotDetSubOne",
-    "statement": "abbrev QuotDetSubOne (n : ℕ) : Type := MvPolynomial ((Fin n) × (Fin n)) ℂ ⧸ Ideal.span {\n      Matrix.det (fun (i : Fin n) ↦ (fun (j : Fin n) ↦ (.X ⟨i, j⟩ : (MvPolynomial ((Fin n) × (Fin n)) ℂ)))) - .C 1}\n\ntheorem ufd_quotDetSubOne (n : ℕ) (h : n ≥ 1) : ∃ (h : IsDomain (QuotDetSubOne n)),\n    UniqueFactorizationMonoid (QuotDetSubOne n) := by\n  sorry",
+    "statement": "theorem fatex_037_compact (n : ℕ) (h : n ≥ 1) : ∃ (h : IsDomain (MvPolynomial ((Fin n) × (Fin n)) ℂ ⧸ Ideal.span {\n      Matrix.det (fun (i : Fin n) ↦ (fun (j : Fin n) ↦ (MvPolynomial.X ⟨i, j⟩ : (MvPolynomial ((Fin n) × (Fin n)) ℂ)))) - MvPolynomial.C 1})),\n    UniqueFactorizationMonoid (MvPolynomial ((Fin n) × (Fin n)) ℂ ⧸ Ideal.span {\n      Matrix.det (fun (i : Fin n) ↦ (fun (j : Fin n) ↦ (MvPolynomial.X ⟨i, j⟩ : (MvPolynomial ((Fin n) × (Fin n)) ℂ)))) - MvPolynomial.C 1}) := by sorry",
     "informal": "Let $R=\\mathbb{C}[x_{11},x_{12},\\dots,x_{1n},x_{21},x_{22},\\dots,x_{2n},\\dots,x_{n1},x_{n2},\\dots,x_{nn}]/(\\det(x_{ij})-1)$, show that $R$ is a unique factorization domain.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Integral Dependence and the Nullstellensatz"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "abbrev QuotDetSubOne (n : ℕ) : Type := MvPolynomial ((Fin n) × (Fin n)) ℂ ⧸ Ideal.span {\n      Matrix.det (fun (i : Fin n) ↦ (fun (j : Fin n) ↦ (.X ⟨i, j⟩ : (MvPolynomial ((Fin n) × (Fin n)) ℂ)))) - .C 1}\n\ntheorem ufd_quotDetSubOne (n : ℕ) (h : n ≥ 1) : ∃ (h : IsDomain (QuotDetSubOne n)),\n    UniqueFactorizationMonoid (QuotDetSubOne n) := by\n  sorry",
+    "strengthProof": "exact fatex_037_compact n h",
+    "compactRewrite": true
   },
   {
     "id": "fatex_038",
     "index": 38,
     "name": "free_dualNumber_and_rank_eq_2",
-    "statement": "open Polynomial DualNumber\n\nabbrev S (k : Type) [Field k] : Type := ((DualNumber k)[X] ⧸ Ideal.span {((C ε) * X^3 + (C ε) * X^2 - X^2 - X : (DualNumber k)[X])})\n\nnoncomputable instance (k : Type) [Field k] : Module (DualNumber k) (S k) := Module.compHom _ C\n\ntheorem free_dualNumber_and_rank_eq_2 (k : Type) [Field k] :\n    Module.Free (DualNumber k) (S k) ∧ Module.rank (DualNumber k) (S k) = 2 := by\n  sorry",
+    "statement": "theorem fatex_038_compact (k : Type) [Field k] :\n    @Module.Free (DualNumber k)\n      (Polynomial (DualNumber k) ⧸ Ideal.span {(Polynomial.C DualNumber.eps * Polynomial.X ^ 3\n        + Polynomial.C DualNumber.eps * Polynomial.X ^ 2 - Polynomial.X ^ 2 - Polynomial.X :\n        Polynomial (DualNumber k))}) _ _ (Module.compHom _ Polynomial.C)\n    ∧ @Module.rank (DualNumber k)\n      (Polynomial (DualNumber k) ⧸ Ideal.span {(Polynomial.C DualNumber.eps * Polynomial.X ^ 3\n        + Polynomial.C DualNumber.eps * Polynomial.X ^ 2 - Polynomial.X ^ 2 - Polynomial.X :\n        Polynomial (DualNumber k))}) _ _ (Module.compHom _ Polynomial.C) = 2 := by sorry",
     "informal": "Let \\( k \\) be a field, and let \\( R = k[t]/(t^2) \\). Set\n\\[\np(x) = tx^3 + tx^2 - x^2 - x \\in R[x].\n\\]\nShow that \\( S = R[x]/(p) \\) is a free \\( R \\)-module of rank \\( 2 \\).",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Tensor Product and Flatness"
     ],
-    "declarations": 2
+    "declarations": 0,
+    "originalStatement": "open Polynomial DualNumber\n\nabbrev S (k : Type) [Field k] : Type := ((DualNumber k)[X] ⧸ Ideal.span {((C ε) * X^3 + (C ε) * X^2 - X^2 - X : (DualNumber k)[X])})\n\nnoncomputable instance (k : Type) [Field k] : Module (DualNumber k) (S k) := Module.compHom _ C\n\ntheorem free_dualNumber_and_rank_eq_2 (k : Type) [Field k] :\n    Module.Free (DualNumber k) (S k) ∧ Module.rank (DualNumber k) (S k) = 2 := by\n  sorry",
+    "strengthProof": "exact fatex_038_compact k",
+    "compactRewrite": true
   },
   {
     "id": "fatex_039",
@@ -510,14 +553,17 @@
     "id": "fatex_040",
     "index": 40,
     "name": "free_of_rank_iff",
-    "statement": "open TensorProduct\n\ntheorem free_of_rank_iff (R : Type) [CommRing R] [IsLocalRing R] [IsReduced R]\n    (h : (minimalPrimes R).Finite) (r : ℕ) (M : Type) [AddCommGroup M] [Module R M] [Module.Finite R M] :\n    Module.Free R M ∧ Module.rank R M = r ↔\n    (Module.rank (IsLocalRing.ResidueField R) ((IsLocalRing.ResidueField R) ⊗[R] M) = r ∧\n    ∀ p ∈ minimalPrimes R,\n    Module.rank (FractionRing (R ⧸ p)) ((FractionRing (R ⧸ p)) ⊗[R] M) = r) := by\n  sorry",
+    "statement": "theorem fatex_040_compact (R : Type) [CommRing R] [IsLocalRing R] [IsReduced R]\n    (h : (minimalPrimes R).Finite) (r : ℕ) (M : Type) [AddCommGroup M] [Module R M]\n    [Module.Finite R M] :\n    Module.Free R M ∧ Module.rank R M = r ↔\n    (Module.rank (IsLocalRing.ResidueField R)\n      (TensorProduct R (IsLocalRing.ResidueField R) M) = r ∧\n    ∀ p ∈ minimalPrimes R,\n    Module.rank (FractionRing (R ⧸ p)) (TensorProduct R (FractionRing (R ⧸ p)) M) = r) := by sorry",
     "informal": "Let $A$ be a reduced local ring with residue field $k$ and finite set $\\Sigma$ of minimal primes. For each $\\mathfrak{p}\\in\\Sigma$, set $K(\\mathfrak{p})=\\mathrm{Frac}(A/\\mathfrak{p})$. Let $P$ be a finitely generated module. Show that $P$ is free of rank $r$ if and only if $\\dim_k(P\\otimes_A k) = r$ and $\\dim_{K(\\mathfrak{p})}(P\\otimes_A K(\\mathfrak{p})) = r$ for each $\\mathfrak{p}\\in\\Sigma$.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Regular Sequences and Regular Local Rings"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open TensorProduct\n\ntheorem free_of_rank_iff (R : Type) [CommRing R] [IsLocalRing R] [IsReduced R]\n    (h : (minimalPrimes R).Finite) (r : ℕ) (M : Type) [AddCommGroup M] [Module R M] [Module.Finite R M] :\n    Module.Free R M ∧ Module.rank R M = r ↔\n    (Module.rank (IsLocalRing.ResidueField R) ((IsLocalRing.ResidueField R) ⊗[R] M) = r ∧\n    ∀ p ∈ minimalPrimes R,\n    Module.rank (FractionRing (R ⧸ p)) ((FractionRing (R ⧸ p)) ⊗[R] M) = r) := by\n  sorry",
+    "strengthProof": "exact fatex_040_compact R h r M",
+    "compactRewrite": true
   },
   {
     "id": "fatex_041",
@@ -530,7 +576,8 @@
       "Ideal Theory",
       "Tensor Product and Flatness"
     ],
-    "declarations": 2
+    "declarations": 2,
+    "toolchainIncompatible": "line 4, col 4: failed to compile definition, consider marking it as `noncomputable` because it depends on `AddMonoidAlgebra.semiring`, which is `noncomputable` (Mathlib API drift v4.28→v4.32)"
   },
   {
     "id": "fatex_042",
@@ -549,40 +596,52 @@
     "id": "fatex_043",
     "index": 43,
     "name": "IsRegularLocalRing.frobenius_flat",
-    "statement": "open IsLocalRing\n\nclass IsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\ntheorem IsRegularLocalRing.frobenius_flat {A : Type} [CommRing A] [IsNoetherianRing A]\n    [IsLocalRing A] [IsReduced A] (p : ℕ) [Fact p.Prime] [CharP A p] :\n    (frobenius A p).Flat ↔ IsRegularLocalRing A := by\n  sorry",
+    "statement": "theorem fatex_043_compact {A : Type} [CommRing A] [IsNoetherianRing A]\n    [IsLocalRing A] [IsReduced A] (p : ℕ) [Fact p.Prime] [CharP A p] :\n    (frobenius A p).Flat ↔\n      Module.finrank (IsLocalRing.ResidueField A) (IsLocalRing.CotangentSpace A)\n        = ringKrullDim A := by sorry",
     "informal": "Let $A$ be a reduced Noetherian local ring, $\\mathrm{Char}\\ A = p$. Show that the absolute Frobenius $F_A\\colon A\\to A, a\\mapsto a^p$ is flat if and only if $A$ is regular.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Ideals and Modules"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsRegularLocalRing → FateXIsRegularLocalRing"
+    ],
+    "originalStatement": "open IsLocalRing\n\nclass FateXIsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\ntheorem FateXIsRegularLocalRing.frobenius_flat {A : Type} [CommRing A] [IsNoetherianRing A]\n    [IsLocalRing A] [IsReduced A] (p : ℕ) [Fact p.Prime] [CharP A p] :\n    (frobenius A p).Flat ↔ FateXIsRegularLocalRing A := by\n  sorry",
+    "strengthProof": "refine (fatex_043_compact p).trans ?_\nconstructor\n· intro h\n  exact { reg := h }\n· intro h\n  exact h.reg",
+    "compactRewrite": true
   },
   {
     "id": "fatex_044",
     "index": 44,
     "name": "quot_x2_sub_y2_y2_sub_z2_xy_yz_zx_not_global_complete_intersection",
-    "statement": "open MvPolynomial\n\nclass IsGlobalCompleteIntersection (k : Type) [Field k] (S : Type) [CommRing S] [Algebra k S] :\n    Prop extends Algebra.FiniteType k S where\n  isGlobalCompleteIntersection : ∃ n : ℕ, ∃ rs : List (MvPolynomial (Fin n) k),\n    Nonempty (S ≃ₐ[k] (MvPolynomial (Fin n) k) ⧸ Ideal.ofList rs) ∧ ringKrullDim S + rs.length = n\n\ntheorem quot_x2_sub_y2_y2_sub_z2_xy_yz_zx_not_global_complete_intersection (k : Type) [Field k] :\n    ¬ IsGlobalCompleteIntersection k (MvPolynomial (Fin 3) k ⧸ Ideal.span\n    ({(X 0)^ 2 - (X 1)^2, (X 1)^2 - (X 2)^2, (X 0) * (X 1), (X 1) * (X 2), (X 2) * (X 0)} :\n    Set (MvPolynomial (Fin 3) k))) := by\n  sorry",
+    "statement": "theorem fatex_044_compact (k : Type) [Field k] :\n    ¬ ∃ (n : ℕ) (rs : List (MvPolynomial (Fin n) k)),\n      Nonempty ((MvPolynomial (Fin 3) k ⧸ Ideal.span\n        ({(MvPolynomial.X 0) ^ 2 - (MvPolynomial.X 1) ^ 2,\n          (MvPolynomial.X 1) ^ 2 - (MvPolynomial.X 2) ^ 2,\n          (MvPolynomial.X 0) * (MvPolynomial.X 1),\n          (MvPolynomial.X 1) * (MvPolynomial.X 2),\n          (MvPolynomial.X 2) * (MvPolynomial.X 0)} : Set (MvPolynomial (Fin 3) k)))\n        ≃ₐ[k] (MvPolynomial (Fin n) k) ⧸ Ideal.ofList rs) ∧\n      ringKrullDim (MvPolynomial (Fin 3) k ⧸ Ideal.span\n        ({(MvPolynomial.X 0) ^ 2 - (MvPolynomial.X 1) ^ 2,\n          (MvPolynomial.X 1) ^ 2 - (MvPolynomial.X 2) ^ 2,\n          (MvPolynomial.X 0) * (MvPolynomial.X 1),\n          (MvPolynomial.X 1) * (MvPolynomial.X 2),\n          (MvPolynomial.X 2) * (MvPolynomial.X 0)} : Set (MvPolynomial (Fin 3) k)))\n        + rs.length = n := by sorry",
     "informal": "Let \\( k \\) be a field, and set \\( A = k[X, Y, Z]/(X^2 - Y^2, Y^2 - Z^2, XY, YZ, ZX) \\). Show that \\( A \\) is not a global complete intersection.",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Completions and Hensel's lemma"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "open MvPolynomial\n\nclass IsGlobalCompleteIntersection (k : Type) [Field k] (S : Type) [CommRing S] [Algebra k S] :\n    Prop extends Algebra.FiniteType k S where\n  isGlobalCompleteIntersection : ∃ n : ℕ, ∃ rs : List (MvPolynomial (Fin n) k),\n    Nonempty (S ≃ₐ[k] (MvPolynomial (Fin n) k) ⧸ Ideal.ofList rs) ∧ ringKrullDim S + rs.length = n\n\ntheorem quot_x2_sub_y2_y2_sub_z2_xy_yz_zx_not_global_complete_intersection (k : Type) [Field k] :\n    ¬ IsGlobalCompleteIntersection k (MvPolynomial (Fin 3) k ⧸ Ideal.span\n    ({(X 0)^ 2 - (X 1)^2, (X 1)^2 - (X 2)^2, (X 0) * (X 1), (X 1) * (X 2), (X 2) * (X 0)} :\n    Set (MvPolynomial (Fin 3) k))) := by\n  sorry",
+    "strengthProof": "intro h\nexact fatex_044_compact k h.isGlobalCompleteIntersection",
+    "compactRewrite": true
   },
   {
     "id": "fatex_045",
     "index": 45,
     "name": "free_of_free_resolution",
-    "statement": "def IsGradedHom {R M N ι : Type} [CommRing R] [AddCommGroup M] [AddCommGroup N]\n    [Module R M] [Module R N] (𝓜 : ι → Submodule R M) (𝒩 : ι → Submodule R N)\n    (f : M →ₗ[R] N) : Prop := ∀ (i : ι) (x : 𝓜 i), f x ∈ 𝒩 i\n\ntheorem free_of_free_resolution {k : Type} [Field k] {r : ℕ}\n    (C : ChainComplex (ModuleCat.{0} (MvPolynomial (Fin r) k)) ℕ)\n    (hC : ∀ (n : ℕ), n > (r + 1) → CategoryTheory.Limits.IsZero (C.X n))\n    (𝓜 : ∀ (n : ℕ), (ℕ → Submodule (MvPolynomial (Fin r) k) (C.X n)))\n    [hM : ∀ (n : ℕ), DirectSum.Decomposition (𝓜 n)]\n    [hM' : ∀ (n : ℕ), SetLike.GradedSMul (MvPolynomial.homogeneousSubmodule (Fin r) k) (𝓜 n)]\n    (h_exact : C.Acyclic)\n    (h_gr : ∀ (i j : ℕ), IsGradedHom (𝓜 i) (𝓜 j) (C.d i j).hom)\n    (h_free : ∀ (n : ℕ), 1 ≤ n ∧ n ≤ r → Module.Free (MvPolynomial (Fin r) k) (C.X n)) :\n    Module.Free (MvPolynomial (Fin r) k) (C.X (r + 1)) := by\n  sorry",
+    "statement": "theorem fatex_045_compact {k : Type} [Field k] {r : ℕ}\n    (C : ChainComplex (ModuleCat.{0} (MvPolynomial (Fin r) k)) ℕ)\n    (hC : ∀ (n : ℕ), n > (r + 1) → CategoryTheory.Limits.IsZero (C.X n))\n    (𝓜 : ∀ (n : ℕ), (ℕ → Submodule (MvPolynomial (Fin r) k) (C.X n)))\n    [hM : ∀ (n : ℕ), DirectSum.Decomposition (𝓜 n)]\n    [hM' : ∀ (n : ℕ), SetLike.GradedSMul (MvPolynomial.homogeneousSubmodule (Fin r) k) (𝓜 n)]\n    (h_exact : C.Acyclic)\n    (h_gr : ∀ (i j : ℕ), ∀ (l : ℕ) (x : (𝓜 i) l), (C.d i j).hom x ∈ (𝓜 j) l)\n    (h_free : ∀ (n : ℕ), 1 ≤ n ∧ n ≤ r → Module.Free (MvPolynomial (Fin r) k) (C.X n)) :\n    Module.Free (MvPolynomial (Fin r) k) (C.X (r + 1)) := by sorry",
     "informal": "Let $k$ be a field and $A = k[x_1, \\dots, x_r]$ the polynomial ring in $r$ variables. Let $M$ be a graded module over $A$, and let\n\\[\n0 \\to K \\to L_{r-1} \\to \\cdots \\to L_0 \\to M \\to 0\n\\]\nbe an exact sequence of graded homomorphisms of graded modules, such that $L_0, \\dots, L_{r-1}$ are free. Then $K$ is free. {Gradings of modules are by $\\mathbb{Z}_{\\geq 0}$.}",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Completions and Hensel's lemma"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "def IsGradedHom {R M N ι : Type} [CommRing R] [AddCommGroup M] [AddCommGroup N]\n    [Module R M] [Module R N] (𝓜 : ι → Submodule R M) (𝒩 : ι → Submodule R N)\n    (f : M →ₗ[R] N) : Prop := ∀ (i : ι) (x : 𝓜 i), f x ∈ 𝒩 i\n\ntheorem free_of_free_resolution {k : Type} [Field k] {r : ℕ}\n    (C : ChainComplex (ModuleCat.{0} (MvPolynomial (Fin r) k)) ℕ)\n    (hC : ∀ (n : ℕ), n > (r + 1) → CategoryTheory.Limits.IsZero (C.X n))\n    (𝓜 : ∀ (n : ℕ), (ℕ → Submodule (MvPolynomial (Fin r) k) (C.X n)))\n    [hM : ∀ (n : ℕ), DirectSum.Decomposition (𝓜 n)]\n    [hM' : ∀ (n : ℕ), SetLike.GradedSMul (MvPolynomial.homogeneousSubmodule (Fin r) k) (𝓜 n)]\n    (h_exact : C.Acyclic)\n    (h_gr : ∀ (i j : ℕ), IsGradedHom (𝓜 i) (𝓜 j) (C.d i j).hom)\n    (h_free : ∀ (n : ℕ), 1 ≤ n ∧ n ≤ r → Module.Free (MvPolynomial (Fin r) k) (C.X n)) :\n    Module.Free (MvPolynomial (Fin r) k) (C.X (r + 1)) := by\n  sorry",
+    "strengthProof": "exact fatex_045_compact C hC 𝓜 h_exact h_gr h_free",
+    "compactRewrite": true
   },
   {
     "id": "fatex_046",
@@ -601,27 +660,33 @@
     "id": "fatex_047",
     "index": 47,
     "name": "isEmpty_isomorphism_UFD_of_quotient",
-    "statement": "abbrev A {k : Type} [Field k] {n : ℕ} (t : (Fin n) → k) : Type := (MvPolynomial (Fin 2) k) ⧸ Ideal.span {(.X 1 ^ 2) - ∏ (m : Fin n), (.X 0 - .C (t m) : (MvPolynomial (Fin 2) k))}\n\ntheorem isEmpty_isomorphism_UFD_of_quotient (k : Type) [Field k] (h_char : ¬ CharP k 2)\n    (n : ℕ) (h_ge : n ≥ 3) (h_odd : Odd n) (t : (Fin n) → k) (h_inj : Function.Injective t) :\n    ∃ _ : IsDedekindDomain (A t), Nontrivial (ClassGroup (A t)) := by\n  sorry",
+    "statement": "theorem fatex_047_compact (k : Type) [Field k] (h_char : ¬ CharP k 2)\n    (n : ℕ) (h_ge : n ≥ 3) (h_odd : Odd n) (t : (Fin n) → k) (h_inj : Function.Injective t) :\n    ∃ _ : IsDedekindDomain ((MvPolynomial (Fin 2) k) ⧸ Ideal.span {(.X 1 ^ 2)\n      - ∏ (m : Fin n), (.X 0 - .C (t m) : (MvPolynomial (Fin 2) k))}),\n      Nontrivial (ClassGroup ((MvPolynomial (Fin 2) k) ⧸ Ideal.span {(.X 1 ^ 2)\n        - ∏ (m : Fin n), (.X 0 - .C (t m) : (MvPolynomial (Fin 2) k))})) := by sorry",
     "informal": "Show that the ring \\(A = k[x,y]/(y^{2} - f(x))\\) is a Dedekind domain and the class group of the ring \\(A\\) is not trivial, where \\(k\\) is a field of characteristic not 2, \\(f(x) = (x - t_{1})\\ldots(x - t_{n})\\) with \\(t_{1},\\ldots,t_{n} \\in k\\) distinct and \\(n \\geq 3\\) is an odd integer.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Depth, Cohen-Macaulay Rings and Gorenstein rings"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "abbrev A {k : Type} [Field k] {n : ℕ} (t : (Fin n) → k) : Type := (MvPolynomial (Fin 2) k) ⧸ Ideal.span {(.X 1 ^ 2) - ∏ (m : Fin n), (.X 0 - .C (t m) : (MvPolynomial (Fin 2) k))}\n\ntheorem isEmpty_isomorphism_UFD_of_quotient (k : Type) [Field k] (h_char : ¬ CharP k 2)\n    (n : ℕ) (h_ge : n ≥ 3) (h_odd : Odd n) (t : (Fin n) → k) (h_inj : Function.Injective t) :\n    ∃ _ : IsDedekindDomain (A t), Nontrivial (ClassGroup (A t)) := by\n  sorry",
+    "strengthProof": "exact fatex_047_compact k h_char n h_ge h_odd t h_inj",
+    "compactRewrite": true
   },
   {
     "id": "fatex_048",
     "index": 48,
     "name": "isAbsolutelyFlat_iff_principal_ideal_idempotent",
-    "statement": "class IsAbsolutelyFlat (R : Type) [CommRing R] : Prop where\n  out ⦃P : Type⦄ [AddCommGroup P] [Module R P] : Module.Flat R P\n\ntheorem isAbsolutelyFlat_iff_principal_ideal_idempotent (R : Type) [CommRing R] :\n    IsAbsolutelyFlat R ↔ (∀ I : Ideal R, I.IsPrincipal → I ^ 2 = I) := by\n  sorry",
+    "statement": "theorem fatex_048_compact (R : Type) [CommRing R] :\n    (∀ (P : Type) [AddCommGroup P] [Module R P], Module.Flat R P) ↔\n      (∀ I : Ideal R, I.IsPrincipal → I ^ 2 = I) := by sorry",
     "informal": "A commutative ring \\( A \\) is \\textit{absolutely flat} if every \\( A \\)-module is flat. Prove that \\( A \\) is absolutely flat if and only if every principal ideal is idempotent.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Smoothness and the Module of Differentials"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "class IsAbsolutelyFlat (R : Type) [CommRing R] : Prop where\n  out ⦃P : Type⦄ [AddCommGroup P] [Module R P] : Module.Flat R P\n\ntheorem isAbsolutelyFlat_iff_principal_ideal_idempotent (R : Type) [CommRing R] :\n    IsAbsolutelyFlat R ↔ (∀ I : Ideal R, I.IsPrincipal → I ^ 2 = I) := by\n  sorry",
+    "strengthProof": "rw [← fatex_048_compact R]\nconstructor\n· intro h P _ _\n  exact @IsAbsolutelyFlat.out R _ h P _ _\n· intro h\n  constructor\n  intro P _ _\n  exact h P",
+    "compactRewrite": true
   },
   {
     "id": "fatex_049",
@@ -679,14 +744,17 @@
     "id": "fatex_053",
     "index": 53,
     "name": "isGorensteinRing_quot_x2_sub_y2_y2_sub_z2_xy_yz_zx",
-    "statement": "open IsLocalRing ModuleCat CategoryTheory MvPolynomial\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\ntheorem isGorensteinRing_quot_x2_sub_y2_y2_sub_z2_xy_yz_zx (k : Type) [Field k] :\n    IsGorensteinRing <| MvPolynomial (Fin 3) k ⧸ Ideal.span ({(X 0)^ 2 - (X 1)^2, (X 1)^2 - (X 2)^2,\n    (X 0) * (X 1), (X 1) * (X 2), (X 2) * (X 0)} : Set (MvPolynomial (Fin 3) k)) := by\n  sorry",
+    "statement": "theorem fatex_053_compact (k : Type) [Field k] (S : Type) [CommRing S]\n    (e : S ≃+* (MvPolynomial (Fin 3) k ⧸ Ideal.span\n      ({(MvPolynomial.X 0) ^ 2 - (MvPolynomial.X 1) ^ 2,\n        (MvPolynomial.X 1) ^ 2 - (MvPolynomial.X 2) ^ 2,\n        (MvPolynomial.X 0) * (MvPolynomial.X 1),\n        (MvPolynomial.X 1) * (MvPolynomial.X 2),\n        (MvPolynomial.X 2) * (MvPolynomial.X 0)} : Set (MvPolynomial (Fin 3) k)))) :\n    IsNoetherianRing S ∧\n    ∀ (m : Ideal S) (_ : m.IsMaximal),\n      IsNoetherianRing (Localization.AtPrime m) ∧\n      ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n        Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime m)\n            (IsLocalRing.ResidueField (Localization.AtPrime m)))\n          (ModuleCat.of.{0} (Localization.AtPrime m) (Localization.AtPrime m)) i) := by sorry",
     "informal": "Let \\( k \\) be a field, and set \\( A = k[X, Y, Z]/(X^2 - Y^2, Y^2 - Z^2, XY, YZ, ZX) \\). Show that \\( A \\) is Gorenstein.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Tensor Product and Flatness"
     ],
-    "declarations": 3
+    "declarations": 0,
+    "originalStatement": "open IsLocalRing ModuleCat CategoryTheory MvPolynomial\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\ntheorem isGorensteinRing_quot_x2_sub_y2_y2_sub_z2_xy_yz_zx (k : Type) [Field k] :\n    IsGorensteinRing <| MvPolynomial (Fin 3) k ⧸ Ideal.span ({(X 0)^ 2 - (X 1)^2, (X 1)^2 - (X 2)^2,\n    (X 0) * (X 1), (X 1) * (X 2), (X 2) * (X 0)} : Set (MvPolynomial (Fin 3) k)) := by\n  sorry",
+    "strengthProof": "obtain ⟨hN, hL⟩ := fatex_053_compact k _ (RingEquiv.refl _)\nhaveI := hN\nrefine ⟨fun m hm => ?_⟩\nobtain ⟨hNL, hE⟩ := hL m hm\nhaveI := hNL\nexact ⟨hE⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_054",
@@ -705,14 +773,17 @@
     "id": "fatex_055",
     "index": 55,
     "name": "stablyFree_iff_free_of_not_fg",
-    "statement": "def IsStablyFree (R : Type) (M : Type) [CommRing R] [AddCommGroup M] [Module R M] : Prop :=\n    ∃ (N : Type) (_ : AddCommGroup N) (_ : Module R N),\n    Module.Finite R N ∧ Module.Free R N ∧ Module.Free R (M × N)\n\ntheorem stablyFree_iff_free_of_not_fg (R : Type) (M : Type) [CommRing R] [AddCommGroup M]\n    [Module R M] (h : ¬ Module.Finite R M) : Module.Free R M ↔ IsStablyFree R M := by\n  sorry",
+    "statement": "theorem fatex_055_compact (R : Type) (M : Type) [CommRing R] [AddCommGroup M]\n    [Module R M] (h : ¬ Module.Finite R M) :\n    Module.Free R M ↔ ∃ (N : Type) (_ : AddCommGroup N) (_ : Module R N),\n      Module.Finite R N ∧ Module.Free R N ∧ Module.Free R (M × N) := by sorry",
     "informal": "A module \\( M \\) over a ring \\( R \\) is \\textit{stably free} if there exists a free finitely generated module \\( F \\) over \\( R \\) such that \n\\[\nM \\oplus F\n\\]\nis a free module.\nProve that if $M$ is stably free and not finitely generated then $M$ is free.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Ideals and Modules"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "def IsStablyFree (R : Type) (M : Type) [CommRing R] [AddCommGroup M] [Module R M] : Prop :=\n    ∃ (N : Type) (_ : AddCommGroup N) (_ : Module R N),\n    Module.Finite R N ∧ Module.Free R N ∧ Module.Free R (M × N)\n\ntheorem stablyFree_iff_free_of_not_fg (R : Type) (M : Type) [CommRing R] [AddCommGroup M]\n    [Module R M] (h : ¬ Module.Finite R M) : Module.Free R M ↔ IsStablyFree R M := by\n  sorry",
+    "strengthProof": "exact fatex_055_compact R M h",
+    "compactRewrite": true
   },
   {
     "id": "fatex_056",
@@ -731,27 +802,36 @@
     "id": "fatex_057",
     "index": 57,
     "name": "completely_integrally_closed_polynomial_ring",
-    "statement": "def IsAlmostIntegral {A : Type} [CommRing A] [IsDomain A] (x : FractionRing A) : Prop :=\n  ∃ r : A, r ≠ 0 ∧ ∀ n : ℕ, ∃ y : A, r • (x ^ n) = algebraMap A (FractionRing A) y\n\ndef IsCompletelyIntegrallyClosed (A : Type) [CommRing A] [IsDomain A] : Prop :=\n  ∀ x : FractionRing A, IsAlmostIntegral x → ∃ y : A, x = algebraMap A (FractionRing A) y\n\ntheorem completely_integrally_closed_polynomial_ring {A : Type} [CommRing A] [IsDomain A]\n    (h : IsCompletelyIntegrallyClosed A) : IsCompletelyIntegrallyClosed (Polynomial A) := by\n  sorry",
+    "statement": "theorem fatex_057_compact {A : Type} [CommRing A] [IsDomain A]\n    (h : ∀ x : FractionRing A,\n      (∃ r : A, r ≠ 0 ∧ ∀ n : ℕ, ∃ y : A, r • (x ^ n) = algebraMap A (FractionRing A) y) →\n      ∃ y : A, x = algebraMap A (FractionRing A) y) :\n    ∀ x : FractionRing (Polynomial A),\n      (∃ r : Polynomial A, r ≠ 0 ∧ ∀ n : ℕ, ∃ y : Polynomial A,\n        r • (x ^ n) = algebraMap (Polynomial A) (FractionRing (Polynomial A)) y) →\n      ∃ y : Polynomial A, x = algebraMap (Polynomial A) (FractionRing (Polynomial A)) y := by sorry",
     "informal": "Let \\( A \\) be a domain and \\( K \\) its field of fractions. \\( x \\in K \\) is called almost integral if there exists an element \\( r\\in A, r \\ne 0 \\) such that \\( rx^n \\in A \\) for all \\( n \\ge 0 \\). \\( A \\) is called \\textit{completely integrally closed} if every almost integral element of \\( K \\) is contained in \\( A \\). Show that if \\( A \\) is completely integrally closed, so is \\( A[X] \\).",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Dedekind Domains and DVRs"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsAlmostIntegral → FateXIsAlmostIntegral"
+    ],
+    "originalStatement": "def FateXIsAlmostIntegral {A : Type} [CommRing A] [IsDomain A] (x : FractionRing A) : Prop :=\n  ∃ r : A, r ≠ 0 ∧ ∀ n : ℕ, ∃ y : A, r • (x ^ n) = algebraMap A (FractionRing A) y\n\ndef IsCompletelyIntegrallyClosed (A : Type) [CommRing A] [IsDomain A] : Prop :=\n  ∀ x : FractionRing A, FateXIsAlmostIntegral x → ∃ y : A, x = algebraMap A (FractionRing A) y\n\ntheorem completely_integrally_closed_polynomial_ring {A : Type} [CommRing A] [IsDomain A]\n    (h : IsCompletelyIntegrallyClosed A) : IsCompletelyIntegrallyClosed (Polynomial A) := by\n  sorry",
+    "strengthProof": "exact fatex_057_compact h",
+    "compactRewrite": true
   },
   {
     "id": "fatex_058",
     "index": 58,
     "name": "flat_of_flat_over_quotient",
-    "statement": "open TensorProduct\n\ntheorem flat_of_flat_over_quotient (R S : Type) [CommRing R] [CommRing S]\n    [IsLocalRing R] [IsLocalRing S] [IsNoetherianRing R] [IsNoetherianRing S] [Algebra R S]\n    (h_map : Ideal.map (algebraMap R S) (IsLocalRing.maximalIdeal R) ≤ IsLocalRing.maximalIdeal S)\n    (M : Type) [AddCommGroup M] [Module S M] [Module R M] [IsScalarTower R S M] [Module.Finite S M]\n    (h_flat_quotient : ∀ (n : ℕ), Module.Flat (R ⧸ (IsLocalRing.maximalIdeal R) ^ n) ((R ⧸ (IsLocalRing.maximalIdeal R) ^ n) ⊗[R] M)) :\n    Module.Flat R M := by\n  sorry",
+    "statement": "theorem fatex_058_compact (R S : Type) [CommRing R] [CommRing S]\n    [IsLocalRing R] [IsLocalRing S] [IsNoetherianRing R] [IsNoetherianRing S] [Algebra R S]\n    (h_map : Ideal.map (algebraMap R S) (IsLocalRing.maximalIdeal R) ≤ IsLocalRing.maximalIdeal S)\n    (M : Type) [AddCommGroup M] [Module S M] [Module R M] [IsScalarTower R S M] [Module.Finite S M]\n    (h_flat_quotient : ∀ (n : ℕ), Module.Flat (R ⧸ (IsLocalRing.maximalIdeal R) ^ n)\n      (TensorProduct R (R ⧸ (IsLocalRing.maximalIdeal R) ^ n) M)) :\n    Module.Flat R M := by sorry",
     "informal": "Suppose that $(R, \\mathfrak{P})$ is a local Noetherian ring, and let $(S, \\mathfrak{Q})$ be a local Noetherian $R$-algebra such that $\\mathfrak{P}S \\subseteq \\mathfrak{Q}$. If $M$ is a finitely generated $S$-module, show that $M$ is flat as an $R$-module if $M / \\mathfrak{P}^n M$ is flat as an $R / \\mathfrak{P}^n$-module for every $n$.",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Homological Methods"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open TensorProduct\n\ntheorem flat_of_flat_over_quotient (R S : Type) [CommRing R] [CommRing S]\n    [IsLocalRing R] [IsLocalRing S] [IsNoetherianRing R] [IsNoetherianRing S] [Algebra R S]\n    (h_map : Ideal.map (algebraMap R S) (IsLocalRing.maximalIdeal R) ≤ IsLocalRing.maximalIdeal S)\n    (M : Type) [AddCommGroup M] [Module S M] [Module R M] [IsScalarTower R S M] [Module.Finite S M]\n    (h_flat_quotient : ∀ (n : ℕ), Module.Flat (R ⧸ (IsLocalRing.maximalIdeal R) ^ n) ((R ⧸ (IsLocalRing.maximalIdeal R) ^ n) ⊗[R] M)) :\n    Module.Flat R M := by\n  sorry",
+    "strengthProof": "exact fatex_058_compact R S h_map M h_flat_quotient",
+    "compactRewrite": true
   },
   {
     "id": "fatex_059",
@@ -770,14 +850,17 @@
     "id": "fatex_060",
     "index": 60,
     "name": "invertible_iff_codimension_one",
-    "statement": "def Ideal.Invertible {R : Type} [CommRing R] [IsDomain R] (I : Ideal R) : Prop :=\n    I ≠ ⊥ ∧ ∃ (N : Ideal R), (N * I).IsPrincipal ∧ N ≠ ⊥\n\ntheorem invertible_iff_codimension_one (R : Type) [CommRing R] [IsDomain R] [IsNoetherianRing R]\n    (h_ufd : ∀ (p : Ideal R), (h : p.IsMaximal) → UniqueFactorizationMonoid (Localization.AtPrime p))\n    (I : Ideal R) : I.Invertible ↔ ∀ (p : associatedPrimes R I), ringKrullDim (R ⧸ p.1) = 1 := by\n  sorry",
+    "statement": "theorem fatex_060_compact (R : Type) [CommRing R] [IsDomain R] [IsNoetherianRing R]\n    (h_ufd : ∀ (p : Ideal R), (h : p.IsMaximal) → UniqueFactorizationMonoid (Localization.AtPrime p))\n    (I : Ideal R) :\n    (I ≠ ⊥ ∧ ∃ (N : Ideal R), (N * I).IsPrincipal ∧ N ≠ ⊥)\n      ↔ ∀ (p : associatedPrimes R I), ringKrullDim (R ⧸ p.1) = 1 := by sorry",
     "informal": "Let $R$ be a Noetherian domain, and suppose that for every maximal ideal $P$ of $R$ the ring $R_P$ is factorial. Let $I \\subset R$ be an ideal. Prove that $I$ is an invertible module iff $I$ has pure codimension $1$.\n    (We say that an ideal $I$ in a ring $R$ has pure codimension $1$ if every associated prime ideal of $I$ has codimension $1$. We include the case when $I$ has no associated primes at all---that is, when $I = R$.)",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Depth, Cohen-Macaulay Rings and Gorenstein rings"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "def Ideal.Invertible {R : Type} [CommRing R] [IsDomain R] (I : Ideal R) : Prop :=\n    I ≠ ⊥ ∧ ∃ (N : Ideal R), (N * I).IsPrincipal ∧ N ≠ ⊥\n\ntheorem invertible_iff_codimension_one (R : Type) [CommRing R] [IsDomain R] [IsNoetherianRing R]\n    (h_ufd : ∀ (p : Ideal R), (h : p.IsMaximal) → UniqueFactorizationMonoid (Localization.AtPrime p))\n    (I : Ideal R) : I.Invertible ↔ ∀ (p : associatedPrimes R I), ringKrullDim (R ⧸ p.1) = 1 := by\n  sorry",
+    "strengthProof": "exact fatex_060_compact R h_ufd I",
+    "compactRewrite": true
   },
   {
     "id": "fatex_061",
@@ -809,66 +892,81 @@
     "id": "fatex_063",
     "index": 63,
     "name": "surjection_of_formally_unramified",
-    "statement": "def UniversalProperty.liftOfSqZeroIdeal {R S S' : Type} [CommRing R] [CommRing S] [CommRing S']\n    [Algebra R S] [Algebra R S'] (f : S' →ₐ[R] S) :=\n  ∀ (A : Type) [CommRing A] [Algebra R A] (I : Ideal A) (g : S →ₐ[R] A⧸I),\n  I^2 = 0 → (g.toRingHom.comp (algebraMap R S) = (Ideal.Quotient.mk I).comp (algebraMap R A)) →\n  ∃! (g' : S' →ₐ[R] A), (Ideal.Quotient.mk I).comp g'.toRingHom  = g.comp f\n\ntheorem surjection_of_formally_unramified (R S : Type) [CommRing R] [CommRing S]\n    [Algebra R S] [Algebra.FormallyUnramified R S] :\n    ∃ (S' : Type) (_ : CommRing S') (_ : Algebra R S') (f : S' →ₐ[R] S), (RingHom.ker f) ^ 2 = 0 ∧ UniversalProperty.liftOfSqZeroIdeal f := by\n  sorry",
+    "statement": "theorem fatex_063_compact (R S : Type) [CommRing R] [CommRing S]\n    [Algebra R S] [Algebra.FormallyUnramified R S] :\n    ∃ (S' : Type) (_ : CommRing S') (_ : Algebra R S') (f : S' →ₐ[R] S),\n      (RingHom.ker f) ^ 2 = 0 ∧\n      ∀ (A : Type) [CommRing A] [Algebra R A] (I : Ideal A) (g : S →ₐ[R] A ⧸ I),\n        I ^ 2 = 0 →\n        (g.toRingHom.comp (algebraMap R S) = (Ideal.Quotient.mk I).comp (algebraMap R A)) →\n        ∃! (g' : S' →ₐ[R] A), (Ideal.Quotient.mk I).comp g'.toRingHom = g.comp f := by sorry",
     "informal": "Let \\( R \\to S \\) be a formally unramified ring map. Show there exists a surjection of \\( R \\)-algebras \\( S' \\to S \\) whose kernel is an ideal of square zero with the following universal property:\nGiven any commutative diagram\n\\[\n\\begin{tikzcd}\nS \\arrow[r, \"a\"] & A/I \\\\\nR \\arrow[u] \\arrow[r, \"b\"] & A \\arrow[u]\n\\end{tikzcd}\n\\]\nwhere \\( I \\subset A \\) is an ideal of square zero, there is a unique \\( R \\)-algebra map \\( \\alpha': S' \\to A \\) such that \\( S' \\to A \\to A/I \\) is equal to \\( S' \\to S \\to A/I \\).",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Ideals and Modules"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "def UniversalProperty.liftOfSqZeroIdeal {R S S' : Type} [CommRing R] [CommRing S] [CommRing S']\n    [Algebra R S] [Algebra R S'] (f : S' →ₐ[R] S) :=\n  ∀ (A : Type) [CommRing A] [Algebra R A] (I : Ideal A) (g : S →ₐ[R] A⧸I),\n  I^2 = 0 → (g.toRingHom.comp (algebraMap R S) = (Ideal.Quotient.mk I).comp (algebraMap R A)) →\n  ∃! (g' : S' →ₐ[R] A), (Ideal.Quotient.mk I).comp g'.toRingHom  = g.comp f\n\ntheorem surjection_of_formally_unramified (R S : Type) [CommRing R] [CommRing S]\n    [Algebra R S] [Algebra.FormallyUnramified R S] :\n    ∃ (S' : Type) (_ : CommRing S') (_ : Algebra R S') (f : S' →ₐ[R] S), (RingHom.ker f) ^ 2 = 0 ∧ UniversalProperty.liftOfSqZeroIdeal f := by\n  sorry",
+    "strengthProof": "exact fatex_063_compact R S",
+    "compactRewrite": true
   },
   {
     "id": "fatex_064",
     "index": 64,
     "name": "homogeneous_coordinate_ring_not_isCohenMacaulayRing",
-    "statement": "section\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nopen MvPolynomial\n\ntheorem homogeneous_coordinate_ring_not_isCohenMacaulayRing (k : Type) [Field k] :\n    ¬ IsCohenMacaulayRing (Algebra.adjoin k ({(X 0) ^ 4, (X 0) ^ 3 * X 1,\n      X 0 * (X 1) ^ 3, (X 1) ^ 4} : Set (MvPolynomial (Fin 2) k))) := by\n  sorry",
+    "statement": "theorem fatex_064_compact (k : Type) [Field k] (S : Type) [CommRing S]\n    (e : S ≃+* (Algebra.adjoin k ({(MvPolynomial.X 0) ^ 4,\n      (MvPolynomial.X 0) ^ 3 * MvPolynomial.X 1,\n      MvPolynomial.X 0 * (MvPolynomial.X 1) ^ 3,\n      (MvPolynomial.X 1) ^ 4} : Set (MvPolynomial (Fin 2) k)))) :\n    ¬ ∀ (p : Ideal S) (_ : p.IsPrime),\n      ringKrullDim (Localization.AtPrime p) =\n        sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n          (ModuleCat.of.{0} (Localization.AtPrime p) (Localization.AtPrime p)) i)} := by sorry",
     "informal": "Prove that the homogeneous coordinate ring of a smooth rational quartic in three-space\n    \\[\n    R=k[s^4, s^3t, st^3, t^4] \\subset k[s,t]\n    \\]\n    is not Cohen-Macaulay.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Depth, Cohen-Macaulay Rings and Gorenstein rings"
     ],
-    "declarations": 6
+    "declarations": 0,
+    "originalStatement": "section\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nopen MvPolynomial\n\ntheorem homogeneous_coordinate_ring_not_isCohenMacaulayRing (k : Type) [Field k] :\n    ¬ IsCohenMacaulayRing (Algebra.adjoin k ({(X 0) ^ 4, (X 0) ^ 3 * X 1,\n      X 0 * (X 1) ^ 3, (X 1) ^ 4} : Set (MvPolynomial (Fin 2) k))) := by\n  sorry",
+    "strengthProof": "intro h\nrefine fatex_064_compact k _ (RingEquiv.refl _) ?_\nintro p hp\nexact (h.CM_localize p hp).depth_eq_dim",
+    "compactRewrite": true
   },
   {
     "id": "fatex_065",
     "index": 65,
     "name": "Polynomial.isGorensteinRing",
-    "statement": "open IsLocalRing ModuleCat CategoryTheory Polynomial\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\ntheorem Polynomial.isGorensteinRing {R : Type} [CommRing R] [IsGorensteinRing R] :\n    IsGorensteinRing R[X] := by\n  sorry",
+    "statement": "theorem fatex_065_compact {R : Type} [CommRing R]\n    (hN : IsNoetherianRing R)\n    (hG : ∀ m : Ideal R, (_ : m.IsMaximal) → IsNoetherianRing (Localization.AtPrime m) ∧\n      ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n        Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime m)\n            (IsLocalRing.ResidueField (Localization.AtPrime m)))\n          (ModuleCat.of.{0} (Localization.AtPrime m) (Localization.AtPrime m)) i)) :\n    IsNoetherianRing (Polynomial R) ∧\n    ∀ m : Ideal (Polynomial R), (_ : m.IsMaximal) → IsNoetherianRing (Localization.AtPrime m) ∧\n      ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n        Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime m)\n            (IsLocalRing.ResidueField (Localization.AtPrime m)))\n          (ModuleCat.of.{0} (Localization.AtPrime m) (Localization.AtPrime m)) i) := by sorry",
     "informal": "If \\( A \\) is a Neotherian Gorenstein ring, then so is the polynomial ring \\( A[X] \\).",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Homological Methods"
     ],
-    "declarations": 3
+    "declarations": 0,
+    "originalStatement": "open IsLocalRing ModuleCat CategoryTheory Polynomial\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\ntheorem Polynomial.isGorensteinRing {R : Type} [CommRing R] [IsGorensteinRing R] :\n    IsGorensteinRing R[X] := by\n  sorry",
+    "strengthProof": "have key := fatex_065_compact (R := R) inferInstance (fun m hm =>\n  ⟨(‹IsGorensteinRing R›.localization_maximal_isGorensteinLocalRing m hm).toIsNoetherian,\n   (‹IsGorensteinRing R›.localization_maximal_isGorensteinLocalRing m hm).injDim_le_infity⟩)\nexact IsGorensteinRing.mk (toIsNoetherian := key.1) (fun m hm =>\n  IsGorensteinLocalRing.mk (toIsNoetherian := (key.2 m hm).1) (key.2 m hm).2)",
+    "compactRewrite": true
   },
   {
     "id": "fatex_066",
     "index": 66,
     "name": "exists_eq_ofList_and_isRegular_of_perm",
-    "statement": "open RingTheory\n\ntheorem exists_eq_ofList_and_isRegular_of_perm {R : Type} [CommRing R] [IsNoetherianRing R] (I : Ideal R) (rs : List R)\n    (gen : I = Ideal.ofList rs) (h₂ : Sequence.IsRegular R rs) : ∃ rs' : List R,\n    I = Ideal.ofList rs' ∧ (∀ l : List R, (l.Perm rs') → Sequence.IsRegular R l) := by\n  sorry",
+    "statement": "theorem fatex_066_compact {R : Type} [CommRing R] [IsNoetherianRing R] (I : Ideal R) (rs : List R)\n    (gen : I = Ideal.ofList rs) (h₂ : RingTheory.Sequence.IsRegular R rs) : ∃ rs' : List R,\n    I = Ideal.ofList rs' ∧ (∀ l : List R, (l.Perm rs') → RingTheory.Sequence.IsRegular R l) := by sorry",
     "informal": "Show that if an ideal \\( I \\) in a Noetherian ring \\( R \\) can be generated by a regular sequence, then it can be generated by a set of elements that is a regular sequence in any order.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Depth, Cohen-Macaulay Rings and Gorenstein rings"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open RingTheory\n\ntheorem exists_eq_ofList_and_isRegular_of_perm {R : Type} [CommRing R] [IsNoetherianRing R] (I : Ideal R) (rs : List R)\n    (gen : I = Ideal.ofList rs) (h₂ : Sequence.IsRegular R rs) : ∃ rs' : List R,\n    I = Ideal.ofList rs' ∧ (∀ l : List R, (l.Perm rs') → Sequence.IsRegular R l) := by\n  sorry",
+    "strengthProof": "exact fatex_066_compact I rs gen h₂",
+    "compactRewrite": true
   },
   {
     "id": "fatex_067",
     "index": 67,
     "name": "isEmpty_mvPowerSeries_tensor_mvPowerSeries_algEquiv",
-    "statement": "open scoped TensorProduct\n\ntheorem isEmpty_mvPowerSeries_tensor_mvPowerSeries_algEquiv\n    {k : Type} [Field k] (n : ℕ) (hn : n ≠ 0) :\n    IsEmpty ((MvPowerSeries (Fin n) k) ⊗[k] (MvPowerSeries (Fin n) k) ≃ₐ[k]\n    (MvPowerSeries (Fin (n + n)) k)) := by\n  sorry",
+    "statement": "theorem fatex_067_compact {k : Type} [Field k] (n : ℕ) (hn : n ≠ 0) :\n    IsEmpty (TensorProduct k (MvPowerSeries (Fin n) k) (MvPowerSeries (Fin n) k) ≃ₐ[k]\n    (MvPowerSeries (Fin (n + n)) k)) := by sorry",
     "informal": "Let $A$ be the ring $k[[x_1, \\dots, x_n]]$, where $k$ is a field, $n \\in \\mathbb{N}$, $n \\ne 0$. Show that\nthere is \\textbf{no} isomorphism \\[\nA \\otimes_k A \\cong k[[x_1, \\dots, x_n, y_1, \\dots, y_n]].\n\\]",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Heights and Dimensions"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open scoped TensorProduct\n\ntheorem isEmpty_mvPowerSeries_tensor_mvPowerSeries_algEquiv\n    {k : Type} [Field k] (n : ℕ) (hn : n ≠ 0) :\n    IsEmpty ((MvPowerSeries (Fin n) k) ⊗[k] (MvPowerSeries (Fin n) k) ≃ₐ[k]\n    (MvPowerSeries (Fin (n + n)) k)) := by\n  sorry",
+    "strengthProof": "exact fatex_067_compact n hn",
+    "compactRewrite": true
   },
   {
     "id": "fatex_068",
@@ -887,14 +985,20 @@
     "id": "fatex_069",
     "index": 69,
     "name": "IsRegularLocalRing.regularAtPrime",
-    "statement": "open IsLocalRing Polynomial\n\nclass IsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\ntheorem IsRegularLocalRing.regularAtPrime {R : Type} [CommRing R] [IsRegularLocalRing R]\n    (P : Ideal R[X]) [P.IsPrime] [P.LiesOver (maximalIdeal R)] :\n    IsRegularLocalRing (Localization.AtPrime P) := by\n  sorry",
+    "statement": "theorem fatex_069_compact {R : Type} [CommRing R] [IsLocalRing R] [IsNoetherianRing R]\n    (hreg : Module.finrank (IsLocalRing.ResidueField R) (IsLocalRing.CotangentSpace R) = ringKrullDim R)\n    (P : Ideal (Polynomial R)) [P.IsPrime] [P.LiesOver (IsLocalRing.maximalIdeal R)] :\n    ∃ _ : IsLocalRing (Localization.AtPrime P), ∃ _ : IsNoetherianRing (Localization.AtPrime P),\n      Module.finrank (IsLocalRing.ResidueField (Localization.AtPrime P))\n        (IsLocalRing.CotangentSpace (Localization.AtPrime P))\n        = ringKrullDim (Localization.AtPrime P) := by sorry",
     "informal": "If \\( R \\) is a regular local ring with maximal ideal \\( \\mathfrak{m} \\) and \\( P \\in \\operatorname{Spec}(R[x]) \\) is a prime ideal with \\( \\mathfrak{m} = P \\cap R \\), then \\( R[x]_P \\) is regular.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Depth, Cohen-Macaulay Rings and Gorenstein rings"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsRegularLocalRing → FateXIsRegularLocalRing"
+    ],
+    "originalStatement": "open IsLocalRing Polynomial\n\nclass FateXIsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\ntheorem FateXIsRegularLocalRing.regularAtPrime {R : Type} [CommRing R] [FateXIsRegularLocalRing R]\n    (P : Ideal R[X]) [P.IsPrime] [P.LiesOver (maximalIdeal R)] :\n    FateXIsRegularLocalRing (Localization.AtPrime P) := by\n  sorry",
+    "strengthProof": "obtain ⟨hL, hN, hr⟩ := fatex_069_compact (R := R) FateXIsRegularLocalRing.reg P\nexact { reg := hr }",
+    "compactRewrite": true
   },
   {
     "id": "fatex_070",
@@ -913,79 +1017,107 @@
     "id": "fatex_071",
     "index": 71,
     "name": "fixedPoints_isCohenMacaulayRing",
-    "statement": "section\n\nvariable (A B : Type) [CommRing A] [CommRing B] [Algebra A B]\nvariable (G : Type) [Monoid G] [MulSemiringAction G B] [SMulCommClass G A B]\n\ndef FixedPoints.subring : Subring B where\n  __ := FixedPoints.addSubgroup G B\n  __ := FixedPoints.submonoid G B\n\ndef FixedPoints.subalgebra : Subalgebra A B where\n  __ := FixedPoints.addSubgroup G B\n  __ := FixedPoints.submonoid G B\n  algebraMap_mem' r := by simp\n\nend\n\nsection\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\ntheorem fixedPoints_isCohenMacaulayRing {R : Type} [CommRing R] (k : Type) [Field k]\n    [CharZero k] [Algebra k R] [IsNoetherianRing R] [IsCohenMacaulayRing R]\n    (G : Subgroup (R ≃ₐ[k] R)) [Finite G] :\n    IsCohenMacaulayRing (FixedPoints.subalgebra k R G) := by\n  sorry",
+    "statement": "theorem fatex_071_compact {R : Type} [CommRing R] (k : Type) [Field k]\n    [CharZero k] [Algebra k R] [IsNoetherianRing R]\n    (hCMR : ∀ (p : Ideal R) (_ : p.IsPrime), (∃ hl : IsLocalRing (Localization.AtPrime p),\n      ringKrullDim (Localization.AtPrime p) = (↑(sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton\n        (@CategoryTheory.Abelian.Ext (ModuleCat.{0} (Localization.AtPrime p)) _ _\n        (CategoryTheory.hasExt_of_enoughProjectives (ModuleCat.{0} (Localization.AtPrime p)) :\n          CategoryTheory.HasExt.{0} (ModuleCat.{0} (Localization.AtPrime p)))\n        (ModuleCat.of (Localization.AtPrime p) ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p))) (ModuleCat.of (Localization.AtPrime p) (Localization.AtPrime p)) i)}) : WithBot ℕ∞)))\n    (G : Subgroup (R ≃ₐ[k] R)) [Finite G]\n    (S : Subalgebra k R) (hS : ∀ x : R, x ∈ S ↔ ∀ g : G, g • x = x) :\n    ∀ (p : Ideal S) (_ : p.IsPrime), (∃ hl : IsLocalRing (Localization.AtPrime p),\n      ringKrullDim (Localization.AtPrime p) = (↑(sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton\n        (@CategoryTheory.Abelian.Ext (ModuleCat.{0} (Localization.AtPrime p)) _ _\n        (CategoryTheory.hasExt_of_enoughProjectives (ModuleCat.{0} (Localization.AtPrime p)) :\n          CategoryTheory.HasExt.{0} (ModuleCat.{0} (Localization.AtPrime p)))\n        (ModuleCat.of (Localization.AtPrime p) ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p))) (ModuleCat.of (Localization.AtPrime p) (Localization.AtPrime p)) i)}) : WithBot ℕ∞)) := by sorry",
     "informal": "Let \\( G \\) be a finite group acting as automorphisms of an algebra \\( R \\) over a field of characteristic \\( 0 \\). Show that if \\( R \\) is Cohen-Macaulay, then the ring of invariants \\( R^G \\) is Cohen-Macaulay.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Regular Sequences and Regular Local Rings"
     ],
-    "declarations": 6
+    "declarations": 0,
+    "toolchainRepair": [
+      "FixedPoints.subring → FateXFixedPoints.subring",
+      "FixedPoints.subalgebra → FateXFixedPoints.subalgebra"
+    ],
+    "originalStatement": "section\n\nvariable (A B : Type) [CommRing A] [CommRing B] [Algebra A B]\nvariable (G : Type) [Monoid G] [MulSemiringAction G B] [SMulCommClass G A B]\n\ndef FateXFixedPoints.subring : Subring B where\n  __ := FixedPoints.addSubgroup G B\n  __ := FixedPoints.submonoid G B\n\ndef FateXFixedPoints.subalgebra : Subalgebra A B where\n  __ := FixedPoints.addSubgroup G B\n  __ := FixedPoints.submonoid G B\n  algebraMap_mem' r := by simp\n\nend\n\nsection\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\ntheorem fixedPoints_isCohenMacaulayRing {R : Type} [CommRing R] (k : Type) [Field k]\n    [CharZero k] [Algebra k R] [IsNoetherianRing R] [IsCohenMacaulayRing R]\n    (G : Subgroup (R ≃ₐ[k] R)) [Finite G] :\n    IsCohenMacaulayRing (FateXFixedPoints.subalgebra k R G) := by\n  sorry",
+    "strengthProof": "refine ⟨fun p hp => ?_⟩\nobtain ⟨h1, h2⟩ := fatex_071_compact (R := R) k\n  (fun q hq => ⟨(IsCohenMacaulayRing.CM_localize q hq).toIsLocalRing,\n                (IsCohenMacaulayRing.CM_localize q hq).depth_eq_dim⟩)\n  G (FateXFixedPoints.subalgebra k R G) (fun x => Iff.rfl) p hp\nexact @IsCohenMacaulayLocalRing.mk _ _ h1 h2",
+    "compactRewrite": true
   },
   {
     "id": "fatex_072",
     "index": 72,
     "name": "isCohenMacaulay_extendScalars_over_mvPolynomial_of_isCohenMacaulay",
-    "statement": "noncomputable def Module.supportDim (R : Type) [CommRing R] (M : Type) [AddCommGroup M]\n    [Module R M] : WithBot ℕ∞ :=\n  Order.krullDim (Module.support R M)\n\nsection\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nclass ModuleCat.IsCohenMacaulay [IsLocalRing R] (M : ModuleCat.{0} R) : Prop where\n  depth_eq_dim : Subsingleton M ∨ Module.supportDim R M = IsLocalRing.depth M\n\nvariable (R)\n\nclass Module.IsCohenMacaulay (M : Type) [AddCommGroup M] [Module R M] : Prop where\n  depth_eq_dim : ∀ p : Ideal R, ∀ (_ : p.IsPrime), (ModuleCat.of (Localization.AtPrime p)\n    (LocalizedModule.AtPrime p M)).IsCohenMacaulay\n\nend\n\nopen TensorProduct\n\nnoncomputable instance (R : Type) [CommRing R] (M : Type) [AddCommGroup M] [Module R M] (n : ℕ) :\n    Module (MvPolynomial (Fin n) R) ((MvPolynomial (Fin n) R) ⊗[R] M) := leftModule\n\ntheorem isCohenMacaulay_extendScalars_over_mvPolynomial_of_isCohenMacaulay\n    (R : Type) [CommRing R] (M : Type) [AddCommGroup M] [Module R M]\n    [IsNoetherianRing R] [Module.IsCohenMacaulay R M] (n : ℕ) :\n    Module.IsCohenMacaulay (MvPolynomial (Fin n) R) ((MvPolynomial (Fin n) R) ⊗[R] M) := by\n  sorry",
+    "statement": "theorem fatex_072_compact (R : Type) [CommRing R] (M : Type) [AddCommGroup M] [Module R M]\n    [IsNoetherianRing R] (n : ℕ)\n    (hM : ∀ (p : Ideal R) (_ : p.IsPrime),\n      Subsingleton (LocalizedModule.AtPrime p M) ∨\n      Order.krullDim (Module.support (Localization.AtPrime p) (LocalizedModule.AtPrime p M)) =\n        ((sSup {d : ℕ∞ | ∀ i : ℕ, i < d → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n          (ModuleCat.of.{0} (Localization.AtPrime p) (LocalizedModule.AtPrime p M)) i)} : ℕ∞)\n          : WithBot ℕ∞)) :\n    ∀ (p : Ideal (MvPolynomial (Fin n) R)) (_ : p.IsPrime),\n      Subsingleton (LocalizedModule.AtPrime p\n        (TensorProduct R (MvPolynomial (Fin n) R) M)) ∨\n      Order.krullDim (Module.support (Localization.AtPrime p)\n        (LocalizedModule.AtPrime p (TensorProduct R (MvPolynomial (Fin n) R) M))) =\n        ((sSup {d : ℕ∞ | ∀ i : ℕ, i < d → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            (LocalizedModule.AtPrime p (TensorProduct R (MvPolynomial (Fin n) R) M))) i)} : ℕ∞)\n          : WithBot ℕ∞) := by sorry",
     "informal": "Let \\( R \\) be a Noetherian ring. Let \\( M \\) be a Cohen-Macaulay module over \\( R \\). Then \\( M \\otimes_R R[x_1, \\dots, x_n] \\) is a Cohen-Macaulay module over \\( R[x_1, \\dots, x_n] \\).",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Completions and Hensel's lemma"
     ],
-    "declarations": 7
+    "declarations": 0,
+    "toolchainRepair": [
+      "Module.supportDim → FateXModule.supportDim"
+    ],
+    "originalStatement": "noncomputable def FateXModule.supportDim (R : Type) [CommRing R] (M : Type) [AddCommGroup M]\n    [Module R M] : WithBot ℕ∞ :=\n  Order.krullDim (Module.support R M)\n\nsection\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nclass ModuleCat.IsCohenMacaulay [IsLocalRing R] (M : ModuleCat.{0} R) : Prop where\n  depth_eq_dim : Subsingleton M ∨ FateXModule.supportDim R M = IsLocalRing.depth M\n\nvariable (R)\n\nclass Module.IsCohenMacaulay (M : Type) [AddCommGroup M] [Module R M] : Prop where\n  depth_eq_dim : ∀ p : Ideal R, ∀ (_ : p.IsPrime), (ModuleCat.of (Localization.AtPrime p)\n    (LocalizedModule.AtPrime p M)).IsCohenMacaulay\n\nend\n\nopen TensorProduct\n\nnoncomputable instance (R : Type) [CommRing R] (M : Type) [AddCommGroup M] [Module R M] (n : ℕ) :\n    Module (MvPolynomial (Fin n) R) ((MvPolynomial (Fin n) R) ⊗[R] M) := leftModule\n\ntheorem isCohenMacaulay_extendScalars_over_mvPolynomial_of_isCohenMacaulay\n    (R : Type) [CommRing R] (M : Type) [AddCommGroup M] [Module R M]\n    [IsNoetherianRing R] [Module.IsCohenMacaulay R M] (n : ℕ) :\n    Module.IsCohenMacaulay (MvPolynomial (Fin n) R) ((MvPolynomial (Fin n) R) ⊗[R] M) := by\n  sorry",
+    "strengthProof": "exact ⟨fun p hp => ⟨fatex_072_compact R M n\n  (fun q hq => (‹Module.IsCohenMacaulay R M›.depth_eq_dim q hq).depth_eq_dim) p hp⟩⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_073",
     "index": 73,
     "name": "mvPolynomial_quotient_isCohenMacaulayRing_iff",
-    "statement": "section\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nattribute [local instance] MvPolynomial.gradedAlgebra\n\ntheorem mvPolynomial_quotient_isCohenMacaulayRing_iff (k : Type) [Field k] (n : ℕ)\n    (R : Type) [CommRing R] (f : (MvPolynomial (Fin n) k) →+* R) (surj : Function.Surjective f)\n    (homo : (RingHom.ker f).IsHomogeneous (MvPolynomial.homogeneousSubmodule (Fin n) k))\n    (le : RingHom.ker f ≤ RingHom.ker MvPolynomial.constantCoeff) :\n    IsCohenMacaulayRing R ↔\n    IsCohenMacaulayRing (Localization.AtPrime ((RingHom.ker MvPolynomial.constantCoeff).map f)\n      (hp := Ideal.map_isPrime_of_surjective surj le (H := RingHom.ker_isPrime _))) := by\n  sorry",
+    "statement": "theorem fatex_073_compact (k : Type) [Field k] (n : ℕ)\n    (R : Type) [CommRing R] (f : (MvPolynomial (Fin n) k) →+* R) (surj : Function.Surjective f)\n    [GradedAlgebra (MvPolynomial.homogeneousSubmodule (Fin n) k)]\n    (homo : (RingHom.ker f).IsHomogeneous (MvPolynomial.homogeneousSubmodule (Fin n) k))\n    (le : RingHom.ker f ≤ RingHom.ker MvPolynomial.constantCoeff) :\n    (∀ p : Ideal (R), ∀ (_ : p.IsPrime),\n      ringKrullDim (Localization.AtPrime p) =\n        (sSup {d : ℕ∞ | ∀ i : ℕ, i < d → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n          (ModuleCat.of.{0} (Localization.AtPrime p) (Localization.AtPrime p)) i)} : ℕ∞))\n    ↔\n    (∀ p : Ideal ((Localization.AtPrime ((RingHom.ker MvPolynomial.constantCoeff).map f)\n      (hp := Ideal.map_isPrime_of_surjective surj le (H := RingHom.ker_isPrime _)))), ∀ (_ : p.IsPrime),\n      ringKrullDim (Localization.AtPrime p) =\n        (sSup {d : ℕ∞ | ∀ i : ℕ, i < d → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n          (ModuleCat.of.{0} (Localization.AtPrime p) (Localization.AtPrime p)) i)} : ℕ∞)) := by sorry",
     "informal": "If $I$ is an homogeneous ideal of $k[x_0, \\dots, x_n]$, \\( R = k[x_0, \\dots, x_n]/I \\), then \\( R \\) is Cohen-Macaulay if and only if \\( R_P \\) is Cohen-Macaulay, where \\( P = (x_0, \\dots, x_n) \\).",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Tensor Product and Flatness"
     ],
-    "declarations": 6
+    "declarations": 0,
+    "originalStatement": "section\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nattribute [local instance] MvPolynomial.gradedAlgebra\n\ntheorem mvPolynomial_quotient_isCohenMacaulayRing_iff (k : Type) [Field k] (n : ℕ)\n    (R : Type) [CommRing R] (f : (MvPolynomial (Fin n) k) →+* R) (surj : Function.Surjective f)\n    (homo : (RingHom.ker f).IsHomogeneous (MvPolynomial.homogeneousSubmodule (Fin n) k))\n    (le : RingHom.ker f ≤ RingHom.ker MvPolynomial.constantCoeff) :\n    IsCohenMacaulayRing R ↔\n    IsCohenMacaulayRing (Localization.AtPrime ((RingHom.ker MvPolynomial.constantCoeff).map f)\n      (hp := Ideal.map_isPrime_of_surjective surj le (H := RingHom.ker_isPrime _))) := by\n  sorry",
+    "strengthProof": "have key := fatex_073_compact k n R f surj homo le\nconstructor\n· intro h\n  exact ⟨fun p hp =>\n    { depth_eq_dim := key.1 (fun q hq => (h.CM_localize q hq).depth_eq_dim) p hp }⟩\n· intro h\n  exact ⟨fun p hp =>\n    { depth_eq_dim := key.2 (fun q hq => (h.CM_localize q hq).depth_eq_dim) p hp }⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_074",
     "index": 74,
     "name": "IsRegularLocalRing.gorensteinAtRegularSequence",
-    "statement": "open IsLocalRing ModuleCat CategoryTheory\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass IsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\nvariable {R : Type} [CommRing R]\n\ntheorem IsRegularLocalRing.gorensteinAtRegularSequence {R : Type} [CommRing R]\n    [IsRegularLocalRing R] {rs : List R} (reg : RingTheory.Sequence.IsRegular R rs) (y : R)\n    (h : y ∉ Ideal.ofList rs) : IsGorensteinRing (R ⧸ (Ideal.ofList rs / Ideal.span {y})) := by\n  sorry",
+    "statement": "theorem fatex_074_compact {R : Type} [CommRing R] [IsLocalRing R] [IsNoetherianRing R]\n    (hreg : Module.finrank (IsLocalRing.ResidueField R) (IsLocalRing.CotangentSpace R) = ringKrullDim R)\n    {rs : List R} (reg : RingTheory.Sequence.IsRegular R rs) (y : R)\n    (h : y ∉ Ideal.ofList rs) :\n    IsNoetherianRing (R ⧸ (Ideal.ofList rs / Ideal.span {y})) ∧\n    ∀ m : Ideal (R ⧸ (Ideal.ofList rs / Ideal.span {y})), (_ : m.IsMaximal) →\n      IsLocalRing (Localization.AtPrime m) ∧ IsNoetherianRing (Localization.AtPrime m) ∧\n      ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n        Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime m)\n            (IsLocalRing.ResidueField (Localization.AtPrime m)))\n          (ModuleCat.of.{0} (Localization.AtPrime m) (Localization.AtPrime m)) i) := by sorry",
     "informal": "Let $R$ be a regular local ring and let $x_1, \\dots, x_c$ be a regular sequence in $R$. Let $y \\in R$, $y \\notin (x_1, \\dots, x_c)$, and set $J := ((x_1, \\dots, x_c) : y)$. Prove that $R/J$ is Gorenstein.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Depth, Cohen-Macaulay Rings and Gorenstein rings"
     ],
-    "declarations": 4
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsRegularLocalRing → FateXIsRegularLocalRing"
+    ],
+    "originalStatement": "open IsLocalRing ModuleCat CategoryTheory\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass FateXIsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\nvariable {R : Type} [CommRing R]\n\ntheorem FateXIsRegularLocalRing.gorensteinAtRegularSequence {R : Type} [CommRing R]\n    [FateXIsRegularLocalRing R] {rs : List R} (reg : RingTheory.Sequence.IsRegular R rs) (y : R)\n    (h : y ∉ Ideal.ofList rs) : IsGorensteinRing (R ⧸ (Ideal.ofList rs / Ideal.span {y})) := by\n  sorry",
+    "strengthProof": "obtain ⟨hN, hm⟩ := fatex_074_compact (inferInstance : FateXIsRegularLocalRing R).reg reg y h\nrefine @IsGorensteinRing.mk _ _ hN (fun m hmax => ?_)\nexact @IsGorensteinLocalRing.mk _ _ (hm m hmax).1 (hm m hmax).2.1 (hm m hmax).2.2",
+    "compactRewrite": true
   },
   {
     "id": "fatex_075",
     "index": 75,
     "name": "gradedAlgebra_isCohenMacaulay_iff_homogeneously_localize",
-    "statement": "open IsLocalRing ModuleCat CategoryTheory\n\nsection\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\ntheorem gradedAlgebra_isCohenMacaulay_iff_homogeneously_localize {A : Type} [CommRing A] [IsNoetherianRing A]\n    (𝒜 : ℕ → Submodule ℤ A) [GradedAlgebra 𝒜] (h : IsField (𝒜 0)) (h1 : Algebra.adjoin (𝒜 0) (𝒜 1) = (⊤ : Subalgebra (𝒜 0) A)) : IsCohenMacaulayRing A ↔\n    ∀ p : Ideal A, (_ : p.IsPrime) → p.IsHomogeneous 𝒜 →\n    IsCohenMacaulayLocalRing (HomogeneousLocalization.AtPrime 𝒜 p) := by\n  sorry",
+    "statement": "theorem fatex_075_compact {A : Type} [CommRing A] [IsNoetherianRing A]\n    (𝒜 : ℕ → Submodule ℤ A) [GradedAlgebra 𝒜] (h : IsField (𝒜 0))\n    (h1 : Algebra.adjoin (𝒜 0) (𝒜 1) = (⊤ : Subalgebra (𝒜 0) A)) :\n    (∀ p : Ideal A, (_ : p.IsPrime) →\n      ringKrullDim (Localization.AtPrime p) =\n      sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n        (ModuleCat.of (Localization.AtPrime p) ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n        (ModuleCat.of (Localization.AtPrime p) (Localization.AtPrime p)) i)}) ↔\n    ∀ p : Ideal A, (_ : p.IsPrime) → p.IsHomogeneous 𝒜 →\n      ringKrullDim (HomogeneousLocalization.AtPrime 𝒜 p) =\n      sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n        (ModuleCat.of (HomogeneousLocalization.AtPrime 𝒜 p) ((HomogeneousLocalization.AtPrime 𝒜 p) ⧸ IsLocalRing.maximalIdeal (HomogeneousLocalization.AtPrime 𝒜 p)))\n        (ModuleCat.of (HomogeneousLocalization.AtPrime 𝒜 p) (HomogeneousLocalization.AtPrime 𝒜 p)) i)} := by sorry",
     "informal": "Let $A$ be a graded Noetherian ring, with $A_0$ a field and $A$ generated by $A_1$.\nShow that $A$ is Cohen-Macaulay if and only if for all homogeneously prime $\\mathfrak{p}$,\n$(A_{\\mathfrak{p}})_0$ is Cohen-Macaulay.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Ideals and Modules"
     ],
-    "declarations": 6
+    "declarations": 0,
+    "originalStatement": "open IsLocalRing ModuleCat CategoryTheory\n\nsection\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\ntheorem gradedAlgebra_isCohenMacaulay_iff_homogeneously_localize {A : Type} [CommRing A] [IsNoetherianRing A]\n    (𝒜 : ℕ → Submodule ℤ A) [GradedAlgebra 𝒜] (h : IsField (𝒜 0)) (h1 : Algebra.adjoin (𝒜 0) (𝒜 1) = (⊤ : Subalgebra (𝒜 0) A)) : IsCohenMacaulayRing A ↔\n    ∀ p : Ideal A, (_ : p.IsPrime) → p.IsHomogeneous 𝒜 →\n    IsCohenMacaulayLocalRing (HomogeneousLocalization.AtPrime 𝒜 p) := by\n  sorry",
+    "strengthProof": "constructor\n· intro hcm p hp hhom\n  exact ⟨(fatex_075_compact 𝒜 h h1).mp\n    (fun q hq => (hcm.CM_localize q hq).depth_eq_dim) p hp hhom⟩\n· intro hrhs\n  exact ⟨fun q hq => ⟨(fatex_075_compact 𝒜 h h1).mpr\n    (fun p hp hhom => (hrhs p hp hhom).depth_eq_dim) q hq⟩⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_076",
     "index": 76,
     "name": "IsCatenary.of_noetherian_ufd_of_dim_le_three",
-    "statement": "open List\n\ndef IsCatenary (R : Type) [CommRing R] : Prop :=\n  ∀ p q : PrimeSpectrum R, p ≤ q →\n  ∃ n : ℕ, ∀ (l : LTSeries (PrimeSpectrum R)), l.head = p → l.last = q →\n  (∀ l' : LTSeries (PrimeSpectrum R), l'.head = p → l'.last = q → l.toList <+ l'.toList → l' = l) →\n  l.toList.length = n\n\ntheorem IsCatenary.of_noetherian_ufd_of_dim_le_three {A : Type} [CommRing A] [IsNoetherianRing A]\n    [IsDomain A] [UniqueFactorizationMonoid A] (h : ringKrullDim A ≤ 3) : IsCatenary A := by\n  sorry",
+    "statement": "theorem fatex_076_compact {A : Type} [CommRing A] [IsNoetherianRing A]\n    [IsDomain A] [UniqueFactorizationMonoid A] (h : ringKrullDim A ≤ 3) :\n    ∀ p q : PrimeSpectrum A, p ≤ q →\n    ∃ n : ℕ, ∀ (l : LTSeries (PrimeSpectrum A)), l.head = p → l.last = q →\n    (∀ l' : LTSeries (PrimeSpectrum A), l'.head = p → l'.last = q →\n      List.Sublist l.toList l'.toList → l' = l) →\n    l.toList.length = n := by sorry",
     "informal": "Let $A$ be a Noetherian UFD of dimension $d \\leq 3$. Prove that $A$ is catenary.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Heights and Dimensions"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open List\n\ndef IsCatenary (R : Type) [CommRing R] : Prop :=\n  ∀ p q : PrimeSpectrum R, p ≤ q →\n  ∃ n : ℕ, ∀ (l : LTSeries (PrimeSpectrum R)), l.head = p → l.last = q →\n  (∀ l' : LTSeries (PrimeSpectrum R), l'.head = p → l'.last = q → l.toList <+ l'.toList → l' = l) →\n  l.toList.length = n\n\ntheorem IsCatenary.of_noetherian_ufd_of_dim_le_three {A : Type} [CommRing A] [IsNoetherianRing A]\n    [IsDomain A] [UniqueFactorizationMonoid A] (h : ringKrullDim A ≤ 3) : IsCatenary A := by\n  sorry",
+    "strengthProof": "exact fatex_076_compact h",
+    "compactRewrite": true
   },
   {
     "id": "fatex_077",
@@ -1004,40 +1136,55 @@
     "id": "fatex_078",
     "index": 78,
     "name": "IsCohenMacaulayLocalRing.isGorensteinRing_of_ufd",
-    "statement": "open IsLocalRing ModuleCat CategoryTheory\n\nsection\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nclass IsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\ntheorem IsCohenMacaulayLocalRing.isGorensteinRing_of_ufd {A B : Type} [CommRing A]\n    [IsCohenMacaulayLocalRing A] [IsDomain A] [UniqueFactorizationMonoid A] [CommRing B]\n    [IsRegularLocalRing B] {f : B →+* A} (hf : Function.Surjective f) :\n    IsGorensteinRing A := by\n  sorry",
+    "statement": "theorem fatex_078_compact {A B : Type} [CommRing A] [IsDomain A]\n    [UniqueFactorizationMonoid A] [CommRing B] {f : B →+* A} (hf : Function.Surjective f)\n    (hCM : (∃ hl : IsLocalRing (A),\n      ringKrullDim (A) = (↑(sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton\n        (@CategoryTheory.Abelian.Ext (ModuleCat.{0} (A)) _ _\n        (CategoryTheory.hasExt_of_enoughProjectives (ModuleCat.{0} (A)) :\n          CategoryTheory.HasExt.{0} (ModuleCat.{0} (A)))\n        (ModuleCat.of (A) ((A) ⧸ IsLocalRing.maximalIdeal (A))) (ModuleCat.of (A) (A)) i)}) : WithBot ℕ∞)))\n    (hReg : ∃ (_ : IsLocalRing B) (_ : IsNoetherian B B),\n      ((Module.finrank (IsLocalRing.ResidueField B) (IsLocalRing.CotangentSpace B) : ℕ∞) : WithBot ℕ∞)\n        = ringKrullDim B) :\n    IsNoetherian A A ∧ ∀ (m : Ideal A) (_ : m.IsMaximal), (∃ (_ : IsLocalRing (Localization.AtPrime m)) (_ : IsNoetherian (Localization.AtPrime m) (Localization.AtPrime m)),\n        ∃ n : ℕ, ∀ i : ℕ, n ≤ i → Subsingleton\n          (@CategoryTheory.Abelian.Ext (ModuleCat.{0} (Localization.AtPrime m)) _ _\n        (CategoryTheory.hasExt_of_enoughProjectives (ModuleCat.{0} (Localization.AtPrime m)) :\n          CategoryTheory.HasExt.{0} (ModuleCat.{0} (Localization.AtPrime m)))\n        (ModuleCat.of (Localization.AtPrime m) (IsLocalRing.ResidueField (Localization.AtPrime m))) (ModuleCat.of (Localization.AtPrime m) (Localization.AtPrime m)) i)) := by sorry",
     "informal": "Let $A$ be a local Cohen–Macaulay (CM) ring that is a quotient of a regular local ring. If $A$ is a UFD, then $A$ is Gorenstein.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 9
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsRegularLocalRing → FateXIsRegularLocalRing"
+    ],
+    "originalStatement": "open IsLocalRing ModuleCat CategoryTheory\n\nsection\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nclass FateXIsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\ntheorem IsCohenMacaulayLocalRing.isGorensteinRing_of_ufd {A B : Type} [CommRing A]\n    [IsCohenMacaulayLocalRing A] [IsDomain A] [UniqueFactorizationMonoid A] [CommRing B]\n    [FateXIsRegularLocalRing B] {f : B →+* A} (hf : Function.Surjective f) :\n    IsGorensteinRing A := by\n  sorry",
+    "strengthProof": "have key := fatex_078_compact (A := A) (B := B) hf\n  ⟨IsCohenMacaulayLocalRing.toIsLocalRing, IsCohenMacaulayLocalRing.depth_eq_dim⟩\n  ⟨FateXIsRegularLocalRing.toIsLocalRing, FateXIsRegularLocalRing.toIsNoetherian,\n   FateXIsRegularLocalRing.reg⟩\nrefine @IsGorensteinRing.mk A _ key.1 (fun m hm => ?_)\nobtain ⟨h1, h2, h3⟩ := key.2 m hm\nexact @IsGorensteinLocalRing.mk _ _ h1 h2 h3",
+    "compactRewrite": true
   },
   {
     "id": "fatex_079",
     "index": 79,
     "name": "IsLocalRing.not_isCompleteIntersection.height_not_zero_and_not_one",
-    "statement": "open IsLocalRing ModuleCat CategoryTheory\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass IsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\n@[stacks 09Q3]\nclass IsLocalCompleteIntersectionRing (A : Type) [CommRing A] : Prop extends\n    IsLocalRing A, IsNoetherianRing A where\n  out (R : Type) [CommRing R] [IsRegularLocalRing R]\n    (f : R →+* (AdicCompletion (maximalIdeal A) A)) (_ : IsLocalHom f) (_ : Function.Surjective f) :\n      ∃ (rs : List R), RingTheory.Sequence.IsRegular R rs ∧ RingHom.ker f = Ideal.ofList rs\n\ntheorem IsLocalRing.not_isCompleteIntersection.height_not_zero_and_not_one (B : Type) [CommRing B]\n    [IsRegularLocalRing B] (I : Ideal B) [IsGorensteinRing (B ⧸ I)]\n    (hc : ¬ IsLocalCompleteIntersectionRing (B ⧸ I)) : I.height ≠ 0 ∧ I.height ≠ 1 := by\n  sorry",
+    "statement": "theorem fatex_079_compact (B : Type) [CommRing B] [IsLocalRing B] [IsNoetherianRing B]\n    (hBreg : Module.finrank (IsLocalRing.ResidueField B) (IsLocalRing.CotangentSpace B)\n      = ringKrullDim B)\n    (I : Ideal B) [IsNoetherianRing (B ⧸ I)]\n    (hgor : ∀ (m : Ideal (B ⧸ I)) (_ : m.IsMaximal),\n      IsNoetherianRing (Localization.AtPrime m) ∧\n      ∃ n : ℕ, ∀ i : ℕ, n ≤ i → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n        (ModuleCat.of.{0} (Localization.AtPrime m)\n          (IsLocalRing.ResidueField (Localization.AtPrime m)))\n        (ModuleCat.of.{0} (Localization.AtPrime m) (Localization.AtPrime m)) i))\n    (hc : ¬ ∃ (hloc : IsLocalRing (B ⧸ I)) (hnoe : IsNoetherianRing (B ⧸ I)),\n      ∀ (A : Type) (hAcr : CommRing A) (hAloc : IsLocalRing A) (hAnoe : IsNoetherianRing A)\n        (hAreg : Module.finrank (IsLocalRing.ResidueField A) (IsLocalRing.CotangentSpace A)\n          = ringKrullDim A)\n        (f : A →+* AdicCompletion (IsLocalRing.maximalIdeal (B ⧸ I)) (B ⧸ I))\n        (hf : IsLocalHom f) (hs : Function.Surjective f),\n        ∃ rs : List A, RingTheory.Sequence.IsRegular A rs ∧ RingHom.ker f = Ideal.ofList rs) :\n    I.height ≠ 0 ∧ I.height ≠ 1 := by sorry",
     "informal": "Let $B$ be a regular local ring and $I \\subset B$ an ideal such that $B/I$ is Gorenstein but not a complete intersection. Show that $I$ cannot have height $0$ or $1$.",
     "tags": [
       "Abstract Algebra",
       "Group Theory",
       "Group Actions and Sylow theorems"
     ],
-    "declarations": 5
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsRegularLocalRing → FateXIsRegularLocalRing"
+    ],
+    "originalStatement": "open IsLocalRing ModuleCat CategoryTheory\n\ninstance (R : Type) [CommRing R] : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives.{0} (ModuleCat.{0} R)\n\nclass FateXIsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\nclass IsGorensteinLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  injDim_le_infity :\n    ∃ n : ℕ, ∀ i : ℕ, n ≤ i →\n    Subsingleton (Abelian.Ext.{0} (of.{0} R (ResidueField R)) (of.{0} R R) i)\n\nclass IsGorensteinRing (R : Type) [CommRing R] : Prop extends IsNoetherianRing R where\n  localization_maximal_isGorensteinLocalRing :\n    ∀ m : Ideal R, (_ : m.IsMaximal) → IsGorensteinLocalRing (Localization.AtPrime m)\n\n@[stacks 09Q3]\nclass IsLocalCompleteIntersectionRing (A : Type) [CommRing A] : Prop extends\n    IsLocalRing A, IsNoetherianRing A where\n  out (R : Type) [CommRing R] [FateXIsRegularLocalRing R]\n    (f : R →+* (AdicCompletion (maximalIdeal A) A)) (_ : IsLocalHom f) (_ : Function.Surjective f) :\n      ∃ (rs : List R), RingTheory.Sequence.IsRegular R rs ∧ RingHom.ker f = Ideal.ofList rs\n\ntheorem IsLocalRing.not_isCompleteIntersection.height_not_zero_and_not_one (B : Type) [CommRing B]\n    [FateXIsRegularLocalRing B] (I : Ideal B) [IsGorensteinRing (B ⧸ I)]\n    (hc : ¬ IsLocalCompleteIntersectionRing (B ⧸ I)) : I.height ≠ 0 ∧ I.height ≠ 1 := by\n  sorry",
+    "strengthProof": "refine fatex_079_compact B FateXIsRegularLocalRing.reg I (fun m hm => ?_) ?_\n· exact ⟨(‹IsGorensteinRing (B ⧸ I)›.localization_maximal_isGorensteinLocalRing m hm).toIsNoetherian,\n    (‹IsGorensteinRing (B ⧸ I)›.localization_maximal_isGorensteinLocalRing m hm).injDim_le_infity⟩\n· intro hP\n  apply hc\n  obtain ⟨hloc, hnoe, hout⟩ := hP\n  haveI := hloc\n  haveI := hnoe\n  exact ⟨fun A _ _ f hf hs => hout A inferInstance inferInstance inferInstance\n    FateXIsRegularLocalRing.reg f hf hs⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_080",
     "index": 80,
     "name": "isCohenMacaulayRing_of_dimension_three",
-    "statement": "section\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nopen MvPolynomial\n\nabbrev target_ring_aux (k : Type) [Field k] :=\n    (MvPolynomial (Fin 6) k) ⧸ Ideal.span ({\n    X 1 * X 3 + X 2 * X 5, X 2 * X 4 + X 0 * X 5, X 0 * X 1 - X 1 * X 4 + X 2 * X 4 - X 4 * X 5,\n    X 1 * X 2 + X 1 * X 3 + X 1 * X 5 + (X 5)^2, (X 2)^2 + X 2 * X 3 + X 2 * X 5 - X 3 * X 5,\n    X 0 * X 2 + X 0 * X 3 + X 3 * X 4 + X 0 * X 5} : Set (MvPolynomial (Fin 6) k))\n\ntheorem isCohenMacaulayRing_of_dimension_three (k : Type) [Field k] :\n    IsCohenMacaulayRing (target_ring_aux k) ∧ (ringKrullDim (target_ring_aux k) = 3) := by\n  sorry",
+    "statement": "theorem fatex_080_compact (k : Type) [Field k] (A : Type) [CommRing A]\n    (e : A ≃+* ((MvPolynomial (Fin 6) k) ⧸ Ideal.span ({\n      MvPolynomial.X 1 * MvPolynomial.X 3 + MvPolynomial.X 2 * MvPolynomial.X 5, MvPolynomial.X 2 * MvPolynomial.X 4 + MvPolynomial.X 0 * MvPolynomial.X 5,\n      MvPolynomial.X 0 * MvPolynomial.X 1 - MvPolynomial.X 1 * MvPolynomial.X 4 + MvPolynomial.X 2 * MvPolynomial.X 4 - MvPolynomial.X 4 * MvPolynomial.X 5,\n      MvPolynomial.X 1 * MvPolynomial.X 2 + MvPolynomial.X 1 * MvPolynomial.X 3 + MvPolynomial.X 1 * MvPolynomial.X 5 + (MvPolynomial.X 5)^2,\n      (MvPolynomial.X 2)^2 + MvPolynomial.X 2 * MvPolynomial.X 3 + MvPolynomial.X 2 * MvPolynomial.X 5 - MvPolynomial.X 3 * MvPolynomial.X 5,\n      MvPolynomial.X 0 * MvPolynomial.X 2 + MvPolynomial.X 0 * MvPolynomial.X 3 + MvPolynomial.X 3 * MvPolynomial.X 4 + MvPolynomial.X 0 * MvPolynomial.X 5}\n      : Set (MvPolynomial (Fin 6) k)))) :\n    (∀ p : Ideal (A), ∀ (_ : p.IsPrime),\n      ringKrullDim (Localization.AtPrime p) =\n        (sSup {d : ℕ∞ | ∀ i : ℕ, i < d → Subsingleton (CategoryTheory.Abelian.Ext.{0}\n          (ModuleCat.of.{0} (Localization.AtPrime p)\n            ((Localization.AtPrime p) ⧸ IsLocalRing.maximalIdeal (Localization.AtPrime p)))\n          (ModuleCat.of.{0} (Localization.AtPrime p) (Localization.AtPrime p)) i)} : ℕ∞))\n    ∧ ringKrullDim A = 3 := by sorry",
     "informal": "Consider the ideal \\( I \\subset k[x_1, \\dots, x_6] \\) generated by the following polynomials:\n\\[\n\\begin{aligned}\nf_1 &= x_2x_4 + x_3x_6, \\\\\nf_2 &= x_3x_5 + x_1x_6, \\\\\nf_3 &= x_1x_2 - x_2x_5 + x_3x_5 - x_5x_6, \\\\\nf_4 &= x_2x_3 + x_2x_4 + x_2x_6 + x_6^2, \\\\\nf_5 &= x_3^2 + x_3x_4 + x_3x_6 - x_4x_6, \\\\\nf_6 &= x_1x_3 + x_1x_4 + x_4x_5 + x_1x_6.\n\\end{aligned}\n\\]\nProve that \\( R/I \\) is Cohen–Macaulay of dimension \\( 3 \\).",
     "tags": [
       "Abstract Algebra",
       "Ring Theory",
       "Polynomials"
     ],
-    "declarations": 7
+    "declarations": 0,
+    "originalStatement": "section\n\nopen CategoryTheory Abelian\n\nvariable {R : Type} [CommRing R]\n\ninstance : CategoryTheory.HasExt.{0} (ModuleCat.{0} R) :=\n  CategoryTheory.hasExt_of_enoughProjectives (ModuleCat R)\n\nnoncomputable def moduleDepth (N M : ModuleCat.{0} R) : ℕ∞ :=\n  sSup {n : ℕ∞ | ∀ i : ℕ, i < n → Subsingleton (CategoryTheory.Abelian.Ext.{0} N M i)}\n\nnoncomputable def Ideal.depth (I : Ideal R) (M : ModuleCat.{0} R) : ℕ∞ :=\n  moduleDepth (ModuleCat.of R (R ⧸ I)) M\n\nnoncomputable def IsLocalRing.depth [IsLocalRing R] (M : ModuleCat.{0} R) : ℕ∞ :=\n  (IsLocalRing.maximalIdeal R).depth M\n\nvariable (R)\n\nclass IsCohenMacaulayLocalRing : Prop extends IsLocalRing R where\n  depth_eq_dim : ringKrullDim R = IsLocalRing.depth (ModuleCat.of R R)\n\nclass IsCohenMacaulayRing : Prop where\n  CM_localize : ∀ p : Ideal R, ∀ (_ : p.IsPrime), IsCohenMacaulayLocalRing (Localization.AtPrime p)\n\nend\n\nopen MvPolynomial\n\nabbrev target_ring_aux (k : Type) [Field k] :=\n    (MvPolynomial (Fin 6) k) ⧸ Ideal.span ({\n    X 1 * X 3 + X 2 * X 5, X 2 * X 4 + X 0 * X 5, X 0 * X 1 - X 1 * X 4 + X 2 * X 4 - X 4 * X 5,\n    X 1 * X 2 + X 1 * X 3 + X 1 * X 5 + (X 5)^2, (X 2)^2 + X 2 * X 3 + X 2 * X 5 - X 3 * X 5,\n    X 0 * X 2 + X 0 * X 3 + X 3 * X 4 + X 0 * X 5} : Set (MvPolynomial (Fin 6) k))\n\ntheorem isCohenMacaulayRing_of_dimension_three (k : Type) [Field k] :\n    IsCohenMacaulayRing (target_ring_aux k) ∧ (ringKrullDim (target_ring_aux k) = 3) := by\n  sorry",
+    "strengthProof": "have key := fatex_080_compact k (target_ring_aux k) (RingEquiv.refl _)\nexact ⟨⟨fun p hp => { depth_eq_dim := key.1 p hp }⟩, key.2⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_081",
@@ -1056,27 +1203,36 @@
     "id": "fatex_082",
     "index": 82,
     "name": "subring_iso_mvPowerSeries_over_DVR",
-    "statement": "open IsLocalRing\n\ntheorem subring_iso_mvPowerSeries_over_DVR (d : ℕ) (A : Type) [CommRing A] [IsLocalRing A]\n    [IsNoetherianRing A] [IsAdicComplete (maximalIdeal A) A] (dim : ringKrullDim A = d)\n    {p : ℕ} (hp : p.Prime) [CharZero A] [CharP (ResidueField A) p]\n    (ht : (Ideal.span {(p : A)}).height = 1) :\n    ∃ B : Subring A, Module.Finite B A ∧\n    ∃ (C : Type) (_ : CommRing C) (_ : IsDomain C), IsDiscreteValuationRing C ∧\n    Nonempty (B ≃+* MvPowerSeries (Fin (d - 1)) C) := by\n  sorry",
+    "statement": "theorem fatex_082_compact (d : ℕ) (A : Type) [CommRing A] [IsLocalRing A]\n    [IsNoetherianRing A] [IsAdicComplete (IsLocalRing.maximalIdeal A) A] (dim : ringKrullDim A = d)\n    {p : ℕ} (hp : p.Prime) [CharZero A] [CharP (IsLocalRing.ResidueField A) p]\n    (ht : (Ideal.span {(p : A)}).height = 1) :\n    ∃ B : Subring A, Module.Finite B A ∧\n    ∃ (C : Type) (_ : CommRing C) (_ : IsDomain C), IsDiscreteValuationRing C ∧\n    Nonempty (B ≃+* MvPowerSeries (Fin (d - 1)) C) := by sorry",
     "informal": "Let \\( A \\) be a Noetherian complete local ring of dimension \\( d \\), of mixed characteristic (i.e., $\\mathrm{Char} A = 0$ and $\\mathrm{Char} A / \\mathfrak{m}$), and let \\( p = \\text{char}(A/\\mathfrak{m}) \\). Assume that \\( \\text{ht}(p \\cdot A) = 1 \\). Prove that \\( A \\) is a finitely generated module over a subring \\( B \\subset A \\) such that\n\\[\nB \\cong C[[x_1, \\dots, x_{d-1}]],\n\\]\nwhere \\( C \\) is a discrete valuation ring (DVR).",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Heights and Dimensions"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open IsLocalRing\n\ntheorem subring_iso_mvPowerSeries_over_DVR (d : ℕ) (A : Type) [CommRing A] [IsLocalRing A]\n    [IsNoetherianRing A] [IsAdicComplete (maximalIdeal A) A] (dim : ringKrullDim A = d)\n    {p : ℕ} (hp : p.Prime) [CharZero A] [CharP (ResidueField A) p]\n    (ht : (Ideal.span {(p : A)}).height = 1) :\n    ∃ B : Subring A, Module.Finite B A ∧\n    ∃ (C : Type) (_ : CommRing C) (_ : IsDomain C), IsDiscreteValuationRing C ∧\n    Nonempty (B ≃+* MvPowerSeries (Fin (d - 1)) C) := by\n  sorry",
+    "strengthProof": "exact fatex_082_compact d A dim hp ht",
+    "compactRewrite": true
   },
   {
     "id": "fatex_083",
     "index": 83,
     "name": "IsRegularLocalRing.flat_local_of_regular",
-    "statement": "open IsLocalRing\n\nclass IsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\ntheorem IsRegularLocalRing.flat_local_of_regular {A B : Type} [CommRing A] [CommRing B]\n    [IsRegularLocalRing A] [IsNoetherianRing B] [IsLocalRing B] {f : A →+* B} (hfl : IsLocalHom f)\n    (hff : f.Flat) [IsRegularLocalRing (B ⧸ (maximalIdeal A).map f)] : IsRegularLocalRing B := by\n  sorry",
+    "statement": "theorem fatex_083_compact {A B : Type} [CommRing A] [CommRing B]\n    [IsLocalRing A] [IsNoetherianRing A] [IsNoetherianRing B] [IsLocalRing B]\n    (hA : Module.finrank (IsLocalRing.ResidueField A) (IsLocalRing.CotangentSpace A) = ringKrullDim A)\n    {f : A →+* B} (hfl : IsLocalHom f) (hff : f.Flat)\n    [IsLocalRing (B ⧸ (IsLocalRing.maximalIdeal A).map f)] [IsNoetherianRing (B ⧸ (IsLocalRing.maximalIdeal A).map f)]\n    (hQ : Module.finrank (IsLocalRing.ResidueField (B ⧸ (IsLocalRing.maximalIdeal A).map f)) (IsLocalRing.CotangentSpace (B ⧸ (IsLocalRing.maximalIdeal A).map f))\n      = ringKrullDim (B ⧸ (IsLocalRing.maximalIdeal A).map f)) :\n    Module.finrank (IsLocalRing.ResidueField B) (IsLocalRing.CotangentSpace B) = ringKrullDim B := by sorry",
     "informal": "Let \\( f \\colon A \\to B \\) be a flat local homomorphism of Noetherian rings, having maximal ideals \\( \\mathfrak{M}_A \\) and \\( \\mathfrak{M}_B \\) respectively. Prove that if \\( A \\) and \\( B/\\mathfrak{M}_A B \\) are regular, then \\( B \\) is regular.",
     "tags": [
       "Commutative Algebra",
       "Dimension Theory and Smoothness",
       "Heights and Dimensions"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "toolchainRepair": [
+      "IsRegularLocalRing → FateXIsRegularLocalRing"
+    ],
+    "originalStatement": "open IsLocalRing\n\nclass FateXIsRegularLocalRing (R : Type) [CommRing R] : Prop extends\n    IsLocalRing R, IsNoetherianRing R where\n  reg : Module.finrank (ResidueField R) (CotangentSpace R) = ringKrullDim R\n\ntheorem FateXIsRegularLocalRing.flat_local_of_regular {A B : Type} [CommRing A] [CommRing B]\n    [FateXIsRegularLocalRing A] [IsNoetherianRing B] [IsLocalRing B] {f : A →+* B} (hfl : IsLocalHom f)\n    (hff : f.Flat) [FateXIsRegularLocalRing (B ⧸ (maximalIdeal A).map f)] : FateXIsRegularLocalRing B := by\n  sorry",
+    "strengthProof": "exact ⟨fatex_083_compact (‹FateXIsRegularLocalRing A›.reg) hfl hff\n  (‹FateXIsRegularLocalRing (B ⧸ (maximalIdeal A).map f)›.reg)⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_084",
@@ -1095,14 +1251,17 @@
     "id": "fatex_085",
     "index": 85,
     "name": "exist_euclideanDomain_not_norm_nat",
-    "statement": "class EuclideanNormNat (R : Type) [CommRing R] extends Nontrivial R where\n  quotient : R → R → R\n  quotient_zero : ∀ a, quotient a 0 = 0\n  remainder : R → R → R\n  quotient_mul_add_remainder_eq : ∀ a b, b * quotient a b + remainder a b = a\n  norm : R → ℕ\n  remainder_lt : ∀ (a) {b}, b ≠ 0 → norm (remainder a b) < norm b\n  mul_left_not_lt : ∀ (a) {b}, b ≠ 0 → ¬ norm (a * b) < norm a\n\ntheorem exist_euclideanDomain_not_norm_nat :\n    ∃ (R : Type) (_ : EuclideanDomain R), IsEmpty (EuclideanNormNat R) := by\n  sorry",
+    "statement": "theorem fatex_085_compact : ∃ (R : Type) (_ : EuclideanDomain R),\n    ¬ ∃ (_ : Nontrivial R) (quotient : R → R → R) (remainder : R → R → R) (norm : R → ℕ),\n      (∀ a, quotient a 0 = 0) ∧\n      (∀ a b, b * quotient a b + remainder a b = a) ∧\n      (∀ a b, b ≠ 0 → norm (remainder a b) < norm b) ∧\n      (∀ a b, b ≠ 0 → ¬ norm (a * b) < norm a) := by sorry",
     "informal": "There exists a transfinite Euclidean domain such that it cannot be given a Euclidean norm taking value in \\(\\mathbb{N}\\).",
     "tags": [
       "Commutative Algebra",
       "Other Topics",
       "Algebraic and Arithmetic Dynamics"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "class EuclideanNormNat (R : Type) [CommRing R] extends Nontrivial R where\n  quotient : R → R → R\n  quotient_zero : ∀ a, quotient a 0 = 0\n  remainder : R → R → R\n  quotient_mul_add_remainder_eq : ∀ a b, b * quotient a b + remainder a b = a\n  norm : R → ℕ\n  remainder_lt : ∀ (a) {b}, b ≠ 0 → norm (remainder a b) < norm b\n  mul_left_not_lt : ∀ (a) {b}, b ≠ 0 → ¬ norm (a * b) < norm a\n\ntheorem exist_euclideanDomain_not_norm_nat :\n    ∃ (R : Type) (_ : EuclideanDomain R), IsEmpty (EuclideanNormNat R) := by\n  sorry",
+    "strengthProof": "obtain ⟨R, hR, hne⟩ := fatex_085_compact\nrefine ⟨R, hR, ⟨fun h => hne ?_⟩⟩\nexact ⟨h.toNontrivial, h.quotient, h.remainder, h.norm, h.quotient_zero,\n  h.quotient_mul_add_remainder_eq, fun a b hb => h.remainder_lt a hb,\n  fun a b hb => h.mul_left_not_lt a hb⟩",
+    "compactRewrite": true
   },
   {
     "id": "fatex_086",
@@ -1134,14 +1293,17 @@
     "id": "fatex_088",
     "index": 88,
     "name": "quotient_not_UFD",
-    "statement": "abbrev R : Type := (MvPolynomial (Fin 3) ℂ) ⧸ Ideal.span {(.X 0 ^ 2 + .X 1 ^ 3 + .X 2 ^ 7 : MvPolynomial (Fin 3) ℂ)}\n\ntheorem quotient_not_UFD :\n    ∃ (h : IsDomain R),\n    (UniqueFactorizationMonoid R) := by\n  sorry",
+    "statement": "theorem fatex_088_compact (A : Type) [CommRing A]\n    (e : A ≃+* (MvPolynomial (Fin 3) ℂ ⧸\n      Ideal.span {(.X 0 ^ 2 + .X 1 ^ 3 + .X 2 ^ 7 : MvPolynomial (Fin 3) ℂ)})) :\n    ∃ (h : IsDomain A), UniqueFactorizationMonoid A := by sorry",
     "informal": "$\\mathbb{C}[x, y, z] / (x^2 + y^3 + z^7)$ is a UFD.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "abbrev R : Type := (MvPolynomial (Fin 3) ℂ) ⧸ Ideal.span {(.X 0 ^ 2 + .X 1 ^ 3 + .X 2 ^ 7 : MvPolynomial (Fin 3) ℂ)}\n\ntheorem quotient_not_UFD :\n    ∃ (h : IsDomain R),\n    (UniqueFactorizationMonoid R) := by\n  sorry",
+    "strengthProof": "exact fatex_088_compact _ (RingEquiv.refl _)",
+    "compactRewrite": true
   },
   {
     "id": "fatex_089",
@@ -1173,27 +1335,36 @@
     "id": "fatex_091",
     "index": 91,
     "name": "pic_three_lines",
-    "statement": "open CategoryTheory MvPolynomial\n\nabbrev CommRing.Pic (R : Type) [CommRing R] : Type 1 := (Skeleton <| ModuleCat.{0} R)ˣ\n\ntheorem pic_three_lines {k : Type} [Field k] : Nonempty <|\n    CommRing.Pic (MvPolynomial (Fin 2) k ⧸ Ideal.span ({(X 0) * (X 1) * (X 0 + X 1 - 1)} :\n    Set (MvPolynomial (Fin 2) k))) ≃* kˣ := by\n  sorry",
+    "statement": "theorem fatex_091_compact {k : Type} [Field k] : Nonempty <|\n    (CategoryTheory.Skeleton <| ModuleCat.{0} (MvPolynomial (Fin 2) k ⧸\n      Ideal.span ({(MvPolynomial.X 0) * (MvPolynomial.X 1) *\n        (MvPolynomial.X 0 + MvPolynomial.X 1 - 1)} :\n        Set (MvPolynomial (Fin 2) k))))ˣ ≃* kˣ := by sorry",
     "informal": "Let $ k $ be a field, $ A := k[x, y]/(xy(x + y - 1)) $, then $ \\mathrm{Pic}\\ A \\cong k^{\\times} $.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "toolchainRepair": [
+      "CommRing.Pic → FateXCommRing.Pic"
+    ],
+    "originalStatement": "open CategoryTheory MvPolynomial\n\nabbrev FateXCommRing.Pic (R : Type) [CommRing R] : Type 1 := (Skeleton <| ModuleCat.{0} R)ˣ\n\ntheorem pic_three_lines {k : Type} [Field k] : Nonempty <|\n    FateXCommRing.Pic (MvPolynomial (Fin 2) k ⧸ Ideal.span ({(X 0) * (X 1) * (X 0 + X 1 - 1)} :\n    Set (MvPolynomial (Fin 2) k))) ≃* kˣ := by\n  sorry",
+    "strengthProof": "exact fatex_091_compact",
+    "compactRewrite": true
   },
   {
     "id": "fatex_092",
     "index": 92,
     "name": "dimension_sequences_of_one_dimensional_rings",
-    "statement": "def a (k : ℕ∞) (n : ℕ) :=\n  if h : n ≤ k then 2 * n + 1\n  else n + WithTop.untop k (by rintro rfl; exact h le_top) + 1\n\ntheorem dimension_sequences_of_one_dimensional_rings :\n    (∀ (A : Type) [CommRing A] (h : ringKrullDim A = 1),\n      ∃ (k : ℕ∞), (∀ (n : ℕ), ringKrullDim (MvPolynomial (Fin n) A) = a k n)) ∧\n    (∀ (k : ℕ), ∃ (A : Type) (_ : CommRing A) (h : ringKrullDim A = 1),\n      (∀ (n : ℕ), ringKrullDim (MvPolynomial (Fin n) A) = a k n)):= by\n  sorry",
+    "statement": "theorem fatex_092_compact :\n    (∀ (A : Type) [CommRing A] (h : ringKrullDim A = 1),\n      ∃ (k : ℕ∞), (∀ (n : ℕ), ringKrullDim (MvPolynomial (Fin n) A) =\n        (if h : (n : ℕ∞) ≤ k then 2 * n + 1\n          else n + WithTop.untop k (by rintro rfl; exact h le_top) + 1 : ℕ))) ∧\n    (∀ (k : ℕ), ∃ (A : Type) (_ : CommRing A) (h : ringKrullDim A = 1),\n      (∀ (n : ℕ), ringKrullDim (MvPolynomial (Fin n) A) =\n        (if h : (n : ℕ∞) ≤ (k : ℕ∞) then 2 * n + 1\n          else n + WithTop.untop (k : ℕ∞) (ENat.coe_ne_top k) + 1 : ℕ)))\n    := by sorry",
     "informal": "Let $A$ be a commutative ring with identity, $\\dim A = 1$.\nThen all possible sequences for \\(a_n = dim A[x_1, \\ldots, x_n] ( n \\in \\mathbb{N})\\) are exactly the sequences of the form: \\(a_n = 2n+1\\) if \\(n \\le k\\) else \\(a_n = n + k + 1\\), for some \\(k \\in \\mathbb{N} \\cup \\{+\\infty\\}\\).",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "def a (k : ℕ∞) (n : ℕ) :=\n  if h : n ≤ k then 2 * n + 1\n  else n + WithTop.untop k (by rintro rfl; exact h le_top) + 1\n\ntheorem dimension_sequences_of_one_dimensional_rings :\n    (∀ (A : Type) [CommRing A] (h : ringKrullDim A = 1),\n      ∃ (k : ℕ∞), (∀ (n : ℕ), ringKrullDim (MvPolynomial (Fin n) A) = a k n)) ∧\n    (∀ (k : ℕ), ∃ (A : Type) (_ : CommRing A) (h : ringKrullDim A = 1),\n      (∀ (n : ℕ), ringKrullDim (MvPolynomial (Fin n) A) = a k n)):= by\n  sorry",
+    "strengthProof": "exact fatex_092_compact",
+    "compactRewrite": true
   },
   {
     "id": "fatex_093",
@@ -1212,53 +1383,65 @@
     "id": "fatex_094",
     "index": 94,
     "name": "zeroSet_finite_or_contain_arithmetic_progression",
-    "statement": "variable {k A : Type} [Field k] [CharZero k] [CommRing A] [IsDomain A] [Algebra k A]\n  [Algebra.FiniteType k A] (f : A →ₐ[k] A) (ϕ : A →ₐ[k] k) (I : Ideal A)\n\ndef zeroSet : Set ℕ := {n | ∀ x : I, (ϕ.comp (f ^ n)) (x : A) = 0}\n\ntheorem zeroSet_finite_or_contain_arithmetic_progression (hf : f.FormallyEtale) :\n    (zeroSet f ϕ I).Finite ∨ ∃ (d : ℕ+) (a : ℕ), ∀ n : ℕ, a + d * n ∈ zeroSet f ϕ I := by\n  sorry",
+    "statement": "theorem fatex_094_compact {k A : Type} [Field k] [CharZero k] [CommRing A] [IsDomain A]\n    [Algebra k A] [Algebra.FiniteType k A] (f : A →ₐ[k] A) (ϕ : A →ₐ[k] k) (I : Ideal A)\n    (hf : f.FormallyEtale) :\n    ({n : ℕ | ∀ x : I, (ϕ.comp (f ^ n)) (x : A) = 0} : Set ℕ).Finite ∨\n    ∃ (d : ℕ+) (a : ℕ), ∀ n : ℕ,\n      a + d * n ∈ ({n : ℕ | ∀ x : I, (ϕ.comp (f ^ n)) (x : A) = 0} : Set ℕ) := by sorry",
     "informal": "Let $k$ be field, $\\mathrm{char}\\ k=0$, $ A $ be a finite-type $k$-algebra, $f: A \\to A$ be an \\'etale endomorphsim, $\\varphi: A \\to k$, $I \\subset A$ be a ideal. If $A$ is a domain, then $$\\left\\lbrace  n \\in \\mathbb{N} \\mid \\left. \\varphi \\circ f^n \\right|_I = 0 \\right\\rbrace $$ is either finite or contains an arithmetic progression with a positive common difference.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "variable {k A : Type} [Field k] [CharZero k] [CommRing A] [IsDomain A] [Algebra k A]\n  [Algebra.FiniteType k A] (f : A →ₐ[k] A) (ϕ : A →ₐ[k] k) (I : Ideal A)\n\ndef zeroSet : Set ℕ := {n | ∀ x : I, (ϕ.comp (f ^ n)) (x : A) = 0}\n\ntheorem zeroSet_finite_or_contain_arithmetic_progression (hf : f.FormallyEtale) :\n    (zeroSet f ϕ I).Finite ∨ ∃ (d : ℕ+) (a : ℕ), ∀ n : ℕ, a + d * n ∈ zeroSet f ϕ I := by\n  sorry",
+    "strengthProof": "exact fatex_094_compact f ϕ I hf",
+    "compactRewrite": true
   },
   {
     "id": "fatex_095",
     "index": 95,
     "name": "p_map_ne_p",
-    "statement": "open Polynomial Bivariate\n\nnoncomputable\ndef f (a : ℂ) (p : ℂ[X]): ℂ[X][Y] →+* ℂ[X][Y] :=\n  eval₂RingHom (aeval (a • Y + C p)).toRingHom (C X)\n\ntheorem p_map_ne_p (p : ℂ[X]) (h : p.natDegree > 1) {a : ℂ} (ha : a ≠ 0)\n    (𝔭 : Ideal ℂ[X][Y]) (h𝔭 : 𝔭.IsPrime) (h : 𝔭.height = 1) :\n    𝔭.map (f a p) ≠ 𝔭 := by\n  sorry",
+    "statement": "theorem fatex_095_compact (p : Polynomial ℂ) (hp : p.natDegree > 1) {a : ℂ} (ha : a ≠ 0)\n    (𝔭 : Ideal (Polynomial (Polynomial ℂ))) (h𝔭 : 𝔭.IsPrime) (hh : 𝔭.height = 1) :\n    𝔭.map (Polynomial.eval₂RingHom\n      (Polynomial.aeval (R := ℂ)\n        (a • (Polynomial.X : Polynomial (Polynomial ℂ)) + Polynomial.C p)).toRingHom\n      (Polynomial.C (Polynomial.X : Polynomial ℂ))) ≠ 𝔭 := by sorry",
     "informal": "Let $f : \\mathbb{C}[x, y] \\to \\mathbb{C}[x, y]$, $x \\mapsto p(x) + ay, y \\mapsto x$, where $a \\in \\mathbb{C}$, $a \\ne 0$, $p(x) \\in \\mathbb{C}[x]$ have degree $>1$, $\\mathfrak{p} \\subset \\mathbb{C}[x, y]$ be a prime ideal. If $\\mathrm{height}\\ \\mathfrak{p} = 1 $, then $f(\\mathfrak{p}) \\ne \\mathfrak{p}$.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 1
+    "declarations": 0,
+    "originalStatement": "open Polynomial Bivariate\n\nnoncomputable\ndef f (a : ℂ) (p : ℂ[X]): ℂ[X][Y] →+* ℂ[X][Y] :=\n  eval₂RingHom (aeval (a • Y + C p)).toRingHom (C X)\n\ntheorem p_map_ne_p (p : ℂ[X]) (h : p.natDegree > 1) {a : ℂ} (ha : a ≠ 0)\n    (𝔭 : Ideal ℂ[X][Y]) (h𝔭 : 𝔭.IsPrime) (h : 𝔭.height = 1) :\n    𝔭.map (f a p) ≠ 𝔭 := by\n  sorry",
+    "strengthProof": "refine fatex_095_compact p ?_ ha 𝔭 h𝔭 h\nassumption",
+    "compactRewrite": true
   },
   {
     "id": "fatex_096",
     "index": 96,
     "name": "ratFunc_square_is_poly_of_orbit_contain_infinite_integer",
-    "statement": "open RatFunc\n\ntheorem ratFunc_square_is_poly_of_orbit_contain_infinite_integer\n    {f : RatFunc ℚ} (hf : f.num.natDegree ≥ 2 ∨ f.denom.natDegree ≥ 2) {a : ℚ}\n    (h : ∀ n : ℕ, (f.eval (RingHom.id ℚ))^[n] a ≠ 0) -- exclude the case that the `denom` is zero\n    (ha : {m : ℤ | ∃ n : ℕ, m = (f.eval (RingHom.id ℚ))^[n] a}.Infinite) :\n    ∃ g : Polynomial ℚ, g = f.eval C f := by\n  sorry",
+    "statement": "theorem fatex_096_compact\n    {f : RatFunc ℚ} (hf : f.num.natDegree ≥ 2 ∨ f.denom.natDegree ≥ 2) {a : ℚ}\n    (h : ∀ n : ℕ, (f.eval (RingHom.id ℚ))^[n] a ≠ 0)\n    (ha : {m : ℤ | ∃ n : ℕ, m = (f.eval (RingHom.id ℚ))^[n] a}.Infinite) :\n    ∃ g : Polynomial ℚ, g = f.eval RatFunc.C f := by sorry",
     "informal": "Let $f(x) \\in \\mathbb{Q}(x)$ be a rational function of degree at least 2, $\\alpha \\in \\mathbb{Q}$. If the orbit $\\mathcal{O}_f(\\alpha)$ contains infinitely many integers, then $f^2(x)$ is a polynomial.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open RatFunc\n\ntheorem ratFunc_square_is_poly_of_orbit_contain_infinite_integer\n    {f : RatFunc ℚ} (hf : f.num.natDegree ≥ 2 ∨ f.denom.natDegree ≥ 2) {a : ℚ}\n    (h : ∀ n : ℕ, (f.eval (RingHom.id ℚ))^[n] a ≠ 0) -- exclude the case that the `denom` is zero\n    (ha : {m : ℤ | ∃ n : ℕ, m = (f.eval (RingHom.id ℚ))^[n] a}.Infinite) :\n    ∃ g : Polynomial ℚ, g = f.eval C f := by\n  sorry",
+    "strengthProof": "exact fatex_096_compact hf h ha",
+    "compactRewrite": true
   },
   {
     "id": "fatex_097",
     "index": 97,
     "name": "exists_point_not_in_zero_set",
-    "statement": "open scoped Polynomial\n\ntheorem exists_point_not_in_zero_set {τ k : Type} [Finite τ] [Nonempty τ] [Field k] [CharZero k]\n    {f : τ → k[X]} (hfd : ∀ i : τ, (f i).natDegree ≥ 2): ∃ a : τ → k,\n    ∀ p : MvPolynomial τ k, p ≠ 0 →\n    ∃ m : ℕ, (((MvPolynomial.aeval (fun i ↦ (f i).toMvPolynomial i)) ^ m) p).aeval a ≠ 0 := by\n  sorry",
+    "statement": "theorem fatex_097_compact {τ k : Type} [Finite τ] [Nonempty τ] [Field k] [CharZero k]\n    {f : τ → Polynomial k} (hfd : ∀ i : τ, (f i).natDegree ≥ 2) : ∃ a : τ → k,\n    ∀ p : MvPolynomial τ k, p ≠ 0 →\n    ∃ m : ℕ, (((MvPolynomial.aeval (fun i ↦ (f i).toMvPolynomial i)) ^ m) p).aeval a ≠ 0 := by sorry",
     "informal": "If $k$ is a field of characteristic zero, $n \\in \\mathbb{N}$, $n \\ne 0$, and $\\phi \\colon k[x_1, \\dots, x_n] \\to k[x_1, \\dots, x_n]$ is given by $(x_1, \\dots, x_n) \\mapsto (f_1(x_1), \\dots, f_n(x_n))$, where $f_i(x_i) \\in k[x_i]$ having degree at least two, then there is a point $a \\in k^n$ such that for any non-zero polyminal $p \\in k[x_1, \\dots, x_n]$, there exists $m \\in \\mathbb{N}$ such that $p(\\phi^m(a)) \\ne 0$.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open scoped Polynomial\n\ntheorem exists_point_not_in_zero_set {τ k : Type} [Finite τ] [Nonempty τ] [Field k] [CharZero k]\n    {f : τ → k[X]} (hfd : ∀ i : τ, (f i).natDegree ≥ 2): ∃ a : τ → k,\n    ∀ p : MvPolynomial τ k, p ≠ 0 →\n    ∃ m : ℕ, (((MvPolynomial.aeval (fun i ↦ (f i).toMvPolynomial i)) ^ m) p).aeval a ≠ 0 := by\n  sorry",
+    "strengthProof": "exact fatex_097_compact hfd",
+    "compactRewrite": true
   },
   {
     "id": "fatex_098",
@@ -1290,13 +1473,16 @@
     "id": "fatex_100",
     "index": 100,
     "name": "free_of_countably_generated_projective_of_local_infinite_rank",
-    "statement": "open Module\n\ntheorem free_of_countably_generated_projective_of_local_infinite_rank {R : Type} [CommRing R]\n    [IsNoetherianRing R] (P : Type) [AddCommGroup P] [Module R P] [Projective R P]\n    (hcg : ∃ s : Set P, s.Countable ∧ Submodule.span R s = ⊤)\n    (hm : ∀ m : Ideal R, (_ : m.IsMaximal) →\n      ¬ Module.Finite (Localization.AtPrime m) (LocalizedModule.AtPrime m P)) : Free R P := by\n  sorry",
+    "statement": "theorem fatex_100_compact {R : Type} [CommRing R]\n    [IsNoetherianRing R] (P : Type) [AddCommGroup P] [Module R P] [Module.Projective R P]\n    (hcg : ∃ s : Set P, s.Countable ∧ Submodule.span R s = ⊤)\n    (hm : ∀ m : Ideal R, (_ : m.IsMaximal) →\n      ¬ Module.Finite (Localization.AtPrime m) (LocalizedModule.AtPrime m P)) :\n    Module.Free R P := by sorry",
     "informal": "Let $R$ be a Noetherian ring, $P$ be a countably generated projective $R$-module such that $P_{\\mathfrak{m}}$ has infinite rank for all maximal ideals $\\mathfrak{m}$ of $R$. Then $P$ is free.",
     "tags": [
       "Commutative Algebra",
       "Ideal Theory",
       "Localization and Decomposition of Ideals"
     ],
-    "declarations": 0
+    "declarations": 0,
+    "originalStatement": "open Module\n\ntheorem free_of_countably_generated_projective_of_local_infinite_rank {R : Type} [CommRing R]\n    [IsNoetherianRing R] (P : Type) [AddCommGroup P] [Module R P] [Projective R P]\n    (hcg : ∃ s : Set P, s.Countable ∧ Submodule.span R s = ⊤)\n    (hm : ∀ m : Ideal R, (_ : m.IsMaximal) →\n      ¬ Module.Finite (Localization.AtPrime m) (LocalizedModule.AtPrime m P)) : Free R P := by\n  sorry",
+    "strengthProof": "exact fatex_100_compact P hcg hm",
+    "compactRewrite": true
   }
 ]

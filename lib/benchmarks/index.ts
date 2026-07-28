@@ -1,5 +1,5 @@
 import { MINIF2F_TEST } from './minif2f';
-import { FATEX } from './fatex';
+import { FATEX_RUNNABLE } from './fatex';
 
 // The benchmark registry. A run names one of these by `id`; the API seeds its
 // items from the server's own bundled copy (never from the client), so a run
@@ -42,11 +42,11 @@ export const BENCHMARKS: BenchmarkDef[] = [
   },
   {
     id: 'fatex',
-    label: 'FATE-X — 100 graduate algebra problems',
+    label: 'FATE-X — 98 graduate algebra problems',
     blurb:
       'Graduate abstract/commutative algebra, ordered by increasing difficulty. Far harder than miniF2F.',
-    note: 'frenzymath/FATE-X. 38 of the 100 carry supporting declarations (a custom class/def the theorem is stated over) inside the statement. ⚠️ FATE-X pins Lean/Mathlib v4.28.0 while the Leak XI/XII/XIV verifier group runs v4.32.0 — most statements elaborate unchanged, but Mathlib drift means a few may simply fail to elaborate.',
-    problems: FATEX.map((p) => ({
+    note: 'frenzymath/FATE-X, 98/100 problems (2 excluded — see below). Every statement is a single self-contained theorem: the 52 that originally needed a preceding class/def/open were rewritten to inline their supporting declarations, each rewrite machine-verified on Leak XII to prove the ORIGINAL FATE-X theorem from the rewritten one, so the benchmark is provably no easier than the source. 2 problems (#9, #41) are excluded outright — genuine Lean/Mathlib v4.28→v4.32 API drift (FATE-X targets v4.28.0; our verifier group runs v4.32.0) that no statement rewrite can fix without changing the mathematical content.',
+    problems: FATEX_RUNNABLE.map((p) => ({
       id: p.id,
       statement: p.statement,
       informal: p.informal,
@@ -55,7 +55,7 @@ export const BENCHMARKS: BenchmarkDef[] = [
       { label: 'Smoke test — first 5', value: 5 },
       { label: 'Easier end — first 25', value: 25 },
       { label: 'First half — first 50', value: 50 },
-      { label: 'Full FATE-X — all 100', value: 0 },
+      { label: 'Full FATE-X — all 98', value: 0 },
     ],
   },
 ];
