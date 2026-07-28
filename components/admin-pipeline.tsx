@@ -742,6 +742,12 @@ const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
 // Starts at 5, +1 per click.
 const ARCHITECT_DEFAULT_ITERS = 5;
 
+// The no-op strategy: problems are generated and saved, but no prover ever
+// runs. Kept as a strategy VALUE (rather than a separate toggle) so that the
+// single `verifyStrategyRef` read inside runVerifier is the only gate the whole
+// pipeline needs — every dispatch path already funnels through it.
+const VERIFY_OFF = 'off';
+
 // The three Leak River variants, each an ablation of the one before it so the
 // research table isolates exactly one change at a time. `note` is shown in the
 // UI under the selector.
@@ -1578,6 +1584,12 @@ export function AdminPipeline() {
   // so a bridge that's down never mis-marks problems as failed.
   const runVerifier = useCallback(async () => {
     if (runningRef.current) return;
+    // Strategy "off" — generate only, never prove. Guarding the one entry point
+    // covers every caller (post-generation, manual enqueue, resume-from-
+    // checkpoint, rebuild-on-load, usage-limit auto-resume), so no path can
+    // start a prover run behind the operator's back. Items already queued stay
+    // queued; they simply wait until a real strategy is selected.
+    if (verifyStrategyRef.current === VERIFY_OFF) return;
     runningRef.current = true;
     setVerifyPaused(null);
     try {
@@ -2091,6 +2103,14 @@ export function AdminPipeline() {
     ) as StatementCheck | null;
     if (savedCheck && savedCheck in STATEMENT_CHECK_LABEL)
       setStatementCheck(savedCheck);
+    const savedStrategy = localStorage.getItem('lca.verifyStrategy');
+    if (savedStrategy) {
+      setVerifyStrategy(savedStrategy);
+      // Sync the ref immediately too — loadAll() above can reach rebuildQueue →
+      // runVerifier before the ref's own effect flushes, and a restored "off"
+      // must not lose that race and start proving the restored queue.
+      verifyStrategyRef.current = savedStrategy;
+    }
     // Pull already-live CompeteMath problems so generation can avoid them.
     fetch('/api/admin/live-problems')
       .then((r) => (r.ok ? r.json() : { problems: [] }))
@@ -2107,6 +2127,19 @@ export function AdminPipeline() {
   const persistMode = (m: GenMode) => {
     setMode(m);
     localStorage.setItem('lca.genMode', m);
+  };
+
+  // Persisted, because a verification off-switch that silently reverted to a
+  // real strategy on reload would start burning prover runs unannounced.
+  const persistVerifyStrategy = (s: string) => {
+    setVerifyStrategy(s);
+    // Set the ref HERE rather than waiting for its sync effect: that effect
+    // runs after the next render, so the runVerifier() call below would still
+    // read the OLD strategy and bail out when switching off -> on.
+    verifyStrategyRef.current = s;
+    localStorage.setItem('lca.verifyStrategy', s);
+    // Switching back on picks up anything queued while it was off.
+    if (s !== VERIFY_OFF && queueRef.current.length > 0) runVerifier();
   };
 
   const persistStatementCheck = (c: StatementCheck) => {
@@ -2558,6 +2591,12 @@ export function AdminPipeline() {
       }
 
       setGenStage('saving');
+      // Strategy "off": save the problem but leave it OUT of the verification
+      // queue entirely. Queueing it would silently bank work that starts
+      // proving the moment a real strategy is picked — the opposite of "just
+      // generate". It stays in the generated history and can be queued by hand
+      // later with "Verify again".
+      const verifyOff = verifyStrategyRef.current === VERIFY_OFF;
       const res = await fetch('/api/admin/generated', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -2566,7 +2605,7 @@ export function AdminPipeline() {
           verified: false,
           proof: '',
           error: null,
-          queued: true,
+          queued: !verifyOff,
           toolchain: TOOLCHAIN,
           genMode: modeRef.current,
           ...(gauntlet ? { gauntlet } : {}),
@@ -2576,15 +2615,21 @@ export function AdminPipeline() {
         const j = await res.json();
         if (j.item) {
           setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
-          // Already persisted queued=true; just add to the in-memory queue.
-          if (!queueRef.current.some((x) => x.id === j.item.id)) {
-            queueRef.current = [...queueRef.current, j.item];
-            syncQueue();
+          if (verifyOff) {
+            pushGenEvent('done', 'Saved — verification off, not queued', {
+              verified: !gauntlet || !gauntlet.solved,
+            });
+          } else {
+            // Already persisted queued=true; just add to the in-memory queue.
+            if (!queueRef.current.some((x) => x.id === j.item.id)) {
+              queueRef.current = [...queueRef.current, j.item];
+              syncQueue();
+            }
+            pushGenEvent('done', `Saved — queued for verification`, {
+              verified: !gauntlet || !gauntlet.solved,
+            });
+            runVerifier();
           }
-          pushGenEvent('done', `Saved — queued for verification`, {
-            verified: !gauntlet || !gauntlet.solved,
-          });
-          runVerifier();
         }
       }
     } finally {
@@ -3305,15 +3350,29 @@ export function AdminPipeline() {
                 )}
               </select>
             </label>
-            {verifyDecompose && (
-              <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+            {/* Always rendered — unlike the proving strategies, "Off" has to be
+                reachable with Decompose off too. The other options are inert
+                without Decompose (strategy is only sent on tree runs), which
+                the title spells out. */}
+            <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                 Strategy
                 <select
                   value={verifyStrategy}
-                  onChange={(e) => setVerifyStrategy(e.target.value)}
-                  className="rounded-md border bg-background px-1.5 py-1 text-xs"
-                  title="A/B-test proof strategies; runs are tagged acg-tree:<strategy> in the agent debug log"
+                  onChange={(e) => persistVerifyStrategy(e.target.value)}
+                  className={cn(
+                    'rounded-md border bg-background px-1.5 py-1 text-xs',
+                    verifyStrategy === VERIFY_OFF &&
+                      'border-amber-500/60 text-amber-600 dark:text-amber-400',
+                  )}
+                  title={
+                    verifyStrategy === VERIFY_OFF
+                      ? 'Verification is OFF — problems are generated and saved, but no prover ever runs.'
+                      : verifyDecompose
+                        ? 'A/B-test proof strategies; runs are tagged acg-tree:<strategy> in the agent debug log'
+                        : 'Turn Decompose on to use a proving strategy — with it off, a single agent run is used and this setting is ignored (except "Off", which always applies).'
+                  }
                 >
+                  <option value={VERIFY_OFF}>Off — generate only, never prove</option>
                   <option value="hacker">Hacker (compiler-driven)</option>
                   <option value="pantograph">Pantograph (interactive Leak II)</option>
                   <option value="librarian">Librarian (search-first control)</option>
@@ -3341,7 +3400,6 @@ export function AdminPipeline() {
                   </optgroup>
                 </select>
               </label>
-            )}
             {/* The refinement-iteration budget lives on the verifier console
                 itself (next to the "+1 min" clock control), so it can be raised
                 MID-FLIGHT rather than only configured before a run. */}
@@ -3357,7 +3415,24 @@ export function AdminPipeline() {
             )}
           </div>
         </div>
-        {verifyDecompose && !isArchitectStrategy(verifyStrategy) && (
+        {verifyStrategy === VERIFY_OFF && (
+          <p className="mb-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+            <strong>Verification is off.</strong> Problems are generated and
+            saved to history, but no prover runs and new problems are not
+            queued.
+            {verifyQueue.length > 0 && (
+              <>
+                {' '}
+                {verifyQueue.length} item
+                {verifyQueue.length === 1 ? '' : 's'} already in the queue will
+                stay put until you pick a strategy.
+              </>
+            )}
+          </p>
+        )}
+        {verifyStrategy !== VERIFY_OFF &&
+          verifyDecompose &&
+          !isArchitectStrategy(verifyStrategy) && (
           <p className="mb-2 text-xs text-muted-foreground">
             Decompose mode: each generated problem is proved-or-split into
             toolchain-verified sub-lemmas (recursively) and assembled into one
