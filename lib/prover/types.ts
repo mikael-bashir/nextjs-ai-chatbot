@@ -47,6 +47,14 @@ export interface ProverMetrics {
    *  and distinct facts the run learned. Absent on the control (no ledger). */
   dead_ends_shared?: number;
   dead_ends_known?: number;
+  /** river-vintage only: the oversight watchers ran, and their activity —
+   *  interceptor notes/aborts, mechanic notes, consultant fires. Absent on
+   *  stone/gate/delta, which run without watchers. */
+  watchers?: boolean;
+  interceptor_notes?: number;
+  interceptor_aborts?: number;
+  mechanic_notes?: number;
+  consults?: number;
   /** Architect only: provable node count in the current/final blueprint. */
   nodes_total?: number;
   /** Architect only: nodes with a registered solve (proof or negation). */

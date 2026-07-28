@@ -7,6 +7,7 @@ import {
   AdminLeakRiver,
   AdminLeakStronghold,
   AdminLeakUltra,
+  AdminLeakVintage,
 } from '@/components/leak/admin-research';
 
 export default async function ResearchPage() {
@@ -27,6 +28,9 @@ export default async function ResearchPage() {
           <span className="font-medium text-foreground"> Leak River</span> — the
           blueprint pipeline driven by Grok, in three nested variants (Stone
           control → Gate ledger → Delta ledger+NL seed).
+          <span className="font-medium text-foreground"> Leak River Vintage</span>{' '}
+          — Stone plus the oversight watchers (per-node interceptor, run-wide
+          mechanic), a separate ablation branch with its own table.
           <span className="font-medium text-foreground"> Leak Ultra</span> — the
           same pipeline driven by the local Claude CLI, so the driver is the
           only difference from Stone.
@@ -47,6 +51,7 @@ export default async function ResearchPage() {
         </Link>
       </div>
       <AdminLeakRiver />
+      <AdminLeakVintage />
       <AdminLeakUltra />
       <AdminLeakStronghold />
     </div>

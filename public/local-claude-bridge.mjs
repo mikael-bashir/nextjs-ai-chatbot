@@ -1918,11 +1918,15 @@ const STRATEGIES = {
   // LeanArchitect toolchain via Leak XI/XII/XIV. Driven by Grok (xAI API),
   // not the Claude CLI — see proveArchitect.
   //
-  // Three variants, each an ablation of the one before it, so the research
-  // tables isolate exactly one change at a time:
-  //   river-stone  CONTROL — the paper as written, nothing added.
-  //   river-gate   + shared dead-end ledger across node provers.
-  //   river-delta  + a one-shot local Sonnet 5 natural-language proof seed.
+  // Four variants. stone→gate→delta is an ablation ladder (each adds exactly
+  // one change to the one before); vintage branches off STONE so its numbers
+  // isolate exactly one change too — the oversight watchers — with no ledger
+  // or NL seed mixed in:
+  //   river-stone    CONTROL — the paper as written, nothing added.
+  //   river-gate     + shared dead-end ledger across node provers.
+  //   river-delta    + a one-shot local Sonnet 5 natural-language proof seed.
+  //   river-vintage  Stone + the oversight watchers (per-node interceptor,
+  //                  run-wide mechanic). Own research table.
   "river-stone": {
     label: "Leak River Stone — CONTROL: bare Goedel blueprint pipeline, isolated nodes",
     node: (t, m, x) => architectProverSystem(),
@@ -1946,6 +1950,14 @@ const STRATEGIES = {
     search: 0,
     style: "architect",
     architect: { shareDeadEnds: true, nlSeedLocal: true },
+  },
+  "river-vintage": {
+    label: "Leak River Vintage — Stone + oversight watchers (interceptor per node, mechanic run-wide)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false, watchers: true },
   },
   // ---- Leak Ultra family -------------------------------------------------------
   // The same Goedel blueprint pipeline as Leak River Stone — identical prompts,
@@ -4422,6 +4434,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     // message alternation the API requires stays intact.
     if (pendingConsult) {
       trace.consults += 1
+      if (ctx.metrics) ctx.metrics.consults = (ctx.metrics.consults || 0) + 1
       emitL({
         type: "message-annotation",
         subtype: "status",
@@ -4463,6 +4476,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       const iv = trace.interceptVerdict
       trace.interceptVerdict = null
       if (iv.action === "abort") {
+        if (ctx.metrics) ctx.metrics.interceptor_aborts = (ctx.metrics.interceptor_aborts || 0) + 1
         emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor ABORT — continuing judged futile:\n${iv.note}` })
         messages.push({
           role: "user",
@@ -4471,6 +4485,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         return { finalText: await forceForfeit(), exhausted: true }
       }
       trace.lastInjectedSub = trace.submissions
+      if (ctx.metrics) ctx.metrics.interceptor_notes = (ctx.metrics.interceptor_notes || 0) + 1
       emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor note:\n${iv.note}` })
       messages.push({
         role: "user",
@@ -5716,6 +5731,7 @@ ${window.map((f) => `[${f.t}s #${f.seq}] ${f.text}`).join("\n\n")}`
     const key = shortHash(note.toLowerCase().replace(/\s+/g, " ").slice(0, 200))
     if (mech.seen.has(key)) continue
     mech.seen.add(key)
+    if (ctx.metrics) ctx.metrics.mechanic_notes = (ctx.metrics.mechanic_notes || 0) + 1
     const target = String(v?.target || "log").trim()
     if (target === "refinement") {
       // Rate limit: refinement-routed notes proved the spam channel (a false
@@ -6706,8 +6722,8 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       // elaborated form, and the facts it was given — enough to judge the
       // attempts cold, nothing about the current tactic fixation.
       consultContext: `${node.signature.trim()}${node.elaborated ? `\nAs Lean elaborates it: ${node.elaborated}` : ""}\n\nDeclared facts available to the prover:\n${parents || "(none)"}`,
-      // Node conversations get the per-agent interceptor (see maybeIntercept).
-      intercept: true,
+      // Per-agent interceptor — river-vintage only (see state.watchers).
+      intercept: !!state.watchers,
     })
     if (out.done) {
       result.solved = !out.done.negated
@@ -6905,10 +6921,19 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     ctx.metrics.models_used = []
     ctx.metrics.driver = driver
   }
-  // The mechanic: run-wide watcher over the operator's own stream window,
-  // running in parallel for the whole run. Grok driver only — Ultra's CLI owns
-  // its own loop, so there is no turn boundary to inject at.
-  if (driver !== "claude") {
+  // The oversight watchers are a VARIANT property (river-vintage), exactly like
+  // the ledger and the NL seed — stone/gate/delta run without them so the
+  // research tables isolate one change at a time. Grok driver only — Ultra's
+  // CLI owns its own loop, so there is no turn boundary to inject at.
+  state.watchers = !!variant.watchers && driver !== "claude"
+  if (state.watchers) {
+    if (ctx.metrics) {
+      ctx.metrics.watchers = true
+      ctx.metrics.interceptor_notes = 0
+      ctx.metrics.interceptor_aborts = 0
+      ctx.metrics.mechanic_notes = 0
+      ctx.metrics.consults = 0
+    }
     const mechanic = architectMechanicStart(ctx, state)
     ctx.stopWatchers = mechanic.stop
   }
@@ -7001,7 +7026,7 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   ctx.emit({
     type: "message-annotation",
     subtype: "status",
-    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${driver === "claude" ? "claude CLI" : "grok API"}:${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"}\n   toolchain=${TOOLCHAINS.architect.lean} · Mathlib ${TOOLCHAINS.architect.mathlib} (${TOOLCHAINS.architect.group})`,
+    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${driver === "claude" ? "claude CLI" : "grok API"}:${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"} · watchers=${state.watchers ? "on (interceptor+mechanic)" : "off"}\n   toolchain=${TOOLCHAINS.architect.lean} · Mathlib ${TOOLCHAINS.architect.mathlib} (${TOOLCHAINS.architect.group})`,
   })
 
   // NL guidance is a VARIANT property, not a caller option. Honouring a supplied

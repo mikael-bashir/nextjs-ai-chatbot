@@ -9,10 +9,18 @@ if (!process.env.POSTGRES_URL) {
 // Research telemetry for the two prover systems under comparison this round:
 //   Leak River      — the Goedel-Architect-style blueprint pipeline (Grok driver),
 //                     in three variants distinguished by the `strategy` column:
-//                       river-stone  CONTROL: the paper as written.
-//                       river-gate   + shared dead-end ledger across node provers.
-//                       river-delta  + one-shot local Sonnet 5 NL-proof seed.
-//                     All three share one table so a single GROUP BY strategy
+//                       river-stone    CONTROL: the paper as written.
+//                       river-gate     + shared dead-end ledger across node provers.
+//                       river-delta    + one-shot local Sonnet 5 NL-proof seed.
+//                       river-vintage  Stone + oversight watchers (per-node
+//                                      interceptor, run-wide mechanic). Shares
+//                                      the columns (plus watcher counters) so it
+//                                      lives in the same physical table, but it
+//                                      is surfaced as its OWN research table —
+//                                      its rows are a separate ablation branch
+//                                      off Stone and must not be averaged into
+//                                      the stone→gate→delta ladder.
+//                     All variants share one table so a single GROUP BY strategy
 //                     compares them; the extra columns are null for variants that
 //                     don't produce them (e.g. cost_seed_usd only on delta).
 //   Leak Ultra      — Stone's blueprint pipeline driven by the LOCAL Claude CLI
@@ -163,6 +171,11 @@ async function ensureTables(): Promise<void> {
     'dead_ends_known integer',
     'lean_toolchain text',
     'mathlib_version text',
+    // river-vintage watcher telemetry (null for stone/gate/delta).
+    'interceptor_notes integer',
+    'interceptor_aborts integer',
+    'mechanic_notes integer',
+    'consults integer',
   ];
   for (const col of riverAdds) {
     await sql.query(
@@ -224,6 +237,13 @@ export interface RiverRunInput {
    *  facts learned. Null on the control, which runs without a ledger. */
   deadEndsShared?: number | null;
   deadEndsKnown?: number | null;
+  /** river-vintage watcher telemetry: notes/aborts the interceptor issued,
+   *  notes the mechanic issued, consultant fires. Null on stone/gate/delta,
+   *  which run without watchers. */
+  interceptorNotes?: number | null;
+  interceptorAborts?: number | null;
+  mechanicNotes?: number | null;
+  consults?: number | null;
   /** Lean toolchain + Mathlib version that certified this run (from the armed
    *  verifier group, NOT assumed) — needed to reproduce the row. */
   leanToolchain?: string | null;
@@ -244,8 +264,9 @@ export async function insertRiverRun(input: RiverRunInput): Promise<string> {
        completion_tokens, cached_tokens, cost_cap_hit, compute_budget_ms,
        time_elapsed_s, llm_calls, tool_calls, max_iters, blueprint_iterations,
        nodes_total, nodes_solved, nodes_forfeited, nodes_negated,
-       dead_ends_shared, dead_ends_known, lean_toolchain, mathlib_version,
-       final_proof, error, bridge_build, notes)
+       dead_ends_shared, dead_ends_known, interceptor_notes,
+       interceptor_aborts, mechanic_notes, consults, lean_toolchain,
+       mathlib_version, final_proof, error, bridge_build, notes)
     VALUES
       (${input.generatedItemId ?? null}, ${input.problemTitle ?? null},
        ${input.difficulty ?? null}, ${input.theoremName ?? null},
@@ -260,7 +281,9 @@ export async function insertRiverRun(input: RiverRunInput): Promise<string> {
        ${input.blueprintIterations ?? null}, ${input.nodesTotal ?? null},
        ${input.nodesSolved ?? null}, ${input.nodesForfeited ?? null},
        ${input.nodesNegated ?? null}, ${input.deadEndsShared ?? null},
-       ${input.deadEndsKnown ?? null}, ${input.leanToolchain ?? null},
+       ${input.deadEndsKnown ?? null}, ${input.interceptorNotes ?? null},
+       ${input.interceptorAborts ?? null}, ${input.mechanicNotes ?? null},
+       ${input.consults ?? null}, ${input.leanToolchain ?? null},
        ${input.mathlibVersion ?? null}, ${input.finalProof ?? null}, ${input.error ?? null},
        ${input.bridgeBuild ?? null}, ${input.notes ?? null})
     RETURNING id;
@@ -268,11 +291,25 @@ export async function insertRiverRun(input: RiverRunInput): Promise<string> {
   return rows[0].id as string;
 }
 
-export async function listRiverRuns(limit = 500): Promise<Record<string, unknown>[]> {
+export async function listRiverRuns(
+  limit = 500,
+  variant: 'core' | 'vintage' = 'core',
+): Promise<Record<string, unknown>[]> {
   await ensureTables();
-  const { rows } = await sql`
-    SELECT * FROM leak_river_runs ORDER BY created_at DESC LIMIT ${limit};
-  `;
+  // 'core' = the stone→gate→delta ablation ladder (plus legacy rows with no
+  // strategy); 'vintage' = the watcher branch, surfaced as its own table.
+  const { rows } =
+    variant === 'vintage'
+      ? await sql`
+          SELECT * FROM leak_river_runs
+          WHERE strategy = 'river-vintage'
+          ORDER BY created_at DESC LIMIT ${limit};
+        `
+      : await sql`
+          SELECT * FROM leak_river_runs
+          WHERE strategy IS DISTINCT FROM 'river-vintage'
+          ORDER BY created_at DESC LIMIT ${limit};
+        `;
   return rows;
 }
 

@@ -796,6 +796,11 @@ const RIVER_STRATEGIES: {
     label: 'Leak River Delta (+ Sonnet 5 NL seed)',
     note: 'Gate + one local Sonnet 5 call up front for a natural-language proof of the target, handed to blueprint generation as a structural guide (the paper’s §4.2 NL guidance). Refinement is deliberately left unseeded — it reasons from machine-checked diagnoses instead.',
   },
+  {
+    value: 'river-vintage',
+    label: 'Leak River Vintage (+ oversight watchers)',
+    note: 'Stone + the oversight watchers: a per-node interceptor (async semantic review of each prover\u2019s own trajectory \u2014 note or abort, the node never waits) and a run-wide mechanic reading the full admin stream window in parallel, routing judgements to live agents, refinement, or the log. Nodes stay fully isolated \u2014 no proof strategy is ever shared between siblings.',
+  },
 ];
 const isRiverStrategy = (s: string) =>
   s === 'architect' || s.startsWith('river-');
@@ -1583,6 +1588,11 @@ export function AdminPipeline() {
               nodesNegated: metrics?.nodes_negated ?? null,
               deadEndsShared: metrics?.dead_ends_shared ?? null,
               deadEndsKnown: metrics?.dead_ends_known ?? null,
+              // river-vintage watcher telemetry (absent on stone/gate/delta).
+              interceptorNotes: metrics?.interceptor_notes ?? null,
+              interceptorAborts: metrics?.interceptor_aborts ?? null,
+              mechanicNotes: metrics?.mechanic_notes ?? null,
+              consults: metrics?.consults ?? null,
             }
           : {
               ...common,

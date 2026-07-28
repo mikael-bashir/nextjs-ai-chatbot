@@ -26,6 +26,10 @@ interface RiverRow {
   max_iters: number | null;
   dead_ends_shared: number | null;
   dead_ends_known: number | null;
+  interceptor_notes: number | null;
+  interceptor_aborts: number | null;
+  mechanic_notes: number | null;
+  consults: number | null;
   verified: boolean | null;
   refuted: boolean | null;
   cost_usd: number | null;
@@ -106,6 +110,7 @@ const RIVER_LABELS: Record<string, string> = {
   'river-stone': 'Stone · control',
   'river-gate': 'Gate · ledger',
   'river-delta': 'Delta · ledger+NL',
+  'river-vintage': 'Vintage · watchers',
   architect: 'Stone · control (legacy tag)',
 };
 
@@ -378,6 +383,64 @@ export function AdminLeakRiver() {
               (drv ${fmtNum(r.cost_driver_usd, 3)} + seed $
               {fmtNum(r.cost_seed_usd, 3)})
             </span>
+          )}
+          {r.cost_cap_hit && (
+            <span className="text-amber-500" title="Hit the dollar cap">
+              💸 cap hit
+            </span>
+          )}
+          <Toolchain lean={r.lean_toolchain} mathlib={r.mathlib_version} />
+        </>
+      )}
+    />
+  );
+}
+
+// Leak River Vintage — Stone + the oversight watchers (per-node interceptor,
+// run-wide mechanic, full-log consultant). Its own table: a separate ablation
+// branch off Stone, not a rung of the stone→gate→delta ladder, so its rows
+// must not be averaged into the River comparison. Same row shape as River
+// plus the watcher counters.
+export function AdminLeakVintage() {
+  return (
+    <ResearchTable<RiverRow>
+      title="Leak River Vintage — research log"
+      subtitle="Stone + oversight watchers (Grok), one row per attempt"
+      endpoint="/api/admin/research/vintage"
+      renderExtra={(r) => (
+        <>
+          <span
+            className="rounded bg-amber-500/10 px-1.5 py-0.5 font-medium text-amber-700 dark:text-amber-400"
+            title="Stone's pipeline + interceptor (per node) + mechanic (run-wide)"
+          >
+            Vintage · watchers
+          </span>
+          <span title="Blueprint iterations reached / budget">
+            iter {r.blueprint_iterations ?? '—'}
+            {r.max_iters ? `/${r.max_iters}` : ''}
+          </span>
+          <span title="Nodes solved / total in the final blueprint">
+            nodes {r.nodes_solved ?? '—'}/{r.nodes_total ?? '—'}
+          </span>
+          {!!r.nodes_forfeited && (
+            <span title="Nodes forfeited">🏳️ {r.nodes_forfeited}</span>
+          )}
+          {!!r.nodes_negated && (
+            <span title="Nodes machine-disproved">🧨 {r.nodes_negated}</span>
+          )}
+          {(r.interceptor_notes ?? 0) + (r.interceptor_aborts ?? 0) > 0 && (
+            <span title="Interceptor notes injected (aborts of futile attempts)">
+              🕵️ {r.interceptor_notes ?? 0}
+              {r.interceptor_aborts ? ` (${r.interceptor_aborts} abort)` : ''}
+            </span>
+          )}
+          {!!r.mechanic_notes && (
+            <span title="Mechanic notes issued (to agents, refinement, or the log)">
+              🔧 {r.mechanic_notes}
+            </span>
+          )}
+          {!!r.consults && (
+            <span title="Stuck-loop consultant fires">🧑‍⚖️ {r.consults}</span>
           )}
           {r.cost_cap_hit && (
             <span className="text-amber-500" title="Hit the dollar cap">

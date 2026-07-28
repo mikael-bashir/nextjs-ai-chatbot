@@ -284,6 +284,9 @@ export function ProverPlayground() {
                 <option value="river-stone">Leak River Stone (control)</option>
                 <option value="river-gate">Leak River Gate (+ dead-end ledger)</option>
                 <option value="river-delta">Leak River Delta (+ Sonnet 5 NL seed)</option>
+                <option value="river-vintage">
+                  Leak River Vintage (+ oversight watchers)
+                </option>
               </optgroup>
             </select>
           </label>
