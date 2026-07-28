@@ -4452,6 +4452,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     // Every injection is mirrored to the stream (no silent side channel).
     const mechNotes = Array.isArray(trace?.mechanicNotes) ? trace.mechanicNotes.splice(0) : []
     for (const mn of mechNotes) {
+      trace.lastInjectedSub = trace.submissions
       emitL({ type: "message-annotation", subtype: "status", thought: `🔧 ${trace.agentId} · mechanic → this agent:\n${mn}`, watcher: "mechanic-inject" })
       messages.push({
         role: "user",
@@ -4469,6 +4470,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         })
         return { finalText: await forceForfeit(), exhausted: true }
       }
+      trace.lastInjectedSub = trace.submissions
       emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor note:\n${iv.note}` })
       messages.push({
         role: "user",
@@ -5537,7 +5539,12 @@ function maybeIntercept(ctx, state, trace, taskContext) {
   try {
     if (!trace || trace.interceptBusy) return
     if (trace.submissions < ARCHITECT_INTERCEPT_EVERY) return
-    if (trace.submissions - (trace.lastInterceptAt || 0) < ARCHITECT_INTERCEPT_EVERY) return
+    // Cooldown anchor is the LAST INJECTION of any watcher note, not just the
+    // last interceptor fire — observed live (count_div24): one node absorbed
+    // five same-topic notes in ~35s because interceptor and mechanic each
+    // re-flagged before the agent had even one submission to act on the first.
+    const anchor = Math.max(trace.lastInterceptAt || 0, trace.lastInjectedSub || 0)
+    if (trace.submissions - anchor < ARCHITECT_INTERCEPT_EVERY) return
     trace.lastInterceptAt = trace.submissions
     trace.interceptBusy = true
     architectIntercept(ctx, state, trace, taskContext)
@@ -5568,6 +5575,7 @@ What needs a NOTE (action "note"):
 When to ABORT (action "abort" — rare, high confidence only):
 - The agent is committed to disproving a statement on grounds you can see are false (e.g. the local-name misread above) and is spending its remaining budget on it.
 - Pure mechanical looping with the duplicate-guard already firing and no structural change across many submissions.
+- The window shows the same advice already injected (by you or the mechanic) two or more times and the submissions since then show NO structural change — a third note teaches nothing; hand the attempt to refinement instead.
 Never abort an agent that is still producing NEW errors — agents often self-correct; a premature abort kills a proof that was one submission away.
 
 Reply with STRICT JSON only, no prose, no fence:
@@ -5652,7 +5660,7 @@ You are the MECHANIC of a multi-agent Lean 4 theorem-proving pipeline (the Goede
 
 ## Output — STRICT JSON only, no prose, no fence
 {"verdicts": [{"target": "<agent id like A7, or \\"refinement\\", or \\"log\\">", "severity": "info" | "warn" | "critical", "note": "<=120 words, concrete and actionable>"}]}
-Empty verdicts ({"verdicts": []}) is the CORRECT output for a healthy window — prefer it. Never repeat a note you can see already addressed in the window; never target yourself; one note per distinct issue.`
+Empty verdicts ({"verdicts": []}) is the CORRECT output for a healthy window — prefer it. Never repeat a note you can see already addressed in the window; never target yourself; one note per distinct issue. An agent that was ALREADY given a note (by you or the interceptor) and has not yet had a few submissions to act on it must NOT be re-noted — the harness enforces a cooldown (re-injection only after ≥3 further submissions), so route follow-ups on an already-advised agent to "log" or "refinement" instead.`
 }
 
 async function architectMechanicTick(ctx, state, mech) {
@@ -5712,8 +5720,16 @@ ${window.map((f) => `[${f.t}s #${f.seq}] ${f.text}`).join("\n\n")}`
     }
     const liveEntry = target !== "log" ? state.liveTraces?.get?.(target) : null
     if (liveEntry?.trace) {
-      liveEntry.trace.mechanicNotes.push(note)
-      if (liveEntry.trace.mechanicNotes.length > 3) liveEntry.trace.mechanicNotes.shift()
+      const tr = liveEntry.trace
+      // Injection cooldown, shared with the interceptor: an agent that has an
+      // undelivered note pending, or fewer than 3 submissions since the last
+      // injected note, is NOT re-injected — the observation is logged instead.
+      // Advice needs runway to act before it is repeated at the agent.
+      if (tr.mechanicNotes.length || tr.submissions - (tr.lastInjectedSub || 0) < 3) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic [${sev}] (re: ${target}; injection cooldown — logged only):\n${note}`, watcher: "mechanic" })
+        continue
+      }
+      tr.mechanicNotes.push(note)
       // The delivery itself is announced here; the injection point mirrors the
       // full text when the agent actually reads it.
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic → ${target} [${sev}] (queued for its next turn):\n${note}`, watcher: "mechanic" })
