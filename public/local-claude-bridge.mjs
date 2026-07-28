@@ -20,8 +20,8 @@
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
 import { randomBytes, timingSafeEqual, randomUUID, createHash } from "node:crypto"
-import { mkdtempSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
+import { mkdtempSync, writeFileSync, readFileSync, renameSync } from "node:fs"
+import { tmpdir, homedir } from "node:os"
 import { join } from "node:path"
 
 // --- Resilience: never let a dropped socket take down the whole bridge. -------
@@ -6967,6 +6967,82 @@ async function proveArchitect(theorem, ctx, opts = {}) {
 }
 
 
+// ===========================================================================
+// PROOF BANK — a verified proof survives the runs that come after it
+// ---------------------------------------------------------------------------
+// The operator's own workflow exposed the gap: prove a test theorem on Ultra
+// to vet the statement, then A/B the same theorem on River — and if the River
+// run fails or is terminated, Ultra's certified proof is gone, because a
+// run's proof only ever existed in the SSE stream to the browser.
+//
+// So: every verified proof from a tree run is written to a small JSON file on
+// this machine, keyed by (normalized target signature, toolchain). One entry
+// per key — when River later proves what Ultra already proved ON THE SAME
+// TOOLCHAIN the entry is replaced, not duplicated; a proof at a DIFFERENT
+// toolchain is a different certificate and gets its own entry. The bank never
+// short-circuits a run (an A/B run must actually run); it only guarantees the
+// failure of a later run cannot lose the success of an earlier one. A failed
+// or terminated run that has a banked sibling gets that proof replayed into
+// its own transcript and `done` frame.
+const PROOF_BANK_PATH = process.env.LEAK_PROOF_BANK || join(homedir(), ".leak-proof-bank.json")
+
+function proofBankRead() {
+  try {
+    const o = JSON.parse(readFileSync(PROOF_BANK_PATH, "utf8"))
+    return o && typeof o === "object" && o.entries && typeof o.entries === "object" ? o : { entries: {} }
+  } catch {
+    return { entries: {} }
+  }
+}
+
+function proofBankWrite(bank) {
+  // Atomic on POSIX: a crash mid-write can never leave a half-written bank.
+  const tmp = `${PROOF_BANK_PATH}.tmp`
+  writeFileSync(tmp, JSON.stringify(bank, null, 2))
+  renameSync(tmp, PROOF_BANK_PATH)
+}
+
+function proofBankKey(theorem, toolchain) {
+  const sig = architectSignatureOf(theorem) || String(theorem || "")
+  const norm = sig.replace(/\s+/g, " ").replace(/^lemma\b/, "theorem").trim()
+  return { key: `${createHash("sha1").update(norm).digest("hex").slice(0, 16)}|${toolchain}`, sig: norm }
+}
+
+function proofBankStore({ theorem, toolchain, group, strategy, proof, runId }) {
+  try {
+    const { key, sig } = proofBankKey(theorem, toolchain)
+    const bank = proofBankRead()
+    const prior = bank.entries[key] || null
+    const now = new Date().toISOString()
+    bank.entries[key] = {
+      name: (/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/.exec(sig) || [])[1] || "",
+      signature: sig,
+      toolchain,
+      group: group || "",
+      strategy,
+      proof: String(proof || ""),
+      verifiedAt: now,
+      runId: runId || "",
+      // Provenance survives replacement: the vetting run stays on record even
+      // after a later same-toolchain success takes over the stored proof.
+      firstProvedBy: prior?.firstProvedBy || strategy,
+      firstProvedAt: prior?.firstProvedAt || now,
+    }
+    proofBankWrite(bank)
+    return { stored: true, replaced: !!prior, prior }
+  } catch (e) {
+    return { stored: false, error: String(e?.message || e) }
+  }
+}
+
+function proofBankFind(theorem, toolchain) {
+  try {
+    return proofBankRead().entries[proofBankKey(theorem, toolchain).key] || null
+  } catch {
+    return null
+  }
+}
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -7173,10 +7249,48 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           send({ type: "text-delta", content: "⚠️ Not accepted — the decomposition tree did not produce a verified, sorry-free proof of the target." })
         }
       }
-      send({ type: "done", metrics, verified: !!(ok && proof), proof })
+      const tc = `${metrics.lean_toolchain || "?"} / Mathlib ${metrics.mathlib_version || "?"}`
+      let banked = null
+      if (ok && proof) {
+        const b = proofBankStore({ theorem, toolchain: tc, group: metrics.verifier_group, strategy, proof, runId })
+        if (b.stored)
+          emit({
+            type: "message-annotation",
+            subtype: "status",
+            thought: b.replaced
+              ? `🏦 Proof banked (${tc}) — replaced the earlier same-toolchain entry (${b.prior.strategy}, ${b.prior.verifiedAt}); one proof per theorem per toolchain, first proved by ${b.prior.firstProvedBy || b.prior.strategy}.`
+              : `🏦 Proof banked (${tc}) — this certificate now survives any later failed run of the same theorem.`,
+          })
+        else emit({ type: "message-annotation", subtype: "status", thought: `⚠️ Proof bank write failed (${b.error}) — the proof is still in this transcript and the done frame.` })
+      } else {
+        banked = proofBankFind(theorem, tc)
+        if (banked) {
+          emit({
+            type: "message-annotation",
+            subtype: "status",
+            thought: `🏦 This run failed, but the theorem is NOT lost — a verified proof from an earlier run is banked (${banked.strategy}, ${banked.verifiedAt}, ${tc}).`,
+          })
+          send({
+            type: "text-delta",
+            content: `ℹ️ This run did not produce a proof, but an earlier run already did — banked on the same toolchain (strategy \`${banked.strategy}\`, ${banked.verifiedAt}), so nothing is lost:\n\n\`\`\`lean\n${banked.proof}\n\`\`\``,
+          })
+        }
+      }
+      send({ type: "done", metrics, verified: !!(ok && proof), proof, bankedProof: banked || undefined })
     } catch (e) {
       emit({ type: "error", message: `tree error: ${String(e?.message || e)}` })
-      send({ type: "done", metrics, verified: false, proof: "" })
+      // A terminated run lands here too — exactly the case the bank exists for.
+      let banked = null
+      try {
+        banked = proofBankFind(theorem, `${metrics.lean_toolchain || "?"} / Mathlib ${metrics.mathlib_version || "?"}`)
+      } catch {}
+      if (banked)
+        emit({
+          type: "message-annotation",
+          subtype: "status",
+          thought: `🏦 Run ended without a proof, but the theorem is NOT lost — a verified proof from an earlier run is banked (${banked.strategy}, ${banked.verifiedAt}).`,
+        })
+      send({ type: "done", metrics, verified: false, proof: "", bankedProof: banked || undefined })
     } finally {
       ACTIVE_RUNS.delete(runId)
       res.end()
@@ -7216,6 +7330,19 @@ const server = createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/health") {
       const v = await getVersion()
       return json(res, 200, { ok: v.ok, version: v.version, error: v.error })
+    }
+    // Read-only view of the proof bank. Default lists metadata (proof length
+    // in place of the proof text); ?full=1 includes the proofs themselves.
+    if (req.method === "GET" && url.pathname === "/proof-bank") {
+      const entries = Object.values(proofBankRead().entries).sort((a, b) =>
+        String(b.verifiedAt || "").localeCompare(String(a.verifiedAt || "")),
+      )
+      const full = url.searchParams.get("full") === "1"
+      return json(res, 200, {
+        path: PROOF_BANK_PATH,
+        count: entries.length,
+        entries: full ? entries : entries.map(({ proof, ...rest }) => ({ ...rest, proofChars: String(proof || "").length })),
+      })
     }
 
     // Compile a Lean script on the Lean daemon over MCP-SSE and hand back the

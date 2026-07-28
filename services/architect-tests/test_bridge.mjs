@@ -6,13 +6,19 @@
  * Run:  node services/architect-tests/test_bridge.mjs
  * Exit 0 = all green.
  */
-import { readFileSync } from "node:fs"
+import { readFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
 import { fileURLToPath } from "node:url"
 import { dirname, join } from "node:path"
 import { loadBridgeSymbols, bridgePath } from "./bridge-lib.mjs"
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CORPUS = JSON.parse(readFileSync(join(HERE, "corpus.json"), "utf8")).cases
+
+// Point the proof bank at a throwaway file BEFORE the module is evaluated —
+// PROOF_BANK_PATH is read from the environment at import time.
+const BANK_TMP = join(tmpdir(), `leak-proof-bank-test-${process.pid}.json`)
+process.env.LEAK_PROOF_BANK = BANK_TMP
 
 const M = await loadBridgeSymbols([
   "ARCHITECT_RESOURCE_RE",
@@ -38,6 +44,12 @@ const M = await loadBridgeSymbols([
   "diffLines",
   "ARCHITECT_CONSULT_STREAK",
   "ARCHITECT_CONSULT_MAX",
+  "PROOF_BANK_PATH",
+  "proofBankRead",
+  "proofBankWrite",
+  "proofBankKey",
+  "proofBankStore",
+  "proofBankFind",
 ])
 
 const fails = []
@@ -322,6 +334,39 @@ for (let i = 1; i <= 6; i++) M.traceSubmission(tr, "lean_compile", { code: `by v
 eq("history is a ring of the last 4 submissions", tr.history, ["by v3", "by v4", "by v5", "by v6"])
 ok("non-code tool calls do not enter the history", (M.traceSubmission(tr, "loogle_search", { query: "x" }), tr.history.length === 4))
 ok("consult fires at the 3rd identical error, bounded per conversation", M.ARCHITECT_CONSULT_STREAK === 2 && M.ARCHITECT_CONSULT_MAX >= 1)
+
+// ---------------------------------------------------------------------------
+console.log("\n== proof bank (a verified proof survives later failed runs) ==")
+// ---------------------------------------------------------------------------
+try { rmSync(BANK_TMP, { force: true }) } catch {}
+ok("bank path honours the env override", M.PROOF_BANK_PATH === BANK_TMP)
+const THM = "theorem bank_t : 1 = 1 := by\n  norm_num"
+const TC32 = "v4.32.0 / Mathlib v4.32.0"
+const TC29 = "v4.29.1 / Mathlib v4.29.1"
+
+const s1 = M.proofBankStore({ theorem: THM, toolchain: TC32, group: "architect", strategy: "leak-ultra", proof: "by rfl", runId: "r1" })
+ok("ultra's proof stored", s1.stored && !s1.replaced)
+const hit = M.proofBankFind(THM, TC32)
+ok("failed river run can retrieve it", hit && hit.proof === "by rfl" && hit.strategy === "leak-ultra")
+ok("missing entry is null, not a throw", M.proofBankFind("theorem other_t : 2 = 2 := by sorry", TC32) === null)
+
+const s2 = M.proofBankStore({ theorem: THM, toolchain: TC32, group: "architect", strategy: "river-stone", proof: "by norm_num", runId: "r2" })
+ok("same theorem + same toolchain REPLACES (no duplicate)", s2.stored && s2.replaced)
+ok("one entry per (theorem, toolchain)", Object.keys(M.proofBankRead().entries).length === 1)
+const after = M.proofBankFind(THM, TC32)
+ok("newest proof wins, provenance survives", after.proof === "by norm_num" && after.firstProvedBy === "leak-ultra")
+
+M.proofBankStore({ theorem: THM, toolchain: TC29, group: "stronghold", strategy: "have-tree", proof: "by decide", runId: "r3" })
+ok("a DIFFERENT toolchain is a separate certificate", Object.keys(M.proofBankRead().entries).length === 2)
+ok("each toolchain retrieves its own proof", M.proofBankFind(THM, TC29).proof === "by decide" && M.proofBankFind(THM, TC32).proof === "by norm_num")
+
+// Keying is on the normalized SIGNATURE: whitespace and the lemma/theorem
+// keyword must not fork entries, and the placeholder body must not matter.
+const k1 = M.proofBankKey("theorem bank_t : 1 = 1 := by\n  norm_num", TC32).key
+const k2 = M.proofBankKey("lemma  bank_t :  1 = 1 := by sorry", TC32).key
+ok("lemma/theorem + whitespace + body do not fork the key", k1 === k2)
+try { rmSync(BANK_TMP, { force: true }) } catch {}
+try { rmSync(`${BANK_TMP}.tmp`, { force: true }) } catch {}
 
 // ---------------------------------------------------------------------------
 console.log("\n== target pre-flight is advisory (source invariant) ==")

@@ -82,8 +82,13 @@ export function extract(names) {
   // Emit in source order so a `const` helper is never used before it is defined.
   included.sort((a, b) => at.get(a) - at.get(b))
   // The bridge's own node imports, re-supplied for extracted helpers that use
-  // them (shortHash → createHash). Unused imports are harmless in ESM.
-  const preamble = `import { createHash } from "node:crypto"\n\n`
+  // them (shortHash → createHash, proofBank* → fs/os/path). Unused imports are
+  // harmless in ESM.
+  const preamble =
+    `import { createHash } from "node:crypto"\n` +
+    `import { mkdtempSync, writeFileSync, readFileSync, renameSync } from "node:fs"\n` +
+    `import { tmpdir, homedir } from "node:os"\n` +
+    `import { join } from "node:path"\n\n`
   return preamble + included.map(sliceOf).join("\n\n") + `\n\nexport { ${names.join(", ")} }\n`
 }
 
