@@ -19,7 +19,7 @@
 
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
-import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto"
+import { randomBytes, timingSafeEqual, randomUUID, createHash } from "node:crypto"
 import { mkdtempSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -4155,7 +4155,21 @@ async function grokCall(state, messages, tools, ctx, callOpts = {}) {
     // split and token counts the research tables record. `state.usage` is
     // cumulative, so this is an assignment, not an accumulation.
     architectRecost(ctx, state)
-    return data.choices?.[0]?.message || { content: "" }
+    // Attach THIS call's own usage to the returned message. state.usage is
+    // shared by concurrently-running node provers, so a caller diffing it
+    // across a turn would bill itself for whatever siblings did in between —
+    // the same trap the cost accounting hit (see claudeArchitectLoop). Read by
+    // the per-turn telemetry only; nothing branches on it.
+    const out = data.choices?.[0]?.message || { content: "" }
+    try {
+      out.__usage = {
+        prompt: Number(usage.prompt_tokens) || 0,
+        completion: Number(usage.completion_tokens) || 0,
+        cached: Number(usage.prompt_tokens_details?.cached_tokens) || 0,
+        total: Number(usage.total_tokens) || 0,
+      }
+    } catch {}
+    return out
   }
 }
 
@@ -4203,7 +4217,7 @@ const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal with
 ## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
 ## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
 
-async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "" }) {
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "", trace = null }) {
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
@@ -4261,6 +4275,19 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     }
     const toolCalls = msg.tool_calls || []
     messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls.length ? toolCalls : undefined })
+    // (3) Turn envelope. Token counts come off THIS call (grokCall attaches
+    // them to the message) — never from a before/after diff of state.usage,
+    // which several node provers share concurrently and which would attribute
+    // siblings' tokens to whichever turn happened to straddle them.
+    if (trace) {
+      trace.turn += 1
+      const u = msg.__usage || {}
+      const parts = [`${trace.agentId} · turn ${trace.turn}/${hardTurns} · ${state.model}`]
+      if (u.total) parts.push(`tokens ${u.prompt || 0}→${u.completion || 0} (total ${u.total}${u.cached ? `, ${u.cached} cached` : ""})`)
+      parts.push(`stage ${state.stageTokens}/${tokenBudget}`)
+      parts.push(toolCalls.length ? `${toolCalls.length} tool call(s)` : "no tool call")
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ ${parts.join(" · ")}` })
+    }
     if (msg.content && msg.content.trim())
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${msg.content.trim()}` })
     if (!toolCalls.length) {
@@ -4297,6 +4324,11 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         input: JSON.stringify(args, null, 2),
       })
       const sig = `${toolName} ${JSON.stringify(args)}`
+      // (4) How this submission differs from THIS agent's previous one, and
+      // what it has stopped changing. Emitted before dispatch so the diff sits
+      // directly above the result it produced.
+      const subLog = traceSubmission(trace, toolName, args)
+      if (subLog) ctx.emit({ type: "message-annotation", subtype: "status", thought: subLog })
       let out
       if (seen.has(sig)) {
         out = {
@@ -4321,6 +4353,10 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       // being told it had already asked).
       if (!seen.has(sig) && !architectIsResourceFailure(out, outText)) seen.set(sig, outText.slice(0, 4000))
       ctx.emit({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
+      // (4b) Has the compiler's FIRST complaint moved? If not, whatever the
+      // model just edited is not the thing blocking it.
+      const resLog = traceResult(trace, outText)
+      if (resLog) ctx.emit({ type: "message-annotation", subtype: "status", thought: resLog })
       messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
       if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
     }
@@ -4343,7 +4379,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
 //     claimed success in prose (the failure mode that wasted whole Grok attempts);
 //   * cost is the CLI's own reported total_cost_usd, so Ultra needs no price
 //     table and cannot drift when published prices change.
-async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "", effort = "" }) {
+async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "", effort = "", trace = null }) {
   const tag = label ? `[${label}] ` : ""
   ctx.emit({
     type: "system",
@@ -4359,9 +4395,17 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
       description: fn.description,
       inputSchema: fn.parameters || { type: "object", properties: {} },
       run: async (args) => {
+        // Same submission telemetry as the Grok loop. This wrapper is the one
+        // place the Claude path funnels every tool call through, so the two
+        // drivers produce the same diagnostic stream from one hook each.
+        const subLog = traceSubmission(trace, fn.name, args || {})
+        if (subLog) ctx?.emit?.({ type: "message-annotation", subtype: "status", thought: subLog })
         const out = await exec(fn.name, args || {})
         if (out && out.__done) done = out.__done
-        return String(out?.report ?? JSON.stringify(out ?? ""))
+        const text = String(out?.report ?? JSON.stringify(out ?? ""))
+        const resLog = traceResult(trace, text)
+        if (resLog) ctx?.emit?.({ type: "message-annotation", subtype: "status", thought: resLog })
+        return text
       },
     })
   }
@@ -4446,8 +4490,23 @@ async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hard
 
 // Stage-level driver dispatch: the River family drives Grok over the xAI API,
 // Leak Ultra drives the local Claude CLI. Identical opts either way.
-const architectLoop = (ctx, state, opts) =>
-  state.driver === "claude" ? claudeArchitectLoop(ctx, state, opts) : grokLoop(ctx, state, opts)
+//
+// This is also where a conversation gets its identity. Minting the agent id
+// here rather than in each driver means the id rides the EXISTING `label` ->
+// `tag` prefix that both drivers already stamp on every emission, so every tool
+// call, tool result, assistant message and forfeit becomes attributable without
+// touching the emission plumbing. `trace` rides alongside for the same reason.
+const architectLoop = (ctx, state, opts) => {
+  const agentId = nextAgentId(state)
+  const trace = makeAgentTrace(agentId)
+  const label = opts.label ? `${agentId} · ${opts.label}` : agentId
+  ctx?.emit?.({
+    type: "system",
+    detail: contextManifest(agentId, state.model, String(opts.system || ""), String(opts.user || ""), opts.promptBlocks),
+  })
+  const next = { ...opts, label, trace }
+  return state.driver === "claude" ? claudeArchitectLoop(ctx, state, next) : grokLoop(ctx, state, next)
+}
 
 const ARCHITECT_COMPILE_TOOL = {
   type: "function",
@@ -5066,6 +5125,216 @@ function deadNameRender(state) {
       .join(", ")}.\n` +
     `These are settled facts, not warnings. Do not submit them, and do not submit a near-variant of one — a name that failed is usually a whole naming CONVENTION that failed, not one typo. ` +
     `When you need a name you are not certain of, settle it before you build on it: \`mathlib_search\` for the FACT you want, or a bare \`#check <name>\` exploration compile for a definitive yes/no on a specific name (several \`#check\`s fit in one call).`
+  )
+}
+
+// ── Agent telemetry ──────────────────────────────────────────────────────────
+//
+// Diagnostic only. Nothing here decides anything: no emission from this section
+// reaches a model, changes a gate, or alters control flow. It exists because a
+// real run was undiagnosable from its own log.
+//
+// What that run looked like: three node provers ran CONCURRENTLY, every one of
+// them labelled "attempt 1/9999", and their lean_compile/mathlib_search calls
+// interleaved into one flat stream with nothing saying which agent made which
+// call. Underneath that, one prover submitted NINE proofs whose first half was
+// byte-identical every time — the half carrying the error the compiler reported
+// first — while it rewrote the other half. The log could not show either fact.
+//
+// So: give every conversation a stable id (1), record the exact bytes it opened
+// with (2), envelope each turn (3), diff each submission against that agent's
+// own previous one and surface what never changes (4), and record the file the
+// daemon actually compiled next to the one the model wrote (5).
+const shortHash = (s) => createHash("sha1").update(String(s ?? "")).digest("hex").slice(0, 8)
+
+// (1) Stable per-conversation id. Minted at the single dispatch point so both
+// drivers inherit it through the existing `label` -> `tag` prefix, which is
+// already stamped on every emission either driver makes. Sequential within the
+// run and short enough to scan: A1, A2, … Concurrency is why the counter lives
+// on `state` (run-scoped) rather than in a module global — two runs in the same
+// bridge process must not share a numbering.
+function nextAgentId(state) {
+  if (!state) return "A?"
+  state.agentSeq = (Number(state.agentSeq) || 0) + 1
+  return `A${state.agentSeq}`
+}
+
+// (4) Per-agent submission history.
+//
+// `frozen` is the interesting one: the set of source lines present in EVERY
+// submission this agent has made. When a node stalls, that set is the part of
+// the proof the prover has stopped thinking about — and in the run that
+// motivated this, it contained the exact line the compiler kept rejecting.
+function makeAgentTrace(agentId) {
+  return {
+    agentId,
+    turn: 0,
+    submissions: 0,
+    lastCode: "",
+    frozen: null, // Set<string> | null (null = no submission yet)
+    lastFirstError: "",
+    repeatedFirstError: 0,
+  }
+}
+
+const normaliseLean = (s) =>
+  String(s ?? "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .trim()
+
+// Line-level comparison. Deliberately NOT a minimal-edit diff: when the model
+// edits a proof in place the line counts match and an index-wise compare is
+// exact; when they don't, a truthful summary beats a pretty-but-approximate
+// alignment. Bounded output either way.
+function diffLines(prev, next, maxShown = 12) {
+  const a = String(prev ?? "").split("\n")
+  const b = String(next ?? "").split("\n")
+  if (a.length !== b.length) {
+    return { sameShape: false, changed: Math.abs(a.length - b.length), lines: [`(${a.length} lines → ${b.length} lines)`] }
+  }
+  const lines = []
+  let changed = 0
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue
+    changed++
+    if (lines.length < maxShown * 2) {
+      lines.push(`  L${i + 1} - ${a[i].trim().slice(0, 140)}`)
+      lines.push(`  L${i + 1} + ${b[i].trim().slice(0, 140)}`)
+    }
+  }
+  return { sameShape: true, changed, lines }
+}
+
+// Called with the raw tool arguments BEFORE dispatch. Returns a rendered block
+// or "" (never throws — a telemetry bug must not cost a compile).
+function traceSubmission(trace, toolName, args) {
+  try {
+    if (!trace) return ""
+    const code = typeof args?.code === "string" ? args.code : ""
+    if (!code) return ""
+    trace.submissions += 1
+    const n = trace.submissions
+    const lines = code.split("\n").map((l) => l.trim()).filter(Boolean)
+    trace.frozen = trace.frozen === null ? new Set(lines) : new Set([...trace.frozen].filter((l) => lines.includes(l)))
+
+    const head = `${trace.agentId} · submission #${n} · ${code.split("\n").length} lines · sha ${shortHash(code)}`
+    if (n === 1) {
+      trace.lastCode = code
+      return `🧾 ${head} (first submission)`
+    }
+
+    const exact = code === trace.lastCode
+    const norm = normaliseLean(code) === normaliseLean(trace.lastCode)
+    const d = diffLines(trace.lastCode, code)
+    trace.lastCode = code
+
+    const verdict = exact
+      ? "IDENTICAL to the previous submission"
+      : norm
+        ? "WHITESPACE-ONLY change from the previous submission"
+        : d.sameShape
+          ? `${d.changed} line(s) changed`
+          : `reshaped (${d.lines[0]})`
+    // The signal the stalled run needed: most of the proof is untouched and the
+    // model is perturbing the rest. Two changed lines after several submissions
+    // is not iteration, it is a loop dodging the duplicate guard.
+    const churn = !exact && d.sameShape && d.changed > 0 && d.changed <= 2 && n >= 3 ? " ⚠️ minimal perturbation" : ""
+    const frozenNote =
+      trace.frozen && trace.frozen.size && n >= 3
+        ? `\n   ${trace.frozen.size} line(s) unchanged across all ${n} submissions — the prover has stopped editing them.`
+        : ""
+    return `🧾 ${head}\n   ${verdict}${churn}${frozenNote}${d.lines.length ? `\n${d.lines.join("\n")}` : ""}`
+  } catch {
+    return ""
+  }
+}
+
+// Called with the tool's report AFTER dispatch. Surfaces the case where the
+// compiler's FIRST complaint has not moved: whatever the model is editing, it
+// is not the thing blocking it.
+function traceResult(trace, outText) {
+  try {
+    if (!trace) return ""
+    const m = /line\s+(\d+),\s*col\s+\d+:\s*([^\n]{0,120})/i.exec(String(outText || ""))
+    if (!m) {
+      trace.lastFirstError = ""
+      trace.repeatedFirstError = 0
+      return ""
+    }
+    const sig = `${m[1]}|${m[2].trim()}`
+    if (sig === trace.lastFirstError) {
+      trace.repeatedFirstError += 1
+      if (trace.repeatedFirstError >= 2)
+        return `🔁 ${trace.agentId} · first compiler error UNCHANGED for ${trace.repeatedFirstError + 1} consecutive submissions — line ${m[1]}: ${m[2].trim()}`
+    } else {
+      trace.lastFirstError = sig
+      trace.repeatedFirstError = 0
+    }
+    return ""
+  } catch {
+    return ""
+  }
+}
+
+// (5) The daemon rebuilds a node submission under the canonical statement, so
+// the line numbers in its report are NOT the line numbers the model wrote. This
+// records both files and the measured offset.
+//
+// It only reports; it does not rewrite the diagnostics the model receives.
+// Remapping them is a real change to what the prover reads and belongs in its
+// own decision, not smuggled in behind a logging patch.
+function rebuildOffsetReport(submitted, rebuilt) {
+  try {
+    const a = String(submitted || "")
+    const b = String(rebuilt || "")
+    if (!a.trim() || !b.trim()) return ""
+    const aLines = a.split("\n")
+    const bLines = b.split("\n")
+    // Anchor on the first non-trivial submitted line that occurs exactly once
+    // in the rebuild — an unambiguous anchor or none at all.
+    let offset = null
+    // Bounded: an anchor is almost always found in the first handful of lines,
+    // and a diagnostic helper must not become the expensive part of a compile.
+    const scanLimit = Math.min(aLines.length, 60)
+    for (let i = 0; i < scanLimit; i++) {
+      const needle = aLines[i].trim()
+      if (needle.length < 8) continue
+      const hits = []
+      for (let j = 0; j < bLines.length; j++) if (bLines[j].trim() === needle) hits.push(j)
+      if (hits.length === 1) {
+        offset = hits[0] - i
+        break
+      }
+    }
+    const head = `📐 rebuild: submitted ${aLines.length} lines (sha ${shortHash(a)}) → compiled ${bLines.length} lines (sha ${shortHash(b)})`
+    if (offset === null) return `${head}\n   line offset: could not be measured (no unambiguous anchor line)`
+    if (offset === 0) return `${head}\n   line offset: 0 — reported line numbers match your submission`
+    return (
+      `${head}\n   line offset: ${offset > 0 ? "+" : ""}${offset} — a diagnostic reported at line N refers to submission line ${
+        offset > 0 ? `N-${offset}` : `N+${-offset}`
+      }`
+    )
+  } catch {
+    return ""
+  }
+}
+
+// (2) What the conversation actually opened with, hashed so two contexts can be
+// compared at a glance, plus which optional blocks were spliced in and how big
+// each was. A block that is silently absent is invisible in the prompt text but
+// obvious here.
+function contextManifest(agentId, model, system, user, blocks) {
+  const rows = Object.entries(blocks || {}).map(([name, text]) => {
+    const s = String(text || "")
+    return `   ${s ? "✓" : "·"} ${name}${s ? ` — ${s.length} chars` : " — absent"}`
+  })
+  return (
+    `${agentId} · context opened · model=${model}\n` +
+    `   system: ${system.length} chars, sha ${shortHash(system)}\n` +
+    `   user:   ${user.length} chars, sha ${shortHash(user)}\n` +
+    `   full:   sha ${shortHash(`${system} ${user}`)}\n` +
+    (rows.length ? `   blocks spliced into the user prompt:\n${rows.join("\n")}` : "")
   )
 }
 
@@ -5743,6 +6012,11 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           prefix,
           prelude,
         }, Number(NODE_TIMEOUT_MS))
+        // (5) The daemon compiles a REBUILT file, so its line numbers are not
+        // the model's. Record both and the measured offset. Report only — the
+        // diagnostics handed back to the model are untouched.
+        const offLog = rebuildOffsetReport(String(args.code || ""), r?.rebuilt)
+        if (offLog) ctx.emit({ type: "message-annotation", subtype: "status", thought: offLog })
         if (r.solve) {
           // Everything after the `:=` that starts the BODY -- not the first
           // `:=` in the text, which for a `let`-binding statement belongs to
@@ -5774,6 +6048,16 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
     const out = await architectLoop(ctx, state, {
       system: architectProverSystem(),
       user: user + deadNames + deadEnds + retryNote,
+      // (2) Declared, not inferred. Sniffing these back out of the assembled
+      // prompt by their headings would silently go wrong the day a heading is
+      // reworded; naming them here means the manifest is right by construction
+      // and an absent block reads as absent instead of as nothing at all.
+      promptBlocks: {
+        target: user,
+        "dead names (run ledger)": deadNames,
+        "dead ends (sibling ledger)": deadEnds,
+        "retry note": retryNote,
+      },
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_NODE_TOKENS,
@@ -5845,6 +6129,7 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
     const out = await architectLoop(ctx, state, {
       system,
       user: user + deadNames + retryNote,
+      promptBlocks: { "stage prompt": user, "dead names (run ledger)": deadNames, "retry note": retryNote },
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
