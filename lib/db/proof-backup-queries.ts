@@ -10,19 +10,15 @@ if (!process.env.POSTGRES_URL) {
 // The Postgres-side twin of the bridge's proof bank (local-claude-bridge.mjs
 // PROOF_BANK_PATH). Same reason, different host: a re-verify (river testing a
 // theorem ultra already vetted) PATCHes the admin panel's generated-problem
-// record in place — see updateGenerated() in lib/redis.ts — and a failed run
-// overwrites the flat `verified`/`proof` fields with false/''. `certs[]`
-// survives that PATCH untouched, but only items that were ALREADY re-verified
-// on a second toolchain have a populated `certs[]`; a single-toolchain item
-// (exactly what "prove on ultra, then try river once" produces) has none, so
-// certsOrFallback() in admin-pipeline.tsx returns [] the moment the flat
-// fields are blanked — the proof is gone from the UI's reach.
-//
-// So: every verified item's flat proof, AND every entry already in its
-// certs[], is snapshotted here — append-only in spirit (upserted by the same
-// (signature, toolchain) key as the bridge bank, never deleted) — before
-// updateGenerated() is allowed to blank a verified record. Independent of
-// whether the record's own certs[] happens to cover this toolchain.
+// record in place — see updateGenerated() in lib/redis.ts. A failed re-verify
+// USED TO overwrite the flat `verified`/`proof` fields with false/'' (and
+// since a single-toolchain item has no populated `certs[]` to fall back to,
+// certsOrFallback() in admin-pipeline.tsx would then return [] — the proof
+// gone from the UI's reach even though the certificate was still valid).
+// updateGenerated() now refuses that: a destructive patch keeps the existing
+// verified/proof untouched. This table remains as a durable, independent
+// snapshot of every verified item's flat proof + certs[] regardless — belt
+// and braces against any future code path that becomes destructive again.
 let tableEnsured = false;
 async function ensureTable(): Promise<void> {
   if (tableEnsured) return;

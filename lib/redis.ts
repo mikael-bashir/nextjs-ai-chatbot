@@ -278,12 +278,12 @@ function serializeGeneratedWrite<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
-// A verified proof is about to be REPLACED with an unverified/blank one.
+// A patch is about to REPLACE a verified proof with an unverified/blank one.
 // Recognizes both an explicit `verified: false` (a failed re-verify PATCH
 // always sends this) and a patch that blanks `proof` outright. A `lean` edit
 // in the SAME patch is a deliberate, legitimate invalidation (the statement
 // itself changed — the old proof no longer applies to anything), so that case
-// is excluded rather than backed up.
+// is excluded — updateGenerated() lets THAT one through.
 function isDestructiveVerifyPatch(
   rec: GeneratedRecord,
   patch: Partial<GeneratedRecord>,
@@ -297,9 +297,11 @@ function isDestructiveVerifyPatch(
 
 // Snapshot every certificate this record currently carries — the flat
 // verified/proof/toolchain fields (always present when `verified`) plus any
-// additional toolchains already accumulated in `certs[]` — before a patch is
-// allowed to blank the flat fields. Fire-and-forget: a backup failure must
-// never block or fail the actual re-verify PATCH the operator is waiting on.
+// additional toolchains already accumulated in `certs[]`. Called whenever a
+// destructive patch is caught (belt-and-braces: updateGenerated() no longer
+// lets it touch the live record, but this keeps a durable copy regardless).
+// Fire-and-forget: a backup failure must never block or fail the actual
+// re-verify PATCH the operator is waiting on.
 function backupBeforeOverwrite(rec: GeneratedRecord): void {
   void (async () => {
     try {
@@ -341,8 +343,18 @@ export async function updateGenerated(
       try {
         const rec = JSON.parse(raws[i]) as GeneratedRecord;
         if (rec.id === id) {
-          if (isDestructiveVerifyPatch(rec, patch)) backupBeforeOverwrite(rec);
-          const updated = { ...rec, ...patch, id: rec.id };
+          const destructive = isDestructiveVerifyPatch(rec, patch);
+          if (destructive) backupBeforeOverwrite(rec);
+          // A failed re-verify (or any patch that would blank a live
+          // certificate) must never destroy it — keep verified/proof exactly
+          // as they were; everything else in the patch (error message, cost
+          // fields, etc.) still applies. Without this, staging/promote read
+          // straight off these flat fields and a re-verify failure silently
+          // erased an already-proven problem's certificate.
+          const safePatch = destructive
+            ? { ...patch, verified: rec.verified, proof: rec.proof }
+            : patch;
+          const updated = { ...rec, ...safePatch, id: rec.id };
           await redis.lset(GENERATED_STORE_KEY, i, JSON.stringify(updated));
           return updated;
         }
