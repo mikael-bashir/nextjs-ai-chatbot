@@ -3806,6 +3806,13 @@ const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 5)
 // Claude CLI (one shot, no tools), so its cost is whatever the CLI reports as
 // total_cost_usd on its result frame — see architectNlSeed.
 const ARCHITECT_SEED_MODEL = process.env.ARCHITECT_SEED_MODEL || "claude-sonnet-5"
+// river-vintage only: divide the per-attempt budgets above by this before a
+// stuck blueprint/node attempt is forced to hand off. With watchers active to
+// correct attempts inline, a stuck attempt doesn't need the full rope stone
+// was tuned for — and without this, refinement (the architecture's "hindsight"
+// stage) could go unreached for 20+ minutes of wall-clock. Stone/gate/delta
+// are untouched (divisor 1) so their research numbers stay exactly as tuned.
+const ARCHITECT_VINTAGE_CUTOFF_DIVISOR = Number(process.env.ARCHITECT_VINTAGE_CUTOFF_DIVISOR || 5)
 
 // --- Cost accounting ---------------------------------------------------------
 // USD per MILLION tokens for the xAI models this pipeline drives. Keyed by
@@ -6742,9 +6749,10 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       exec,
       // Driver-specific: see ARCHITECT_NODE_HARD_TURNS above for why a shared
       // cap makes Ultra wait far longer per node than River before a stuck
-      // attempt hands off toward refinement.
-      hardTurns: ARCHITECT_NODE_HARD_TURNS[state.driver] || ARCHITECT_NODE_HARD_TURNS.grok,
-      tokenBudget: ARCHITECT_NODE_TOKENS_BY_DRIVER[state.driver] || ARCHITECT_NODE_TOKENS_BY_DRIVER.grok,
+      // attempt hands off toward refinement. Pre-scoped in state.nodeHardTurns/
+      // state.nodeTokenBudget — vintage runs these 1/ARCHITECT_VINTAGE_CUTOFF_DIVISOR.
+      hardTurns: state.nodeHardTurns,
+      tokenBudget: state.nodeTokenBudget,
       forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
       label: `node ⟪${node.name}⟫ · attempt ${attempt + 1}/${ARCHITECT_NODE_RETRIES}`,
       // What the consultant sees when this prover stalls: the node, its
@@ -6833,7 +6841,11 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
       promptBlocks: { "stage prompt": user, "dead names (run ledger)": deadNames, "retry note": retryNote },
       tools: [ARCHITECT_COMPILE_TOOL, ...ARCHITECT_SEARCH_TOOLS],
       exec,
-      tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
+      // Pre-scoped in state.blueprintTokenBudget — vintage runs this
+      // 1/ARCHITECT_VINTAGE_CUTOFF_DIVISOR, so a stuck attempt resets to a
+      // fresh one (with the watchers now attached, per the fix above) much
+      // sooner instead of burning its whole budget on one syntax loop.
+      tokenBudget: state.blueprintTokenBudget,
       label: `${stageLabel} · attempt ${attempt + 1}/${retries}`,
       effort,
       // Interceptor coverage — river-vintage only (state.watchers). BUG FIXED:
@@ -6966,6 +6978,11 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   // research tables isolate one change at a time. Grok driver only — Ultra's
   // CLI owns its own loop, so there is no turn boundary to inject at.
   state.watchers = !!variant.watchers && driver !== "claude"
+  // Earlier per-attempt cutoff, vintage-only — see ARCHITECT_VINTAGE_CUTOFF_DIVISOR.
+  const cutoffDivisor = state.watchers ? ARCHITECT_VINTAGE_CUTOFF_DIVISOR : 1
+  state.blueprintTokenBudget = Math.round(ARCHITECT_BLUEPRINT_TOKENS / cutoffDivisor)
+  state.nodeHardTurns = Math.max(4, Math.round((ARCHITECT_NODE_HARD_TURNS[driver] || ARCHITECT_NODE_HARD_TURNS.grok) / cutoffDivisor))
+  state.nodeTokenBudget = Math.round((ARCHITECT_NODE_TOKENS_BY_DRIVER[driver] || ARCHITECT_NODE_TOKENS_BY_DRIVER.grok) / cutoffDivisor)
   if (state.watchers) {
     if (ctx.metrics) {
       ctx.metrics.watchers = true
