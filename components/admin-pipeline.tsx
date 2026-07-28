@@ -113,16 +113,24 @@ const fmtPct = (n: number | null | undefined) =>
   n == null ? '—' : `${(n * 100).toFixed(0)}%`;
 import { MathMarkdown } from '@/components/math-markdown';
 
-// Lean pins per verifier group. These are NOT interchangeable: the original Leak
-// group (I/II/IV, gate = verify_full_script) runs 4.29.1, while the architect
-// group (XI/XII/XIV, gate = Leak XIV) runs 4.32.0. A proof certified by one does
-// not carry a claim about the other, so a run's toolchain is taken from the
-// bridge's own report (metrics.lean_toolchain) and only falls back to these when
-// an older bridge didn't send it. Keep in sync with TOOLCHAINS in the bridge.
-const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
-const MATHLIB_VERSION = 'v4.29.1';
-const ARCHITECT_TOOLCHAIN = 'leanprover/lean4:v4.32.0';
-const ARCHITECT_MATHLIB_VERSION = 'v4.32.0';
+// Lean pins per verifier group, the strategy catalogue and the strategy-family
+// predicates all live in lib/prover/strategies.ts — shared with the benchmark
+// console so the two can't drift apart. The pins are NOT interchangeable: the
+// original Leak group (I/II/IV, gate = verify_full_script) runs 4.29.1, while
+// the architect group (XI/XII/XIV, gate = Leak XIV) runs 4.32.0.
+import {
+  ARCHITECT_MATHLIB_VERSION,
+  ARCHITECT_TOOLCHAIN,
+  MATHLIB_VERSION,
+  RIVER_STRATEGIES,
+  TOOLCHAIN,
+  ULTRA_STRATEGIES,
+  enforcerLabelFor,
+  isArchitectStrategy,
+  isRiverStrategy,
+  isUltraStrategy,
+} from '@/lib/prover/strategies';
+import { recordResearchRun as postResearchRun } from '@/lib/research/record-run';
 
 // Generation needs no tools/MCP — run claude lean so each call carries ~4k
 // tokens of context instead of ~17k (default system prompt + tool schemas),
@@ -773,73 +781,10 @@ const ARCHITECT_DEFAULT_ITERS = 5;
 // pipeline needs — every dispatch path already funnels through it.
 const VERIFY_OFF = 'off';
 
-// The three Leak River variants, each an ablation of the one before it so the
-// research table isolates exactly one change at a time. `note` is shown in the
-// UI under the selector.
-const RIVER_STRATEGIES: {
-  value: string;
-  label: string;
-  note: string;
-}[] = [
-  {
-    value: 'river-stone',
-    label: 'Leak River Stone (control)',
-    note: 'Control: the Goedel-Architect paper as written — blueprint → parallel isolated node provers → refinement. Nothing added.',
-  },
-  {
-    value: 'river-gate',
-    label: 'Leak River Gate (+ dead-end ledger)',
-    note: 'Stone + a shared dead-end ledger: environment facts the compiler establishes on one node (names that do not exist, unavailable typeclasses, coercion traps) are pooled and handed to sibling nodes, so no two nodes independently rediscover the same wall. Proof strategy is never shared.',
-  },
-  {
-    value: 'river-delta',
-    label: 'Leak River Delta (+ Sonnet 5 NL seed)',
-    note: 'Gate + one local Sonnet 5 call up front for a natural-language proof of the target, handed to blueprint generation as a structural guide (the paper’s §4.2 NL guidance). Refinement is deliberately left unseeded — it reasons from machine-checked diagnoses instead.',
-  },
-  {
-    value: 'river-vintage',
-    label: 'Leak River Vintage (+ oversight watchers)',
-    note: 'Stone + the oversight watchers: a per-node interceptor (async semantic review of each prover\u2019s own trajectory \u2014 note or abort, the node never waits) and a run-wide mechanic reading the full admin stream window in parallel, routing judgements to live agents, refinement, or the log. Nodes stay fully isolated \u2014 no proof strategy is ever shared between siblings.',
-  },
-];
-const isRiverStrategy = (s: string) =>
-  s === 'architect' || s.startsWith('river-');
+// RIVER_STRATEGIES / ULTRA_STRATEGIES and the family predicates are imported
+// from lib/prover/strategies.ts (shared with the benchmark console).
 
-// Leak Ultra — Stone's blueprint pipeline with the LOCAL Claude CLI as driver, on
-// whatever model the dropdown says. Same Leak XI/XII/XIV gates as River, so it
-// shares the architect toolchain, but its own research table: the driver differs,
-// so its rows are not a River ablation.
-const ULTRA_STRATEGIES: { value: string; label: string; note: string }[] = [
-  {
-    value: 'ultra-fleeting',
-    label: 'Leak Ultra Fleeting (Claude driver)',
-    note: "Stone's pipeline — identical prompts, tool contract and gates — driven by the local Claude CLI instead of the xAI API, on the model selected above. The bridge serves lean_compile/mathlib_search to the CLI from a local MCP server so the compile gate stays bridge-side; cost is the CLI's own reported total_cost_usd, so no price table is involved.",
-  },
-];
-const isUltraStrategy = (s: string) => s.startsWith('ultra-');
-// Both families run the architect orchestrator (and therefore Leak XI/XII/XIV).
-const isArchitectStrategy = (s: string) =>
-  isRiverStrategy(s) || isUltraStrategy(s);
-
-// Human-readable "who enforced this" name for the certificate's Enforcer line
-// (e.g. "Leak Ultra Fleeting", "Leak River Gate") — distinct per strategy,
-// replacing the bland "Leak" every certificate showed before this existed.
-const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
-  hacker: 'Leak Hacker',
-  pantograph: 'Leak Pantograph',
-  librarian: 'Leak Librarian',
-  sketch: 'Leak Sketch',
-  brute: 'Leak Brute',
-  have: 'Leak Have',
-  'have-tree': 'Leak Stronghold Dark',
-};
-function enforcerLabelFor(strategy: string): string {
-  const river = RIVER_STRATEGIES.find((s) => s.value === strategy);
-  if (river) return river.label.split('(')[0].trim();
-  const ultra = ULTRA_STRATEGIES.find((s) => s.value === strategy);
-  if (ultra) return ultra.label.split('(')[0].trim();
-  return STRONGHOLD_ENFORCER_LABELS[strategy] ?? 'Leak';
-}
+// enforcerLabelFor is imported from lib/prover/strategies.ts.
 
 // Replace this toolchain's entry (re-verifying the same toolchain updates it
 // in place) or append a new one (a genuinely new toolchain). Never grows
@@ -1471,10 +1416,10 @@ export function AdminPipeline() {
   };
 
   // Research telemetry: one row per verification ATTEMPT into whichever table
-  // matches the strategy that ran — Leak River (architect) or Leak Stronghold
-  // (every Claude-driven strategy: hacker/pantograph/librarian/sketch/brute/
-  // have/have-tree, or the plain single-agent CLI with decompose off). Fire-
-  // and-forget: recording must never affect the verify loop.
+  // matches the strategy that ran — Leak River / Leak Ultra (architect) or Leak
+  // Stronghold (every other Claude-driven strategy). The row is built and filed
+  // by lib/research/record-run.ts, shared with the benchmark console so both
+  // produce identical rows. Fire-and-forget: it must never affect the verify loop.
   const recordResearchRun = useCallback(
     (args: {
       item: GeneratedItem;
@@ -1490,125 +1435,13 @@ export function AdminPipeline() {
       nlSeedUsed: boolean;
       seedUsed: boolean;
     }) => {
-      const {
-        item,
-        strategy,
-        model,
-        verified,
-        refuted,
-        costUsd,
-        computeBudgetMs,
-        metrics,
-        finalProof,
-        error,
-        nlSeedUsed,
-        seedUsed,
-      } = args;
-      const theoremName =
-        /(?:theorem|lemma)\s+([A-Za-z_][\w'.]*)/.exec(item.lean || '')?.[1] ??
-        null;
-      const common = {
+      const { item, ...rest } = args;
+      void postResearchRun({
+        ...rest,
         generatedItemId: item.id,
         problemTitle: item.questionTitle ?? item.problem?.slice(0, 80) ?? null,
         difficulty: item.difficulty ?? null,
-        theoremName,
         sorriedTheorem: item.lean || '',
-        model: model || null,
-        // Every model that actually served a call. The bridge reports this for
-        // River runs (driver + any ladder fallback + the Sonnet seed); for the
-        // Claude strategies the configured model is the only one that runs.
-        modelsUsed:
-          metrics?.models_used && metrics.models_used.length
-            ? metrics.models_used
-            : model
-              ? [model]
-              : null,
-        verified,
-        refuted,
-        costUsd: costUsd ?? null,
-        computeBudgetMs: computeBudgetMs ?? null,
-        timeElapsedS: metrics?.time_elapsed ?? null,
-        llmCalls: metrics?.llm_invocations ?? null,
-        toolCalls: metrics?.tools_invoked ?? null,
-        finalProof: finalProof || null,
-        error,
-        bridgeBuild: metrics?.bridge_build ?? null,
-        // The toolchain that ACTUALLY certified this run, as reported by the
-        // bridge from the armed verifier group. Falling back to the group implied
-        // by the strategy keeps older bridges honest rather than defaulting every
-        // row to 4.29.1, which would be a false claim for architect runs.
-        leanToolchain:
-          metrics?.lean_toolchain ??
-          (isArchitectStrategy(strategy) ? ARCHITECT_TOOLCHAIN : TOOLCHAIN),
-        mathlibVersion:
-          metrics?.mathlib_version ??
-          (isArchitectStrategy(strategy)
-            ? ARCHITECT_MATHLIB_VERSION
-            : MATHLIB_VERSION),
-      };
-      const path = isRiverStrategy(strategy)
-        ? '/api/admin/research/river'
-        : isUltraStrategy(strategy)
-          ? '/api/admin/research/ultra'
-          : '/api/admin/research/stronghold';
-      const body = isUltraStrategy(strategy)
-        ? {
-            ...common,
-            strategy,
-            // Claude CLI driver: one authoritative cost, one combined token
-            // total — no per-bucket counts and no driver/seed split to report.
-            tokens: metrics?.tokens ?? null,
-            costCapHit: metrics?.cost_cap_hit ?? null,
-            maxIters: metrics?.max_iters ?? null,
-            blueprintIterations: metrics?.blueprint_iterations ?? null,
-            nodesTotal: metrics?.nodes_total ?? null,
-            nodesSolved: metrics?.nodes_solved ?? null,
-            nodesForfeited: metrics?.nodes_forfeited ?? null,
-            nodesNegated: metrics?.nodes_negated ?? null,
-          }
-        : isRiverStrategy(strategy)
-        ? {
-              ...common,
-              // Which River variant ran — the GROUP BY key for the comparison.
-              strategy,
-              // Prefer the bridge's own observation of whether a seed was used
-              // (river-delta generates its own), falling back to what we sent.
-              nlSeedUsed: metrics?.nl_seed_used ?? nlSeedUsed,
-              costDriverUsd: metrics?.cost_driver_usd ?? null,
-              costSeedUsd: metrics?.cost_seed_usd ?? null,
-              promptTokens: metrics?.prompt_tokens ?? null,
-              completionTokens: metrics?.completion_tokens ?? null,
-              cachedTokens: metrics?.cached_tokens ?? null,
-              costCapHit: metrics?.cost_cap_hit ?? null,
-              maxIters: metrics?.max_iters ?? null,
-              blueprintIterations: metrics?.blueprint_iterations ?? null,
-              nodesTotal: metrics?.nodes_total ?? null,
-              nodesSolved: metrics?.nodes_solved ?? null,
-              nodesForfeited: metrics?.nodes_forfeited ?? null,
-              nodesNegated: metrics?.nodes_negated ?? null,
-              deadEndsShared: metrics?.dead_ends_shared ?? null,
-              deadEndsKnown: metrics?.dead_ends_known ?? null,
-              // river-vintage watcher telemetry (absent on stone/gate/delta).
-              interceptorNotes: metrics?.interceptor_notes ?? null,
-              interceptorAborts: metrics?.interceptor_aborts ?? null,
-              mechanicNotes: metrics?.mechanic_notes ?? null,
-              consults: metrics?.consults ?? null,
-            }
-          : {
-              ...common,
-              strategy,
-              haveCaseCount: finalProof
-                ? (finalProof.match(/\bhave\b/g) || []).length
-                : null,
-              checkpointUsed: seedUsed,
-            };
-      fetch(path, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(body),
-        keepalive: true,
-      }).catch(() => {
-        /* research logging must never affect the verify loop */
       });
     },
     [],
