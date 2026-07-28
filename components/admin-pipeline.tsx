@@ -369,7 +369,17 @@ Core requirements:
   2 = knowledge content up to early high / secondary school;
   3 = knowledge up to the end of sixth form / college;
   4 = built around a single advanced, university-level concept;
-  5 = several advanced concepts combined together.`;
+  5 = several advanced concepts combined together.
+
+DO NOT PROVE THE LEAN THEOREM. You write the STATEMENT only; its body must be
+exactly \`:= by sorry\`. Never emit \`decide\`, \`native_decide\`, \`norm_num\`,
+\`simp\`, \`rfl\` or any other tactic or term as the proof, and never try to
+discharge the goal in your head. State-of-the-art provers run downstream and
+that is their entire job — proving is not merely unnecessary here, it is a
+waste of your budget and it hands them a target that is not a clean goal.
+Note this is about the BODY only: where a mode below asks for a statement that
+is "decidable by decide/native_decide", that constrains the SHAPE OF THE CLAIM
+(a finite, checkable domain) — it is not permission to write the tactic.`;
 
 // Trapdoor, Integral and Mirage modes have no static block — their prompts are
 // built per-run around code-sampled recipes/instances (see the lib/generation

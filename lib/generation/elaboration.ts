@@ -73,9 +73,11 @@ export type BridgePost = (
  * single self-contained declaration (enforced by leanSplitsIntoSeparateDecl)
  * and assumes an ambient Mathlib, so the only thing missing is the import.
  *
- * The body is deliberately left as `sorry`: we are asking "does this SIGNATURE
- * elaborate?", not "is it provable?". `sorry` elaborates against any well-typed
- * goal, so any diagnostic that survives is a genuine statement defect.
+ * Whatever body the generator wrote is passed through untouched; a `:= by
+ * sorry` is appended only when there is no body at all. If a generator does
+ * emit a real tactic (`native_decide`, say), the daemon simply runs it and the
+ * verdict stands — the generator is told upstream not to attempt proofs, and
+ * that is where it is kept honest, not here.
  */
 export function buildElaborationScript(lean: string): string {
   const body = String(lean || '').trim();
