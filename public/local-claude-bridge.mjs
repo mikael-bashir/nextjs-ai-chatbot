@@ -3812,7 +3812,7 @@ const ARCHITECT_SEED_MODEL = process.env.ARCHITECT_SEED_MODEL || "claude-sonnet-
 // was tuned for — and without this, refinement (the architecture's "hindsight"
 // stage) could go unreached for 20+ minutes of wall-clock. Stone/gate/delta
 // are untouched (divisor 1) so their research numbers stay exactly as tuned.
-const ARCHITECT_VINTAGE_CUTOFF_DIVISOR = Number(process.env.ARCHITECT_VINTAGE_CUTOFF_DIVISOR || 5)
+const ARCHITECT_VINTAGE_CUTOFF_DIVISOR = Number(process.env.ARCHITECT_VINTAGE_CUTOFF_DIVISOR || 3)
 
 // --- Cost accounting ---------------------------------------------------------
 // USD per MILLION tokens for the xAI models this pipeline drives. Keyed by
