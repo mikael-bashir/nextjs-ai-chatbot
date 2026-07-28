@@ -46,7 +46,11 @@ import {
 } from '@/lib/generation/trapdoor';
 import {
   ElaborationUnavailableError,
+  MAX_REFORMALIZE_ATTEMPTS,
+  REFORMALIZER_SYSTEM_PROMPT,
   checkStatementElaborates,
+  parseReformalized,
+  reformalizePrompt,
 } from '@/lib/generation/elaboration';
 import {
   INTEGRAL_VERIFIER_SYSTEM_PROMPT,
@@ -214,6 +218,17 @@ const GAUNTLET_JUDGE_RUN_OPTIONS = {
   model: GAUNTLET_MODEL,
   systemPrompt: GAUNTLET_JUDGE_SYSTEM_PROMPT,
   timeoutMs: GAUNTLET_TIMEOUT_MS,
+};
+
+// Re-formalization: rewrite a Lean statement that failed to compile, keeping
+// the problem. Pure formalization work against a concrete compiler error, so a
+// mid-tier model is enough and no tools are needed — the daemon re-checks the
+// result anyway, which is the real verdict.
+const REFORMALIZER_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: REFORMALIZER_SYSTEM_PROMPT,
+  timeoutMs: 5 * 60 * 1000,
 };
 
 // Post-hoc level assessment: one cheap classification call per problem.
@@ -885,6 +900,7 @@ export function AdminPipeline() {
     | 'idle'
     | 'generating'
     | 'elaborating'
+    | 'reformalizing'
     | 'validating'
     | 'gauntlet'
     | 'assessing'
@@ -2421,14 +2437,6 @@ export function AdminPipeline() {
         }\n\n----- raw output (${raw.length} chars) -----\n${raw || '(empty)'}`;
         throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
       }
-      if (leanSplitsIntoSeparateDecl(gen.lean)) {
-        throw Object.assign(
-          new Error(
-            `Discarded — Lean statement splits into a separate def + theorem; the formalization must condense everything into the theorem's own signature`,
-          ),
-          { detail: gen.lean },
-        );
-      }
       setStats((s) => ({ ...s, generated: s.generated + 1 }));
       pushGenEvent('text', `Generated: ${gen.questionTitle ?? 'untitled'}`, {
         detail: raw,
@@ -2449,51 +2457,129 @@ export function AdminPipeline() {
         });
       }
 
-      // STATEMENT PRE-CHECK: does the Lean theorem actually ELABORATE?
-      // Runs before every paid stage below, because a statement that doesn't
-      // typecheck is unprovable no matter how good the mathematics is — the
-      // prover's target signature is immutable, so blueprint refinement can
-      // never repair the theorem's own opening line and burns its whole
-      // iteration budget rediscovering an edit it isn't allowed to make.
-      // One Lean compile here replaces a full forfeited prover run.
-      if (statementCheckRef.current !== 'off') {
-        setGenStage('elaborating');
-        let verdict: Awaited<ReturnType<typeof checkStatementElaborates>>;
+      // STATEMENT PRE-CHECK, then REPAIR — never discard the mathematics.
+      //
+      // A failed elaboration condemns the Lean RENDERING, not the problem. The
+      // statement, answer, insight and hidden chain are all still good and are
+      // the expensive part; the theorem is a cheap re-derivable view of them.
+      // So a compile failure feeds the exact compiler errors back and asks for
+      // a corrected statement for the SAME problem, up to
+      // MAX_REFORMALIZE_ATTEMPTS times. Binning a sound problem over a
+      // typeclass slip would also contradict the doctrine this pipeline already
+      // took from VHG: nothing valid is ever discarded.
+      //
+      // Running it before the paid stages still matters — a statement that
+      // never typechecks is unprovable (the prover's target signature is
+      // immutable, so refinement cannot repair the theorem's own opening line)
+      // and would forfeit a whole prover run.
+      const checkRemote = statementCheckRef.current !== 'off';
+      const leanFailures: { lean: string; errors: string }[] = [];
+      let leanOk = false;
+      for (let attempt = 0; ; attempt++) {
+        // Free, local, and the same repair fixes it, so it shares the loop.
+        const structural = leanSplitsIntoSeparateDecl(gen.lean)
+          ? 'The submission was split into a separate top-level declaration plus the theorem. It must be ONE self-contained theorem: fold the helper into the signature as a bound variable plus hypotheses giving its defining equations.'
+          : '';
+        let errText = structural;
+        if (!structural) {
+          if (!checkRemote) {
+            leanOk = true;
+            break;
+          }
+          setGenStage('elaborating');
+          let verdict: Awaited<ReturnType<typeof checkStatementElaborates>>;
+          try {
+            // Through the Work bridge — the same one that just generated this,
+            // so the check needs nothing running that generation didn't.
+            verdict = await checkStatementElaborates(gen.lean, (path, init) =>
+              callBridge(true, path, init),
+            );
+          } catch (e) {
+            if (e instanceof ElaborationUnavailableError) {
+              // Infrastructure, not a verdict — surface it and stop WITHOUT
+              // touching the problem. Re-formalizing here would rewrite a
+              // statement that was never actually found wanting.
+              setCheckError(e.message);
+              pushGenEvent('error', 'Statement check unavailable', {
+                detail: e.message,
+              });
+              throw new Error(`Statement check unavailable — ${e.message}`);
+            }
+            throw e;
+          }
+          setCheckError(null);
+          pushGenEvent(
+            verdict.elaborates ? 'verified' : 'rejected',
+            `Statement check (${verdict.serverUrl ? new URL(verdict.serverUrl).host : 'Leak'}): ${
+              verdict.elaborates ? 'elaborates' : `${verdict.errors.length} error(s)`
+            }`,
+            { detail: verdict.raw },
+          );
+          if (verdict.elaborates) {
+            leanOk = true;
+            break;
+          }
+          errText = verdict.errors.join('\n') || verdict.raw;
+        }
+        leanFailures.push({ lean: gen.lean, errors: errText });
+        if (attempt >= MAX_REFORMALIZE_ATTEMPTS - 1) break;
+
+        setGenStage('reformalizing');
+        pushGenEvent(
+          'text',
+          `Re-formalizing (${attempt + 1}/${MAX_REFORMALIZE_ATTEMPTS - 1}) — keeping the problem, rewriting only the Lean`,
+          { detail: errText },
+        );
+        let rf: BridgeRunResult;
         try {
-          // Through the Work bridge — the same one that just generated this, so
-          // the check needs nothing running that generation didn't already.
-          verdict = await checkStatementElaborates(gen.lean, (path, init) =>
-            callBridge(true, path, init),
+          rf = await runBridgeStream(
+            true,
+            {
+              prompt: reformalizePrompt(
+                gen.problem || '',
+                gen.answer ?? '',
+                leanFailures,
+              ),
+              options: REFORMALIZER_RUN_OPTIONS,
+            },
+            'Re-formalizer',
+            ctrl.signal,
           );
         } catch (e) {
-          if (e instanceof ElaborationUnavailableError) {
-            // Infrastructure, not a verdict — surface it in the UI and stop.
-            // Discarding the problem here would blame the generator for a
-            // disconnected daemon.
-            setCheckError(e.message);
-            pushGenEvent('error', 'Statement check unavailable', {
-              detail: e.message,
-            });
-            throw new Error(`Statement check unavailable — ${e.message}`);
-          }
-          throw e;
+          if (ctrl.signal.aborted) throw new Error('Generation terminated by you');
+          pushGenEvent('error', 'Re-formalizer bridge call failed', {
+            detail: String(e),
+          });
+          break;
         }
-        setCheckError(null);
-        pushGenEvent(
-          verdict.elaborates ? 'verified' : 'rejected',
-          `Statement check (${verdict.serverUrl ? new URL(verdict.serverUrl).host : 'Leak'}): ${
-            verdict.elaborates ? 'elaborates' : `${verdict.errors.length} error(s)`
-          }`,
-          { detail: verdict.raw },
+        recordUsage(
+          rf.usage as Parameters<typeof recordUsage>[0],
+          (rf.costUsd as number | undefined) ?? null,
         );
-        if (!verdict.elaborates) {
-          throw Object.assign(
-            new Error(
-              `Discarded — Lean statement does not elaborate: ${verdict.errors[0] ?? 'unknown error'}`,
-            ),
-            { detail: `${gen.lean}\n\n----- compiler -----\n${verdict.raw}` },
-          );
+        const fixed = parseReformalized(String(rf.text || ''));
+        if (!fixed) {
+          pushGenEvent('error', 'Re-formalizer returned no usable statement', {
+            detail: String(rf.text || ''),
+          });
+          break;
         }
+        gen.lean = fixed.lean;
+        pushGenEvent('text', `New statement — ${fixed.fix || '(no note)'}`, {
+          detail: fixed.lean,
+        });
+      }
+      // Still broken after every repair attempt. The MATHEMATICS is untouched
+      // and worth keeping, so the problem is saved anyway — just held out of
+      // the prover queue, with the compiler output recorded so the Lean can be
+      // fixed by hand (the admin PATCH accepts `lean`). Discarding here is what
+      // this loop exists to prevent.
+      const leanNeedsHand = !leanOk;
+      if (leanNeedsHand) {
+        pushGenEvent(
+          'rejected',
+          `Lean still not elaborating after ${leanFailures.length} attempt(s) — saving the problem unqueued for a manual fix`,
+          { detail: leanFailures.at(-1)?.errors ?? '' },
+        );
       }
 
       // Integral mode: HARD verification (VHG Appendix E.3) before anything
@@ -2600,7 +2686,9 @@ export function AdminPipeline() {
       // proving the moment a real strategy is picked — the opposite of "just
       // generate". It stays in the generated history and can be queued by hand
       // later with "Verify again".
-      const verifyOff = verifyStrategyRef.current === VERIFY_OFF;
+      // A statement that never elaborated is also held back — proving it is
+      // impossible, so queueing it would only burn a forfeited run.
+      const verifyOff = verifyStrategyRef.current === VERIFY_OFF || leanNeedsHand;
       const res = await fetch('/api/admin/generated', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -2608,7 +2696,9 @@ export function AdminPipeline() {
           ...gen,
           verified: false,
           proof: '',
-          error: null,
+          error: leanNeedsHand
+            ? `Lean statement does not elaborate after ${leanFailures.length} re-formalization attempt(s) — the problem is kept; edit the Lean and re-queue. Last compiler output:\n${leanFailures.at(-1)?.errors ?? ''}`
+            : null,
           queued: !verifyOff,
           toolchain: TOOLCHAIN,
           genMode: modeRef.current,
@@ -2620,9 +2710,13 @@ export function AdminPipeline() {
         if (j.item) {
           setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
           if (verifyOff) {
-            pushGenEvent('done', 'Saved — verification off, not queued', {
-              verified: !gauntlet || !gauntlet.solved,
-            });
+            pushGenEvent(
+              'done',
+              leanNeedsHand
+                ? 'Saved — problem kept, Lean needs a manual fix (not queued)'
+                : 'Saved — verification off, not queued',
+              { verified: !gauntlet || !gauntlet.solved },
+            );
           } else {
             // Already persisted queued=true; just add to the in-memory queue.
             if (!queueRef.current.some((x) => x.id === j.item.id)) {

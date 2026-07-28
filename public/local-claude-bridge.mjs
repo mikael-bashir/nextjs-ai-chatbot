@@ -1472,7 +1472,25 @@ function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {})
             ? tools.find((t) => t.name === toolMatch) || tools.find((t) => String(t.name).endsWith(toolMatch))
             : tools.find((t) => toolMatch.test(t.name))
         if (!tool) throw new Error(`tool not found on server: ${toolMatch}`)
-        const r = await rpc("tools/call", { name: tool.name, arguments: args || {} })
+        // Adapt the argument KEY to THIS server's schema. The same logical tool
+        // is exposed with different parameter names across daemons (Leak IV's
+        // verify_full_script takes `script`, another takes `code`), so a
+        // hardcoded key passes on one server and fails pydantic validation on
+        // the rest — which then looks like a broken Lean statement rather than
+        // a wiring bug. Only remaps when the supplied keys do NOT fit and both
+        // sides have exactly one field, so a real multi-arg call is never
+        // silently rewritten.
+        let callArgs = args || {}
+        const props = tool?.inputSchema?.properties
+        if (props && typeof props === "object") {
+          const schemaKeys = Object.keys(props)
+          const givenKeys = Object.keys(callArgs)
+          const unknown = givenKeys.filter((k) => !schemaKeys.includes(k))
+          if (unknown.length && givenKeys.length === 1 && schemaKeys.length === 1) {
+            callArgs = { [schemaKeys[0]]: callArgs[givenKeys[0]] }
+          }
+        }
+        const r = await rpc("tools/call", { name: tool.name, arguments: callArgs })
         if (r?.error) throw new Error(`mcp RPC error: ${JSON.stringify(r.error)}`)
         const c = r?.result?.content
         const text = Array.isArray(c)
