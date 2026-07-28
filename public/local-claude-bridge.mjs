@@ -4038,6 +4038,8 @@ Three tools settle existence, and the difference between them is WHAT THEIR SILE
 
 A name that failed is usually a whole naming CONVENTION that failed, not one typo -- so after \`Nat.foo_of_bar\` comes back unknown, do not immediately try \`Nat.foo_of_baz\`. Search for the FACT instead: \`moogle_search\` the mathematics, then \`loogle_search\` or \`#check\` the candidate it gives you.
 
+SCOPE: \`loogle_search\` and \`moogle_search\` see ONLY the published Mathlib environment — NEVER declarations local to this problem (your target, its declared parent facts, blueprint \`def\`s such as helper sets). A zero-hit for a LOCAL name is expected and means NOTHING — it is not evidence the statement is ill-formed or false. Local names are settled with \`#check <name>\` via lean_compile, which DOES see them.
+
 ## Other outcomes
 If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.`
 
@@ -4247,7 +4249,7 @@ const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal with
 ## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
 ## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
 
-async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "", trace = null, consultContext = "" }) {
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "", trace = null, consultContext = "", intercept = false }) {
   const messages = [
     { role: "system", content: system },
     { role: "user", content: user },
@@ -4255,11 +4257,18 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
   state.stageTokens = 0
   let finalText = ""
   const tag = label ? `[${label}] ` : ""
+  // Every emission from THIS conversation is also appended to the agent's own
+  // rolling log (trace.streamLog) — the raw material the consultant and the
+  // interceptor read. Forwarding is unchanged; this only observes.
+  const emitL = (o) => {
+    traceLogPush(trace, o)
+    ctx.emit(o)
+  }
 
   // Full context this conversation opens with — every dialogue the operator
   // watches gets its own expandable "system" row before any turns happen, so
   // the exact SYSTEM + USER text handed to Grok is always inspectable live.
-  ctx.emit({
+  emitL({
     type: "system",
     detail: `${tag}Grok context opened (${state.model})\n\n--- SYSTEM ---\n${system}\n\n--- USER ---\n${user}`,
   })
@@ -4270,16 +4279,16 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
   const forceForfeit = async () => {
     if (!forfeitPrompt) return finalText
     messages.push({ role: "user", content: forfeitPrompt })
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Budget exhausted — requesting a structured forfeit.` })
+    emitL({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Budget exhausted — requesting a structured forfeit.` })
     try {
       // grace: allowed past the wall-clock deadline (one small no-tools call)
       // so refinement always gets its diagnosis, even on time exhaustion.
       const msg = await grokCall(state, messages, [], ctx, { grace: true })
       const text = String(msg.content || "") || finalText
-      if (text.trim()) ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${text}` })
+      if (text.trim()) emitL({ type: "message-annotation", subtype: "status", thought: `${tag}${text}` })
       return text
     } catch (e) {
-      ctx.emit({ type: "message-annotation", subtype: "error", thought: `${tag}Forfeit request failed: ${String(e?.message || e)}` })
+      emitL({ type: "message-annotation", subtype: "error", thought: `${tag}Forfeit request failed: ${String(e?.message || e)}` })
       return finalText
     }
   }
@@ -4300,7 +4309,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     try {
       msg = await grokCall(state, messages, tools, ctx)
     } catch (e) {
-      ctx.emit({ type: "message-annotation", subtype: "error", thought: `${tag}Grok call failed (turn ${turn + 1}): ${String(e?.message || e)}` })
+      emitL({ type: "message-annotation", subtype: "error", thought: `${tag}Grok call failed (turn ${turn + 1}): ${String(e?.message || e)}` })
       throw e
     }
     const toolCalls = msg.tool_calls || []
@@ -4316,10 +4325,10 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       if (u.total) parts.push(`tokens ${u.prompt || 0}→${u.completion || 0} (total ${u.total}${u.cached ? `, ${u.cached} cached` : ""})`)
       parts.push(`stage ${state.stageTokens}/${tokenBudget}`)
       parts.push(toolCalls.length ? `${toolCalls.length} tool call(s)` : "no tool call")
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ ${parts.join(" · ")}` })
+      emitL({ type: "message-annotation", subtype: "status", thought: `⏱️ ${parts.join(" · ")}` })
     }
     if (msg.content && msg.content.trim())
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${msg.content.trim()}` })
+      emitL({ type: "message-annotation", subtype: "status", thought: `${tag}${msg.content.trim()}` })
     if (!toolCalls.length) {
       finalText = String(msg.content || "")
       // Every registered exit is tool-driven (a lean_compile solve / a
@@ -4330,7 +4339,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       // paper's loop contract ("iterate until lean_compile reports ...").
       if (!/##\s*Diagnosis/i.test(finalText) && nudges < 2) {
         nudges++
-        ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}↩︎ Reply had no tool call — steering the prover back to lean_compile (nudge ${nudges}/2).` })
+        emitL({ type: "message-annotation", subtype: "status", thought: `${tag}↩︎ Reply had no tool call — steering the prover back to lean_compile (nudge ${nudges}/2).` })
         messages.push({
           role: "user",
           content: "Your reply was NOT submitted to the compiler — nothing is checked or registered unless you CALL the lean_compile tool. Never paste Lean code as chat text. Call lean_compile now with your full current candidate.",
@@ -4347,7 +4356,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       } catch {}
       ctx.metrics.tools_invoked += 1
       const toolName = tc.function?.name || "tool"
-      ctx.emit({
+      emitL({
         type: "message-annotation",
         subtype: "tool_intent",
         thought: `${tag}Using ${toolName}`,
@@ -4359,7 +4368,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       // what it has stopped changing. Emitted before dispatch so the diff sits
       // directly above the result it produced.
       const subLog = traceSubmission(trace, toolName, args)
-      if (subLog) ctx.emit({ type: "message-annotation", subtype: "status", thought: subLog })
+      if (subLog) emitL({ type: "message-annotation", subtype: "status", thought: subLog })
       let out
       if (seen.has(sig)) {
         out = {
@@ -4383,12 +4392,12 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
       // "maximum recursion depth has been reached" spent its remaining turns
       // being told it had already asked).
       if (!seen.has(sig) && !architectIsResourceFailure(out, outText)) seen.set(sig, outText.slice(0, 4000))
-      ctx.emit({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
+      emitL({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
       // (4b) Has the compiler's FIRST complaint moved? If not, whatever the
       // model just edited is not the thing blocking it.
       const resLog = traceResult(trace, outText)
       if (resLog) {
-        ctx.emit({ type: "message-annotation", subtype: "status", thought: resLog })
+        emitL({ type: "message-annotation", subtype: "status", thought: resLog })
         // The streak has a consumer now: a consultant with a fresh context.
         // Fired at the 3rd identical first-error, again 3 submissions later,
         // capped per conversation — a teammate's nudge, not a chaperone.
@@ -4400,6 +4409,12 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
         )
           pendingConsult = outText
       }
+      // Interceptor: a SEMANTIC watcher over this agent's own trajectory,
+      // fired off-thread every few submissions. Unlike the consultant's
+      // literal-string streak gate it can catch circling-but-not-identical
+      // failure, and unlike the consultant the agent NEVER waits for it —
+      // its verdict (if any) is read at the next injection point below.
+      if (intercept) maybeIntercept(ctx, state, trace, consultContext)
       messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
       if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
     }
@@ -4407,7 +4422,7 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
     // message alternation the API requires stays intact.
     if (pendingConsult) {
       trace.consults += 1
-      ctx.emit({
+      emitL({
         type: "message-annotation",
         subtype: "status",
         thought: `🧑‍⚖️ ${trace.agentId} · first error unmoved for ${trace.repeatedFirstError + 1} submissions — asking a consultant (fresh context, no stake in the current approach) for an outside view (${trace.consults}/${ARCHITECT_CONSULT_MAX}).`,
@@ -4418,21 +4433,51 @@ async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, ha
           taskContext: consultContext,
           history: trace.history,
           errorText: pendingConsult,
+          streamLog: trace.streamLog,
         })
         if (note) {
-          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant's review:\n${note}` })
+          emitL({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant's review:\n${note}` })
           messages.push({
             role: "user",
             content: `## Outside review\nA second model was shown your recent submissions and the compiler error that has not moved, with no other context. Its review:\n\n${note}\n\nAddress this before your next submission. If it identifies a type or coercion mismatch with a declared fact, do NOT retry the same rewrite — restructure or forfeit with that diagnosis.`,
           })
         }
       } catch (e) {
-        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant unavailable (${String(e?.message || e).slice(0, 120)}) — continuing without it.` })
+        emitL({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant unavailable (${String(e?.message || e).slice(0, 120)}) — continuing without it.` })
       }
+    }
+    // Watcher verdicts land HERE — after the turn's tool replies, so the
+    // assistant→tool alternation the API requires stays intact. The agent
+    // never waited on any of these; it only reads what has already arrived.
+    // Every injection is mirrored to the stream (no silent side channel).
+    const mechNotes = Array.isArray(trace?.mechanicNotes) ? trace.mechanicNotes.splice(0) : []
+    for (const mn of mechNotes) {
+      emitL({ type: "message-annotation", subtype: "status", thought: `🔧 ${trace.agentId} · mechanic → this agent:\n${mn}`, watcher: "mechanic-inject" })
+      messages.push({
+        role: "user",
+        content: `## Note from the run mechanic\nA system-wide watcher reading the whole run's live stream (context you cannot see) flagged this for you:\n\n${mn}\n\nWeigh it before your next submission; if it is wrong for your specific goal, say why in one line and continue.`,
+      })
+    }
+    if (trace?.interceptVerdict) {
+      const iv = trace.interceptVerdict
+      trace.interceptVerdict = null
+      if (iv.action === "abort") {
+        emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor ABORT — continuing judged futile:\n${iv.note}` })
+        messages.push({
+          role: "user",
+          content: `## Interceptor decision: this attempt stops now\nA watcher reviewing your recent trajectory concluded that continuing is futile:\n\n${iv.note}\n\nFold this into your forfeit diagnosis.`,
+        })
+        return { finalText: await forceForfeit(), exhausted: true }
+      }
+      emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor note:\n${iv.note}` })
+      messages.push({
+        role: "user",
+        content: `## Interceptor note\nA watcher reviewing your recent trajectory (a rolling window, not your full context) observes:\n\n${iv.note}\n\nAddress it if it is right; if it is wrong, say why in one line and continue.`,
+      })
     }
     architectCompact(messages)
   }
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}⛔ Hard turn cap (${hardTurns}) reached.` })
+  emitL({ type: "message-annotation", subtype: "status", thought: `${tag}⛔ Hard turn cap (${hardTurns}) reached.` })
   return { finalText: await forceForfeit(), exhausted: true }
 }
 
@@ -4575,7 +4620,11 @@ const architectLoop = (ctx, state, opts) => {
     detail: contextManifest(agentId, state.model, String(opts.system || ""), String(opts.user || ""), opts.promptBlocks),
   })
   const next = { ...opts, label, trace }
-  return state.driver === "claude" ? claudeArchitectLoop(ctx, state, next) : grokLoop(ctx, state, next)
+  // Live-agent registry: how the mechanic addresses a note to a conversation
+  // that is still running. Registered for the whole call, removed on exit.
+  if (state.liveTraces) state.liveTraces.set(agentId, { trace, label })
+  const run = state.driver === "claude" ? claudeArchitectLoop(ctx, state, next) : grokLoop(ctx, state, next)
+  return state.liveTraces ? run.finally(() => state.liveTraces.delete(agentId)) : run
 }
 
 const ARCHITECT_COMPILE_TOOL = {
@@ -5301,6 +5350,16 @@ function makeAgentTrace(agentId) {
     // material for "what has this agent actually been changing".
     history: [],
     consults: 0,
+    // This agent's own rolling activity log (rendered stream frames) — what the
+    // consultant reads in full and the interceptor reads a tail of.
+    streamLog: [],
+    // Interceptor bookkeeping: at most one judgement in flight, verdicts parked
+    // here until the loop's injection point reads them. The agent never waits.
+    lastInterceptAt: 0,
+    interceptBusy: false,
+    interceptVerdict: null,
+    // Mechanic notes addressed to THIS agent, parked until the injection point.
+    mechanicNotes: [],
   }
 }
 
@@ -5381,6 +5440,313 @@ function traceSubmission(trace, toolName, args) {
   }
 }
 
+// --- Stream rendering + rolling logs (shared by consultant/interceptor/mechanic)
+// One renderer produces the compact textual form of every SSE frame — the same
+// content the admin prover viewer shows the operator — so the run-scoped ring
+// (the mechanic's window) and each agent's own log (consultant/interceptor
+// material) are built from identical ground truth.
+function renderStreamFrame(obj) {
+  try {
+    if (!obj || typeof obj !== "object") return ""
+    const clip = (s, n) => {
+      s = String(s ?? "")
+      return s.length > n ? `${s.slice(0, n)} …[+${s.length - n} chars]` : s
+    }
+    if (obj.type === "message-annotation") {
+      if (obj.subtype === "tool_intent") return `TOOL_CALL → ${obj.tool || "tool"}\n${clip(obj.input, 700)}`
+      if (obj.subtype === "tool_result") return `TOOL_RESULT\n${clip(obj.output, 1000)}`
+      if (obj.subtype === "error") return `ERROR — ${clip(obj.thought, 700)}`
+      return `TEXT — ${clip(obj.thought, 1500)}`
+    }
+    // Context manifests + full prompts repeat identically per agent; the
+    // mechanic's brief already carries the stage contracts, so clip hard here.
+    if (obj.type === "system") return `SYSTEM — ${clip(obj.detail, 500)}`
+    if (obj.type === "error") return `ERROR — ${clip(obj.message, 500)}`
+    if (obj.type === "text-delta") return `TEXT — ${clip(obj.content, 400)}`
+    if (obj.type === "prompt") return "RECEIVED — run prompt captured (full stage contracts live in the run header)"
+    if (obj.type === "run") return "SYSTEM — run registered (budgets set)"
+    if (obj.type === "done") return `DONE — verified=${!!obj.verified}`
+    return ""
+  } catch {
+    return ""
+  }
+}
+
+// Append a rendered frame to one agent's own rolling log. Bounded; never throws
+// (telemetry must not cost a compile).
+function traceLogPush(trace, obj) {
+  try {
+    if (!trace || !Array.isArray(trace.streamLog)) return
+    const text = renderStreamFrame(obj)
+    if (!text) return
+    trace.streamLog.push(text)
+    if (trace.streamLog.length > 400) trace.streamLog.shift()
+  } catch {}
+}
+
+// A watcher (interceptor/mechanic) calls Grok through the SAME shared state so
+// cost/usage accounting stays correct — but with its OWN stageTokens, so a
+// watcher's tokens never eat the budget of the stage it is watching.
+// Object.create: reads fall through to the real state (shared usage object,
+// model, driver), the += on stageTokens lands on the proxy.
+function watcherStateOf(state) {
+  const w = Object.create(state)
+  w.stageTokens = 0
+  return w
+}
+
+// --- Local-name scope caveat (deterministic, no LLM) -------------------------
+// Observed twice in one run: a node prover loogle-searched a name declared in
+// its OWN blueprint file (`good_residues`), read the truthful "does not exist
+// in Mathlib" reply as proof the lemma statement was ill-formed, and forfeited
+// a TRUE node as STATEMENT_WRONG. loogle/moogle index the published Mathlib
+// environment only — they structurally cannot see local declarations, and
+// their zero-hit wording does not distinguish "absent from Mathlib" from
+// "not something I can even look at". The harness knows every locally-declared
+// name, so it settles this mechanically at the exact moment of confusion.
+function architectLocalScopeCaveat(queryText, localNames) {
+  try {
+    if (!localNames || !localNames.size) return ""
+    const toks = new Set(String(queryText || "").match(/[A-Za-z_][A-Za-z0-9_']*/g) || [])
+    const hits = [...localNames].filter((n) => toks.has(n))
+    if (!hits.length) return ""
+    const one = hits.length === 1
+    return (
+      `\n\n⚠️ SCOPE NOTE from the harness: ${hits.map((h) => `\`${h}\``).join(", ")} ${one ? "is" : "are"} declared locally in THIS run's blueprint file — ${one ? "it is not, and will never be, a Mathlib name" : "they are not, and will never be, Mathlib names"}. ` +
+      `loogle_search/moogle_search search ONLY the published Mathlib environment and can NEVER see local declarations, so this result says NOTHING about ${one ? "that name" : "those names"} — in particular it is NOT evidence that a statement using ${one ? "it" : "them"} is ill-formed or false. ` +
+      `To inspect a local name, use a bare \`#check ${hits[0]}\` exploration compile via lean_compile (no import line) — that DOES see local declarations.`
+    )
+  } catch {
+    return ""
+  }
+}
+
+// --- The interceptor: a per-agent semantic watcher ---------------------------
+// The consultant fires on a LITERAL streak (same first error, string-identical,
+// 3 times) and the agent waits for its reply. The interceptor is the other
+// half of the coverage: fired off-thread every few submissions, it judges the
+// agent's recent trajectory SEMANTICALLY — circling-but-not-identical failure,
+// a misread tool contract, building on an unverified claim — none of which a
+// string-match gate can see. The agent never waits for it; a verdict (if any)
+// is injected at the next turn boundary, and every injection is mirrored to
+// the stream. Scope is ONE agent's own window — never a sibling's (isolated
+// lasers stay isolated; see the mechanic for the run-wide view).
+const ARCHITECT_INTERCEPT_EVERY = Number(process.env.ARCHITECT_INTERCEPT_EVERY || 3)
+
+function maybeIntercept(ctx, state, trace, taskContext) {
+  try {
+    if (!trace || trace.interceptBusy) return
+    if (trace.submissions < ARCHITECT_INTERCEPT_EVERY) return
+    if (trace.submissions - (trace.lastInterceptAt || 0) < ARCHITECT_INTERCEPT_EVERY) return
+    trace.lastInterceptAt = trace.submissions
+    trace.interceptBusy = true
+    architectIntercept(ctx, state, trace, taskContext)
+      .then((v) => {
+        if (v && (v.action === "note" || v.action === "abort") && v.note) trace.interceptVerdict = v
+      })
+      .catch(() => {})
+      .finally(() => {
+        trace.interceptBusy = false
+      })
+  } catch {}
+}
+
+async function architectIntercept(ctx, state, trace, taskContext) {
+  const system = `You are the INTERCEPTOR for one agent in a multi-agent Lean 4 proving pipeline. You watch a rolling window of ONE prover's live activity (its turns, submissions with diffs, tool calls and compiler replies) and decide whether to interrupt. You are not the prover and you write no tactics.
+
+What is HEALTHY (do not interrupt):
+- Compiler errors that CHANGE between submissions — the agent is exploring; unique errors are progress.
+- Search calls followed by use of what was found.
+- Partial proofs with sorry placeholders being narrowed turn over turn.
+
+What needs a NOTE (action "note"):
+- Circling: submissions vary superficially (renamed hypotheses, reordered rewrites, permuted lemma variants) while failing in the same REGION for the same underlying reason, even when the literal error text differs each time.
+- A misread tool contract. Especially: loogle_search/moogle_search see ONLY the published Mathlib environment — never declarations local to this problem (the target, its parents, blueprint \`def\`s). A zero-hit on a LOCAL name is meaningless; treating it as evidence the statement is ill-formed is a critical misread. Local names are checked with \`#check\` via lean_compile.
+- Building multiple submissions on an unverified numeric or naming assumption a single #eval/#check would settle.
+- Ignoring an explicit hint already present in a tool reply (e.g. a search result that directly states the needed lemma).
+
+When to ABORT (action "abort" — rare, high confidence only):
+- The agent is committed to disproving a statement on grounds you can see are false (e.g. the local-name misread above) and is spending its remaining budget on it.
+- Pure mechanical looping with the duplicate-guard already firing and no structural change across many submissions.
+Never abort an agent that is still producing NEW errors — agents often self-correct; a premature abort kills a proof that was one submission away.
+
+Reply with STRICT JSON only, no prose, no fence:
+{"action": "silent" | "note" | "abort", "note": "<=120 words; empty when silent. Concrete: name the exact misread or the exact circling pattern and the ONE thing to do differently.>"}
+Prefer "silent" — a needless interruption is a real cost.`
+  const windowText = (trace.streamLog || []).slice(-30).join("\n\n").slice(-16000)
+  const user = `## The task this agent was given
+${String(taskContext || "").slice(0, 2500)}
+
+## The agent's recent activity window (oldest first)
+${windowText || "(no activity captured yet)"}`
+  const msg = await grokCall(
+    watcherStateOf(state),
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    [],
+    ctx,
+  )
+  const raw = String(msg?.content || "")
+  const m = raw.match(/\{[\s\S]*\}/)
+  if (!m) return { action: "silent", note: "" }
+  try {
+    const v = JSON.parse(m[0])
+    const action = ["silent", "note", "abort"].includes(v.action) ? v.action : "silent"
+    return { action, note: String(v.note || "").trim().slice(0, 1200) }
+  } catch {
+    return { action: "silent", note: "" }
+  }
+}
+
+// --- The mechanic: a run-wide watcher over the operator's own stream ---------
+// Every role above works from a NARROW context by design (isolated node
+// provers, a per-agent interceptor, a per-node diagnostician). The mechanic is
+// the one watcher with the OPERATOR's view: the full rolling window of the
+// admin prover viewer's stream, refreshed continuously, running in parallel
+// with the main loop and never gating it. It cannot compile, cannot edit the
+// blueprint, cannot change code — it only emits judgements, each routed to a
+// live agent, to the refinement stage's evidence, or to the log, and every
+// one of them is mirrored into the stream. Its own frames are tagged and
+// stripped from its next window, so it can never feed on its own output.
+//
+// Division of labour it must respect: the harness already DETERMINISTICALLY
+// catches identical resubmissions, literal error streaks (→ consultant),
+// unknown-name streaks (→ compile lock) and rebuild line offsets. The
+// mechanic's value is what needs judgement across agents and stages:
+// the same categorical mistake recurring in independent conversations, tool
+// misuse the per-agent watchers missed, blueprint-level trouble, harness
+// anomalies, and budget being visibly wasted.
+const ARCHITECT_MECHANIC_MIN_FRAMES = Number(process.env.ARCHITECT_MECHANIC_MIN_FRAMES || 15)
+const ARCHITECT_MECHANIC_INTERVAL_MS = Number(process.env.ARCHITECT_MECHANIC_INTERVAL_MS || 25000)
+const ARCHITECT_MECHANIC_WINDOW = Number(process.env.ARCHITECT_MECHANIC_WINDOW || 250)
+
+function architectMechanicBrief() {
+  return `## Role
+You are the MECHANIC of a multi-agent Lean 4 theorem-proving pipeline (the Goedel-Architect "Leak River" system). You watch the SAME live stream the human operator watches — a rolling window of every agent's turns, submissions, tool calls, compiler replies and harness telemetry — and you run in parallel with the main loop, analysing every role's behaviour the way the operator would. You make NO code changes and prove nothing yourself. Your only output is judgements: short notes routed to a live agent, to the refinement stage, or to the log.
+
+## The team you are watching
+- BLUEPRINT GENERATOR (C.1): one agent per iteration; decomposes the target theorem into a dependency graph of @[blueprint] declarations and must compile the main theorem's ASSEMBLY against sorried lemmas. Tools: lean_compile, loogle_search, moogle_search.
+- NODE PROVERS (C.2): one FRESH, ISOLATED agent per unproved node (ids A1, A2, ...). Each sees only its own node, its parents' proved facts, and a run-wide dead-names ledger. Isolation is DELIBERATE — many independent lasers cover more ground than a shared beam. Never suggest sharing strategies or lemmas between live sibling nodes.
+- CONSULTANT: fires inside a node when its literal first error is unchanged 3 submissions running; fresh context, reads the node's full log, the node WAITS for its reply.
+- INTERCEPTOR: per-node async watcher over that node's own recent window; can note or abort. The node never waits for it.
+- DIAGNOSTICIAN: after a node fails, classifies the failure (DISPROVED / SUSPECT_STATEMENT / PARENTS_MISSING / HARNESS_LIMIT / PROOF_TOO_HARD); every factual claim it makes is machine-checked before refinement sees it.
+- DOWNGRADE GUARD (deterministic): a prover claiming its statement is false WITHOUT a compiled disproof is downgraded to SUSPECT_STATEMENT so refinement may not delete a true lemma on a hunch.
+- REFINEMENT (C.3): the one graph-aware stage; reads every verdict and rewrites the graph between iterations. Your notes targeted "refinement" land in its evidence for the next iteration.
+- HARNESS (deterministic, no LLM): duplicate-submission cache, identical-error streak counter, unknown-name compile lock, blueprint sanity refutation gate, rebuild line-offset reports. Do not re-report what these already caught and announced — escalate only when they misfire or when the pattern is beyond them.
+
+## Tool ground truth (for spotting misuse)
+- lean_compile: compiles against Mathlib + this run's blueprint prelude; #eval/#check output is returned; ONLY a lean_compile solve registers.
+- loogle_search: exact name/type search over the PUBLISHED Mathlib environment. Zero hits proves a MATHLIB name absent — it says NOTHING about names declared locally in this run's blueprint (loogle cannot see those; \`#check\` can). An agent treating a local-name zero-hit as evidence its statement is ill-formed is making a critical misread — flag it immediately.
+- moogle_search: semantic search; always returns nearest neighbours; never evidence of absence.
+
+## What is GOOD (stay silent)
+- An agent whose compile errors CHANGE submission to submission — unique errors mean the model is trying things. This is the healthy baseline; do not interrupt it.
+- Search → confirm → apply chains; partial proofs narrowing; forfeits with honest structured diagnoses.
+
+## What needs ADDRESSING
+- The same error, or the same underlying mistake, again and again — within one agent (if the consultant/interceptor visibly missed it or already fired and it persists) or ACROSS independent agents (a pattern no per-agent watcher can see; usually means a tool contract or prompt is misleading everyone at once). Route to the affected live agent, or to refinement if it should reshape the graph.
+- System/harness issues: a tool systematically misread, line offsets that look wrong, a stage stalled with nothing in the stream, budget draining with no progress. Route to "log" — a log entry promoted into the stream is enough; the operator and refinement will see it.
+- Blueprint-generation issues: a graph whose decomposition is fighting the target's types, a false-looking closed statement, an assembly repeatedly failing for a structural reason. Route to the blueprint/refinement agent currently live (by its id) or to "refinement".
+
+## Output — STRICT JSON only, no prose, no fence
+{"verdicts": [{"target": "<agent id like A7, or \\"refinement\\", or \\"log\\">", "severity": "info" | "warn" | "critical", "note": "<=120 words, concrete and actionable>"}]}
+Empty verdicts ({"verdicts": []}) is the CORRECT output for a healthy window — prefer it. Never repeat a note you can see already addressed in the window; never target yourself; one note per distinct issue.`
+}
+
+async function architectMechanicTick(ctx, state, mech) {
+  const all = Array.isArray(ctx.streamLog) ? ctx.streamLog : []
+  const frames = all.filter((f) => !f.mech)
+  if (frames.length < 20) return
+  const newest = frames[frames.length - 1].seq
+  const freshCount = frames.filter((f) => f.seq > mech.lastSeq).length
+  if (!freshCount) return
+  if (freshCount < ARCHITECT_MECHANIC_MIN_FRAMES && Date.now() - mech.lastCallAt < ARCHITECT_MECHANIC_INTERVAL_MS) return
+  mech.lastSeq = newest
+  mech.lastCallAt = Date.now()
+  const window = frames.slice(-ARCHITECT_MECHANIC_WINDOW)
+  const live =
+    [...(state.liveTraces?.entries?.() || [])]
+      .map(([id, x]) => `- ${id} — ${String(x?.label || "agent").slice(0, 120)}`)
+      .join("\n") || "(none right now)"
+  const user = `## Live agents right now (address a note to one by its id)
+${live}
+
+## Rolling stream window — ${window.length} entries, oldest first (your own prior output removed)
+${window.map((f) => `[${f.t}s #${f.seq}] ${f.text}`).join("\n\n")}`
+  const msg = await grokCall(
+    mech.state,
+    [
+      { role: "system", content: architectMechanicBrief() },
+      { role: "user", content: user },
+    ],
+    [],
+    ctx,
+  )
+  const raw = String(msg?.content || "")
+  const m = raw.match(/\{[\s\S]*\}/)
+  if (!m) return
+  let verdicts = []
+  try {
+    const parsed = JSON.parse(m[0])
+    verdicts = Array.isArray(parsed?.verdicts) ? parsed.verdicts : []
+  } catch {
+    return
+  }
+  for (const v of verdicts.slice(0, 4)) {
+    const note = String(v?.note || "").trim().slice(0, 1200)
+    if (!note) continue
+    const sev = ["info", "warn", "critical"].includes(v?.severity) ? v.severity : "info"
+    // Dedup on content: the window rolls, so an unaddressed issue would
+    // otherwise be re-flagged every tick forever.
+    const key = shortHash(note.toLowerCase().replace(/\s+/g, " ").slice(0, 200))
+    if (mech.seen.has(key)) continue
+    mech.seen.add(key)
+    const target = String(v?.target || "log").trim()
+    if (target === "refinement") {
+      state.mechanicNotes.push(`[${sev}] ${note}`)
+      if (state.mechanicNotes.length > 12) state.mechanicNotes.shift()
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic → refinement [${sev}]:\n${note}`, watcher: "mechanic" })
+      continue
+    }
+    const liveEntry = target !== "log" ? state.liveTraces?.get?.(target) : null
+    if (liveEntry?.trace) {
+      liveEntry.trace.mechanicNotes.push(note)
+      if (liveEntry.trace.mechanicNotes.length > 3) liveEntry.trace.mechanicNotes.shift()
+      // The delivery itself is announced here; the injection point mirrors the
+      // full text when the agent actually reads it.
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic → ${target} [${sev}] (queued for its next turn):\n${note}`, watcher: "mechanic" })
+      continue
+    }
+    // "log" or a target that is no longer live — promote to the stream.
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic [${sev}]:\n${note}`, watcher: "mechanic" })
+  }
+}
+
+function architectMechanicStart(ctx, state) {
+  const mech = { stopped: false, lastSeq: 0, lastCallAt: 0, busy: false, seen: new Set(), state: watcherStateOf(state) }
+  ;(async () => {
+    while (!mech.stopped && !ctx.signal?.aborted) {
+      await new Promise((r) => setTimeout(r, 5000))
+      if (mech.stopped || ctx.signal?.aborted || mech.busy) continue
+      if (deadlinePassed(ctx) || architectCostCapHit(ctx)) continue
+      mech.busy = true
+      try {
+        await architectMechanicTick(ctx, state, mech)
+      } catch (e) {
+        // A watcher failure must never dent the run — note it once per message.
+        const t = `🔧 mechanic tick failed (${String(e?.message || e).slice(0, 140)}) — continuing.`
+        if (t !== mech.lastErr) ctx.emit({ type: "message-annotation", subtype: "status", thought: t, watcher: "mechanic" })
+        mech.lastErr = t
+      } finally {
+        mech.busy = false
+      }
+    }
+  })()
+  return { stop: () => (mech.stopped = true), mech }
+}
+
 // --- The consultant: a second model, called when the first is stuck ---------
 // A prover deep in a failing attempt reads its 20th pattern-mismatch error
 // with the same eyes that wrote the pattern. The telemetry already DETECTS
@@ -5393,16 +5759,20 @@ function traceSubmission(trace, toolName, args) {
 const ARCHITECT_CONSULT_STREAK = 2 // repeatedFirstError value → 3rd identical error
 const ARCHITECT_CONSULT_MAX = Number(process.env.ARCHITECT_CONSULT_MAX || 2)
 
-async function architectConsult(ctx, state, { agentId, taskContext, history, errorText }) {
-  const system = `You are a Lean 4 expert reviewing a STUCK colleague's proof attempts cold. You did not write these attempts and you have no stake in their approach. You are given the task, the last few submissions, and the one compiler error that has not moved across them. Answer in under 200 words, no code blocks longer than 3 lines:
+async function architectConsult(ctx, state, { agentId, taskContext, history, errorText, streamLog }) {
+  const system = `You are a Lean 4 expert reviewing a STUCK colleague's proof attempts cold. You did not write these attempts and you have no stake in their approach. You are given the task, the agent's FULL activity log for this attempt (every turn, submission diff, tool call and compiler reply, oldest first), its last few full submissions, and the one compiler error that has not moved. Answer in under 200 words, no code blocks longer than 3 lines:
 1. WHY the error is not moving — name the exact mismatch (compare the failing pattern and the goal character by character: a ↑ coercion in one and not the other, a differing binder or literal type, a wrong lemma orientation).
-2. What the submissions keep CHANGING that cannot matter, if anything.
-3. The ONE structural change to make next — a different fact to rewrite with, a cast transport (zify/push_cast/norm_cast) before the rewrite, a restated have, or the honest conclusion that the declared facts cannot reach this goal and the node should be forfeited with that diagnosis.`
+2. What the submissions keep CHANGING that cannot matter, if anything — the full log shows every edit, so be specific.
+3. The ONE structural change to make next — a different fact to rewrite with, a cast transport (zify/push_cast/norm_cast) before the rewrite, a restated have, or the honest conclusion that the declared facts cannot reach this goal and the node should be forfeited with that diagnosis.
+Note on tools you may see in the log: loogle_search/moogle_search only see the published Mathlib environment — NEVER declarations local to this problem (the target, its parents, blueprint \`def\`s). A zero-hit on a local name is meaningless, not evidence the statement is ill-formed.`
   const shown = (history || []).slice(-3)
+  // The full per-attempt log is bounded by the node's own token budget, so
+  // handing all of it over is safe — take the TAIL if it ever overflows.
+  const logText = Array.isArray(streamLog) && streamLog.length ? streamLog.join("\n\n").slice(-48000) : ""
   const user = `## The task the stuck prover was given
 ${String(taskContext || "").slice(0, 3000)}
-
-## Its last ${shown.length} submission(s), oldest first
+${logText ? `\n## The agent's full activity log for this attempt (oldest first; head may be truncated)\n${logText}\n` : ""}
+## Its last ${shown.length} full submission(s), oldest first
 ${shown.map((c, i) => `### Submission ${i + 1}\n\`\`\`lean\n${String(c).slice(0, 1600)}\n\`\`\``).join("\n\n")}
 
 ## The compiler error that has NOT moved across them
@@ -6227,7 +6597,13 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
           name === "loogle_search"
             ? { query: String(args.query || "") }
             : { concept: String(args.concept || args.query || ""), k: Number(args.k) || 10 }
-        return architectSearchCall(urls.xi, name, searchArgs, 60000)
+        const r = await architectSearchCall(urls.xi, name, searchArgs, 60000)
+        // Deterministic scope guard: searching a LOCALLY-declared name gets a
+        // truthful "not in Mathlib" that two independent provers have misread
+        // as "the statement is ill-formed". Say what the silence means, inline.
+        const caveat = architectLocalScopeCaveat(searchArgs.query || searchArgs.concept, graphNames)
+        if (caveat && r && typeof r.report === "string") r.report += caveat
+        return r
       }
       if (name === "lean_compile") {
         if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
@@ -6300,6 +6676,8 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
       // elaborated form, and the facts it was given — enough to judge the
       // attempts cold, nothing about the current tactic fixation.
       consultContext: `${node.signature.trim()}${node.elaborated ? `\nAs Lean elaborates it: ${node.elaborated}` : ""}\n\nDeclared facts available to the prover:\n${parents || "(none)"}`,
+      // Node conversations get the per-agent interceptor (see maybeIntercept).
+      intercept: true,
     })
     if (out.done) {
       result.solved = !out.done.negated
@@ -6328,6 +6706,9 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
     if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return null
     let captured = null
     let hallucinationStreak = 0
+    // Names declared in the model's own most recent submission (plus the
+    // target) — the set the local-scope caveat checks search queries against.
+    let localNames = new Set([state.targetName])
     const exec = async (name, args) => {
       if (name === "loogle_search" || name === "moogle_search") {
         hallucinationStreak = 0
@@ -6336,11 +6717,15 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
           name === "loogle_search"
             ? { query: String(args.query || "") }
             : { concept: String(args.concept || args.query || ""), k: Number(args.k) || 10 }
-        return architectSearchCall(urls.xi, name, searchArgs, 60000)
+        const r = await architectSearchCall(urls.xi, name, searchArgs, 60000)
+        const caveat = architectLocalScopeCaveat(searchArgs.query || searchArgs.concept, localNames)
+        if (caveat && r && typeof r.report === "string") r.report += caveat
+        return r
       }
       if (name === "lean_compile") {
         if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
           return { report: architectHallucinationBlockedReport(hallucinationStreak) }
+        for (const n of declaredNamesIn(args.code)) localNames.add(n)
         const r = await architectMcpCall(urls.xii, "lean_compile", {
           mode: "blueprint",
           code: String(args.code || ""),
@@ -6480,11 +6865,22 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     deadNames: new Map(),
     targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
     targetSignature: architectSignatureOf(theorem),
+    // Live-agent registry (agentId → {trace, label}) — the mechanic's address
+    // book — and the mechanic notes queued for the next refinement prompt.
+    liveTraces: new Map(),
+    mechanicNotes: [],
   }
   if (ctx.metrics) {
     ctx.metrics.max_iters = maxIters()
     ctx.metrics.models_used = []
     ctx.metrics.driver = driver
+  }
+  // The mechanic: run-wide watcher over the operator's own stream window,
+  // running in parallel for the whole run. Grok driver only — Ultra's CLI owns
+  // its own loop, so there is no turn boundary to inject at.
+  if (driver !== "claude") {
+    const mechanic = architectMechanicStart(ctx, state)
+    ctx.stopWatchers = mechanic.stop
   }
 
   // ---- Pre-flight: does the TARGET elaborate on its own? -------------------
@@ -6996,9 +7392,19 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     const elabSection = elabBlock
       ? `\n\n## Statements as Lean elaborates them (numeric-literal types explicit)\nA node whose sums, intervals or casts elaborate at a DIFFERENT type than the node it must feed cannot be chained into it — restate it at the consumer's types rather than adding helpers that repeat the mismatched shape.\n${elabBlock}`
       : ""
+    // Systemic observations from the mechanic land in refinement's evidence —
+    // above the per-node diagnostician prose in reliability, because it is the
+    // one source that can correlate ACROSS independent node conversations.
+    const mechSection = state.mechanicNotes.length
+      ? `\n\n## Systemic observations (mechanic — a live watcher over the whole run's stream; cross-agent patterns the per-node diagnoses cannot see)\n${state.mechanicNotes
+          .slice(-10)
+          .map((m) => `- ${m}`)
+          .join("\n")}`
+      : ""
+    state.mechanicNotes = []
     const refined = await architectAdmitBlueprint(ctx, state, urls, {
       system: architectRefineSystem(),
-      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}${elabSection}`,
+      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}${elabSection}${mechSection}`,
       retries: ARCHITECT_REFINE_RETRIES,
       stageLabel: `refinement ${iter + 1}/${maxIters()}`,
     })
@@ -7107,8 +7513,20 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   }
   const start = Date.now()
   const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0, bridge_build: BRIDGE_BUILD }
+  // Run-scoped ring of rendered frames — the same content the admin prover
+  // viewer shows. This is the mechanic's window. Frames the mechanic itself
+  // authored are tagged so its next window never contains its own output.
+  const streamLog = []
+  let streamSeq = 0
   const emit = (obj) => {
     metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    try {
+      const text = renderStreamFrame(obj)
+      if (text) {
+        streamLog.push({ seq: ++streamSeq, t: metrics.time_elapsed, text, mech: String(obj?.watcher || "").startsWith("mechanic") })
+        if (streamLog.length > 600) streamLog.shift()
+      }
+    } catch {}
     send({ ...obj, metrics })
   }
 
@@ -7211,6 +7629,8 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // getDeadline, so "+1 iter" reaches a run already on its last iteration.
     getMaxIters: () => runState.maxIters,
     computeGoverned: budgetMs > 0,
+    // The mechanic's window: run-scoped ring of rendered stream frames.
+    streamLog,
     // Turn budgets below are used ONLY by the lemma-style prove-or-split tree
     // (proveNode), where the budget doubles as a "force a decomposition after N
     // turns" trigger. The have-tree/have paths ignore them (time-governed).
@@ -7342,6 +7762,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
       send({ type: "done", metrics, verified: false, proof: "", bankedProof: banked || undefined })
     } finally {
       ACTIVE_RUNS.delete(runId)
+      ctx.stopWatchers?.()
       res.end()
     }
   })()
