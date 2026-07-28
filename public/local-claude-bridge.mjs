@@ -5989,6 +5989,11 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   let resourceBoost = 1
   let resourceRetries = 0
   const ARCHITECT_MAX_RESOURCE_RETRIES = 2
+  // The exact minimal file the target-standalone check last submitted. Retrying
+  // an identical file can only produce an identical verdict, so the check is
+  // skipped until something about it actually changes (a new target proof, a
+  // new prelude, a changed definition).
+  let lastStandaloneAttempt = null
 
   // Unbounded loop with a LIVE cap check at the bottom — the budget can grow
   // mid-iteration, so it can't be baked into the loop condition.
@@ -6156,6 +6161,62 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     }
 
     const unsolved = provable.filter((n) => !proofs.has(n.name))
+
+    // ---- EARLY EXIT: is the target already closed WITHOUT its parents? ------
+    // A node prover proves its node in isolation and is free to ignore the
+    // parents the blueprint declared for it — most starkly when it closes the
+    // target outright with `native_decide`. The graph still lists those parents
+    // in `sorry_using`, so `unsolved` stays non-empty and the loop keeps
+    // refining lemmas the finished proof never referenced. Observed live on
+    // count_div24: `native_decide` closed the target 4m19s into a 10m23s run,
+    // and the remaining ~6 minutes went on helper nodes — two of which were
+    // false (`24 ∣ (n-1)*n*(n+1)` fails at n = 2) and could never have been
+    // proved at all.
+    //
+    // Rather than INFER whether the proof needs its parents (reading a tactic
+    // block for name references is exactly the kind of guess that goes wrong),
+    // just compile it without them and let Lean answer. Drop only the other
+    // lemmas/theorems; every definition, instance and prelude line stays, so
+    // anything the target's own signature needs in order to elaborate is still
+    // there. Removing declarations can never change what the target STATES, and
+    // the certification call pins target_name + target_signature, so a pass here
+    // is exactly as strong as a pass on the full assembly. A failure changes
+    // nothing and the normal loop continues untouched.
+    if (
+      unsolved.length > 0 &&
+      proofs.has(state.targetName) &&
+      graph.some((n) => n.name === state.targetName && ["lemma", "theorem"].includes(n.kind))
+    ) {
+      const minimalGraph = graph.filter(
+        (n) => n.name === state.targetName || !["lemma", "theorem"].includes(n.kind),
+      )
+      const minimalCode = architectAssemble(minimalGraph, prelude, proofs)
+      if (minimalCode !== lastStandaloneAttempt && !architectAssemblyDefects(minimalGraph, proofs).length) {
+        lastStandaloneAttempt = minimalCode
+        const dropped = provable.filter(
+          (n) => n.name !== state.targetName && !proofs.has(n.name),
+        ).length
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Target ⟪${state.targetName}⟫ is proved while ${dropped} lemma(s) are still open — testing whether its proof stands without them.` })
+        let scert
+        try {
+          scert = await architectMcpCall(urls.xiv, "verify_full_script", {
+            code: minimalCode,
+            target_name: state.targetName,
+            target_signature: state.targetSignature,
+          }, Number(VERIFY_TIMEOUT_MS))
+        } catch (e) {
+          scert = { ok: false, report: String(e?.message || e) }
+        }
+        if (scert.ok) {
+          ctx.metrics.early_exit = "target_standalone"
+          ctx.metrics.early_exit_dropped_nodes = dropped
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏁 Leak XIV certified the target without them — the ${dropped} open lemma(s) were never needed. Stopping instead of refining them.` })
+          return { verified: true, proof: minimalCode }
+        }
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `↩︎ The target does need its lemmas (${oneLine(scert.report || "no report")}) — continuing to refine.` })
+      }
+    }
+
     if (unsolved.length === 0) {
       // ---- Assembly + certification (Leak XIV is the only exit).
       ctx.emit({ type: "message-annotation", subtype: "status", thought: "🧵 All nodes solved — assembling the final proof for Leak XIV certification." })
