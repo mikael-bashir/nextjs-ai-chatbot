@@ -19,19 +19,21 @@
 // This is a check of WELL-FORMEDNESS, not of TRUTH. A statement that passes may
 // still be false; that is exactly what the prover exists to determine.
 //
-// HOW IT RUNS. Entirely on the user's remote Lean daemon, reached through the
-// Python MCP connection manager (app/api/index.py) — the same singleton the
-// prover and the MCP server list already use, so a server connected in the UI
-// is usable here with no extra setup and no local Lean toolchain.
+// HOW IT RUNS — bridge only, no other service.
+//   browser → local bridge (/verify-statement) → Lean daemon over MCP-SSE
+// The bridge is already running (it drives generation), and it already owns a
+// hardened MCP-SSE client with daemon-hiccup retries, so it acts as the MCP
+// connection manager here. Nothing else has to be kept up: no Python process,
+// and no local Lean toolchain. The only other call is to /api/mcp/servers,
+// which is the app's own Postgres-backed list — it is NOT the Python manager.
 
 export const ELABORATION_TOOL_NAME = 'verify_full_script';
-export const ELABORATION_SCRIPT_ARG = 'script';
 
-// Thrown when the check is enabled but the connection manager has no connected
-// server exposing the tool. Kept distinct from a compile failure: this is an
-// infrastructure problem the user must fix (connect Leak IV), NOT a verdict on
-// the problem, so the caller must surface it in the UI rather than discarding
-// the generated problem as if it were malformed.
+// Thrown when the check cannot run at all — bridge unreachable, no MCP server
+// registered, daemon down. Kept distinct from a compile failure: this is an
+// infrastructure problem the user must fix, NOT a verdict on the problem, so
+// the caller must surface it in the UI rather than discarding the generated
+// problem as if it were malformed.
 export class ElaborationUnavailableError extends Error {
   readonly kind = 'unavailable';
   constructor(message: string) {
@@ -47,13 +49,24 @@ export interface ElaborationVerdict {
   warnings: string[];
   /** The daemon's verbatim reply, for the activity console's detail pane. */
   raw: string;
-  /** Which MCP server answered, for the console line. */
-  serverName?: string;
+  /** Which daemon answered, for the console line. */
+  serverUrl?: string;
+}
+
+/** Minimal shape of a registered MCP server (from the app's own DB route). */
+export interface ElaborationServer {
+  name: string;
+  url: string;
+  tools?: { name: string }[];
 }
 
 type FetchFn = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
-const FLASK = '/api/flask';
+/** Posts to the local bridge. Supplied by the caller (see callBridge). */
+export type BridgePost = (
+  path: string,
+  init?: RequestInit,
+) => Promise<Response>;
 
 /**
  * Wrap a bare theorem in a compilable file. The generated `lean` field is a
@@ -71,30 +84,8 @@ export function buildElaborationScript(lean: string): string {
 }
 
 /**
- * Dig the text payload out of a FastMCP CallToolResult. The Python manager
- * returns `result.dict()`, so the shape is {content: [{type:'text', text}]},
- * but it falls back to `str(result)` for older servers — hence the string case.
- */
-export function extractToolText(result: unknown): string {
-  if (typeof result === 'string') return result;
-  if (!result || typeof result !== 'object') return '';
-  const r = result as Record<string, unknown>;
-  const content = r.content;
-  if (Array.isArray(content)) {
-    const parts = content
-      .map((c) =>
-        c && typeof c === 'object' ? String((c as { text?: unknown }).text ?? '') : '',
-      )
-      .filter(Boolean);
-    if (parts.length) return parts.join('\n');
-  }
-  if (typeof r.text === 'string') return r.text;
-  return JSON.stringify(result);
-}
-
-/**
- * Read Leak IV's reply. It reports overall failure whenever ANY diagnostic is
- * present, and a `sorry` counts as a warning — so "compilation failed" alone
+ * Read the daemon's reply. It reports overall failure whenever ANY diagnostic
+ * is present, and a `sorry` counts as a warning — so "compilation failed"
  * cannot be the signal. What matters is whether any line is an (Error):
  *
  *   Line 8 (Error): failed to synthesize instance ...   → broken statement
@@ -111,7 +102,6 @@ export function parseElaborationVerdict(text: string): ElaborationVerdict {
     if (m[1].toLowerCase() === 'error') errors.push(entry);
     else warnings.push(entry);
   }
-  // An explicit success banner with no parsed diagnostics is unambiguous.
   const explicitOk = /compilation successful/i.test(raw);
   // Guard against a reply we could not parse at all: if the daemon said it
   // failed and we found no diagnostic lines, treat that as an error rather than
@@ -122,104 +112,77 @@ export function parseElaborationVerdict(text: string): ElaborationVerdict {
   return { elaborates: errors.length === 0, errors, warnings, raw };
 }
 
-interface ConnectedServer {
-  id: string;
-  name: string;
-}
-
 /**
- * Find a connected MCP server that actually exposes the verification tool.
- *
- * Matching on the TOOL rather than on a server named "Leak IV" is deliberate:
- * the user runs several Leak daemons (XI/XII/XIV) on different toolchains and
- * renames them, so a name match would break the moment a server is relabelled,
- * while the tool name is what we actually depend on.
+ * The user's registered MCP servers, straight from the app's Postgres-backed
+ * route. Deliberately NOT lib/mcp/fetch-prover-servers: that one also pings the
+ * Python manager to enrich each server with its live tool list, and the whole
+ * point here is to need nothing but the bridge. Tool metadata is optional —
+ * the bridge falls back to probing each server, which is cheap.
  */
-export async function findElaborationServer(
+export async function fetchRegisteredServers(
   fetchFn: FetchFn = fetch,
-): Promise<ConnectedServer | null> {
-  let servers: Array<Record<string, unknown>> = [];
+): Promise<ElaborationServer[]> {
   try {
-    const r = await fetchFn(`${FLASK}/mcp/servers`);
-    if (!r.ok) return null;
-    const d = await r.json();
-    // The manager returns a bare array; tolerate a {servers: [...]} wrapper too.
-    servers = Array.isArray(d) ? d : Array.isArray(d?.servers) ? d.servers : [];
+    const r = await fetchFn('/api/mcp/servers');
+    if (!r.ok) return [];
+    const rows = await r.json();
+    if (!Array.isArray(rows)) return [];
+    return rows
+      .filter((x: any) => x?.url && x?.isActive !== false)
+      .map((x: any) => ({ name: String(x.name ?? 'MCP server'), url: String(x.url) }));
   } catch {
-    return null;
+    return [];
   }
-  for (const s of servers) {
-    const id = String(s.id ?? s.server_id ?? '');
-    if (!id) continue;
-    try {
-      const tr = await fetchFn(`${FLASK}/mcp/servers/${encodeURIComponent(id)}/tools`);
-      if (!tr.ok) continue;
-      const td = await tr.json();
-      const tools: Array<Record<string, unknown>> = Array.isArray(td?.tools)
-        ? td.tools
-        : [];
-      const hit = tools.some((t) => {
-        const name = String(t?.name ?? '');
-        if (name === ELABORATION_TOOL_NAME) return true;
-        // Tolerate a renamed tool as long as it verifies a whole script.
-        const props = (t?.inputSchema as { properties?: Record<string, unknown> })
-          ?.properties;
-        return (
-          /verify/i.test(name) && !!props && ELABORATION_SCRIPT_ARG in props
-        );
-      });
-      if (hit) return { id, name: String(s.name ?? 'MCP server') };
-    } catch {
-      /* try the next server */
-    }
-  }
-  return null;
 }
 
 /**
- * Compile the statement on the remote daemon and return the verdict.
- * Throws ElaborationUnavailableError when no suitable server is connected.
+ * Compile the statement on the Lean daemon via the bridge.
+ * Throws ElaborationUnavailableError when the check cannot run at all.
  */
 export async function checkStatementElaborates(
   lean: string,
+  bridgePost: BridgePost,
   fetchFn: FetchFn = fetch,
 ): Promise<ElaborationVerdict> {
-  const server = await findElaborationServer(fetchFn);
-  if (!server) {
+  const servers = await fetchRegisteredServers(fetchFn);
+  if (!servers.length) {
     throw new ElaborationUnavailableError(
-      `No connected MCP server exposes "${ELABORATION_TOOL_NAME}". Connect Leak IV in MCP servers, then generate again — or set Statement check to Off to generate without it.`,
+      'No MCP servers are registered, so there is no Lean daemon to compile against. Add Leak IV under MCP servers, or set Statement check to Off to generate without it.',
     );
   }
   let res: Response;
   try {
-    res = await fetchFn(
-      `${FLASK}/mcp/servers/${encodeURIComponent(server.id)}/call`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          tool_name: ELABORATION_TOOL_NAME,
-          arguments: { [ELABORATION_SCRIPT_ARG]: buildElaborationScript(lean) },
-        }),
-      },
-    );
+    res = await bridgePost('/verify-statement', {
+      method: 'POST',
+      body: JSON.stringify({
+        script: buildElaborationScript(lean),
+        mcpServers: servers,
+      }),
+    });
   } catch (e) {
     throw new ElaborationUnavailableError(
-      `Couldn't reach the MCP connection manager to run the statement check (${(e as Error)?.message ?? e}).`,
+      `Couldn't reach the bridge to run the statement check (${(e as Error)?.message ?? e}). Start the bridge, or set Statement check to Off.`,
+    );
+  }
+  if (res.status === 404) {
+    // Older bridge without the endpoint — say so precisely, since the fix is a
+    // re-download rather than anything to do with the daemon or the problem.
+    throw new ElaborationUnavailableError(
+      'This bridge is too old for the statement check (no /verify-statement). Re-download the bridge, or set Statement check to Off.',
     );
   }
   if (!res.ok) {
     throw new ElaborationUnavailableError(
-      `${server.name} rejected the statement check (HTTP ${res.status}). It may have disconnected — reconnect it in MCP servers.`,
+      `The bridge rejected the statement check (HTTP ${res.status}).`,
     );
   }
   const data = await res.json().catch(() => null);
-  if (!data?.success) {
+  if (!data?.ok) {
     throw new ElaborationUnavailableError(
-      `${server.name} failed to run the statement check: ${data?.error ?? 'unknown error'}`,
+      `The Lean daemon couldn't run the statement check: ${data?.error ?? 'unknown error'}`,
     );
   }
-  const verdict = parseElaborationVerdict(extractToolText(data.result));
-  verdict.serverName = server.name;
+  const verdict = parseElaborationVerdict(String(data.text ?? ''));
+  verdict.serverUrl = data.serverUrl;
   return verdict;
 }

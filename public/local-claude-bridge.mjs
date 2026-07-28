@@ -6500,6 +6500,40 @@ const server = createServer(async (req, res) => {
       return json(res, 200, { ok: v.ok, version: v.version, error: v.error })
     }
 
+    // Compile a Lean script on the Lean daemon over MCP-SSE and hand back the
+    // raw verdict. NO claude process, no tokens — here the bridge is acting
+    // purely as the browser's MCP client, which is the whole point: the app can
+    // typecheck a generated statement with nothing running but this bridge.
+    //
+    // Server choice is by TOOL, never by server name (the user renames these).
+    // resolveVerifyUrl picks a server that advertises the verifier when the
+    // caller supplied tool metadata; otherwise every server is tried in turn.
+    // Probing is cheap because a server lacking the tool fails inside
+    // tools/list, before any Lean work happens.
+    if (req.method === "POST" && url.pathname === "/verify-statement") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const script = body.script
+      if (typeof script !== "string" || !script.trim()) {
+        return json(res, 400, { error: "script_required" })
+      }
+      const servers = (Array.isArray(body.mcpServers) ? body.mcpServers : []).filter((s) => s && s.url)
+      if (!servers.length) return json(res, 400, { error: "no_mcp_servers" })
+      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || 180000, 5000), 600000)
+      const preferred = resolveVerifyUrl(servers)
+      const urls = [...new Set([preferred, ...servers.map((s) => s.url)].filter(Boolean))]
+      let last = { ok: false, text: "", error: "no reachable MCP server" }
+      for (const sseUrl of urls) {
+        const r = await verifyViaDaemon(script, sseUrl, { timeoutMs })
+        if (r?.ok) return json(res, 200, { ...r, serverUrl: sseUrl })
+        last = { ...r, serverUrl: sseUrl }
+        // "tool not found" means WRONG SERVER — keep looking. Any other error
+        // (daemon down, timeout) is a real failure and must surface as itself
+        // rather than being masked by probing the remaining servers.
+        if (!/tool not found on server/i.test(String(r?.error || ""))) break
+      }
+      return json(res, 200, last)
+    }
+
     if (req.method === "POST" && url.pathname === "/run") {
       const body = JSON.parse((await readBody(req)) || "{}")
       const prompt = body.prompt

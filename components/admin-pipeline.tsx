@@ -2460,7 +2460,11 @@ export function AdminPipeline() {
         setGenStage('elaborating');
         let verdict: Awaited<ReturnType<typeof checkStatementElaborates>>;
         try {
-          verdict = await checkStatementElaborates(gen.lean);
+          // Through the Work bridge — the same one that just generated this, so
+          // the check needs nothing running that generation didn't already.
+          verdict = await checkStatementElaborates(gen.lean, (path, init) =>
+            callBridge(true, path, init),
+          );
         } catch (e) {
           if (e instanceof ElaborationUnavailableError) {
             // Infrastructure, not a verdict — surface it in the UI and stop.
@@ -2477,7 +2481,7 @@ export function AdminPipeline() {
         setCheckError(null);
         pushGenEvent(
           verdict.elaborates ? 'verified' : 'rejected',
-          `Statement check (${verdict.serverName ?? 'Leak'}): ${
+          `Statement check (${verdict.serverUrl ? new URL(verdict.serverUrl).host : 'Leak'}): ${
             verdict.elaborates ? 'elaborates' : `${verdict.errors.length} error(s)`
           }`,
           { detail: verdict.raw },
@@ -2637,7 +2641,15 @@ export function AdminPipeline() {
       setGenStartedAt(null);
       setGenStage('idle');
     }
-  }, [runBridgeStream, runVerifier, recordUsage, runGauntlet, pushLog, pushGenEvent]);
+  }, [
+    runBridgeStream,
+    callBridge,
+    runVerifier,
+    recordUsage,
+    runGauntlet,
+    pushLog,
+    pushGenEvent,
+  ]);
 
   const terminateGeneration = () => genAbortRef.current?.abort();
 
@@ -2985,7 +2997,7 @@ export function AdminPipeline() {
             </div>
             <p className="mt-1 text-[11px] text-muted-foreground">
               {statementCheck === 'leak'
-                ? 'Compiles each generated Lean statement on the connected Lean daemon before anything is spent on it. A statement that does not elaborate is unprovable — the prover cannot edit its own target signature — so it is discarded here instead of forfeiting a full prover run.'
+                ? 'Compiles each generated Lean statement on your Lean daemon — through the bridge, so nothing extra needs to be running — before anything is spent on it. A statement that does not elaborate is unprovable (the prover cannot edit its own target signature), so it is discarded here instead of forfeiting a full prover run.'
                 : 'No statement check. Problems are generated and queued without compiling their Lean, so a statement that does not elaborate will only surface once the prover forfeits on it.'}
             </p>
           </div>
