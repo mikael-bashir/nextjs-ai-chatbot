@@ -5124,6 +5124,22 @@ const DEAD_NAME_MAX = 60
 // prefix did not carry. Recording those as "not in Mathlib" would be a lie that
 // steers every later node away from a name that does exist, so callers pass the
 // names that are theirs.
+// "Unknown identifier" fires for LOCAL BINDERS that are simply out of scope, not
+// only for library names that don't exist — a submission referring to `k` outside
+// the lambda that bound it produces the same diagnostic as one inventing
+// `Nat.foo_of_bar`. Recording the first kind tells every later prover that a
+// perfectly ordinary variable "does not exist in this Mathlib", which is both
+// false and confusing. Observed live: `k` landed in the ledger and was served to
+// three downstream node provers.
+//
+// The shape test: a declaration reference carries a namespace dot or an
+// underscore, or is long enough not to be a binder. Binders are short and bare
+// (`k`, `n`, `hx`, `ih`); Mathlib names are `Nat.mul_div_assoc`, `sq_sub_sq`,
+// `congrArg`. The asymmetry is deliberate — failing to record a real absence
+// costs one repeated compile, while recording a false one misdirects every node
+// for the rest of the run, so this errs toward recording nothing.
+const looksLikeDeclName = (n) => /[._]/.test(n) || n.length >= 5
+
 function deadNameAdd(state, names, exclude) {
   if (!state) return
   if (!state.deadNames) state.deadNames = new Map()
@@ -5131,6 +5147,7 @@ function deadNameAdd(state, names, exclude) {
   for (const name of names) {
     if (state.deadNames.size >= DEAD_NAME_MAX) return
     if (!name || skip.has(name) || state.deadNames.has(name)) continue
+    if (!looksLikeDeclName(name)) continue
     state.deadNames.set(name, true)
   }
 }
