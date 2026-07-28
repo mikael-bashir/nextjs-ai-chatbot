@@ -133,12 +133,35 @@ def _fmt_info(infos: list[str], limit: int = 12) -> str:
 
 
 def _strip_imports(code: str) -> tuple[str, list[str]]:
-    """Remove import lines (the REPL env already has Mathlib+Architect);
-    return (code-without-imports, list-of-import-lines)."""
+    """Blank out import lines in place (the REPL env already has
+    Mathlib+Architect) rather than deleting them; return
+    (code-with-imports-blanked, list-of-import-lines).
+
+    Deleting the lines outright — the previous behavior — shifted every
+    line BELOW an import upward by one for each import removed. Blueprint
+    mode and explore mode compile this function's returned body directly
+    (`_compile_blueprint`, `_compile_explore`, `lean_elaborate`), so every
+    diagnostic Lean reported for those modes was silently off by the
+    stripped-import count from the very first declaration onward.
+
+    Observed live: a blueprint submission whose real failure was two lines
+    below what Lean reported (a `rw [...]` reported as though it were the
+    `theorem ... := by` header two lines above it) produced eight
+    near-identical resubmissions that could never converge, because the
+    model kept "fixing" a tactic that was never the one actually failing.
+
+    Blanking instead of deleting keeps every other line's position
+    identical to the original submission, so Lean's own line numbers need
+    no further correction. Node mode is unaffected either way: it never
+    compiles this function's returned body directly (see `_compile_node`'s
+    `run_snippet`, built from `header + prefix + rebuilt`) — it only calls
+    this to REJECT a submission that adds import lines at all, which is
+    unchanged by blanking instead of deleting them."""
     imports, kept = [], []
     for ln in code.split("\n"):
         if re.match(r"^\s*import\s+\S+", ln):
             imports.append(ln.strip())
+            kept.append("")
         else:
             kept.append(ln)
     return "\n".join(kept), imports

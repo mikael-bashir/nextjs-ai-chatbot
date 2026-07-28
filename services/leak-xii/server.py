@@ -104,12 +104,24 @@ def _messages(resp: dict):
 
 
 def _strip_imports(code: str) -> tuple[str, list[str]]:
-    """Remove import lines (the REPL env already has Mathlib+Architect);
-    return (code-without-imports, list-of-import-lines)."""
+    """Blank out import lines in place (the REPL env already has
+    Mathlib+Architect) rather than deleting them; return
+    (code-with-imports-blanked, list-of-import-lines).
+
+    Deleting the lines outright — the previous behavior — shifted every
+    line BELOW an import upward by one for each import removed. Blueprint
+    mode and explore mode compile this function's returned body directly,
+    so every diagnostic Lean reported for those modes was silently off by
+    the stripped-import count from the very first declaration onward.
+    Blanking instead of deleting keeps every other line's position
+    identical to the original submission, so Lean's own line numbers need
+    no further correction. See the FastMCP twin's identical fix
+    (services/hf-spaces/leak-xii/server.py) for the full incident writeup."""
     imports, kept = [], []
     for ln in code.split("\n"):
         if re.match(r"^\s*import\s+\S+", ln):
             imports.append(ln.strip())
+            kept.append("")
         else:
             kept.append(ln)
     return "\n".join(kept), imports

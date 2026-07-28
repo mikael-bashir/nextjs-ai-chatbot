@@ -14,13 +14,16 @@ rc=0
 
 hr() { printf '\n\033[1m%s\033[0m\n' "$1"; }
 
-hr "1/3  blueprint.py — splitter, safeguards, graph validation"
+hr "1/4  blueprint.py — splitter, safeguards, graph validation"
 python3 services/architect-tests/test_blueprint.py | tail -3 || rc=1
 
-hr "2/3  claude-bridge.mjs — signature extraction, classification, assembly"
+hr "2/4  claude-bridge.mjs — signature extraction, classification, assembly"
 node services/architect-tests/test_bridge.mjs | tail -3 || rc=1
 
-hr "3/3  differential — the two splitters must agree"
+hr "3/4  leak-xii server.py — _strip_imports preserves line numbers (both copies)"
+python3 services/architect-tests/test_strip_imports.py | tail -3 || rc=1
+
+hr "4/4  differential — the two splitters must agree"
 # Both implement the same rule in different languages. Every parser defect
 # found in this stack so far was that rule implemented wrongly in BOTH, so
 # hand-written cases alone are not evidence; these are generated.
