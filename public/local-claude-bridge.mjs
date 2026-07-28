@@ -4001,6 +4001,13 @@ To check a number before you build a proof around it, submit a bare \`#eval\` (n
 
 Use \`mathlib_search\` as a lookup helper for *specific* Mathlib lemmas you need while executing your plan -- for example a name, signature, or hypothesis pattern like "monotonicity of natural number addition" or "Cauchy-Schwarz inequality", or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. For named mathematical objects (cyclotomic polynomials, totients, binomial coefficients, ...) Mathlib frequently already contains the exact fact you are proving, or a lemma that closes it in one application: if a search hit states your goal or subsumes it, APPLY IT AND SUBMIT immediately -- one lookup is cheaper than re-deriving standard theory, and a library one-liner is a perfectly good registered solve. What search will NOT find is a bespoke bound or numeric identity invented for this problem, so do not query for the goal's exact numbers verbatim.
 
+## Never submit a name you have not confirmed exists
+An invented lemma name is the cheapest mistake to prevent and one of the most expensive to make: it burns a full compile turn, teaches you nothing about the goal, and \`lean_compile\` LOCKS after ${ARCHITECT_HALLUCINATION_LOCK} unknown-name errors in a row with no search between them. Two tools settle existence, and they answer different questions:
+- \`mathlib_search\` — "what is the lemma FOR this fact?" Query the mathematical content, not the name you hope exists. Search is fuzzy and always returns its best guesses, so a result set that does not contain your name is NOT a near-miss telling you to try a variant -- it is evidence the name is not there.
+- \`#check <name>\` — "does THIS name exist?" A bare \`#check Nat.div_eq_zero_of_dvd\` (no \`import\` line) is a definitive yes/no, and you can batch several in one exploration compile. When you are about to build a rewrite chain on three or four remembered names, \`#check\` all of them in a single call FIRST.
+
+A name that failed is usually a whole naming CONVENTION that failed, not one typo -- so after \`Nat.foo_of_bar\` comes back unknown, do not immediately try \`Nat.foo_of_baz\`. Search for the fact instead.
+
 ## Other outcomes
 If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.`
 
@@ -4902,9 +4909,10 @@ function ledgerHarvest(ledger, report, nodeName) {
     if (ledger.entries.size >= LEDGER_MAX || ledger.entries.has(key)) return
     ledger.entries.set(key, { note, from: nodeName })
   }
-  // Names the environment does not contain — highest-signal, zero strategy leak.
-  for (const m of text.matchAll(/Unknown (?:identifier|constant)\s+`([^`]+)`/g))
-    add(`name:${m[1]}`, `\`${m[1]}\` does not exist — do not use it (or any close guess at it).`)
+  // (Names the environment does not contain used to be harvested here. They now
+  // live in the ALWAYS-ON nonexistent-name ledger below — every arm gets them,
+  // and without this ledger's `excludeNode` suppression, which is wrong for
+  // names. See deadNameHarvest.)
   // Typeclass instances that aren't derivable for the types in play.
   //
   // Entries containing metavariables (`?m.109`, `?a`) are SKIPPED here too, and
@@ -4988,6 +4996,77 @@ function ledgerRender(ledger, excludeNode) {
     ? `\n\n## Verified library names (each appeared in a sibling node's ACCEPTED proof on this same problem — they exist and resolve here; how you use them is up to you)\n${goodNames.join(", ")}`
     : ""
   return `${dead}${good}\n\nThese are environment facts only; no proof strategy is implied. Do not spend turns rediscovering them.`
+}
+
+// --- Nonexistent-name ledger (ALWAYS on, every arm) --------------------------
+//
+// Deliberately NOT gated by the variant, unlike the dead-end ledger above.
+// "This identifier is not in this Mathlib" is a fact the compiler established
+// about the ENVIRONMENT — the same class as a search result — and re-earning it
+// is pure waste, not an experimental condition. Keeping it universal also keeps
+// the control's node ISOLATION intact: nothing about any node's approach,
+// tactics or proof crosses over, only a list of strings Lean refused.
+//
+// The hallucination lock catches a streak INSIDE one conversation. But every
+// node prover is a fresh conversation, and every refinement re-dispatches its
+// nodes from zero, so the lock resets and the same invented name gets paid for
+// again. Observed live on floors_recover_whole: `Nat.div_eq_zero_of_dvd` does
+// not exist, and it was submitted at least a dozen times across FIVE separate
+// prover contexts (iterations 0, 1, 2, 3, 5) — most of a ten-minute run spent
+// re-proving one absence. The dead-end ledger already harvested this class, but
+// only for gate/delta, and it hid the fact from the very node that found it
+// (`excludeNode`) — right within one conversation, wrong across fresh attempts,
+// which is exactly this case.
+//
+// Bounded, deduped, and never guessed: an entry is minted only where the
+// compiler itself said the name is unknown.
+const DEAD_NAME_MAX = 60
+// An "unknown identifier" can also name a BLUEPRINT declaration — a node citing
+// a non-parent sibling, or a submission referring to something the daemon's
+// prefix did not carry. Recording those as "not in Mathlib" would be a lie that
+// steers every later node away from a name that does exist, so callers pass the
+// names that are theirs.
+function deadNameAdd(state, names, exclude) {
+  if (!state) return
+  if (!state.deadNames) state.deadNames = new Map()
+  const skip = exclude instanceof Set ? exclude : new Set(exclude || [])
+  for (const name of names) {
+    if (state.deadNames.size >= DEAD_NAME_MAX) return
+    if (!name || skip.has(name) || state.deadNames.has(name)) continue
+    state.deadNames.set(name, true)
+  }
+}
+function deadNameHarvest(state, report, exclude) {
+  if (!report) return
+  deadNameAdd(
+    state,
+    [...String(report).matchAll(/Unknown (?:identifier|constant)\s+[`'"]?([A-Za-z_][A-Za-z0-9_'.]*)[`'"]?/gi)].map(
+      (m) => m[1],
+    ),
+    exclude,
+  )
+}
+// Declarations introduced by a submission itself — the exclusion set for a
+// whole-file (blueprint/refinement) compile, where there is no graph yet.
+function declaredNamesIn(code) {
+  const out = new Set()
+  for (const m of String(code || "").matchAll(
+    /^\s*(?:@\[[^\]]*\]\s*)?(?:noncomputable\s+|private\s+|protected\s+)*(?:theorem|lemma|def|abbrev|structure|instance|inductive)\s+([A-Za-z_][A-Za-z0-9_'.]*)/gm,
+  ))
+    out.add(m[1])
+  return out
+}
+function deadNameRender(state) {
+  const names = state?.deadNames
+  if (!names || names.size === 0) return ""
+  return (
+    `\n\n## Names already proved absent in this Mathlib (this run, this problem)\n` +
+    `The compiler has already rejected each of these as an unknown constant/identifier: ${[...names.keys()]
+      .map((n) => `\`${n}\``)
+      .join(", ")}.\n` +
+    `These are settled facts, not warnings. Do not submit them, and do not submit a near-variant of one — a name that failed is usually a whole naming CONVENTION that failed, not one typo. ` +
+    `When you need a name you are not certain of, settle it before you build on it: \`mathlib_search\` for the FACT you want, or a bare \`#check <name>\` exploration compile for a definitive yes/no on a specific name (several \`#check\`s fit in one call).`
+  )
 }
 
 function architectParseForfeit(text) {
@@ -5585,6 +5664,7 @@ async function architectProveNode(node, graph, prelude, urls, ctx, state) {
     .join("\n")
   const negSig = architectNegSignature(node.signature)
   const prefix = architectNodePrefix(graph, node.name)
+  const graphNames = new Set(graph.map((g) => g.name))
   const user = `## Target
 Prove this EXACT statement (the signature is immutable — your submission is rebuilt under it):
 
@@ -5629,6 +5709,9 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
     // Rendered per attempt (not once per node) so a node starting late in the
     // pass — or retrying — sees everything its siblings have learned by then.
     const deadEnds = ledgerRender(state.ledger, node.name)
+    // Rendered per attempt, like the ledger: a retry is a fresh conversation, so
+    // it must be told the names its own earlier attempts already burned.
+    const deadNames = deadNameRender(state)
     const retryNote =
       attempt === 0
         ? ""
@@ -5680,6 +5763,9 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
         // Pool environment-level facts for sibling nodes (gate/delta only —
         // state.ledger is null for the control).
         ledgerHarvest(state.ledger, r.report, node.name)
+        // Blueprint declarations are excluded: a node citing a non-parent
+        // sibling raises "unknown identifier" for a name that does exist.
+        deadNameHarvest(state, r.report, graphNames)
         hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
         return { report: r.report }
       }
@@ -5687,7 +5773,7 @@ ${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its
     }
     const out = await architectLoop(ctx, state, {
       system: architectProverSystem(),
-      user: user + deadEnds + retryNote,
+      user: user + deadNames + deadEnds + retryNote,
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_NODE_TOKENS,
@@ -5745,15 +5831,20 @@ async function architectBlueprintStage(ctx, state, urls, { system, user, retries
           captured = { graph: r.graph, code: String(args.code || "") }
           return { report: r.report, __done: captured }
         }
+        // Whole-file compile: the submission's own declarations are excluded, so
+        // a forward reference or a typo'd `sorry_using` dep can't be recorded as
+        // a Mathlib absence.
+        deadNameHarvest(state, r.report, declaredNamesIn(args.code))
         hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
         return { report: r.report }
       }
       return { report: `unknown tool ${name}` }
     }
+    const deadNames = deadNameRender(state)
     const retryNote = attempt === 0 ? "" : `\n\n(Attempt ${attempt + 1} of ${retries}. The previous attempt failed its last gate with:\n${lastReport}\nStart fresh and fix that.)`
     const out = await architectLoop(ctx, state, {
       system,
-      user: user + retryNote,
+      user: user + deadNames + retryNote,
       tools: [ARCHITECT_COMPILE_TOOL, ARCHITECT_SEARCH_TOOL],
       exec,
       tokenBudget: ARCHITECT_BLUEPRINT_TOKENS,
@@ -5859,6 +5950,8 @@ async function proveArchitect(theorem, ctx, opts = {}) {
     // Shared environment facts across node provers — gate/delta only. Null for
     // the control, so its nodes stay exactly as isolated as the paper's.
     ledger: variant.shareDeadEnds ? makeDeadEndLedger() : null,
+    // Names the compiler has refused, run-scoped. Always on — see deadNameHarvest.
+    deadNames: new Map(),
     targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
     targetSignature: architectSignatureOf(theorem),
   }
@@ -6128,6 +6221,10 @@ async function proveArchitect(theorem, ctx, opts = {}) {
             disproof: !!r.negated,
           }, architectNodePrefix(graph, n.name), prelude)
           verdicts.set(n.name, { ...base, ...v, note: base.note })
+          // `#check`-verified absences — the highest-confidence entries the run
+          // ledger gets. Graph names are excluded: the diagnostician can cite
+          // one, and `#check` sees Mathlib only, so a real node reads as absent.
+          deadNameAdd(state, v.deadNames || [], new Set(graph.map((g) => g.name)))
           const bits = []
           if (v.facts?.length) bits.push(`${v.facts.length} verified fact(s)`)
           if (v.helpers?.length) bits.push(`${v.helpers.length} helper(s) accepted`)
