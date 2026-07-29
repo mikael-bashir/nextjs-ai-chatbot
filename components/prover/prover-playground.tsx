@@ -275,6 +275,9 @@ export function ProverPlayground() {
               <option value="have-tree">
                 Leak Stronghold Dark (planner + isolated per-hole minions)
               </option>
+              <option value="have-surround">
+                Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)
+              </option>
               <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
                 <option value="ultra-fleeting">
                   Leak Ultra Fleeting (model from the selector)

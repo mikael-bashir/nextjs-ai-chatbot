@@ -3343,6 +3343,9 @@ export function AdminPipeline() {
                   <option value="have-tree">
                     Leak Stronghold Dark (planner + isolated per-hole minions)
                   </option>
+                  <option value="have-surround">
+                    Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)
+                  </option>
                   <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
                     {RIVER_STRATEGIES.map((s) => (
                       <option key={s.value} value={s.value}>

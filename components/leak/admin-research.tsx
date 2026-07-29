@@ -119,6 +119,7 @@ const RIVER_LABELS: Record<string, string> = {
 // items and saved checkpoints keep resolving.
 const STRONGHOLD_LABELS: Record<string, string> = {
   'have-tree': 'Stronghold Dark · planner+minions',
+  'have-surround': 'Stronghold Surround · parallel minion waves',
   have: 'Have · single context',
 };
 

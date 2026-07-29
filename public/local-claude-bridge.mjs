@@ -1912,6 +1912,18 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have-tree",
   },
+  // Stronghold Surround: Dark's exact planner/minion/assembler shape, but the
+  // minion phase runs as PARALLEL WAVES over the ghost-army Leak II (persistent
+  // per-state ledger, id-scoped cleanup, snapshot_state / branch_tactics).
+  // Dark above stays byte-identical as the sequential control. See
+  // proveHaveSurround.
+  "have-surround": {
+    label: "Leak Stronghold Surround — parallel minion waves over the ghost-army Leak II",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => surroundHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "have-surround",
+  },
   // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
@@ -3680,6 +3692,266 @@ async function proveHaveTree(theorem, ctx) {
   // ---- 4) FINISH: hand the PARTIALLY-filled skeleton to flat mode as a seed, so
   // the proven holes are never thrown away. Flat mode's gate still requires a
   // full, independently-verified proof of the master, so soundness is unchanged.
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ---------------------------------------------------------------------------
+// STRONGHOLD SURROUND — Dark's shape with PARALLEL minion waves.
+// Requires the ghost-army Leak II (per-state ledger, id-scoped cleanup_memory,
+// snapshot_state, branch_tactics): concurrent minions each own their proof
+// states inside ONE resident daemon, so nothing here ever clears state
+// globally. proveHaveTree above is deliberately untouched as the sequential
+// control; every difference from it is commented.
+// ---------------------------------------------------------------------------
+const SURROUND_MINIONS = Number(process.env.LEAK_SURROUND_MINIONS || 4)
+
+function surroundHoleFillPrompt(skeleton, id, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are a MINION working ONE hole in a Lean 4 proof skeleton. Do NOT touch any other hole.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE SKELETON (already compiles with every \`have\` stubbed as \`sorry\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`. Its declared type is your GOAL; the hypotheses in scope are the theorem's binders plus the EARLIER \`have\`s (they're available by name). To see the EXACT goal state, \`init_proof\` your hole's proposition (closed: ∀-quantify any free variable) and step it with \`apply_tactic\` — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`).
+
+You have TWO ways to make progress — you must ALWAYS produce one of them, never nothing:
+
+CLOSE — if you can finish the hole, work out the tactics and CHECK them: take the skeleton, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other \`sorry --⟪…⟫\` untouched), verify_full_script until it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Then output:
+FILL ⟪${id}⟫
+\`\`\`lean
+<only the tactics that replace \`sorry\`, one per line, from the LEFT margin — no \`have\`, no leading \`by\`, no theorem>
+\`\`\`
+
+DECOMPOSE — if the hole resists a direct close, do NOT give up: break its goal into SMALLER sub-steps that another minion will fill. Write local \`have\`s (they inherit this hole's context automatically — do NOT re-quantify), each a NEW tagged hole, then close THIS hole's goal from them. CHECK it by splicing in place of \`sorry --⟪${id}⟫\` and verify_full_script — it MUST compile with only \`sorry\` warnings (the new ones plus the untouched others), NO errors. Then output:
+DECOMPOSE ⟪${id}⟫
+\`\`\`lean
+have s1 : <smaller subgoal> := by sorry --⟪s1⟫
+have s2 : <smaller subgoal> := by sorry --⟪s2⟫
+<tactics that close THIS hole's goal from s1, s2, …>
+\`\`\`
+Each sub-step must be a GENUINELY smaller/easier goal. Use fresh tags (s1, s2, …); the system renames them to stay unique. Prefer CLOSE; DECOMPOSE only when you can't close directly — but ALWAYS pick one, never report that it's impossible.
+
+PARALLEL ETIQUETTE — you are ONE OF SEVERAL minions working DIFFERENT holes at the same time against the same Pantograph service:
+- Any state you \`init_proof\` is yours alone; siblings cannot touch it and you must not touch theirs.
+- NEVER call \`cleanup_memory\` with no arguments — that wipes EVERY minion's states, not just yours. When you are finished with a state, free exactly it: \`cleanup_memory(state_id)\`. Free your states before you emit your final answer.
+- \`snapshot_state(state_id)\` instantly forks a state — snapshot before a risky tactic line so a dead end never costs you your position.
+- \`branch_tactics(state_id, [t1, t2, …])\` races several candidate tactics against ONE state in a single call (e.g. ["omega","simp_all","nlinarith","positivity","decide"]) — use it early to triage which automation bites; every survivor is a new state you can continue from (free the ones you abandon).
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// Identical to fillHole but with the parallel-etiquette minion prompt and a
+// wave-aware status line. Kept separate so Dark's path stays untouched.
+async function fillHoleSurround(skeleton, id, ctx) {
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Surround minion working hole ⟪${id}⟫ (parallel wave)…` })
+  const applied = []
+  const res = await spawnProverStream(
+    {
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, ""),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    {
+      onObject: (o) => {
+        if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+          for (const c of o.message.content) {
+            if (c?.type === "tool_use" && String(c.name || "").endsWith("apply_tactic") && c.input?.tactic)
+              applied.push(String(c.input.tactic))
+          }
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
+  )
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
+}
+
+// Stronghold Surround orchestrator. Planner and finisher are Dark's verbatim;
+// the minion phase dispatches each round's open holes as a PARALLEL wave of up
+// to SURROUND_MINIONS isolated minions. Result APPLICATION is serialised
+// through one async lock so splices and decompose-verifications never race on
+// `partial`; minion RUNS overlap freely. No global Pantograph cleanup ever
+// happens — minions free their own states (ghost-army id-scoped cleanup).
+async function proveHaveSurround(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "🛰️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Stronghold Surround: planning a decomposition skeleton (parallel minion waves ×${SURROUND_MINIONS}).` })
+
+  // ---- 1) PLANNER (verbatim from Dark) --------------------------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+            skeleton = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "🛰️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+  const holeIds = parseHoleIds(skeleton)
+  if (!holeIds.length) return proveHaveFlat(theorem, ctx)
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Skeleton verified — ${holeIds.length} hole(s): ${holeIds.map((h) => `⟪${h}⟫`).join(" ")}. Dispatching parallel minion waves (×${Math.min(SURROUND_MINIONS, holeIds.length)}).` })
+  ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: holeIds.length })
+
+  // ---- 2) CONTINUOUS WORK QUEUE over ONE evolving skeleton ------------------
+  // No rounds, no barrier: every open hole is a queue item {id, depth}, and up
+  // to SURROUND_MINIONS workers pull from the queue CONCURRENTLY. When a
+  // decompose is accepted its sub-holes enter the queue IMMEDIATELY, so an
+  // idle worker starts them while slower siblings are still grinding — a
+  // round barrier here would idle workers behind the slowest minion of each
+  // round exactly when the tree deepens (observed live on fatex_001: three
+  // fresh sub-holes plus three free workers all waiting on one long minion).
+  // The per-hole depth bound replaces the old per-round bound — identical
+  // recursion limit, no synchronisation.
+  //   Each minion sees the skeleton as of its claim — safe, because a fill
+  // only depends on the have SIGNATURES (immutable), never on sibling proof
+  // bodies, and the final assembly re-verifies hole-free on the daemon anyway.
+  // All mutations of `partial` (fill splices, decompose trial+verify+accept)
+  // run under `applyLock` so they serialise; a decompose trial therefore
+  // always verifies against the up-to-date partial, fills included.
+  let partial = skeleton
+  const rejectedNotes = {}
+  const stuck = new Set()
+  let banked = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const queue = parseHoleIds(skeleton).map((id) => ({ id, depth: 0 }))
+  let inFlight = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(SURROUND_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const item = queue.shift()
+      if (!item) {
+        if (inFlight === 0) return // drained and nobody can add more
+        await new Promise((r) => setTimeout(r, 500)) // a sibling may still split
+        continue
+      }
+      inFlight++
+      try {
+        const { id, depth } = item
+        const r = await fillHoleSurround(partial, id, ctx)
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted) return
+          if (r.fill != null) {
+            partial = spliceHole(partial, id, r.fill)
+            banked++
+            ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (parallel wave).` })
+          } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
+            const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
+            const trial = spliceHole(partial, id, freshBody)
+            const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+            if (v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig)) {
+              partial = trial
+              for (const t of tags) queue.push({ id: t, depth: depth + 1 }) // live hand-off — idle workers start these NOW
+              ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Split hole ⟪${id}⟫ into ${tags.length} smaller hole(s): ${tags.map((t) => `⟪${t}⟫`).join(" ")} — queued for the next free minion.` })
+            } else {
+              stuck.add(id)
+              if (r.notes) rejectedNotes[id] = r.notes
+              ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ split didn't type-check — leaving it for the finisher.` })
+            }
+          } else {
+            stuck.add(id)
+            if (r.notes) rejectedNotes[id] = r.notes
+          }
+          const openNow = parseHoleIds(partial)
+          ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow.length })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+
+  // ---- 3) + 4) verbatim from Dark: assemble, else finish from the seed ------
+  const remaining = parseHoleIds(partial)
+  const filled = banked
+
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Stronghold Surround assembled a verified proof from ${filled} banked hole(s) (parallel waves).` })
+      return { verified: true, proof: partial }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Banked ${filled}/${filled + remaining.length} hole(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
+  }
+
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
 }
@@ -7681,6 +7953,11 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             haveTreePlannerPrompt(theorem, mcpServers) +
             "\n\n=== HOLE-FILL (MINION) PROMPT ===\n" +
             haveHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
+          : style === "have-surround"
+          ? `[DECOMPOSITION MODE — Stronghold Surround (parallel minion waves ×${SURROUND_MINIONS} over the ghost-army Leak II) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers) +
+            "\n\n=== HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -7802,19 +8079,26 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
-        // Resuming from a saved checkpoint short-circuits both: finish the
-        // remaining holes straight from the seed (proven work is handed in, not
-        // rediscovered). The independent verify gate is unchanged, so soundness
-        // is identical to a from-scratch run.
+        // `have-surround`: have-tree with the minion phase parallelized over
+        // the ghost-army Leak II. Resuming from a saved checkpoint
+        // short-circuits all three: finish the remaining holes straight from
+        // the seed (proven work is handed in, not rediscovered). The
+        // independent verify gate is unchanged, so soundness is identical to a
+        // from-scratch run.
         let r
         if (ctx.seed) {
           emit({ type: "message-annotation", subtype: "status", thought: "▶️ Resuming from a saved checkpoint — finishing the remaining hole(s) from banked progress." })
           r = await proveHaveFlat(theorem, ctx, { seed: ctx.seed })
         } else {
-          r = style === "have-tree" ? await proveHaveTree(theorem, ctx) : await proveHaveFlat(theorem, ctx)
+          r =
+            style === "have-tree"
+              ? await proveHaveTree(theorem, ctx)
+              : style === "have-surround"
+                ? await proveHaveSurround(theorem, ctx)
+                : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

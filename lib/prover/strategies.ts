@@ -55,6 +55,15 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     label: 'Leak Stronghold Dark (planner + isolated per-hole minions)',
     note: 'Planner writes a `have`-skeleton; each hole is filled by its own isolated minion; a finisher assembles. Resumable from a banked checkpoint.',
   },
+  {
+    // Dark's shape with the minion phase parallelized over the ghost-army
+    // Leak II (id-scoped state, snapshot/branch tools). Dark stays untouched
+    // as the sequential control; Surround is the variant that exploits the
+    // parallel service. Bridge knob: LEAK_SURROUND_MINIONS (default 4).
+    value: 'have-surround',
+    label: 'Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)',
+    note: 'Stronghold Dark with concurrent minions: each wave works several holes at once against the parallel Leak II, every minion owning (and freeing) its own proof states, with snapshot/branch tactics available. Requires the ghost-army Leak II. Resumable from a banked checkpoint.',
+  },
 ];
 
 // The Leak River variants — each an ablation of the previous one.
@@ -114,6 +123,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   brute: 'Leak Brute',
   have: 'Leak Have',
   'have-tree': 'Leak Stronghold Dark',
+  'have-surround': 'Leak Stronghold Surround',
 };
 
 export function enforcerLabelFor(strategy: string): string {
@@ -173,11 +183,12 @@ export function benchmarkBudgetFor(strategy: string): {
           : BENCHMARK_ARCHITECT_MAX_ITERS,
     };
   }
-  // Leak Stronghold Dark is the direct capability comparison against Leak
-  // Ultra (same isolated-decomposition shape, different driver) — deliberately
-  // pinned to the SAME constant, not just the same value, so the two can never
-  // drift out of sync if the architect budget changes later.
-  if (strategy === 'have-tree') {
+  // Leak Stronghold Dark (and its parallel-minion variant Surround) is the
+  // direct capability comparison against Leak Ultra (same isolated-
+  // decomposition shape, different driver) — deliberately pinned to the SAME
+  // constant, not just the same value, so the three can never drift out of
+  // sync if the architect budget changes later.
+  if (strategy === 'have-tree' || strategy === 'have-surround') {
     return { computeBudgetMs: BENCHMARK_ARCHITECT_BUDGET_MS };
   }
   if (usesTreeEndpoint(strategy)) {
