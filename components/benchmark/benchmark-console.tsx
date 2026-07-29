@@ -757,6 +757,30 @@ export function BenchmarkConsole() {
                               retry
                             </button>
                           )}
+                          {it.status !== 'pending' && it.status !== 'running' && (
+                            <button
+                              type="button"
+                              disabled={running}
+                              className="text-[11px] text-amber-600 underline-offset-2 hover:underline disabled:opacity-40"
+                              title="Clear this item's banked checkpoint and attempt count, then retry — use when a resumed attempt keeps skipping straight to single-context mode instead of running the selected strategy for real"
+                              onClick={async () => {
+                                if (
+                                  !window.confirm(
+                                    `Retry "${it.problemId}" completely fresh? This clears its saved checkpoint and attempt count — only this problem is affected, everything else in the run stays as-is.`,
+                                  )
+                                )
+                                  return;
+                                await patchItem(selectedRun.id, {
+                                  action: 'reset_fresh',
+                                  itemId: it.id,
+                                });
+                                await loadRun(selectedRun.id);
+                                await loadRuns();
+                              }}
+                            >
+                              fresh
+                            </button>
+                          )}
                           <button
                             type="button"
                             disabled={running}

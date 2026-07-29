@@ -5,6 +5,7 @@ import {
   recordOutcome,
   releaseItem,
   requeueItem,
+  resetItemFresh,
   retryItem,
   saveCheckpoint,
   skipItem,
@@ -30,6 +31,14 @@ async function requireAdmin() {
 //     scoring it as a prover miss, after repeated non-catastrophic failures.
 //   { action: 'requeue', itemId }  — put a finished/skipped item back in the
 //     queue so it is attempted again.
+//   { action: 'reset_fresh', itemId }  — like requeue, but ALSO clears the
+//     banked checkpoint and attempt count. Every other resume path keeps the
+//     checkpoint on purpose (so a have-tree/have-surround item continues its
+//     partial skeleton across a lapsed session); this is the escape hatch for
+//     when the operator wants the SELECTED STRATEGY to run for real again —
+//     a live checkpoint short-circuits dispatch straight to the flat single-
+//     context finisher regardless of strategy. Scoped to one item; every
+//     other item in the run (proved or not) is untouched.
 //   { action: 'checkpoint', itemId, skeleton, filled, total }  — persist a
 //     have-tree partial-skeleton checkpoint without changing status.
 export async function PATCH(request: Request) {
@@ -59,6 +68,10 @@ export async function PATCH(request: Request) {
     }
     if (body.action === 'requeue') {
       await requeueItem(itemId);
+      return Response.json({ ok: true });
+    }
+    if (body.action === 'reset_fresh') {
+      await resetItemFresh(itemId);
       return Response.json({ ok: true });
     }
     if (body.action === 'checkpoint') {

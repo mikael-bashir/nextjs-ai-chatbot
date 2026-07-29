@@ -323,6 +323,34 @@ export async function retryItem(itemId: string): Promise<void> {
   `;
 }
 
+// Reset ONE item to a genuinely clean slate: every other resume path (retry,
+// release, requeue, skip→requeue) deliberately KEEPS proof_checkpoint, so a
+// have-tree/have-surround item with banked partial progress resumes straight
+// into the single-context finisher — bypassing the planner + minion path
+// regardless of which strategy is selected (ctx.seed short-circuits dispatch
+// before the strategy switch is ever read). That's correct for continuing a
+// long run across a lapsed session, but wrong when the operator wants to see
+// the SELECTED STRATEGY'S real behavior again on this problem.
+//
+// This clears the checkpoint (and the attempt count, since "fresh" means
+// fresh) so the next claim runs the real planner/minion path. Scoped to a
+// single itemId — every other item in the run, proved or not, is untouched.
+export async function resetItemFresh(itemId: string): Promise<void> {
+  await ensureTables();
+  await sql`
+    UPDATE benchmark_items
+    SET status = 'pending',
+        error_message = NULL,
+        finished_at = NULL,
+        proof_checkpoint = NULL,
+        proof_checkpoint_filled = NULL,
+        proof_checkpoint_total = NULL,
+        attempts = 0,
+        updated_at = now()
+    WHERE id = ${itemId};
+  `;
+}
+
 /** Terminal states for one attempt. `skipped` = abandoned, never scored. */
 export type ItemStatus = 'proved' | 'refuted' | 'unsolved' | 'skipped';
 export const TERMINAL_STATUSES: ItemStatus[] = [
