@@ -48,8 +48,11 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     note: 'One agent, everything inside the proof as `have` steps; no top-level helper lemmas.',
   },
   {
+    // value stays `have-tree` — renaming it would orphan saved checkpoints,
+    // queued items and every existing research row (matches admin-pipeline.tsx
+    // and prover-playground.tsx, which already show the same display name).
     value: 'have-tree',
-    label: 'Have-tree (isolated per-hole minions)',
+    label: 'Leak Stronghold Dark (planner + isolated per-hole minions)',
     note: 'Planner writes a `have`-skeleton; each hole is filled by its own isolated minion; a finisher assembles. Resumable from a banked checkpoint.',
   },
 ];
@@ -148,7 +151,7 @@ export function strategyNote(strategy: string): string | null {
 export const BENCHMARK_ARCHITECT_BUDGET_MS = 20 * 60_000;
 export const BENCHMARK_VINTAGE_MAX_ITERS = 5;
 export const BENCHMARK_ARCHITECT_MAX_ITERS = 8;
-/** Non-architect decomposition (have-tree) keeps the ACG pipeline's own clock. */
+/** Every OTHER non-architect decomposition strategy keeps the ACG pipeline's own clock. */
 export const BENCHMARK_TREE_BUDGET_MS = 30 * 60_000;
 
 /**
@@ -169,6 +172,13 @@ export function benchmarkBudgetFor(strategy: string): {
           ? BENCHMARK_VINTAGE_MAX_ITERS
           : BENCHMARK_ARCHITECT_MAX_ITERS,
     };
+  }
+  // Leak Stronghold Dark is the direct capability comparison against Leak
+  // Ultra (same isolated-decomposition shape, different driver) — deliberately
+  // pinned to the SAME constant, not just the same value, so the two can never
+  // drift out of sync if the architect budget changes later.
+  if (strategy === 'have-tree') {
+    return { computeBudgetMs: BENCHMARK_ARCHITECT_BUDGET_MS };
   }
   if (usesTreeEndpoint(strategy)) {
     return { computeBudgetMs: BENCHMARK_TREE_BUDGET_MS };
