@@ -278,6 +278,9 @@ export function ProverPlayground() {
               <option value="have-surround">
                 Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)
               </option>
+              <option value="finality-1">
+                Leak Finality I (Surround + timed skeleton refinement)
+              </option>
               <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
                 <option value="ultra-fleeting">
                   Leak Ultra Fleeting (model from the selector)

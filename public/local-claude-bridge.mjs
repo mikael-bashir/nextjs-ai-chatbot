@@ -1954,6 +1954,18 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have-surround",
   },
+  // Leak Finality I: Surround's parallel work-queue + Ultra's refinement loop.
+  // A bridge timer summons a refiner 5 min after the last refinement
+  // completed; in-flight minions are cut off, their Pantograph states handed
+  // to the refiner (assign-or-decimate), and a run-scoped proven-lemma bank
+  // refills kept haves in the revised skeleton for free. See proveFinality.
+  "finality-1": {
+    label: "Leak Finality I — Surround + timed skeleton refinement (lemma bank, state hand-off)",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => finalityRefinerPrompt(t, "<the current skeleton>", [], {}, [], m, x),
+    search: GOV_INITIAL,
+    style: "finality",
+  },
   // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
@@ -3980,6 +3992,514 @@ async function proveHaveSurround(theorem, ctx) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
   } else if (!ctx.signal?.aborted) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Banked ${filled}/${filled + remaining.length} hole(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ===========================================================================
+// LEAK FINALITY I — Surround's continuous parallel work-queue crossed with
+// Ultra's system-summoned refinement loop, on the ancestral Leak I/II/IV
+// stack (Lean 4.29.1, legacy certificate key group).
+// ---------------------------------------------------------------------------
+// Identical to Stronghold Surround (planner → parallel minion work-queue →
+// assembler → flat-finisher fallback) EXCEPT:
+//   • A bridge-side timer fires FINALITY_REFINE_MS (default 5 min) after the
+//     LAST refinement completed (the planner counts as refinement #0). When it
+//     fires, in-flight minions are CUT OFF immediately (epoch abort — no
+//     waiting for the slowest), and a REFINER conversation is summoned.
+//   • A run-scoped PROVEN-LEMMA BANK keyed by have-PROPOSITION (not tag)
+//     records every closed hole. The refiner sees it; any have it keeps
+//     verbatim in the new skeleton is re-filled automatically for free. The
+//     bank is a function local — disposed with the run, never persisted.
+//   • Minions' live Pantograph proof-state ids are ledgered per hole (ghost-
+//     army Leak II). The refiner receives them all — inspectable via
+//     get_current_proof_state — and must TRIAGE each: ASSIGN it to a hole
+//     whose have it kept exactly (the next minion resumes from that state),
+//     or DECIMATE it with cleanup_memory(state_id). The orchestrator frees
+//     anything left unassigned anyway, so the ledger can never leak.
+//   • Refinements are bounded by FINALITY_MAX_REFINES (default 8 — Ultra's
+//     refinement-iteration budget), NOT by any new wall clock: time
+//     governance stays exactly the shared ctx.getDeadline the parents use.
+// Surround above stays byte-identical as the no-refinement control.
+// ===========================================================================
+const FINALITY_REFINE_MS = Number(process.env.LEAK_FINALITY_REFINE_MS || 300000)
+const FINALITY_MAX_REFINES = Number(process.env.LEAK_FINALITY_MAX_REFINES || 8)
+const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+
+// The have-line carrying hole `id`: its bound name and proposition. The bank
+// keys on the WHITESPACE-NORMALIZED proposition so a refiner keeping the same
+// have under a different tag (tags are re-freshened every refinement) still
+// gets the banked proof restored.
+function holeHaveInfo(skeleton, id) {
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const line = String(skeleton || "")
+    .split("\n")
+    .find((l) => markRe.test(l))
+  if (!line) return null
+  const m = line.match(/have\s+([^\s:(]+)\s*:\s*([\s\S]*?):=\s*by\s+sorry\s*--/)
+  if (!m || !m[2].trim()) return null
+  return { name: m[1], prop: m[2].trim(), key: m[2].replace(/\s+/g, " ").trim() }
+}
+
+// ASSIGN lines in the refiner's final message: `ASSIGN <state-uuid> ⟪tag⟫`.
+function parseAssignLines(text) {
+  const out = []
+  const re = /ASSIGN\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*⟪\s*(\w+)\s*⟫/gi
+  let m
+  while ((m = re.exec(String(text || ""))) !== null) out.push({ stateId: m[1].toLowerCase(), tag: m[2] })
+  return out
+}
+
+function finalityRefinerPrompt(theorem, skeleton, bankList, stuckNotes, inflight, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  const bankBlock = bankList.length
+    ? bankList.map((b) => `- ${b.name} : ${b.prop}   [PROVED — kept verbatim ⇒ refilled for free]`).join("\n")
+    : "(none proved yet)"
+  const stuckBlock = Object.keys(stuckNotes).length
+    ? Object.entries(stuckNotes)
+        .map(([id, n]) => `- ⟪${id}⟫: ${oneLine(String(n?.text || "no notes")).slice(0, 500)}${n?.tactics?.length ? `\n    tactics tried: ${n.tactics.slice(-10).join(" ; ").slice(0, 400)}` : ""}`)
+        .join("\n")
+    : "(none)"
+  const inflightBlock = inflight.length
+    ? inflight
+        .map(
+          (f) =>
+            `- hole ⟪${f.tag}⟫ — state id(s): ${[...f.ids].join(", ")}${f.lastGoal ? `\n    last goals: ${oneLine(f.lastGoal).slice(0, 400)}` : ""}${f.tactics?.length ? `\n    tactics applied: ${f.tactics.slice(-10).join(" ; ").slice(0, 300)}` : ""}`,
+        )
+        .join("\n")
+    : "(none)"
+  return `You are the REFINER in the Leak Finality I pipeline for a Lean 4 + Mathlib proof. A planner wrote a \`have\`-skeleton; parallel minions have been filling its holes. You are summoned on a timer to REDESIGN the skeleton in light of everything learned so far. Your output becomes the new skeleton the minions work next.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE TARGET THEOREM (its signature is IMMUTABLE):
+${theorem}
+
+CURRENT SKELETON (proven steps have their tactic bodies spliced in; open holes are \`:= by sorry --⟪tag⟫\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+PROVEN-LEMMA BANK — steps already closed this run. If your new skeleton contains a \`have\` with EXACTLY one of these propositions (whitespace aside; the tag may differ), its proof is restored automatically for free. Changing a proposition even slightly forfeits the free proof:
+${bankBlock}
+
+STUCK HOLES — minions tried and failed; their notes:
+${stuckBlock}
+
+LIVE PARTIAL PROGRESS — Pantograph proof states from minions that were cut off mid-work. Inspect any of them with get_current_proof_state(state_id) before deciding:
+${inflightBlock}
+
+YOUR JOB:
+1. Decide the best skeleton NOW. Keep proven \`have\`s verbatim (free). Restructure what is stuck: a different split, different intermediate propositions, more or fewer steps — informed by the failure notes and partial progress above.
+2. VERIFY the new skeleton exactly like the planner: reproduce the master theorem VERBATIM (same name + signature), open with \`by\`, every open step a ONE-LINE hole \`have hN : <prop> := by sorry --⟪hN⟫\` with a DISTINCT tag, assembly closed from the \`have\`s and sorry-FREE, then verify_full_script it — it MUST compile with the ONLY diagnostics being \`sorry\` warnings (no errors). Iterate until it passes; an unverified skeleton is useless.
+3. TRIAGE every live partial state listed above — each must end either assigned or freed:
+   - If your new skeleton keeps that hole's \`have\` with the SAME proposition, you may hand its progress to the next minion: output an ASSIGN line (format below).
+   - Otherwise DECIMATE it: call cleanup_memory(state_id) for exactly that state. Never call cleanup_memory with no arguments — that wipes every state on the server.
+4. OUTPUT: the verified skeleton in ONE \`\`\`lean block, then one line per state you kept:
+ASSIGN <state_id> ⟪tag⟫
+
+RULES: master signature immutable; every hole tagged \`--⟪hN⟫\` and unique; do NOT fill holes yourself (banked proofs are restored by the system); prefer keeping proven propositions word-for-word.
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// Surround's minion with two Finality additions: (a) every Pantograph state id
+// the minion creates is ledgered into `reg` (init_proof / snapshot_state /
+// branch_tactics results; ids it frees itself are removed), along with the
+// last goal state seen, so a cut-off minion's progress is visible to the
+// refiner; (b) an optional resume hint points it at a state a refiner carried
+// over from a predecessor.
+async function fillHoleFinality(skeleton, id, ctx, reg) {
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Finality minion working hole ⟪${id}⟫…` })
+  const resumeExtra = reg?.resume
+    ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. Inspect it with get_current_proof_state and CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over, if it helps. Free it with cleanup_memory(state_id) if you abandon it.`
+    : ""
+  const applied = []
+  const toolNames = new Map() // tool_use id -> short tool name
+  const res = await spawnProverStream(
+    {
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, resumeExtra),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    {
+      onObject: (o) => {
+        try {
+          if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_use") continue
+              const name = String(c.name || "")
+              if (c.id) toolNames.set(c.id, name.replace(/^.*__/, ""))
+              if (name.endsWith("apply_tactic") && c.input?.tactic) applied.push(String(c.input.tactic))
+              // A state the minion frees itself leaves the ledger immediately.
+              if (name.endsWith("cleanup_memory") && typeof c.input?.state_id === "string" && reg)
+                reg.ids.delete(c.input.state_id.toLowerCase())
+            }
+          } else if (o?.type === "user" && Array.isArray(o.message?.content) && reg) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_result" || !c.tool_use_id) continue
+              const tool = toolNames.get(c.tool_use_id)
+              if (!tool) continue
+              const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+              if (/init_proof|snapshot_state|branch_tactics/.test(tool)) {
+                UUID_ANY_RE.lastIndex = 0
+                let m
+                while ((m = UUID_ANY_RE.exec(t)) !== null) reg.ids.add(m[0].toLowerCase())
+              }
+              if (/init_proof|apply_tactic|branch_tactics|get_current_proof_state/.test(tool) && /⊢|Goal/i.test(t))
+                reg.lastGoal = t.slice(-700)
+            }
+          }
+        } catch {
+          /* ledgering must never crash a minion */
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
+  )
+  if (reg) reg.tactics.push(...applied)
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
+}
+
+// Leak Finality I orchestrator.
+async function proveFinality(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "♾️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Leak Finality I: Surround's parallel waves + a ${Math.round(FINALITY_REFINE_MS / 60000)}-min refinement cadence (lemma bank + state hand-off).` })
+
+  // ---- 1) PLANNER — verbatim Surround/Dark planner phase --------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+            skeleton = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "♾️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+  if (!parseHoleIds(skeleton).length) return proveHaveFlat(theorem, ctx)
+
+  // ---- 2) EPOCHS: Surround work-queue, cut off by the refinement timer ------
+  // Run-scoped, disposed with the run (plain locals — nothing persists):
+  const bank = new Map() // normalized have-proposition -> { name, prop, fill }
+  const stateReg = new Map() // open hole tag -> { ids:Set<uuid>, lastGoal, tactics:[], resume }
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  const freeStates = async (ids) => {
+    if (!pantoUrl) return
+    for (const id of ids)
+      await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, { state_id: id }, { timeoutMs: 15000 }).catch(() => {})
+  }
+  const allLedgeredIds = () => {
+    const out = new Set()
+    for (const r of stateReg.values()) for (const i of r.ids) out.add(i)
+    return out
+  }
+
+  let partial = skeleton
+  let rejectedNotes = {}
+  let stuck = new Set()
+  let banked = 0
+  let refines = 0
+  let lastRefineDoneAt = Date.now() // the planner counts as refinement #0
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Skeleton verified — ${parseHoleIds(skeleton).length} hole(s). Waves of ×${SURROUND_MINIONS} minions; refinement summoned ${Math.round(FINALITY_REFINE_MS / 60000)} min after the last one completed.` })
+  ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: parseHoleIds(skeleton).length })
+
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    const open = parseHoleIds(partial).filter((h) => !stuck.has(h))
+
+    if (open.length) {
+      // ---- one epoch: Surround's continuous queue under an epoch abort ------
+      const epochAC = new AbortController()
+      const onParentAbort = () => epochAC.abort()
+      ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+      let refineDue = false
+      const msLeft = lastRefineDoneAt + FINALITY_REFINE_MS - Date.now()
+      const timer = setTimeout(() => {
+        refineDue = true
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏰ Refinement cadence hit (${Math.round(FINALITY_REFINE_MS / 60000)} min since the last refinement) — cutting off in-flight minions and summoning the refiner.` })
+        epochAC.abort()
+      }, Math.max(1000, msLeft))
+      const ectx = { ...ctx, signal: epochAC.signal }
+
+      let applyLock = Promise.resolve()
+      const withApplyLock = (fn) => {
+        const p = applyLock.then(fn)
+        applyLock = p.then(() => {}, () => {})
+        return p
+      }
+      const queue = open.map((id) => ({ id, depth: 0 }))
+      let inFlight = 0
+      const workers = Array.from({ length: Math.max(1, Math.min(SURROUND_MINIONS, queue.length)) }, async () => {
+        while (true) {
+          if (epochAC.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+          const item = queue.shift()
+          if (!item) {
+            if (inFlight === 0) return
+            await new Promise((r) => setTimeout(r, 500))
+            continue
+          }
+          inFlight++
+          try {
+            const { id, depth } = item
+            let reg = stateReg.get(id)
+            if (!reg) {
+              reg = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+              stateReg.set(id, reg)
+            }
+            const r = await fillHoleFinality(partial, id, ectx, reg)
+            await withApplyLock(async () => {
+              if (ctx.signal?.aborted) return
+              if (r.fill != null) {
+                const info = holeHaveInfo(partial, id)
+                partial = spliceHole(partial, id, r.fill)
+                banked++
+                if (info) bank.set(info.key, { name: info.name, prop: info.prop, fill: r.fill })
+                // The hole is closed — its ledgered states are dead weight now.
+                const dead = [...reg.ids]
+                stateReg.delete(id)
+                freeStates(dead)
+                ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (Finality wave).` })
+              } else if (epochAC.signal.aborted && !ctx.signal?.aborted) {
+                // Cut off by the refinement timer mid-work: NOT stuck — its
+                // partial states stay ledgered for the refiner to triage.
+                queue.length = 0
+              } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
+                const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
+                const trial = spliceHole(partial, id, freshBody)
+                const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+                if (v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig)) {
+                  partial = trial
+                  stateReg.delete(id)
+                  for (const t of tags) queue.push({ id: t, depth: depth + 1 })
+                  ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Split hole ⟪${id}⟫ into ${tags.length} smaller hole(s): ${tags.map((t) => `⟪${t}⟫`).join(" ")}.` })
+                } else {
+                  stuck.add(id)
+                  if (r.notes) rejectedNotes[id] = r.notes
+                  ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ split didn't type-check — flagged for the refiner.` })
+                }
+              } else {
+                stuck.add(id)
+                if (r.notes) rejectedNotes[id] = r.notes
+              }
+              const openNow = parseHoleIds(partial)
+              ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow.length })
+            })
+          } finally {
+            inFlight--
+          }
+        }
+      })
+      await Promise.all(workers)
+      clearTimeout(timer)
+      ctx.signal?.removeEventListener?.("abort", onParentAbort)
+
+      if (!refineDue && parseHoleIds(partial).length === 0) break // all closed — assemble below
+      if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+      // Fall through to refinement: either the timer fired, or every open hole
+      // is stuck (waiting idle for the timer would waste pure wall-clock).
+    }
+
+    // ---- 3) REFINEMENT — system-summoned redesign of the skeleton -----------
+    if (refines >= FINALITY_MAX_REFINES) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Refinement budget spent (${FINALITY_MAX_REFINES}) — handing the banked partial to the finisher.` })
+      break
+    }
+    refines++
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked lemma(s), ${stateReg.size} live partial state-set(s).` })
+
+    const inflight = [...stateReg.entries()]
+      .filter(([, r]) => r.ids.size)
+      .map(([tag, r]) => ({ tag, ids: r.ids, lastGoal: r.lastGoal, tactics: r.tactics }))
+    const refGate = makeProofGate(theorem)
+    const refScripts = new Map()
+    let refined = null
+    const onRefine = (o) => {
+      const ev = refGate.observe(o)
+      if (ev?.verified) return true // refiner closed the whole theorem outright
+      try {
+        if (o.type === "assistant" && o.message?.content) {
+          for (const c of o.message.content) {
+            if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) refScripts.set(c.id, c.input?.script ?? "")
+          }
+        } else if (o.type === "user" && o.message?.content) {
+          for (const c of o.message.content) {
+            if (c.type !== "tool_result" || !refScripts.has(c.tool_use_id)) continue
+            const script = refScripts.get(c.tool_use_id)
+            const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+            const parsed = parseVerifyOutput(t)
+            if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+              refined = script
+            }
+          }
+        }
+      } catch {
+        /* observation must never crash the run */
+      }
+      return false
+    }
+    const refRes = await spawnProverStream(
+      {
+        prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, inflight, ctx.mcpServers),
+        mcpServers: ctx.mcpServers,
+        model: ctx.model,
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "📐",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      { onObject: onRefine, emit: ctx.emit },
+    )
+
+    if (refGate.verifiedScript) {
+      const v = await verifyViaDaemon(refGate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+      if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(refGate.verifiedScript, sig)) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Refiner closed the theorem outright." })
+        await freeStates(allLedgeredIds())
+        return { verified: true, proof: refGate.verifiedScript }
+      }
+    }
+
+    if (refined) {
+      // Restore banked proofs into every kept have (keyed by proposition), then
+      // carry ASSIGNed partial states over to their new tags.
+      let restored = 0
+      let next = refined
+      for (const id of parseHoleIds(refined)) {
+        const info = holeHaveInfo(next, id)
+        const hit = info && bank.get(info.key)
+        if (hit) {
+          next = spliceHole(next, id, hit.fill)
+          restored++
+        }
+      }
+      const assigns = parseAssignLines(refRes.finalText)
+      const before = allLedgeredIds()
+      const keptIds = new Set()
+      const nextReg = new Map()
+      const openNext = new Set(parseHoleIds(next))
+      for (const { stateId, tag } of assigns) {
+        if (!openNext.has(tag) || !before.has(stateId)) continue
+        let r = nextReg.get(tag)
+        if (!r) {
+          r = { ids: new Set(), lastGoal: "", tactics: [], resume: stateId }
+          nextReg.set(tag, r)
+        }
+        r.ids.add(stateId)
+        keptIds.add(stateId)
+        // Carry the goal/tactic trail from whichever old hole ledgered it.
+        for (const [, old] of stateReg) {
+          if (old.ids.has(stateId)) {
+            r.lastGoal = r.lastGoal || old.lastGoal
+            r.tactics.push(...old.tactics)
+          }
+        }
+      }
+      // Decimate everything the refiner did not carry over (it was told to
+      // cleanup_memory these itself — this is the guarantee).
+      await freeStates([...before].filter((i) => !keptIds.has(i)))
+      stateReg.clear()
+      for (const [k, v2] of nextReg) stateReg.set(k, v2)
+      partial = next
+      stuck = new Set()
+      rejectedNotes = {}
+      const openCount = parseHoleIds(partial).length
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines} accepted: ${restored} banked proof(s) restored, ${keptIds.size} partial state(s) handed over, ${openCount} hole(s) open.` })
+      ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openCount })
+      if (openCount === 0) break // bank restoration alone closed everything
+    } else {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Refinement #${refines} produced no verified skeleton — keeping the current one.` })
+      // Free cut-off states anyway (nothing will resume them under this
+      // skeleton) and clear `stuck` so the surviving holes get another wave.
+      await freeStates(allLedgeredIds())
+      stateReg.clear()
+      if (!parseHoleIds(partial).filter((h) => !stuck.has(h)).length) stuck = new Set()
+    }
+    lastRefineDoneAt = Date.now()
+  }
+
+  // ---- 4) + 5) verbatim from Surround: assemble, else finish from the seed --
+  const remaining = parseHoleIds(partial)
+  await freeStates(allLedgeredIds()) // dispose the ghost ledger with the run
+
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Finality I assembled a verified proof: ${banked} banked hole(s), ${refines} refinement(s).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Banked ${banked} hole(s) across ${refines} refinement(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
   }
 
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
@@ -8076,6 +8596,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             haveTreePlannerPrompt(theorem, mcpServers) +
             "\n\n=== HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
             surroundHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
+          : style === "finality"
+          ? `[DECOMPOSITION MODE — Leak Finality I (Surround waves ×${SURROUND_MINIONS} + ${Math.round(FINALITY_REFINE_MS / 60000)}-min refinement cadence) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers) +
+            "\n\n=== HOLE-FILL (FINALITY MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the current skeleton>", "hN", mcpServers) +
+            "\n\n=== REFINER PROMPT (system-summoned every cadence) ===\n" +
+            finalityRefinerPrompt(theorem, "<the current skeleton>", [], {}, [], mcpServers)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -8197,7 +8724,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -8216,7 +8743,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
               ? await proveHaveTree(theorem, ctx)
               : style === "have-surround"
                 ? await proveHaveSurround(theorem, ctx)
-                : await proveHaveFlat(theorem, ctx)
+                : style === "finality"
+                  ? await proveFinality(theorem, ctx)
+                  : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

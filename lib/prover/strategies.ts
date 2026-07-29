@@ -64,6 +64,18 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     label: 'Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)',
     note: 'Stronghold Dark with concurrent minions: each wave works several holes at once against the parallel Leak II, every minion owning (and freeing) its own proof states, with snapshot/branch tactics available. Requires the ghost-army Leak II. Resumable from a banked checkpoint.',
   },
+  {
+    // Surround crossed with Ultra's refinement loop, on the same ancestral
+    // Leak I/II/IV stack. A bridge-side timer summons a refiner 5 minutes
+    // after the last refinement completed: in-flight minions are cut off
+    // immediately, their live Pantograph proof states handed to the refiner
+    // (assign to a kept have, or decimate via cleanup_memory), and a
+    // run-scoped proven-lemma bank refills kept haves in the revised
+    // skeleton for free.
+    value: 'finality-1',
+    label: 'Leak Finality I (Surround + timed skeleton refinement)',
+    note: "Stronghold Surround's parallel waves plus a system-summoned refinement loop on a 5-minute cadence: the refiner sees the current skeleton, every lemma proven so far (a run-scoped bank, restored for free where kept), and all live Pantograph proof states from cut-off minions — reassigning or decimating each. Requires the ghost-army Leak II. Resumable from a banked checkpoint.",
+  },
 ];
 
 // The Leak River variants — each an ablation of the previous one.
@@ -124,6 +136,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   have: 'Leak Have',
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
+  'finality-1': 'Leak Finality I',
 };
 
 export function enforcerLabelFor(strategy: string): string {
@@ -183,12 +196,16 @@ export function benchmarkBudgetFor(strategy: string): {
           : BENCHMARK_ARCHITECT_MAX_ITERS,
     };
   }
-  // Leak Stronghold Dark (and its parallel-minion variant Surround) is the
-  // direct capability comparison against Leak Ultra (same isolated-
-  // decomposition shape, different driver) — deliberately pinned to the SAME
-  // constant, not just the same value, so the three can never drift out of
-  // sync if the architect budget changes later.
-  if (strategy === 'have-tree' || strategy === 'have-surround') {
+  // Leak Stronghold Dark (and its parallel-minion variant Surround, and their
+  // refinement-loop child Finality I) is the direct capability comparison
+  // against Leak Ultra (same isolated-decomposition shape, different driver)
+  // — deliberately pinned to the SAME constant, not just the same value, so
+  // none of them can drift out of sync if the architect budget changes later.
+  if (
+    strategy === 'have-tree' ||
+    strategy === 'have-surround' ||
+    strategy === 'finality-1'
+  ) {
     return { computeBudgetMs: BENCHMARK_ARCHITECT_BUDGET_MS };
   }
   if (usesTreeEndpoint(strategy)) {

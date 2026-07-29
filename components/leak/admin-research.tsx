@@ -120,6 +120,7 @@ const RIVER_LABELS: Record<string, string> = {
 const STRONGHOLD_LABELS: Record<string, string> = {
   'have-tree': 'Stronghold Dark · planner+minions',
   'have-surround': 'Stronghold Surround · parallel minion waves',
+  'finality-1': 'Finality I · timed refinement',
   have: 'Have · single context',
 };
 
