@@ -1091,10 +1091,12 @@ function stripImports(script) {
 // actually got compiled) ended up with a certificate that silently depended
 // on the daemon's injection to ever compile standalone. Leak IV now appends
 // a `[[LEAK_NORMALIZED_SCRIPT_B64:<base64>]]` marker to a successful verify's
-// text carrying the exact compiled bytes — prefer that. Falls back to
-// mirroring the daemon's own injection rule client-side (same substring
-// check as the daemon) for any response that predates the marker, so this
-// stays correct even before every daemon is redeployed.
+// text carrying the EXACT compiled bytes — this only ever returns that, byte-
+// identical to what the daemon actually checked. No client-side guessing: if
+// the marker isn't present (an un-redeployed daemon), this returns the raw
+// script unchanged rather than fabricating a substitute — a normalized
+// script must come from the daemon that actually compiled it, never a
+// heuristic mirror of its injection rule.
 function normalizeProofScript(daemonText, rawScript) {
   const m = String(daemonText == null ? "" : daemonText).match(
     /\[\[LEAK_NORMALIZED_SCRIPT_B64:([A-Za-z0-9+/=]+)\]\]/,
@@ -1104,11 +1106,10 @@ function normalizeProofScript(daemonText, rawScript) {
       const decoded = Buffer.from(m[1], "base64").toString("utf8")
       if (decoded.trim()) return decoded
     } catch {
-      /* fall through to the client-side fallback below */
+      /* fall through — treat as no marker */
     }
   }
-  const s = String(rawScript == null ? "" : rawScript)
-  return s.includes("import Mathlib") ? s : `import Mathlib\n\n${s}`
+  return String(rawScript == null ? "" : rawScript)
 }
 
 // Identify the master declaration in a scaffold BY NAME (robust to the agent
