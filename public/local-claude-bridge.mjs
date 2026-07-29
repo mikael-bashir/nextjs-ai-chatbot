@@ -4386,6 +4386,8 @@ Refinement is library-aware: you have \`loogle_search\` (exact -- zero hits prov
 
 A \`-- PROVED\` node carries a real, verified proof. It survives your revision only while BOTH its signature and its \`sorry_using\` parent set stay unchanged — touching either discards the proof and the node must be re-proved from scratch. So leave proved nodes alone, and when a revision would leave one unreachable from the main theorem (which the graph-validity gate forbids), RE-WIRE it into the new structure rather than deleting it. Deleting a proved node throws away work that was already paid for.
 
+Separately, the harness NEVER throws a proven lemma away: every lemma proved in ANY earlier iteration stays banked run-wide, even if a past revision dropped or renamed its node. When such dormant lemmas exist, the input carries a \`## Proven-lemma vault\` section listing them. Re-emitting one — same signature, same \`sorry_using\` parent set, any name — restores its verified proof automatically, at zero prover cost. Check the vault before writing any new lemma: if a banked statement (or a trivial rephrasing you could instead consume as-is) already does the job, re-wire the banked one.
+
 Numbers in your own natural-language sketches are not evidence. If a \`## Machine-verified facts\` line contradicts a constant you previously wrote, the machine is right. If a node hinges on a concrete number that has never been verified, you can check it yourself: \`lean_compile\` returns \`#eval\` output, so submit \`#eval <term>\` (no \`import\` line) and read the value back before you commit a constant to a signature.
 
 After every edit, call \`lean_compile\`. The tool reports pre-compile safeguard violations, real Lean compile errors (including an assembly that no longer derives the target from the revised lemmas — fix the lemma STATEMENTS, usually their types, not just the tactic line), the body invariant (lemmas are \`:= by sorry_using [...]\` or a complete sorry-free proof; the main theorem is always its sorry-free assembly), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\`
@@ -6789,6 +6791,59 @@ function architectAnnotate(graph, results, verdicts) {
     .join("\n\n")
 }
 
+// ---------------------------------------------------------------------------
+// PROVEN-LEMMA VAULT (paper: proven lemmas are never thrown away).
+// Every lemma a node prover closes is banked for the REST OF THE RUN, keyed by
+// (normalized signature, sorted parent set) — NOT by name — so it survives
+// refinements that drop or rename its node. Two consumers:
+//   (a) vaultRestore: a revised-graph node matching an entry's signature AND
+//       parent set inherits the proof instantly under ANY name, so a rename or
+//       a drop-then-readd never costs a prover;
+//   (b) architectVaultSection: entries with no live PROVED node are listed to
+//       the refiner as already-paid-for lemmas it should re-wire, not re-derive.
+// An entry is evicted ONLY when assembly certification implicates its proof
+// (the same evidence that demotes it from `proofs`); a later graph editing the
+// node's signature/parents leaves the vault untouched — the old lemma is still
+// a true, proven statement.
+// ---------------------------------------------------------------------------
+const vaultKeyOf = (sigNorm, dk) => `${sigNorm}||${dk}`
+
+function vaultRestore({ vault, provable, proofs, sigOfProof, depsOfProof, depsKey, emit, metrics }) {
+  let restored = 0
+  for (const n of provable) {
+    if (proofs.has(n.name)) continue
+    if (n.glue && String(n.body || "").trim()) continue // glue bodies are refinement-authored, re-seeded from the graph
+    const hit = vault.get(vaultKeyOf(n.signatureNorm, depsKey(n)))
+    if (!hit) continue
+    proofs.set(n.name, hit.proof)
+    sigOfProof.set(n.name, n.signatureNorm)
+    depsOfProof.set(n.name, depsKey(n))
+    restored++
+    if (metrics) metrics.vault_restores = (metrics.vault_restores || 0) + 1
+    emit?.({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🏛️ Vault restored the proven lemma for ⟪${n.name}⟫${hit.name !== n.name ? ` (originally proved as ⟪${hit.name}⟫)` : ""} — no prover dispatched.`,
+    })
+  }
+  return restored
+}
+
+// The refinement-input section: proven lemmas with NO live PROVED node in the
+// current graph. `liveKeys` is the set of vault keys currently backed by a
+// live proof, so entries the refiner kept intact are not repeated at it.
+function architectVaultSection(vault, liveKeys) {
+  const dormant = [...vault.entries()].filter(([k]) => !liveKeys.has(k)).map(([, v]) => v)
+  if (!dormant.length) return ""
+  return (
+    `\n\n## Proven-lemma vault (verified THIS RUN, already paid for, currently absent from the graph)\n` +
+    `Each lemma below was fully proved by a node prover this run; its proof is banked. Re-emitting a node with EXACTLY this signature and EXACTLY this \`sorry_using\` parent set (under any name) restores the proof automatically — zero prover cost. Prefer re-wiring one of these into your revision over writing a near-duplicate lemma, and never spend a prover re-deriving one.\n` +
+    dormant
+      .map((v) => `- ${String(v.signature).replace(/\s+/g, " ").trim()}  -- sorry_using [${(v.deps || []).join(", ")}]`)
+      .join("\n")
+  )
+}
+
 function architectAssemble(graph, prelude, proofs) {
   const parts = ["import Mathlib", ""]
   if (prelude) parts.push(prelude, "")
@@ -7428,6 +7483,9 @@ async function proveArchitect(theorem, ctx, opts = {}) {
   // is read, before any proving or assembly is attempted on it.
   const depsOfProof = new Map()
   const depsKey = (n) => [...n.deps].sort().join(",")
+  // Run-wide proven-lemma vault (paper: proven lemmas are never thrown away) —
+  // see vaultRestore / architectVaultSection above for the two consumers.
+  const vault = new Map() // vaultKeyOf(signatureNorm, depsKey) -> {name, signature, deps, proof}
   // Multiplier on the elaborator resource floor, raised only by the
   // resource-retry branch below (never lowered within a run).
   let resourceBoost = 1
@@ -7457,6 +7515,11 @@ async function proveArchitect(theorem, ctx, opts = {}) {
         depsOfProof.delete(n.name)
       }
     }
+    // Vault restore (paper: proven lemmas are never thrown away): any node the
+    // name-keyed reuse above left unproved but whose signature + parent set
+    // matches a banked lemma inherits that proof — renames and drop-then-readd
+    // included. No-op on the first iteration (vault is empty).
+    vaultRestore({ vault, provable, proofs, sigOfProof, depsOfProof, depsKey, emit: ctx.emit, metrics: ctx.metrics })
     // Glue nodes (the main theorem always; interior nodes optionally) carry
     // their proof AS their body, and the admission compile already verified it
     // against sorried parents — so no prover is ever dispatched at one.
@@ -7505,6 +7568,14 @@ async function proveArchitect(theorem, ctx, opts = {}) {
           proofs.set(node.name, r.proofBody)
           sigOfProof.set(node.name, node.signatureNorm)
           depsOfProof.set(node.name, depsKey(node))
+          // Bank it for the rest of the run — survives any later refinement
+          // dropping or renaming this node (paper: never throw away a proof).
+          vault.set(vaultKeyOf(node.signatureNorm, depsKey(node)), {
+            name: node.name,
+            signature: node.signature,
+            deps: [...node.deps].sort(),
+            proof: r.proofBody,
+          })
           ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ node ⟪${node.name}⟫ solved (attempt ${r.attempts}).` })
         } else if (r.negated) {
           ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${node.name}⟫ DISPROVED — machine-checked negation registered (STATEMENT_WRONG).` })
@@ -7619,6 +7690,10 @@ async function proveArchitect(theorem, ctx, opts = {}) {
       ctx.metrics.dead_ends_shared = state.ledger.shared
       ctx.metrics.dead_ends_known = state.ledger.entries.size
     }
+    // Proven-lemma vault telemetry: how many lemmas are banked run-wide, and
+    // how many were restored for free (vault_restores accumulates in
+    // vaultRestore itself).
+    ctx.metrics.vault_lemmas = vault.size
 
     const unsolved = provable.filter((n) => !proofs.has(n.name))
 
@@ -7724,6 +7799,9 @@ async function proveArchitect(theorem, ctx, opts = {}) {
           proofs.delete(n.name)
           sigOfProof.delete(n.name)
           depsOfProof.delete(n.name)
+          // The certification failure implicates THIS proof — evict it from the
+          // vault too, or refinement could restore a known-bad proof forever.
+          vault.delete(vaultKeyOf(n.signatureNorm, depsKey(n)))
           results.set(n.name, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `The node's proof passed in isolation but failed during final assembly: ${errText.slice(0, 800)}`, fix: "Adjust this node (or its parents) so the proof also elaborates in the assembled file." } })
           demoted++
         }
@@ -7794,9 +7872,19 @@ async function proveArchitect(theorem, ctx, opts = {}) {
           .join("\n")}`
       : ""
     state.mechanicNotes = []
+    // Proven-lemma vault → refinement (paper: proven lemmas are never thrown
+    // away): lemmas proved in ANY earlier iteration whose node the current
+    // graph no longer carries as PROVED are offered back to the refiner, which
+    // can re-wire them in at zero prover cost (vaultRestore honors the match).
+    const liveVaultKeys = new Set(
+      provable.filter((n) => proofs.has(n.name)).map((n) => vaultKeyOf(n.signatureNorm, depsKey(n))),
+    )
+    const vaultSection = architectVaultSection(vault, liveVaultKeys)
+    if (vaultSection)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Vault: offering ${vaultSection.split("\n- ").length - 1} dropped-but-proven lemma(s) back to refinement.` })
     const refined = await architectAdmitBlueprint(ctx, state, urls, {
       system: architectRefineSystem(),
-      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}${elabSection}${mechSection}`,
+      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}${elabSection}${vaultSection}${mechSection}`,
       retries: ARCHITECT_REFINE_RETRIES,
       stageLabel: `refinement ${iter + 1}/${maxIters()}`,
     })

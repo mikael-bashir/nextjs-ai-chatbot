@@ -158,7 +158,7 @@ export function strategyNote(strategy: string): string | null {
 // bridge, so it reaches refinement sooner and spends its clock differently —
 // giving it the same iteration count would not make it a fair comparison, it
 // would just let it run more refinements in the same time.
-export const BENCHMARK_ARCHITECT_BUDGET_MS = 20 * 60_000;
+export const BENCHMARK_ARCHITECT_BUDGET_MS = 30 * 60_000;
 export const BENCHMARK_VINTAGE_MAX_ITERS = 5;
 export const BENCHMARK_ARCHITECT_MAX_ITERS = 8;
 /** Every OTHER non-architect decomposition strategy keeps the ACG pipeline's own clock. */
