@@ -934,8 +934,10 @@ function makeProofGate(theorem) {
         ) {
           const okScript = verifyCalls[c.tool_use_id]
           if (gateAccepts(okScript)) {
-            verifiedScript = okScript
-            return { verified: okScript }
+            // Persist what the daemon actually compiled (import-complete),
+            // not necessarily the raw argument the model sent.
+            verifiedScript = normalizeProofScript(t, okScript)
+            return { verified: verifiedScript }
           }
           return { rejected: okScript }
         }
@@ -1080,6 +1082,33 @@ function stripImports(script) {
     .filter((l) => !/^\s*import\b/.test(l))
     .join("\n")
     .trim()
+}
+
+// Recover the SELF-CONTAINED version of a script we're about to persist as a
+// "final proof". The daemon (Leak IV) injects "import Mathlib" internally to
+// compile a script that lacks one, but historically only returned a plain
+// success sentence — so a caller that stored `script` (what it SENT, not what
+// actually got compiled) ended up with a certificate that silently depended
+// on the daemon's injection to ever compile standalone. Leak IV now appends
+// a `[[LEAK_NORMALIZED_SCRIPT_B64:<base64>]]` marker to a successful verify's
+// text carrying the exact compiled bytes — prefer that. Falls back to
+// mirroring the daemon's own injection rule client-side (same substring
+// check as the daemon) for any response that predates the marker, so this
+// stays correct even before every daemon is redeployed.
+function normalizeProofScript(daemonText, rawScript) {
+  const m = String(daemonText == null ? "" : daemonText).match(
+    /\[\[LEAK_NORMALIZED_SCRIPT_B64:([A-Za-z0-9+/=]+)\]\]/,
+  )
+  if (m) {
+    try {
+      const decoded = Buffer.from(m[1], "base64").toString("utf8")
+      if (decoded.trim()) return decoded
+    } catch {
+      /* fall through to the client-side fallback below */
+    }
+  }
+  const s = String(rawScript == null ? "" : rawScript)
+  return s.includes("import Mathlib") ? s : `import Mathlib\n\n${s}`
 }
 
 // Identify the master declaration in a scaffold BY NAME (robust to the agent
@@ -3682,7 +3711,7 @@ async function proveHaveTree(theorem, ctx) {
     const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${filled} banked hole(s) (recursive decomposition).` })
-      return { verified: true, proof: partial }
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
     }
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
   } else if (!ctx.signal?.aborted) {
@@ -3945,7 +3974,7 @@ async function proveHaveSurround(theorem, ctx) {
     const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Stronghold Surround assembled a verified proof from ${filled} banked hole(s) (parallel waves).` })
-      return { verified: true, proof: partial }
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
     }
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
   } else if (!ctx.signal?.aborted) {
