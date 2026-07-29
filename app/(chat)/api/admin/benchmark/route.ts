@@ -53,11 +53,23 @@ export async function POST(request: Request) {
   if (!benchmark) {
     return Response.json({ error: 'unknown benchmark' }, { status: 400 });
   }
-  const limit = Number(body?.limit);
-  const problems =
-    Number.isFinite(limit) && limit > 0
-      ? benchmark.problems.slice(0, limit)
-      : benchmark.problems;
+  // `problemIds` (even an empty array) means the client is building the queue
+  // itself — the picker adds items one at a time / in batches afterward. Its
+  // absence falls back to the old bulk-seed-at-creation behavior (`limit`, or
+  // the whole benchmark) for any caller that still wants a one-shot full run.
+  let problems: typeof benchmark.problems;
+  if (Array.isArray(body?.problemIds)) {
+    const ids = new Set(
+      (body.problemIds as unknown[]).filter((x): x is string => typeof x === 'string'),
+    );
+    problems = benchmark.problems.filter((p) => ids.has(p.id));
+  } else {
+    const limit = Number(body?.limit);
+    problems =
+      Number.isFinite(limit) && limit > 0
+        ? benchmark.problems.slice(0, limit)
+        : benchmark.problems;
+  }
   const num = (v: unknown) => (Number.isFinite(Number(v)) ? Number(v) : null);
   try {
     const run = await createRun({

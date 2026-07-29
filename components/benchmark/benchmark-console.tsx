@@ -1,6 +1,15 @@
 'use client';
 
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -96,6 +105,12 @@ interface BenchmarkDefRow {
   sampleSizes: { label: string; value: number }[];
 }
 
+interface PoolProblem {
+  id: string;
+  statement: string;
+  informal: string | null;
+}
+
 interface RunRow {
   id: string;
   benchmark: string;
@@ -189,6 +204,122 @@ function fmtDuration(from: string | null, to: string | null): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
 }
 
+// The "add exactly the problems you want" picker — ACG-style click-to-add
+// (no drag-and-drop library needed; ACG's own queue is click-based too, see
+// admin-pipeline.tsx's enqueueVerify). Pool is whatever the SELECTED run's
+// benchmark is; already-queued problems are hidden so re-picking one is a
+// visible no-op rather than a silent duplicate.
+function PoolPicker({
+  pool,
+  loading,
+  queuedIds,
+  picked,
+  setPicked,
+  filter,
+  setFilter,
+  adding,
+  onAddOne,
+  onAddMany,
+}: {
+  pool: PoolProblem[] | null;
+  loading: boolean;
+  queuedIds: Set<string>;
+  picked: Set<string>;
+  setPicked: Dispatch<SetStateAction<Set<string>>>;
+  filter: string;
+  setFilter: (v: string) => void;
+  adding: boolean;
+  onAddOne: (id: string) => void;
+  onAddMany: (ids: string[]) => void;
+}) {
+  const available = (pool ?? []).filter((p) => !queuedIds.has(p.id));
+  const q = filter.trim().toLowerCase();
+  const visible = q
+    ? available.filter(
+        (p) =>
+          p.id.toLowerCase().includes(q) ||
+          (p.informal ?? '').toLowerCase().includes(q),
+      )
+    : available;
+
+  const toggle = (id: string) =>
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  return (
+    <div className="space-y-2 rounded-md border p-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={filter}
+          onChange={(e) => setFilter(e.target.value)}
+          placeholder="Filter by id or text…"
+          className="h-8 max-w-xs text-sm"
+        />
+        <span className="text-xs text-muted-foreground">
+          {loading
+            ? 'Loading pool…'
+            : `${visible.length} available${filter ? ` (of ${available.length} unqueued)` : ''}`}
+        </span>
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={adding || !visible.length}
+            onClick={() => onAddMany(visible.map((p) => p.id))}
+          >
+            Add all {visible.length}
+          </Button>
+          <Button
+            size="sm"
+            disabled={adding || !picked.size}
+            onClick={() => onAddMany([...picked])}
+          >
+            {adding ? 'Adding…' : `Add ${picked.size} selected`}
+          </Button>
+        </div>
+      </div>
+      <div className="max-h-64 overflow-y-auto rounded border">
+        {!loading && !visible.length && (
+          <p className="p-3 text-xs text-muted-foreground">
+            {available.length
+              ? 'No problems match that filter.'
+              : 'Every problem in this pool is already queued.'}
+          </p>
+        )}
+        {visible.map((p) => (
+          <div
+            key={p.id}
+            className="flex items-center gap-2 border-t p-1.5 text-xs first:border-t-0"
+          >
+            <input
+              type="checkbox"
+              checked={picked.has(p.id)}
+              onChange={() => toggle(p.id)}
+              className="size-3.5"
+            />
+            <span className="font-mono">{p.id}</span>
+            <span className="flex-1 truncate text-muted-foreground">
+              {p.informal ?? ''}
+            </span>
+            <button
+              type="button"
+              className="text-sky-600 underline-offset-2 hover:underline disabled:opacity-40"
+              disabled={adding}
+              onClick={() => onAddOne(p.id)}
+            >
+              + add
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export function BenchmarkConsole() {
   const [runs, setRuns] = useState<RunRow[] | null>(null);
   const [benchmarks, setBenchmarks] = useState<BenchmarkDefRow[]>([]);
@@ -199,8 +330,20 @@ export function BenchmarkConsole() {
   const [benchmarkId, setBenchmarkId] = useState('');
   const [model, setModel] = useState('claude-opus-4-8');
   const [strategy, setStrategy] = useState('river-vintage');
-  const [sampleSize, setSampleSize] = useState(0);
   const [expanded, setExpanded] = useState<string | null>(null);
+
+  // The problem picker — ACG-style: the config above (benchmark/strategy/
+  // model/label) sets up the SESSION, then you add exactly the problems you
+  // want one at a time, in whatever order, rather than bulk-seeding N up
+  // front. Pool is scoped to the SELECTED run's own benchmark (not the "new
+  // session" dropdown above it), so adding to an existing FATE-X run always
+  // offers FATE-X problems even if the top dropdown has since moved on.
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pool, setPool] = useState<PoolProblem[] | null>(null);
+  const [poolLoading, setPoolLoading] = useState(false);
+  const [poolFilter, setPoolFilter] = useState('');
+  const [poolPicked, setPoolPicked] = useState<Set<string>>(new Set());
+  const [adding, setAdding] = useState(false);
 
   const [events, setEvents] = useState<ProverEvent[]>([]);
   const [running, setRunning] = useState(false);
@@ -237,13 +380,10 @@ export function BenchmarkConsole() {
   const selectedRun = runs?.find((r) => r.id === selected) || null;
   const activeBenchmark = benchmarks.find((b) => b.id === benchmarkId) || null;
 
-  // Reset the sample size whenever the benchmark changes — its options differ.
-  useEffect(() => {
-    setSampleSize(0);
-  }, [benchmarkId]);
-
   const budget = useMemo(() => benchmarkBudgetFor(strategy), [strategy]);
 
+  // A new session starts EMPTY — no bulk seed, no sample-size picker. The
+  // picker below is how problems get added, one at a time or in a batch.
   const createRun = async () => {
     setCreating(true);
     try {
@@ -258,7 +398,7 @@ export function BenchmarkConsole() {
           model,
           strategy: strategy || null,
           decompose: usesTreeEndpoint(strategy),
-          limit: sampleSize || undefined,
+          problemIds: [], // empty session — add problems via the picker
           computeBudgetMs: budget.computeBudgetMs ?? null,
           maxIters: budget.maxIters ?? null,
         }),
@@ -268,11 +408,40 @@ export function BenchmarkConsole() {
         setLabel('');
         await loadRuns();
         setSelected(run.id);
+        setPickerOpen(true);
       }
     } finally {
       setCreating(false);
     }
   };
+
+  // Load the picker's pool from the SELECTED run's own benchmark, not the
+  // "new session" dropdown — so opening the picker on an existing FATE-X run
+  // always shows FATE-X problems regardless of what's picked above.
+  useEffect(() => {
+    if (!pickerOpen || !selectedRun) return;
+    let cancelled = false;
+    setPoolLoading(true);
+    fetch(`/api/admin/benchmark/pool?benchmark=${encodeURIComponent(selectedRun.benchmark)}`)
+      .then((r) => (r.ok ? r.json() : { problems: [] }))
+      .then((j) => {
+        if (!cancelled) setPool(j.problems ?? []);
+      })
+      .finally(() => {
+        if (!cancelled) setPoolLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pickerOpen, selectedRun?.benchmark, selectedRun?.id]);
+
+  // Reset picker selection/filter whenever the selected run changes, so stale
+  // checkboxes from a different run's pool can never leak into an add_many call.
+  useEffect(() => {
+    setPoolPicked(new Set());
+    setPoolFilter('');
+    setPool(null);
+  }, [selected]);
 
   const deleteRun = async (runId: string) => {
     await fetch(`/api/admin/benchmark/${runId}`, { method: 'DELETE' });
@@ -302,6 +471,50 @@ export function BenchmarkConsole() {
       await loadRuns();
     },
     [loadRun, loadRuns],
+  );
+
+  // Already-queued problem ids for the selected run — the picker hides these
+  // (or marks them added) so re-picking the same problem is a visible no-op,
+  // not a silent duplicate click.
+  const queuedIds = useMemo(
+    () => new Set((items ?? []).map((it) => it.problemId)),
+    [items],
+  );
+
+  const addOne = useCallback(
+    async (problemId: string) => {
+      if (!selected) return;
+      await patchItem(selected, { action: 'add', problemId });
+      await loadRun(selected);
+      await loadRuns();
+    },
+    [selected, patchItem, loadRun, loadRuns],
+  );
+
+  const addMany = useCallback(
+    async (problemIds: string[]) => {
+      if (!selected || !problemIds.length) return;
+      setAdding(true);
+      try {
+        await patchItem(selected, { action: 'add_many', problemIds });
+        setPoolPicked(new Set());
+        await loadRun(selected);
+        await loadRuns();
+      } finally {
+        setAdding(false);
+      }
+    },
+    [selected, patchItem, loadRun, loadRuns],
+  );
+
+  const removeQueued = useCallback(
+    async (itemId: string) => {
+      if (!selected) return;
+      await patchItem(selected, { action: 'remove', itemId });
+      await loadRun(selected);
+      await loadRuns();
+    },
+    [selected, patchItem, loadRun, loadRuns],
   );
 
   // The resumable loop: claim the next pending problem, prove it on the
@@ -479,15 +692,17 @@ export function BenchmarkConsole() {
       </div>
 
       <div className="rounded-lg border p-4">
-        <h2 className="text-sm font-semibold">New benchmark run</h2>
+        <h2 className="text-sm font-semibold">New session</h2>
         <p className="mt-1 text-xs text-muted-foreground">
           Runs on your connected bridge, one problem at a time, fully resumable —
           a usage limit or a closed laptop pauses the pass without scoring
           anything. Every attempt files a research row and stores its proof.
+          A session starts empty — pick exactly the problems you want below
+          after creating it.
         </p>
         <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <div className="lg:col-span-2">
-            <Label className="text-xs">Benchmark</Label>
+            <Label className="text-xs">Benchmark (problem pool)</Label>
             <select
               value={benchmarkId}
               onChange={(e) => setBenchmarkId(e.target.value)}
@@ -501,21 +716,7 @@ export function BenchmarkConsole() {
             </select>
           </div>
           <div>
-            <Label className="text-xs">Sample size</Label>
-            <select
-              value={sampleSize}
-              onChange={(e) => setSampleSize(Number(e.target.value))}
-              className="mt-1 h-8 w-full rounded-md border bg-background px-2 text-sm"
-            >
-              {(activeBenchmark?.sampleSizes ?? []).map((s) => (
-                <option key={s.value} value={s.value}>
-                  {s.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <Label className="text-xs">Label</Label>
+            <Label className="text-xs">Tag / label</Label>
             <Input
               value={label}
               onChange={(e) => setLabel(e.target.value)}
@@ -579,15 +780,15 @@ export function BenchmarkConsole() {
         </p>
 
         <Button size="sm" className="mt-3" disabled={creating} onClick={createRun}>
-          {creating ? 'Creating…' : 'Create run'}
+          {creating ? 'Creating…' : 'Create session'}
         </Button>
       </div>
 
       <div className="space-y-2">
-        <h2 className="text-sm font-semibold">Runs</h2>
+        <h2 className="text-sm font-semibold">Sessions</h2>
         {!runs?.length && (
           <p className="text-xs text-muted-foreground">
-            No benchmark runs yet — create one above.
+            No sessions yet — create one above.
           </p>
         )}
         <div className="space-y-2">
@@ -624,8 +825,21 @@ export function BenchmarkConsole() {
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h3 className="text-sm font-semibold">{selectedRun.label}</h3>
             <div className="flex flex-wrap items-center gap-2">
+              <Button
+                size="sm"
+                variant={pickerOpen ? 'secondary' : 'outline'}
+                disabled={running}
+                onClick={() => setPickerOpen((v) => !v)}
+              >
+                {pickerOpen ? 'Close picker' : '+ Add problems'}
+              </Button>
               {!running ? (
-                <Button size="sm" onClick={runLoop}>
+                <Button
+                  size="sm"
+                  disabled={!selectedRun.total}
+                  title={!selectedRun.total ? 'Add problems below first' : undefined}
+                  onClick={runLoop}
+                >
                   {selectedRun.proved +
                     selectedRun.refuted +
                     selectedRun.unsolved +
@@ -687,6 +901,21 @@ export function BenchmarkConsole() {
             </p>
           )}
 
+          {pickerOpen && (
+            <PoolPicker
+              pool={pool}
+              loading={poolLoading}
+              queuedIds={queuedIds}
+              picked={poolPicked}
+              setPicked={setPoolPicked}
+              filter={poolFilter}
+              setFilter={setPoolFilter}
+              adding={adding}
+              onAddOne={addOne}
+              onAddMany={addMany}
+            />
+          )}
+
           <ProverConsole
             events={events}
             running={running}
@@ -740,6 +969,17 @@ export function BenchmarkConsole() {
                       <td className="px-2 py-1">{it.attempts}</td>
                       <td className="px-2 py-1">
                         <div className="flex gap-1">
+                          {it.status === 'pending' && (
+                            <button
+                              type="button"
+                              disabled={running}
+                              title="Drag this one out of the queue before it's ever attempted — pending only, use Skip once it's been tried"
+                              className="text-[11px] text-destructive underline-offset-2 hover:underline disabled:opacity-40"
+                              onClick={() => removeQueued(it.id)}
+                            >
+                              remove
+                            </button>
+                          )}
                           {it.status !== 'pending' && it.status !== 'running' && (
                             <button
                               type="button"

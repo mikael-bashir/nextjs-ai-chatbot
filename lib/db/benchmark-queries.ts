@@ -206,10 +206,80 @@ export async function createRun(input: {
   return toRun(run);
 }
 
+// ── Incremental queue building (ACG-style: add exactly the problems you want,
+// in whatever order you pick them, rather than bulk-seeding at creation) ──────
+// `seq` is assigned as the next free slot so processing order is INSERTION
+// order, not the dataset's own order — picking problem #80 before #5 means #80
+// runs first. `ON CONFLICT DO NOTHING` makes re-adding an already-queued
+// problem a harmless no-op instead of a unique-index error.
+
+/** Add one problem to a run's queue. Returns the new (or already-existing) row. */
+export async function addItem(
+  runId: string,
+  problem: { id: string; statement: string; informal: string | null },
+): Promise<BenchmarkItemRow> {
+  await ensureTables();
+  const { rows } = await sql`
+    INSERT INTO benchmark_items (run_id, problem_id, statement, informal, seq)
+    VALUES (
+      ${runId}, ${problem.id}, ${problem.statement}, ${problem.informal},
+      (SELECT coalesce(max(seq), -1) + 1 FROM benchmark_items WHERE run_id = ${runId})
+    )
+    ON CONFLICT (run_id, problem_id) DO NOTHING
+    RETURNING *;
+  `;
+  if (rows.length) return toItem(rows[0]);
+  // Already queued — return the existing row so the caller still gets a result.
+  const existing = await sql`
+    SELECT * FROM benchmark_items WHERE run_id = ${runId} AND problem_id = ${problem.id};
+  `;
+  return toItem(existing.rows[0]);
+}
+
+/** Add many problems in one call (the "add all" / multi-select actions). */
+export async function addItems(
+  runId: string,
+  problems: { id: string; statement: string; informal: string | null }[],
+): Promise<number> {
+  await ensureTables();
+  let added = 0;
+  // Sequential, not parallel: each insert reads the CURRENT max(seq) for this
+  // run, so concurrent inserts racing that subquery could collide on the same
+  // seq value. A benchmark's "add all" batch is at most a few hundred rows —
+  // fast enough sequentially that this is not worth a more complex upsert.
+  for (const p of problems) {
+    const { rows } = await sql`
+      INSERT INTO benchmark_items (run_id, problem_id, statement, informal, seq)
+      VALUES (
+        ${runId}, ${p.id}, ${p.statement}, ${p.informal},
+        (SELECT coalesce(max(seq), -1) + 1 FROM benchmark_items WHERE run_id = ${runId})
+      )
+      ON CONFLICT (run_id, problem_id) DO NOTHING
+      RETURNING id;
+    `;
+    if (rows.length) added++;
+  }
+  return added;
+}
+
+/**
+ * Remove one item from the queue — but ONLY while it's still `pending`, so a
+ * click can never destroy a running attempt or a scored result (that's what
+ * `skip`/`requeue` are for). Returns false (no-op) if the item wasn't pending.
+ */
+export async function removeItem(itemId: string): Promise<boolean> {
+  await ensureTables();
+  const { rowCount } = await sql`
+    DELETE FROM benchmark_items WHERE id = ${itemId} AND status = 'pending';
+  `;
+  return (rowCount ?? 0) > 0;
+}
+
 export async function listRuns(): Promise<BenchmarkRunSummary[]> {
   await ensureTables();
   const { rows } = await sql`
-    SELECT r.id, r.benchmark, r.label, r.model, r.strategy, r.decompose, r.total,
+    SELECT r.id, r.benchmark, r.label, r.model, r.strategy, r.decompose,
+           count(i.id) AS total,
            r.compute_budget_ms, r.max_iters, r.created_at,
            count(*) FILTER (WHERE i.status = 'pending')  AS pending,
            count(*) FILTER (WHERE i.status = 'running')  AS running,
@@ -238,9 +308,10 @@ export async function listRuns(): Promise<BenchmarkRunSummary[]> {
 export async function getRun(runId: string): Promise<BenchmarkRunRow | null> {
   await ensureTables();
   const { rows } = await sql`
-    SELECT id, benchmark, label, model, strategy, decompose, total,
-           compute_budget_ms, max_iters, created_at
-    FROM benchmark_runs WHERE id = ${runId};
+    SELECT r.id, r.benchmark, r.label, r.model, r.strategy, r.decompose,
+           (SELECT count(*) FROM benchmark_items WHERE run_id = r.id) AS total,
+           r.compute_budget_ms, r.max_iters, r.created_at
+    FROM benchmark_runs r WHERE r.id = ${runId};
   `;
   return rows.length ? toRun(rows[0]) : null;
 }

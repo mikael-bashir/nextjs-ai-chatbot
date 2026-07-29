@@ -1,9 +1,14 @@
 import { auth } from '@/app/(auth)/auth';
 import { isAdminEmail } from '@/lib/admin';
+import { benchmarkById } from '@/lib/benchmarks';
 import {
   TERMINAL_STATUSES,
+  addItem,
+  addItems,
+  getRun,
   recordOutcome,
   releaseItem,
+  removeItem,
   requeueItem,
   resetItemFresh,
   retryItem,
@@ -18,7 +23,16 @@ async function requireAdmin() {
   return isAdminEmail(session?.user?.email) ? session : null;
 }
 
-// PATCH one claimed item. Distinguished by `action`:
+// PATCH one item, or add/remove queue entries. Distinguished by `action`:
+//   { action: 'add', problemId }  — add ONE problem from the run's own
+//     benchmark pool to the queue (looked up server-side, never trusting a
+//     client-supplied statement). Idempotent: re-adding an already-queued
+//     problem is a no-op, not an error.
+//   { action: 'add_many', problemIds: string[] }  — batch form (multi-select /
+//     "add all"). Returns how many were actually new.
+//   { action: 'remove', itemId }  — delete a queue entry outright, but ONLY
+//     while it's still `pending` — this is "drag it out before you run it",
+//     not a way to erase a scored or in-flight attempt (use `skip` for that).
 //   { action: 'outcome', itemId, status, proof?, costUsd?, metrics?, ... } — a
 //     completed attempt (proved / refuted / unsolved) — always a genuine result.
 //   { action: 'release', itemId }  — hand the claim back to `pending` without
@@ -41,16 +55,65 @@ async function requireAdmin() {
 //     other item in the run (proved or not) is untouched.
 //   { action: 'checkpoint', itemId, skeleton, filled, total }  — persist a
 //     have-tree partial-skeleton checkpoint without changing status.
-export async function PATCH(request: Request) {
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ runId: string }> },
+) {
   if (!(await requireAdmin())) {
     return Response.json({ error: 'forbidden' }, { status: 403 });
   }
+  const { runId } = await params;
   const body = await request.json().catch(() => null);
-  const itemId = body?.itemId;
-  if (typeof itemId !== 'string' || !itemId) {
-    return Response.json({ error: 'itemId required' }, { status: 400 });
-  }
   try {
+    // These two create/remove queue entries by problemId, not itemId — handle
+    // them before the itemId gate below applies to everything else.
+    if (body?.action === 'add') {
+      const problemId = body.problemId;
+      if (typeof problemId !== 'string' || !problemId) {
+        return Response.json({ error: 'problemId required' }, { status: 400 });
+      }
+      const run = await getRun(runId);
+      if (!run) return Response.json({ error: 'not found' }, { status: 404 });
+      const problem = benchmarkById(run.benchmark)?.problems.find(
+        (p) => p.id === problemId,
+      );
+      if (!problem) {
+        return Response.json({ error: 'unknown problem' }, { status: 400 });
+      }
+      const item = await addItem(runId, problem);
+      return Response.json({ ok: true, item });
+    }
+    if (body?.action === 'add_many') {
+      const ids = Array.isArray(body.problemIds)
+        ? (body.problemIds as unknown[]).filter(
+            (x): x is string => typeof x === 'string',
+          )
+        : [];
+      if (!ids.length) {
+        return Response.json({ error: 'problemIds required' }, { status: 400 });
+      }
+      const run = await getRun(runId);
+      if (!run) return Response.json({ error: 'not found' }, { status: 404 });
+      const pool = benchmarkById(run.benchmark)?.problems ?? [];
+      const idSet = new Set(ids);
+      const problems = pool.filter((p) => idSet.has(p.id));
+      const added = await addItems(runId, problems);
+      return Response.json({ ok: true, added });
+    }
+
+    const itemId = body?.itemId;
+    if (typeof itemId !== 'string' || !itemId) {
+      return Response.json({ error: 'itemId required' }, { status: 400 });
+    }
+    if (body.action === 'remove') {
+      const removed = await removeItem(itemId);
+      return removed
+        ? Response.json({ ok: true })
+        : Response.json(
+            { error: 'only a pending item can be removed from the queue' },
+            { status: 409 },
+          );
+    }
     if (body.action === 'release') {
       await releaseItem(itemId);
       return Response.json({ ok: true });
