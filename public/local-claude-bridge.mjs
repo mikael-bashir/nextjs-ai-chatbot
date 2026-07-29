@@ -3445,24 +3445,46 @@ function freshenTags(body, existing) {
 }
 
 // Replace hole `id`'s `:= by sorry --⟪id⟫` with the minion's tactics, re-indented
-// under the `have`. Returns the skeleton unchanged if the hole's shape is
-// unexpected (the final assembly verify then catches the leftover sorry).
+// under the `have`. TWO shapes are accepted:
+//   1. the one-liner the planner emits — `have h : P := by sorry --⟪id⟫`;
+//   2. the WRAPPED form a refiner produces when a long proposition spills over
+//      several lines and `sorry --⟪id⟫` ends up on its own line under `:= by`.
+// Shape 2 used to fail here SILENTLY (returning the skeleton unchanged while the
+// caller still counted the hole as banked), so genuinely proven lemmas were
+// dropped and their holes re-dispatched forever. Anything else still returns the
+// skeleton unchanged — the final assembly verify then catches the leftover sorry.
 function spliceHole(skeleton, id, tactics) {
   const lines = String(skeleton || "").split("\n")
   const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
   const idx = lines.findIndex((l) => markRe.test(l))
   if (idx < 0) return skeleton
   const line = lines[idx]
+  const indentOf = (s) => (s.match(/^\s*/) || [""])[0].length
+  const reindent = (width) => {
+    const pad = " ".repeat(width)
+    return String(tactics)
+      .split("\n")
+      .map((t) => (t.trim() === "" ? "" : pad + t))
+      .join("\n")
+  }
   const bodyRe = new RegExp(":=\\s*by\\s+sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫\\s*$")
-  if (!bodyRe.test(line)) return skeleton
-  const ind = (line.match(/^\s*/) || [""])[0].length
-  const pad = " ".repeat(ind + 2)
-  const body = String(tactics)
-    .split("\n")
-    .map((t) => (t.trim() === "" ? "" : pad + t))
-    .join("\n")
-  lines[idx] = line.replace(bodyRe, ":= by\n" + body)
-  return lines.join("\n")
+  if (bodyRe.test(line)) {
+    lines[idx] = line.replace(bodyRe, ":= by\n" + reindent(indentOf(line) + 2))
+    return lines.join("\n")
+  }
+  // Wrapped: the marker line holds NOTHING but `sorry --⟪id⟫`, and the nearest
+  // preceding non-blank line ends with `:= by`. Replace just that line, at its
+  // own indentation — already the body indent Lean expects under the `by`.
+  const soloRe = new RegExp("^\\s*sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫\\s*$")
+  if (soloRe.test(line)) {
+    let prev = idx - 1
+    while (prev >= 0 && !lines[prev].trim()) prev--
+    if (prev >= 0 && /:=\s*by\s*$/.test(lines[prev])) {
+      lines[idx] = reindent(indentOf(line))
+      return lines.join("\n")
+    }
+  }
+  return skeleton
 }
 
 function haveTreePlannerPrompt(theorem, mcpServers = [], extra = "") {
@@ -4033,14 +4055,36 @@ const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 // have under a different tag (tags are re-freshened every refinement) still
 // gets the banked proof restored.
 function holeHaveInfo(skeleton, id) {
+  const lines = String(skeleton || "").split("\n")
   const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
-  const line = String(skeleton || "")
-    .split("\n")
-    .find((l) => markRe.test(l))
-  if (!line) return null
-  const m = line.match(/have\s+([^\s:(]+)\s*:\s*([\s\S]*?):=\s*by\s+sorry\s*--/)
-  if (!m || !m[2].trim()) return null
-  return { name: m[1], prop: m[2].trim(), key: m[2].replace(/\s+/g, " ").trim() }
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return null
+  const mk = (m) =>
+    m && m[2].trim()
+      ? { name: m[1], prop: m[2].trim(), key: m[2].replace(/\s+/g, " ").trim() }
+      : null
+  const one = mk(lines[idx].match(/have\s+([^\s:(]+)\s*:\s*([\s\S]*?):=\s*by\s+sorry\s*--/))
+  if (one) return one
+  // Wrapped hole (see spliceHole): walk back to THIS hole's `have` and read the
+  // joined block. Bounded, and abandoned the moment another hole's marker shows
+  // up, so a malformed hole can never borrow its neighbour's proposition. The
+  // key normalizes whitespace, so a re-wrapped proposition still matches the
+  // bank entry it was proved under.
+  for (let i = idx - 1; i >= 0 && idx - i <= 12; i--) {
+    if (/--\s*⟪/.test(lines[i])) break
+    if (!/^\s*have\s/.test(lines[i])) continue
+    return mk(
+      lines
+        .slice(i, idx + 1)
+        .join("\n")
+        .match(
+          new RegExp(
+            "have\\s+([^\\s:(]+)\\s*:\\s*([\\s\\S]*?):=\\s*by\\s*sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫",
+          ),
+        ),
+    )
+  }
+  return null
 }
 
 // ASSIGN lines in the refiner's final message: `ASSIGN <state-uuid> ⟪tag⟫`.
@@ -4317,14 +4361,25 @@ async function proveFinality(theorem, ctx) {
               if (ctx.signal?.aborted) return
               if (r.fill != null) {
                 const info = holeHaveInfo(partial, id)
-                partial = spliceHole(partial, id, r.fill)
-                banked++
-                if (info) bank.set(info.key, { name: info.name, prop: info.prop, fill: r.fill })
-                // The hole is closed — its ledgered states are dead weight now.
-                const dead = [...reg.ids]
-                stateReg.delete(id)
-                freeStates(dead)
-                ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (Finality wave).` })
+                const next = spliceHole(partial, id, r.fill)
+                if (next === partial) {
+                  // Proved, but the hole's shape defeated the splicer, so the
+                  // skeleton did NOT change. Counting this as banked is how a
+                  // run silently loops forever re-proving the same hole — say
+                  // it out loud and hand the hole to the refiner instead.
+                  stuck.add(id)
+                  if (r.notes) rejectedNotes[id] = r.notes
+                  ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ was proved but its skeleton shape could not be spliced — flagged for the refiner.` })
+                } else {
+                  partial = next
+                  banked++
+                  if (info) bank.set(info.key, { name: info.name, prop: info.prop, fill: r.fill })
+                  // The hole is closed — its ledgered states are dead weight now.
+                  const dead = [...reg.ids]
+                  stateReg.delete(id)
+                  freeStates(dead)
+                  ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (Finality wave).` })
+                }
               } else if (epochAC.signal.aborted && !ctx.signal?.aborted) {
                 // Cut off by the refinement timer mid-work: NOT stuck — its
                 // partial states stay ledgered for the refiner to triage.
@@ -4371,11 +4426,14 @@ async function proveFinality(theorem, ctx) {
       break
     }
     refines++
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked lemma(s), ${stateReg.size} live partial state-set(s).` })
-
+    // Count what the refiner will ACTUALLY be shown (a ledger entry with no
+    // state ids renders as "(none)"), not how many holes happen to have an
+    // entry — reporting stateReg.size claimed live progress the prompt didn't
+    // contain, which is exactly the kind of thing that hides a real gap.
     const inflight = [...stateReg.entries()]
       .filter(([, r]) => r.ids.size)
       .map(([tag, r]) => ({ tag, ids: r.ids, lastGoal: r.lastGoal, tactics: r.tactics }))
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked lemma(s), ${inflight.length} live partial state-set(s).` })
     const refGate = makeProofGate(theorem)
     const refScripts = new Map()
     let refined = null
