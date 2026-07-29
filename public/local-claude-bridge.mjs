@@ -915,9 +915,9 @@ function makeProofGate(theorem) {
           String(c.name || "").endsWith("verify_full_script") &&
           c.input &&
           typeof c.input === "object" &&
-          typeof c.input.script === "string"
+          typeof c.input.code === "string"
         ) {
-          verifyCalls[c.id] = c.input.script
+          verifyCalls[c.id] = c.input.code
         }
       }
     } else if (o.type === "user" && o.message?.content) {
@@ -2772,7 +2772,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           if (o.type === "assistant" && o.message?.content) {
             for (const c of o.message.content) {
               if (c.type === "tool_use" && String(c.name || "").endsWith("verify_full_script") && c.id) {
-                verifyCalls.set(c.id, c.input?.script ?? "")
+                verifyCalls.set(c.id, c.input?.code ?? "")
               }
             }
           } else if (o.type === "user" && o.message?.content) {
@@ -2960,9 +2960,9 @@ async function runDecomposer(node, ctx, extraContext = "") {
           c.type === "tool_use" &&
           String(c.name || "").endsWith("verify_full_script") &&
           c.input &&
-          typeof c.input.script === "string"
+          typeof c.input.code === "string"
         ) {
-          verifyCalls[c.id] = c.input.script
+          verifyCalls[c.id] = c.input.code
         }
       }
     } else if (o.type === "user" && o.message?.content) {
@@ -3543,7 +3543,7 @@ async function proveHaveTree(theorem, ctx) {
     try {
       if (o.type === "assistant" && o.message?.content) {
         for (const c of o.message.content) {
-          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.code ?? "")
         }
       } else if (o.type === "user" && o.message?.content) {
         for (const c of o.message.content) {
