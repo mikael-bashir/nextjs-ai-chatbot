@@ -1962,7 +1962,7 @@ const STRATEGIES = {
   "finality-1": {
     label: "Leak Finality I — Surround + timed skeleton refinement (lemma bank, state hand-off)",
     node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
-    decompose: (t, m, x) => finalityRefinerPrompt(t, "<the current skeleton>", [], {}, [], m, x),
+    decompose: (t, m, x) => finalityRefinerPrompt(t, "<the current skeleton>", [], {}, {}, [], m, x),
     search: GOV_INITIAL,
     style: "finality",
   },
@@ -4110,16 +4110,52 @@ function parseAssignLines(text) {
   return out
 }
 
-function finalityRefinerPrompt(theorem, skeleton, bankList, stuckNotes, inflight, mcpServers = [], extra = "") {
+// `BRIEF ⟪tag⟫` + free-form body, the refiner's channel for handing what was
+// learned before a redesign to the minion that works that hole next. A block
+// runs to the next BRIEF/ASSIGN line or the end of the message, so the refiner
+// can write real prose instead of cramming it onto one line.
+function parseBriefBlocks(text) {
+  const lines = String(text || "").split("\n")
+  const out = {}
+  let tag = null
+  let buf = []
+  const flush = () => {
+    if (tag) {
+      const body = buf.join("\n").trim()
+      if (body) out[tag] = body
+    }
+    tag = null
+    buf = []
+  }
+  for (const line of lines) {
+    const m = line.match(/^\s*BRIEF\s*⟪\s*(\w+)\s*⟫\s*$/i)
+    if (m) {
+      flush()
+      tag = m[1]
+      continue
+    }
+    if (tag) {
+      if (/^\s*(BRIEF|ASSIGN)\b/i.test(line)) flush()
+      else buf.push(line)
+    }
+  }
+  flush()
+  return out
+}
+
+function finalityRefinerPrompt(theorem, skeleton, bankList, stuckNotes, cutoffNotes, inflight, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
   const bankBlock = bankList.length
     ? bankList.map((b) => `- ${b.name} : ${b.prop}   [PROVED — kept verbatim ⇒ refilled for free]`).join("\n")
     : "(none proved yet)"
-  const stuckBlock = Object.keys(stuckNotes).length
-    ? Object.entries(stuckNotes)
-        .map(([id, n]) => `- ⟪${id}⟫: ${oneLine(String(n?.text || "no notes")).slice(0, 500)}${n?.tactics?.length ? `\n    tactics tried: ${n.tactics.slice(-10).join(" ; ").slice(0, 400)}` : ""}`)
-        .join("\n")
-    : "(none)"
+  const noteLine = ([id, n]) =>
+    `- ⟪${id}⟫: ${oneLine(String(n?.text || "no notes")).slice(0, 500)}${n?.tactics?.length ? `\n    tactics tried: ${n.tactics.slice(-10).join(" ; ").slice(0, 400)}` : ""}`
+  const stuckBlock = Object.keys(stuckNotes).length ? Object.entries(stuckNotes).map(noteLine).join("\n") : "(none)"
+  // Kept SEPARATE from the stuck notes on purpose: a stuck minion tried and
+  // failed, an interrupted one merely ran out of clock. Merging them would
+  // report a live approach as a dead one, which is how a refiner talks itself
+  // out of the direction that was about to work.
+  const cutoffBlock = Object.keys(cutoffNotes || {}).length ? Object.entries(cutoffNotes).map(noteLine).join("\n") : "(none)"
   const inflightBlock = inflight.length
     ? inflight
         .map(
@@ -4148,6 +4184,9 @@ ${bankBlock}
 STUCK HOLES — minions tried and failed; their notes:
 ${stuckBlock}
 
+INTERRUPTED WORK — these minions were CUT OFF by the refinement timer, not defeated. Their approach was still in flight and may well have been the right one; do NOT read this as evidence that it fails:
+${cutoffBlock}
+
 LIVE PARTIAL PROGRESS — Pantograph proof states from minions that were cut off mid-work. Inspect any of them with get_current_proof_state(state_id) before deciding:
 ${inflightBlock}
 
@@ -4157,8 +4196,11 @@ YOUR JOB:
 3. TRIAGE every live partial state listed above — each must end either assigned or freed:
    - If your new skeleton keeps that hole's \`have\` with the SAME proposition, you may hand its progress to the next minion: output an ASSIGN line (format below).
    - Otherwise DECIMATE it: call cleanup_memory(state_id) for exactly that state. Never call cleanup_memory with no arguments — that wipes every state on the server.
-4. OUTPUT: the verified skeleton in ONE \`\`\`lean block, then one line per state you kept:
+4. BRIEF THE NEXT WAVE — for every hole still open in your new skeleton, hand the next minion everything worth knowing so it does not restart from zero. Put in it: which approaches were already tried and how far each got; which lemma names turned out NOT to exist; which ones did work; and — if you reshaped the hole — WHY, and what the new shape is meant to make easier. A minion sees only the skeleton and its own hole: this brief is the ONLY channel by which anything learned before the refinement reaches it. Write nothing you would not want acted on — the minion treats it as established fact and will not re-verify it.
+5. OUTPUT: the verified skeleton in ONE \`\`\`lean block, then one line per state you kept, then one briefing per hole you want to brief:
 ASSIGN <state_id> ⟪tag⟫
+BRIEF ⟪tag⟫
+<briefing text, one or more lines; it ends at the next line beginning with BRIEF or ASSIGN, or at the end of your message>
 
 RULES: master signature immutable; every hole tagged \`--⟪hN⟫\` and unique; do NOT fill holes yourself (banked proofs are restored by the system); prefer keeping proven propositions word-for-word.
 ${SEARCH_USAGE_NOTE}
@@ -4174,9 +4216,16 @@ ${extra ? `\n${extra}\n` : ""}`
 async function fillHoleFinality(skeleton, id, ctx, reg) {
   if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Finality minion working hole ⟪${id}⟫…` })
-  const resumeExtra = reg?.resume
+  const resumeBlock = reg?.resume
     ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. Inspect it with get_current_proof_state and CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over, if it helps. Free it with cleanup_memory(state_id) if you abandon it.`
     : ""
+  // Written by the refiner that redesigned this skeleton. Without it a
+  // post-refinement minion starts cold on a hole earlier minions already
+  // explored for minutes — the redesign silently erases what they learned.
+  const briefBlock = reg?.brief
+    ? `CARRIED-OVER BRIEFING — the refiner that just redesigned this skeleton wrote this from what earlier minions learned on this problem BEFORE the redesign. Treat it as established: do not re-derive what it says is known, and do not re-try what it says already failed.\n${String(reg.brief).slice(0, 2000)}`
+    : ""
+  const resumeExtra = [briefBlock, resumeBlock].filter(Boolean).join("\n\n")
   const applied = []
   const toolNames = new Map() // tool_use id -> short tool name
   const res = await spawnProverStream(
@@ -4321,6 +4370,10 @@ async function proveFinality(theorem, ctx) {
 
   let partial = skeleton
   let rejectedNotes = {}
+  // Notes from minions the refinement timer cut off mid-work. Separate from
+  // `rejectedNotes` because these holes are NOT stuck — they get re-queued —
+  // and because the refiner must be told the difference.
+  let cutoffNotes = {}
   let stuck = new Set()
   let banked = 0
   let refines = 0
@@ -4396,7 +4449,11 @@ async function proveFinality(theorem, ctx) {
                 }
               } else if (epochAC.signal.aborted && !ctx.signal?.aborted) {
                 // Cut off by the refinement timer mid-work: NOT stuck — its
-                // partial states stay ledgered for the refiner to triage.
+                // partial states stay ledgered for the refiner to triage, and
+                // its scratch notes go to the refiner too. Dropping them (as
+                // this branch used to) is how ten minutes of real exploration
+                // reached the refiner as "STUCK HOLES: (none)".
+                if (r.notes) cutoffNotes[id] = r.notes
                 queue.length = 0
               } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
                 const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
@@ -4477,7 +4534,7 @@ async function proveFinality(theorem, ctx) {
     }
     const refRes = await spawnProverStream(
       {
-        prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, inflight, ctx.mcpServers),
+        prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, cutoffNotes, inflight, ctx.mcpServers),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         effort: FINALITY_REFINE_EFFORT,
@@ -4536,6 +4593,21 @@ async function proveFinality(theorem, ctx) {
           }
         }
       }
+      // Briefings attach to a hole whether or not a Pantograph state came with
+      // it, so a hole the refiner RESHAPED — which by definition cannot carry
+      // its old state — still reaches its next minion with what was learned.
+      const briefs = parseBriefBlocks(refRes.finalText)
+      let briefed = 0
+      for (const [tag, text] of Object.entries(briefs)) {
+        if (!openNext.has(tag)) continue
+        let r = nextReg.get(tag)
+        if (!r) {
+          r = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+          nextReg.set(tag, r)
+        }
+        r.brief = text
+        briefed++
+      }
       // Decimate everything the refiner did not carry over (it was told to
       // cleanup_memory these itself — this is the guarantee).
       await freeStates([...before].filter((i) => !keptIds.has(i)))
@@ -4544,8 +4616,9 @@ async function proveFinality(theorem, ctx) {
       partial = next
       stuck = new Set()
       rejectedNotes = {}
+      cutoffNotes = {}
       const openCount = parseHoleIds(partial).length
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines} accepted: ${restored} banked proof(s) restored, ${keptIds.size} partial state(s) handed over, ${openCount} hole(s) open.` })
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines} accepted: ${restored} banked proof(s) restored, ${keptIds.size} partial state(s) handed over, ${briefed} hole(s) briefed, ${openCount} hole(s) open.` })
       ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openCount })
       if (openCount === 0) break // bank restoration alone closed everything
     } else {
@@ -8675,7 +8748,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             "\n\n=== HOLE-FILL (FINALITY MINION) PROMPT ===\n" +
             surroundHoleFillPrompt("<the current skeleton>", "hN", mcpServers) +
             "\n\n=== REFINER PROMPT (system-summoned every cadence) ===\n" +
-            finalityRefinerPrompt(theorem, "<the current skeleton>", [], {}, [], mcpServers)
+            finalityRefinerPrompt(theorem, "<the current skeleton>", [], {}, {}, [], mcpServers)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
