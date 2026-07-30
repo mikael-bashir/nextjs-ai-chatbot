@@ -4410,8 +4410,8 @@ YOUR JOB:
 2. VERIFY the new skeleton exactly like the planner: reproduce the master theorem VERBATIM (same name + signature), open with \`by\`, every open step a ONE-LINE hole \`have hN : <prop> := by sorry --⟪hN⟫\` with a DISTINCT tag, assembly closed from the \`have\`s and sorry-FREE, then verify_full_script it — it MUST compile with the ONLY diagnostics being \`sorry\` warnings (no errors). Iterate until it passes; an unverified skeleton is useless.
 3. TRIAGE every live partial state listed above — each must end either assigned or freed:
    - If your new skeleton keeps that hole's \`have\` with the SAME proposition, you may hand its progress to the next minion: output an ASSIGN line (format below).
-   - Otherwise DECIMATE it: call cleanup_memory(state_id) for exactly that state. Never call cleanup_memory with no arguments — that wipes every state on the server.
-4. BRIEF THE NEXT WAVE — for every hole still open in your new skeleton, hand the next minion everything worth knowing so it does not restart from zero. Put in it: which approaches were already tried and how far each got; which lemma names turned out NOT to exist; which ones did work; and — if you reshaped the hole — WHY, and what the new shape is meant to make easier. A minion sees only the skeleton and its own hole: this brief is the ONLY channel by which anything learned before the refinement reaches it. Write nothing you would not want acted on — the minion treats it as established fact and will not re-verify it.
+   - Otherwise DECIMATE it: call cleanup_memory(state_id) for exactly that state. Never call cleanup_memory with no arguments — that wipes every state on the server. Freeing a state DESTROYS its proof script permanently — the listing above is the last copy — so before you free one, lift any tactic lines that still apply under your new shape into that hole's BRIEF.
+4. BRIEF THE NEXT WAVE — for every hole still open in your new skeleton, hand the next minion everything worth knowing so it does not restart from zero. Put in it: which approaches were already tried and how far each got; which lemma names turned out NOT to exist; which ones did work; and — if you reshaped the hole — WHY, and what the new shape is meant to make easier. If you FREED a state whose proof script above had real work in it, transcribe the tactic lines that still apply into the brief, verbatim: that script dies with the state, and a minion that has to rediscover a sequence you were just shown is the most expensive kind of waste there is. A minion sees only the skeleton and its own hole: this brief is the ONLY channel by which anything learned before the refinement reaches it. Write nothing you would not want acted on — the minion treats it as established fact and will not re-verify it.
 5. OUTPUT: the verified skeleton in ONE \`\`\`lean block, then one line per state you kept, then one briefing per hole you want to brief:
 ASSIGN <state_id> ⟪tag⟫
 BRIEF ⟪tag⟫
@@ -4432,7 +4432,9 @@ async function fillHoleFinality(skeleton, id, ctx, reg) {
   if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Finality minion working hole ⟪${id}⟫…` })
   const resumeBlock = reg?.resume
-    ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. Inspect it with get_current_proof_state and CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over, if it helps. Free it with cleanup_memory(state_id) if you abandon it.`
+    ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. That state is LIVE and already holds the tactics below — CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over. Free it with cleanup_memory(state_id) if you abandon it.${
+        reg.script ? `\nTactics this state has already accepted:\n\`\`\`lean\n${reg.script}\n\`\`\`` : ""
+      }`
     : ""
   // Written by the refiner that redesigned this skeleton. Without it a
   // post-refinement minion starts cold on a hole earlier minions already
@@ -4854,6 +4856,11 @@ async function proveFinality(theorem, ctx) {
         }
         r.ids.add(stateId)
         keptIds.add(stateId)
+        // The script was already fetched for the refiner a moment ago, so hand
+        // the SAME text to the minion rather than making it spend a
+        // get_current_proof_state call to see what it inherited — and rather
+        // than trusting it to make that call at all.
+        r.script = r.script || scriptById.get(stateId)
         // Carry the goal/tactic trail from whichever old hole ledgered it.
         for (const [, old] of stateReg) {
           if (old.ids.has(stateId)) {
