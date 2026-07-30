@@ -1112,6 +1112,174 @@ function normalizeProofScript(daemonText, rawScript) {
   return String(rawScript == null ? "" : rawScript)
 }
 
+// ===========================================================================
+// RUN-SCOPED VERIFIED-LEMMA POOL
+// ---------------------------------------------------------------------------
+// Every `verify_full_script` that returns "✅ Compilation Successful" is, by
+// construction, a FULLY CLOSED Lean fact: Leak IV fails on any warning and
+// `sorry` is a warning, so a successful verify can never contain a hole. That
+// makes the compiler channel a free, already-paid-for stream of proven lemmas.
+//
+// Minions spend most of their tokens establishing small facts on the way to a
+// hole — a coset characterisation, a cardinality rewrite, which `exact?` closes
+// a goal — and then every one of them dies with the minion's context. Only the
+// hole's final FILL survives, so a hole that is cut off or fails banks nothing
+// at all, and a sibling working a related hole re-derives the same lemmas from
+// scratch minutes later.
+//
+// This pool keeps them for the run and hands the relevant ones to whoever is
+// dispatched next. It is the shared memory isolated minions otherwise cannot
+// have, and it costs NOTHING: no extra model call, no extra compile, no extra
+// token spent producing it — only re-use of work already done and verified.
+const LEMMA_POOL_MAX = Number(process.env.LEAK_LEMMA_POOL_MAX || 250)
+const LEMMA_CTX_N = Number(process.env.LEAK_LEMMA_CTX_N || 14)
+const LEMMA_STMT_CHARS = 400
+const LEMMA_PROOF_CHARS = 900
+
+function makeLemmaPool() {
+  return { facts: new Map() } // normalized statement -> {statement, proof, tokens, seq}
+}
+
+// Syntax words carry no evidence about WHICH goal a fact is about.
+const LEMMA_STOP = new Set(
+  "the and for with have show from this that using where obtain refine exact apply simp intro intros rintro constructor rfl sorry example theorem lemma open scoped Type Prop def instance".split(" "),
+)
+
+// Identifiers plus the notation that actually discriminates between goals (`⧸`
+// for a quotient, `•` for a coset action…). A dotted Mathlib name also yields
+// its last component, so `Subgroup.IsComplement` and a bare `IsComplement` in
+// the hole's statement count as the same evidence.
+function lemmaTokens(text) {
+  const out = new Set()
+  const s = String(text == null ? "" : text)
+  for (const m of s.matchAll(/[A-Za-z_][A-Za-z0-9_.']*/g)) {
+    const t = m[0]
+    if (t.length < 3 || LEMMA_STOP.has(t)) continue
+    out.add(t)
+    const dot = t.lastIndexOf(".")
+    if (dot > 0 && dot < t.length - 1) out.add(t.slice(dot + 1))
+  }
+  for (const m of s.matchAll(/[⧸•∈∉⊆≤≥∀∃↔∧∨¬≠∑∏⨆⨅⁻ᵒᵖ]/gu)) out.add(m[0])
+  return out
+}
+
+// Top-level declarations of a compiled script. `open … in` and `@[attr]` lines
+// PREFIX the declaration that follows rather than starting one of their own.
+function splitTopLevelDecls(script) {
+  const startRe = /^(open\b.*\bin\s*$|@\[|example\b|theorem\b|lemma\b|def\b|instance\b|abbrev\b|noncomputable\b|private\b|protected\b)/
+  const prefixRe = /^(open\b.*\bin\s*$|@\[)/
+  const blocks = []
+  let cur = null
+  for (const ln of String(script == null ? "" : script).split("\n")) {
+    if (/^import\b/.test(ln)) continue
+    if (startRe.test(ln)) {
+      if (cur && prefixRe.test(cur[cur.length - 1] || "")) {
+        cur.push(ln)
+        continue
+      }
+      cur = [ln]
+      blocks.push(cur)
+      continue
+    }
+    if (cur) cur.push(ln)
+  }
+  return blocks.map((b) => b.join("\n").trim()).filter(Boolean)
+}
+
+// The conclusion's colon is the FIRST one at bracket depth 0: every binder is
+// bracketed, so `example (h : A) [Inst] : B` and `example : ∀ x : Nat, P x`
+// both resolve correctly (taking the LAST depth-0 colon gets the second one
+// wrong, splitting inside the ∀ binder).
+function topLevelColon(stmt) {
+  let d = 0
+  for (let i = 0; i < stmt.length; i++) {
+    const c = stmt[i]
+    if ("([{⟨".includes(c)) d++
+    else if (")]}⟩".includes(c)) d--
+    else if (c === ":" && d === 0 && stmt[i + 1] !== "=") return i
+  }
+  return -1
+}
+
+// Definitional probes (`example … : Set G' := g • H`) elaborate a TERM, not a
+// proposition — they are not lemmas and would only dilute the context.
+const LEMMA_NOT_A_PROP =
+  /^(Set|Type|Prop|Sort|Nat|ℕ|ℤ|ℚ|ℝ|ℂ|Setoid|Subgroup|Submonoid|Finset|List|Multiset|True)\b[^↔=∈∉≤≥<>∀∃∧∨¬≠]*$/
+
+function parseLemmaDecl(block) {
+  const s = String(block == null ? "" : block)
+  if (!/^(?:(?:open|@\[)[^\n]*\n)*\s*(?:example|theorem|lemma)\b/.test(s)) return null
+  const i = s.indexOf(":=")
+  if (i < 0) return null
+  const statement = s.slice(0, i).replace(/\s+/g, " ").trim()
+  const proof = s.slice(i + 2).trim()
+  // `sorry` cannot reach here (it is a warning and warnings fail the daemon) —
+  // this is the belt to that braces, so a future daemon that downgrades the
+  // check can never silently seed the pool with holes.
+  if (!statement || !proof || /\bsorry\b/.test(proof)) return null
+  const colon = topLevelColon(statement)
+  if (colon < 0) return null
+  const concl = statement.slice(colon + 1).trim()
+  if (!concl || LEMMA_NOT_A_PROP.test(concl)) return null
+  return { statement: statement.slice(0, LEMMA_STMT_CHARS), proof: proof.slice(0, LEMMA_PROOF_CHARS) }
+}
+
+function harvestVerifiedLemmas(pool, script) {
+  if (!pool || !script) return 0
+  let added = 0
+  for (const block of splitTopLevelDecls(script)) {
+    const d = parseLemmaDecl(block)
+    if (!d || pool.facts.has(d.statement)) continue
+    pool.facts.set(d.statement, { ...d, tokens: lemmaTokens(d.statement), seq: pool.facts.size })
+    added++
+    // Oldest-first eviction: a run's later lemmas are the ones aimed at the
+    // holes still open.
+    if (pool.facts.size > LEMMA_POOL_MAX) pool.facts.delete(pool.facts.keys().next().value)
+  }
+  return added
+}
+
+// Rank the pool against the text of whatever is about to be worked (a hole's
+// proposition, or the whole skeleton for the refiner) and render the top slice.
+function lemmaPoolBlock(pool, focusText, limit = LEMMA_CTX_N) {
+  if (!pool || !pool.facts.size) return ""
+  const facts = [...pool.facts.values()]
+  const focus = lemmaTokens(focusText)
+  let picked
+  if (focus.size) {
+    // IDF, because `Group`/`Subgroup` appear in EVERY fact of a group-theory
+    // run: without it the shared boilerplate outranks the one distinctive name
+    // that the hole and the fact genuinely have in common, and the ranking
+    // degenerates to "most verbose fact wins".
+    const df = new Map()
+    for (const f of facts) for (const t of f.tokens) df.set(t, (df.get(t) || 0) + 1)
+    const n = facts.length
+    const score = (f) => {
+      let s = 0
+      for (const t of f.tokens) if (focus.has(t)) s += Math.log(1 + n / (df.get(t) || 1))
+      return s
+    }
+    picked = facts
+      .map((f) => ({ f, s: score(f) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s || b.f.seq - a.f.seq)
+      .slice(0, limit)
+      .map((x) => x.f)
+    // Nothing shares a token: hand over the most recent few rather than
+    // nothing — they are the ones aimed at the part of the proof still open.
+    if (!picked.length) picked = facts.slice(-Math.min(limit, 4))
+  } else {
+    picked = facts.slice(-limit)
+  }
+  const body = picked.map((f) => `${f.statement} :=\n  ${f.proof.replace(/\n/g, "\n  ")}`).join("\n\n")
+  const more = pool.facts.size - picked.length
+  return `ALREADY-PROVED FACTS from earlier work on THIS problem — each one COMPILED on Leak IV with zero errors and zero warnings, so each is a closed, correct Lean proof, not a suggestion. They were established by other agents whose contexts are gone; this block is the only way they reach you. Reuse them directly (paste one in as a local \`have\`, or lift its tactic), and do NOT spend a verify re-deriving anything listed here${more > 0 ? ` (${more} further proved fact(s) are on file but less related to your goal)` : ""}:
+
+\`\`\`lean
+${body}
+\`\`\``
+}
+
 // Identify the master declaration in a scaffold BY NAME (robust to the agent
 // renaming binders or re-spacing the statement — that drift is judged separately
 // by the semantic drift guard). Falls back to a signature match.
@@ -2650,7 +2818,7 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort, lemmaPool }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
@@ -2835,6 +3003,14 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
                 const t = Array.isArray(c.content)
                   ? c.content.map((x) => x.text || "").join("\n")
                   : String(c.content ?? "")
+                // A successful verify is a CLOSED Lean fact (the daemon fails on
+                // any warning, and `sorry` is a warning) — bank it for the rest
+                // of the run. The compile has already been paid for; keeping the
+                // result costs nothing and is the only way this agent's side
+                // lemmas outlive its context. Normalized, so what we store is
+                // byte-identical to what the daemon actually compiled.
+                if (lemmaPool && /Compilation Successful|100% verified/i.test(t))
+                  harvestVerifiedLemmas(lemmaPool, normalizeProofScript(t, verifyCalls.get(c.tool_use_id)))
                 // Refill ONLY when a genuine proof attempt hit an unknown name —
                 // never for a `#check @guess` probe (that would reward guessing).
                 if (verifyTextIsSyntaxError(t) && isRealProofScript(verifyCalls.get(c.tool_use_id))) {
@@ -3284,6 +3460,12 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
           })
           .join("\n") + "\n"
       : ""
+  // Verified side lemmas banked by every agent on this run (only set by
+  // strategies that keep a pool — absent everywhere else, so the flat path is
+  // unchanged for them). Ranked against the seed when there is one, since the
+  // seed is exactly what still needs closing.
+  const lemmaBlock = lemmaPoolBlock(ctx.lemmaPool, seed || theorem)
+  const lemmaNote = lemmaBlock ? `\n${lemmaBlock}\n` : ""
   let extra = ""
   for (let attempt = 0; ; attempt++) {
     if (ctx.signal?.aborted) return { verified: false, proof: "" }
@@ -3319,7 +3501,7 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
     }
     await spawnProverStream(
       {
-        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${extra}`),
+        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${lemmaNote}${extra}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         // NO turn cap. The finisher runs until it proves the goal or the SHARED
@@ -3332,6 +3514,8 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
         metrics: ctx.metrics,
         signal: ctx.signal,
         searchBudget: ctx.searchBudget,
+        // Undefined for strategies that keep no pool — capture is a no-op then.
+        lemmaPool: ctx.lemmaPool,
       },
       { onObject, emit: ctx.emit },
     )
@@ -4225,7 +4409,18 @@ async function fillHoleFinality(skeleton, id, ctx, reg) {
   const briefBlock = reg?.brief
     ? `CARRIED-OVER BRIEFING — the refiner that just redesigned this skeleton wrote this from what earlier minions learned on this problem BEFORE the redesign. Treat it as established: do not re-derive what it says is known, and do not re-try what it says already failed.\n${String(reg.brief).slice(0, 2000)}`
     : ""
-  const resumeExtra = [briefBlock, resumeBlock].filter(Boolean).join("\n\n")
+  // Everything any agent on this run has already PROVED, ranked against this
+  // hole's own proposition. Siblings work different holes of the same theorem,
+  // so their side lemmas are usually the ones this hole needs — and without
+  // this they are unreachable, because a minion's context dies with it.
+  const lemmaBlock = lemmaPoolBlock(ctx.lemmaPool, holeHaveInfo(skeleton, id)?.prop || skeleton)
+  const resumeExtra = [lemmaBlock, briefBlock, resumeBlock].filter(Boolean).join("\n\n")
+  if (lemmaBlock)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🧠 ⟪${id}⟫ starts with the most relevant of ${ctx.lemmaPool.facts.size} lemma(s) already proved on this run.`,
+    })
   const applied = []
   const toolNames = new Map() // tool_use id -> short tool name
   const res = await spawnProverStream(
@@ -4240,6 +4435,7 @@ async function fillHoleFinality(skeleton, id, ctx, reg) {
       metrics: ctx.metrics,
       signal: ctx.signal,
       searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
     },
     {
       onObject: (o) => {
@@ -4293,6 +4489,13 @@ async function proveFinality(theorem, ctx) {
   ctx.stage = "♾️"
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Leak Finality I: Surround's parallel waves + a ${Math.round(FINALITY_REFINE_MS / 60000)}-min refinement cadence (lemma bank + state hand-off).` })
 
+  // Shared memory for the whole run: every lemma any agent gets past Leak IV,
+  // from the planner's first probe onward, ranked back out to whoever works
+  // next. Hung on `ctx` so the epoch spread (`{...ctx, signal}`) and the
+  // finisher hand-off both carry the same pool by reference. Only Finality
+  // sets it, so Surround/Dark stay byte-identical controls.
+  ctx.lemmaPool = makeLemmaPool()
+
   // ---- 1) PLANNER — verbatim Surround/Dark planner phase --------------------
   const gate = makeProofGate(theorem)
   const verifyScripts = new Map()
@@ -4333,6 +4536,7 @@ async function proveFinality(theorem, ctx) {
       metrics: ctx.metrics,
       signal: ctx.signal,
       searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
     },
     { onObject: onPlan, emit: ctx.emit },
   )
@@ -4504,7 +4708,7 @@ async function proveFinality(theorem, ctx) {
     const inflight = [...stateReg.entries()]
       .filter(([, r]) => r.ids.size)
       .map(([tag, r]) => ({ tag, ids: r.ids, lastGoal: r.lastGoal, tactics: r.tactics }))
-    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked lemma(s), ${inflight.length} live partial state-set(s).` })
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked hole(s), ${ctx.lemmaPool.facts.size} verified lemma(s) from the run pool, ${inflight.length} live partial state-set(s).` })
     const refGate = makeProofGate(theorem)
     const refScripts = new Map()
     let refined = null
@@ -4534,7 +4738,11 @@ async function proveFinality(theorem, ctx) {
     }
     const refRes = await spawnProverStream(
       {
-        prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, cutoffNotes, inflight, ctx.mcpServers),
+        // Ranked against the WHOLE skeleton, not one hole: the refiner is
+        // choosing the next decomposition, so what it most needs is the set of
+        // facts already closed anywhere on this problem — a split it would
+        // otherwise call risky may already be half-proved in the pool.
+        prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, cutoffNotes, inflight, ctx.mcpServers, lemmaPoolBlock(ctx.lemmaPool, partial)),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         effort: FINALITY_REFINE_EFFORT,
@@ -4545,6 +4753,7 @@ async function proveFinality(theorem, ctx) {
         metrics: ctx.metrics,
         signal: ctx.signal,
         searchBudget: ctx.searchBudget,
+        lemmaPool: ctx.lemmaPool,
       },
       { onObject: onRefine, emit: ctx.emit },
     )
