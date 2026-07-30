@@ -20,9 +20,9 @@
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
 import { randomBytes, timingSafeEqual, randomUUID, createHash } from "node:crypto"
-import { mkdtempSync, writeFileSync, readFileSync, renameSync } from "node:fs"
+import { mkdtempSync, writeFileSync, readFileSync, renameSync, mkdirSync, appendFileSync } from "node:fs"
 import { tmpdir, homedir } from "node:os"
-import { join } from "node:path"
+import { join, basename } from "node:path"
 
 // --- Resilience: never let a dropped socket take down the whole bridge. -------
 // The relay connection and remote MCP servers (HF Spaces sleep, tunnels reset)
@@ -9002,6 +9002,57 @@ function proofBankFind(theorem, toolchain) {
   }
 }
 
+// ---- RUN LOGS -------------------------------------------------------------
+// The activity stream only ever existed in the browser and in a 600-frame
+// in-memory ring. A run that failed — or whose tab was closed, or that died
+// with the process — took its own diagnosis with it, so two 30-minute runs
+// could burn real money and leave literally nothing to look at afterwards.
+//
+// Every frame is teed to disk as it is rendered, using the SAME text the
+// console shows, so the file reads exactly like the transcript. Written with
+// appendFileSync deliberately: a diagnostic log is worthless if it is buffered
+// in a stream that never flushes because the process was killed, and a
+// sub-millisecond syscall a few hundred times over half an hour costs nothing.
+// Every operation is wrapped — logging must never be able to break a run.
+const RUN_LOG_DIR = join(homedir(), ".leak-runs")
+function slugForRun(theorem) {
+  const m = String(theorem || "").match(/theorem\s+([A-Za-z0-9_'.]+)/)
+  return (m ? m[1] : "run").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 60) || "run"
+}
+function openRunLog(theorem, opts = {}) {
+  try {
+    mkdirSync(RUN_LOG_DIR, { recursive: true })
+    const started = new Date()
+    const stamp = started.toISOString().replace(/[:.]/g, "-")
+    const file = join(RUN_LOG_DIR, `${stamp}-${slugForRun(theorem)}.jsonl`)
+    const write = (o) => {
+      try {
+        appendFileSync(file, JSON.stringify(o) + "\n")
+      } catch {
+        /* a full or read-only disk must not take the run down */
+      }
+    }
+    write({ kind: "start", at: started.toISOString(), theorem, strategy: opts.strategy || "", model: opts.model || "", bridge_build: BRIDGE_BUILD })
+    return {
+      file,
+      line: (t, text) => write({ kind: "event", t, text }),
+      close: (summary) => {
+        write({ kind: "end", at: new Date().toISOString(), ...summary })
+        try {
+          appendFileSync(
+            join(RUN_LOG_DIR, "index.jsonl"),
+            JSON.stringify({ at: started.toISOString(), file: basename(file), theorem: String(theorem || "").slice(0, 200), ...summary }) + "\n",
+          )
+        } catch {
+          /* index is a convenience; the per-run file is the record */
+        }
+      },
+    }
+  } catch {
+    return null
+  }
+}
+
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
 // as proveStream (prompt / message-annotation / thinking / text-delta / done),
 // so the existing client + ProverConsole render it with no changes.
@@ -9022,6 +9073,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   // authored are tagged so its next window never contains its own output.
   const streamLog = []
   let streamSeq = 0
+  // Same frames, but on disk and uncapped — the ring above is a 600-frame
+  // window for the mechanic, not a record. See openRunLog.
+  const runLog = openRunLog(theorem, opts)
   const emit = (obj) => {
     metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
     try {
@@ -9029,6 +9083,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
       if (text) {
         streamLog.push({ seq: ++streamSeq, t: metrics.time_elapsed, text, mech: String(obj?.watcher || "").startsWith("mechanic") })
         if (streamLog.length > 600) streamLog.shift()
+        runLog?.line(metrics.time_elapsed, text)
       }
     } catch {}
     send({ ...obj, metrics })
@@ -9096,6 +9151,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   const verifyUrl = resolveVerifyUrl(mcpServers)
   if (!verifyUrl && style !== "architect") {
     emit({ type: "error", message: "No verify_full_script MCP server is connected — decomposition needs one to gate scaffolds." })
+    runLog?.close({ ok: false, reason: "startup", seconds: metrics.time_elapsed, cost_usd: metrics.cost_usd || 0 })
     send({ type: "done", metrics, verified: false, proof: "" })
     res.end()
     return
@@ -9276,6 +9332,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           })
         }
       }
+      runLog?.close({ ok: !!(ok && proof), reason: ok && proof ? "verified" : usageBlocked() ? "usage-limit" : "unverified", seconds: metrics.time_elapsed, cost_usd: metrics.cost_usd || 0 })
       send({ type: "done", metrics, verified: !!(ok && proof), proof, bankedProof: banked || undefined })
     } catch (e) {
       emit({ type: "error", message: `tree error: ${String(e?.message || e)}` })
@@ -9290,6 +9347,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           subtype: "status",
           thought: `🏦 Run ended without a proof, but the theorem is NOT lost — a verified proof from an earlier run is banked (${banked.strategy}, ${banked.verifiedAt}).`,
         })
+      runLog?.close({ ok: false, reason: usageBlocked() ? "usage-limit" : "error", seconds: metrics.time_elapsed, cost_usd: metrics.cost_usd || 0 })
       send({ type: "done", metrics, verified: false, proof: "", bankedProof: banked || undefined })
     } finally {
       ACTIVE_RUNS.delete(runId)
@@ -9472,6 +9530,30 @@ const server = createServer(async (req, res) => {
 
     // Decomposition orchestrator: prove-or-split proof tree. Same SSE shape as
     // /prove-stream, so the same client renders it.
+    // Where did that run go? Newest first, with outcome + cost, so a failed run
+    // can be found and pasted without hunting through ~/.leak-runs by hand.
+    if (req.method === "GET" && url.pathname === "/runs") {
+      try {
+        const raw = readFileSync(join(RUN_LOG_DIR, "index.jsonl"), "utf8")
+        const rows = raw
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => {
+            try {
+              return JSON.parse(l)
+            } catch {
+              return null
+            }
+          })
+          .filter(Boolean)
+          .reverse()
+          .slice(0, Number(url.searchParams.get("limit") || 30))
+        return json(res, 200, { dir: RUN_LOG_DIR, runs: rows })
+      } catch {
+        return json(res, 200, { dir: RUN_LOG_DIR, runs: [] })
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/prove-tree") {
       const body = JSON.parse((await readBody(req)) || "{}")
       const theorem = body.theorem || body.prompt
