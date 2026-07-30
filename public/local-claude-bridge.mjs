@@ -3510,6 +3510,7 @@ RULES:
 - Every hole tag must be unique and match \`--⟪hN⟫\` EXACTLY (double angle brackets). Hole bodies are a single \`:= by sorry --⟪hN⟫\`.
 - No top-level \`theorem\`/\`lemma\` other than the master; all structure is \`have\`s.
 - A skeleton whose assembly still has a bare \`sorry\`, or whose holes aren't tagged, is INVALID — fix it before stopping.
+- NEVER call \`cleanup_memory\` with no arguments — the Pantograph service is SHARED and a bare call wipes every state on it, including ones that are not yours. Free each state you created individually: \`cleanup_memory(state_id)\`.
 
 ${SEARCH_USAGE_NOTE}
 ${extra ? `\n${extra}\n` : ""}
