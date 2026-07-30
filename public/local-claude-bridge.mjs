@@ -4048,6 +4048,16 @@ async function proveHaveSurround(theorem, ctx) {
 // ===========================================================================
 const FINALITY_REFINE_MS = Number(process.env.LEAK_FINALITY_REFINE_MS || 300000)
 const FINALITY_MAX_REFINES = Number(process.env.LEAK_FINALITY_MAX_REFINES || 8)
+// Reasoning effort for the REFINER only. Refinement is a barrier — minions are
+// cut off and nothing else runs — so its deliberation is paid for in dead wall
+// clock. Observed live on fatex_001: ~8 min of refinement against 5 min of
+// proving, of which roughly 6 min was pure thinking behind only 4 tool calls.
+// This is the same lever (and the same symptom) as the architect blueprint
+// stage, where dropping effort was measured to work and prompt tweaks were
+// measured NOT to — see ARCHITECT_BLUEPRINT_EFFORT. Minions keep the default on
+// purpose, for the same reason node proving does: that stage is real proof
+// search and the deliberation earns its keep.
+const FINALITY_REFINE_EFFORT = process.env.LEAK_FINALITY_REFINE_EFFORT || "medium"
 const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
 
 // The have-line carrying hole `id`: its bound name and proposition. The bank
@@ -4466,6 +4476,7 @@ async function proveFinality(theorem, ctx) {
         prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, inflight, ctx.mcpServers),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
+        effort: FINALITY_REFINE_EFFORT,
         maxTurns: 0,
         timeoutMs: ctx.nodeTimeoutMs,
         getDeadline: ctx.getDeadline,
