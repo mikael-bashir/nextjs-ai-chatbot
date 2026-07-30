@@ -4298,6 +4298,35 @@ function parseAssignLines(text) {
 // learned before a redesign to the minion that works that hole next. A block
 // runs to the next BRIEF/ASSIGN line or the end of the message, so the refiner
 // can write real prose instead of cramming it onto one line.
+// Pull the assembled tactic sequence out of a `get_current_proof_state` reply.
+// Pantograph answers with "=== LEAN 4 SCRIPT SO FAR ===" + a ```lean4 fence,
+// then "=== CURRENT OPEN GOALS ===" — we keep only the script, because the
+// goals are already rendered on their own line from the ledger and repeating
+// them doubles the block for nothing. Tolerates the raw text or the
+// {"result": …} JSON envelope the MCP layer sometimes wraps it in.
+const STATE_SCRIPT_CHARS = 1400
+function proofScriptOfState(text) {
+  let s = String(text == null ? "" : text)
+  if (!s.trim()) return ""
+  try {
+    const j = JSON.parse(s)
+    if (j && typeof j.result === "string") s = j.result
+  } catch {
+    /* not an envelope — use as-is */
+  }
+  const m = s.match(/SCRIPT SO FAR ===\s*```(?:lean4?|)\n([\s\S]*?)```/)
+  const body = (m ? m[1] : "").trim()
+  if (!body) return ""
+  // An UNTOUCHED state still prints a script: the theorem line, then
+  // Pantograph's "-- no tactics applied yet" placeholder. Showing that as
+  // partial progress is worse than showing nothing — it is precisely the
+  // scratch probe the refiner mistook for real work last run. Judge by the
+  // tactic block (everything after the header's `:= by`), not the first line.
+  const tail = body.slice(body.indexOf(":= by") + 5)
+  if (!tail.split("\n").some((l) => l.trim() && !l.trim().startsWith("--"))) return ""
+  return body.length > STATE_SCRIPT_CHARS ? body.slice(0, STATE_SCRIPT_CHARS) + "\n-- …truncated" : body
+}
+
 function parseBriefBlocks(text) {
   const lines = String(text || "").split("\n")
   const out = {}
@@ -4344,7 +4373,9 @@ function finalityRefinerPrompt(theorem, skeleton, bankList, stuckNotes, cutoffNo
     ? inflight
         .map(
           (f) =>
-            `- hole ⟪${f.tag}⟫ — state id(s): ${[...f.ids].join(", ")}${f.lastGoal ? `\n    last goals: ${oneLine(f.lastGoal).slice(0, 400)}` : ""}${f.tactics?.length ? `\n    tactics applied: ${f.tactics.slice(-10).join(" ; ").slice(0, 300)}` : ""}`,
+            `- hole ⟪${f.tag}⟫ — state id(s): ${[...f.ids].join(", ")}${f.lastGoal ? `\n    last goals: ${oneLine(f.lastGoal).slice(0, 400)}` : ""}${f.tactics?.length ? `\n    tactics applied: ${f.tactics.slice(-10).join(" ; ").slice(0, 300)}` : ""}${(f.scripts || [])
+              .map((s) => `\n    proof script in state ${s.id}:\n\`\`\`lean\n${s.script}\n\`\`\``)
+              .join("")}`,
         )
         .join("\n")
     : "(none)"
@@ -4371,7 +4402,7 @@ ${stuckBlock}
 INTERRUPTED WORK — these minions were CUT OFF by the refinement timer, not defeated. Their approach was still in flight and may well have been the right one; do NOT read this as evidence that it fails:
 ${cutoffBlock}
 
-LIVE PARTIAL PROGRESS — Pantograph proof states from minions that were cut off mid-work. Inspect any of them with get_current_proof_state(state_id) before deciding:
+LIVE PARTIAL PROGRESS — Pantograph proof states from minions that were cut off mid-work. The tactic sequence each state has ALREADY accepted is printed below, so read it here rather than spending a call on get_current_proof_state; call that only if you need a goal state the listing does not show. A state whose script is long is a real, part-built proof — reshaping its hole throws that away, so prefer keeping the proposition and ASSIGNing the state:
 ${inflightBlock}
 
 YOUR JOB:
@@ -4571,6 +4602,28 @@ async function proveFinality(theorem, ctx) {
     for (const r of stateReg.values()) for (const i of r.ids) out.add(i)
     return out
   }
+  // The refiner could already read these itself — but that costs it a tool call
+  // per state and a guess about which one matters, and last run it guessed
+  // wrong and inspected a `True` scratch probe. Fetching them here puts the
+  // actual tactic sequences in front of it before it decides anything. Bounded:
+  // one call per ledgered state, only at refinement time, failures ignored.
+  const stateScripts = async (ids) => {
+    const out = new Map()
+    if (!pantoUrl || !ids.length) return out
+    await Promise.all(
+      ids.slice(0, MAX_STATE_SCRIPTS).map(async (id) => {
+        const r = await callRemoteMcpTool(
+          pantoUrl,
+          /get.*current.*proof.*state|get_current_proof_state/i,
+          { state_id: id },
+          { timeoutMs: 15000 },
+        ).catch(() => null)
+        const s = proofScriptOfState(r?.text)
+        if (s) out.set(id, s)
+      }),
+    )
+    return out
+  }
 
   let partial = skeleton
   let rejectedNotes = {}
@@ -4705,9 +4758,16 @@ async function proveFinality(theorem, ctx) {
     // state ids renders as "(none)"), not how many holes happen to have an
     // entry — reporting stateReg.size claimed live progress the prompt didn't
     // contain, which is exactly the kind of thing that hides a real gap.
+    const scriptById = await stateScripts([...allLedgeredIds()])
     const inflight = [...stateReg.entries()]
       .filter(([, r]) => r.ids.size)
-      .map(([tag, r]) => ({ tag, ids: r.ids, lastGoal: r.lastGoal, tactics: r.tactics }))
+      .map(([tag, r]) => ({
+        tag,
+        ids: r.ids,
+        lastGoal: r.lastGoal,
+        tactics: r.tactics,
+        scripts: [...r.ids].map((id) => ({ id, script: scriptById.get(id) })).filter((s) => s.script),
+      }))
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked hole(s), ${ctx.lemmaPool.facts.size} verified lemma(s) from the run pool, ${inflight.length} live partial state-set(s).` })
     const refGate = makeProofGate(theorem)
     const refScripts = new Map()
@@ -4972,6 +5032,8 @@ const VERIFY_TIMEOUT_MS = 600000
 // code change.
 const ARCHITECT_BLUEPRINT_EFFORT = process.env.ARCHITECT_BLUEPRINT_EFFORT || "low"
 const ARCHITECT_IDLE_NOTICE_S = 45
+// Ceiling on get_current_proof_state fetches per refinement (see stateScripts).
+const MAX_STATE_SCRIPTS = Number(process.env.LEAK_MAX_STATE_SCRIPTS || 8)
 const ARCHITECT_BLUEPRINT_RETRIES = 9999
 const ARCHITECT_NODE_RETRIES = 9999
 const ARCHITECT_REFINE_RETRIES = 9999
