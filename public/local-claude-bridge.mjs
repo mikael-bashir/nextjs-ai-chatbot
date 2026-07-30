@@ -1955,7 +1955,7 @@ const STRATEGIES = {
     style: "have-surround",
   },
   // Leak Finality I: Surround's parallel work-queue + Ultra's refinement loop.
-  // A bridge timer summons a refiner 5 min after the last refinement
+  // A bridge timer summons a refiner 10 min after the last refinement
   // completed; in-flight minions are cut off, their Pantograph states handed
   // to the refiner (assign-or-decimate), and a run-scoped proven-lemma bank
   // refills kept haves in the revised skeleton for free. See proveFinality.
@@ -4027,8 +4027,11 @@ async function proveHaveSurround(theorem, ctx) {
 // ---------------------------------------------------------------------------
 // Identical to Stronghold Surround (planner → parallel minion work-queue →
 // assembler → flat-finisher fallback) EXCEPT:
-//   • A bridge-side timer fires FINALITY_REFINE_MS (default 5 min) after the
-//     LAST refinement completed (the planner counts as refinement #0). When it
+//   • A bridge-side timer fires FINALITY_REFINE_MS (default 10 min — matched
+//     to Ultra's own refinement pacing, up from the original 5 min once a
+//     real hard-benchmark run showed 5 min cutting minions off before they
+//     got real traction) after the LAST refinement completed (the planner
+//     counts as refinement #0). When it
 //     fires, in-flight minions are CUT OFF immediately (epoch abort — no
 //     waiting for the slowest), and a REFINER conversation is summoned.
 //   • A run-scoped PROVEN-LEMMA BANK keyed by have-PROPOSITION (not tag)
@@ -4046,7 +4049,7 @@ async function proveHaveSurround(theorem, ctx) {
 //     governance stays exactly the shared ctx.getDeadline the parents use.
 // Surround above stays byte-identical as the no-refinement control.
 // ===========================================================================
-const FINALITY_REFINE_MS = Number(process.env.LEAK_FINALITY_REFINE_MS || 300000)
+const FINALITY_REFINE_MS = Number(process.env.LEAK_FINALITY_REFINE_MS || 600000)
 const FINALITY_MAX_REFINES = Number(process.env.LEAK_FINALITY_MAX_REFINES || 8)
 // Reasoning effort for the REFINER only. Refinement is a barrier — minions are
 // cut off and nothing else runs — so its deliberation is paid for in dead wall

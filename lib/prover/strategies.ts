@@ -66,15 +66,17 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
   },
   {
     // Surround crossed with Ultra's refinement loop, on the same ancestral
-    // Leak I/II/IV stack. A bridge-side timer summons a refiner 5 minutes
-    // after the last refinement completed: in-flight minions are cut off
-    // immediately, their live Pantograph proof states handed to the refiner
-    // (assign to a kept have, or decimate via cleanup_memory), and a
+    // Leak I/II/IV stack. A bridge-side timer summons a refiner 10 minutes
+    // after the last refinement completed (matched to Ultra's own pacing —
+    // bumped from 5 min after a real hard-benchmark run showed minions
+    // getting cut off before they had real traction): in-flight minions are
+    // cut off immediately, their live Pantograph proof states handed to the
+    // refiner (assign to a kept have, or decimate via cleanup_memory), and a
     // run-scoped proven-lemma bank refills kept haves in the revised
     // skeleton for free.
     value: 'finality-1',
     label: 'Leak Finality I (Surround + timed skeleton refinement)',
-    note: "Stronghold Surround's parallel waves plus a system-summoned refinement loop on a 5-minute cadence: the refiner sees the current skeleton, every lemma proven so far (a run-scoped bank, restored for free where kept), and all live Pantograph proof states from cut-off minions — reassigning or decimating each. Requires the ghost-army Leak II. Resumable from a banked checkpoint.",
+    note: "Stronghold Surround's parallel waves plus a system-summoned refinement loop on a 10-minute cadence: the refiner sees the current skeleton, every lemma proven so far (a run-scoped bank, restored for free where kept), and all live Pantograph proof states from cut-off minions — reassigning or decimating each. Requires the ghost-army Leak II. Resumable from a banked checkpoint.",
   },
 ];
 
