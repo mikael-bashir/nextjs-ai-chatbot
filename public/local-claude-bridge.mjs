@@ -2755,7 +2755,44 @@ function registerRun(budgetMs, maxIters = 0) {
   return { runId, st }
 }
 // True once a governed run's wall-clock budget is spent (used to stop retrying).
+// ---- ACCOUNT QUOTA -------------------------------------------------------
+// When the Claude CLI is out of quota it does not fail — it returns, instantly,
+// with "You've hit your session limit · resets 6:30pm". Every loop in this file
+// reads that as "the stage produced no usable output" and tries again, and
+// because a refused call costs no wall-clock the retry budget (which assumes an
+// attempt takes minutes) is spent in seconds. One observed run burned 8
+// refinements, 8 minion waves and 74 finisher retries in ~3 minutes, all of
+// them no-ops, and then reported "unverified" — as if the mathematics had been
+// attempted and failed.
+//
+// The block is per ACCOUNT, not per run, so it is module-level: once one stage
+// is refused, every other stage in flight is refused too, and spawning more
+// processes cannot help. Cleared when a new run starts (`clearUsageBlock`), so
+// a later run after the reset time proceeds normally.
+const USAGE_LIMIT_RE = /hit your (?:session|usage|weekly|5-hour|five-hour) limit/i
+let usageBlock = null // { at:number, message:string }
+function noteUsageBlock(text) {
+  if (usageBlock) return true
+  const s = String(text == null ? "" : text)
+  if (!USAGE_LIMIT_RE.test(s)) return false
+  const m = s.match(/You've hit your[^\n"]*/i)
+  usageBlock = { at: Date.now(), message: (m ? m[0] : "usage limit reached").trim() }
+  return true
+}
+function usageBlocked() {
+  return !!usageBlock
+}
+function clearUsageBlock() {
+  usageBlock = null
+}
+
+// True when the run must stop. Deliberately ALSO covers the quota block: every
+// loop already gates on this (19 call sites), so folding the check in here stops
+// the whole pipeline at once instead of scattering a second condition through
+// each one — and a refused account is exactly as unable to continue as an
+// expired clock.
 function deadlinePassed(ctx) {
+  if (usageBlocked()) return true
   if (typeof ctx?.getDeadline !== "function") return false
   const dl = ctx.getDeadline()
   return Number.isFinite(dl) && Date.now() >= dl
@@ -2974,6 +3011,19 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         const line = buf.slice(0, nl)
         buf = buf.slice(nl + 1)
         if (!line.trim()) continue
+        // Checked on the RAW line: the refusal can arrive as assistant text or
+        // as the result frame, and testing here catches it whatever shape it
+        // takes. First sighting kills this stage; deadlinePassed() then stops
+        // every other loop, so we never spawn another doomed process.
+        if (!usageBlocked() && noteUsageBlock(line)) {
+          say({
+            type: "message-annotation",
+            subtype: "error",
+            thought: `🛑 ${usageBlock.message} — stopping the run. No further stage can succeed until the quota resets, so nothing more is spawned. This is NOT a proof failure: the problem was not attempted.`,
+          })
+          stopped = true
+          kill()
+        }
         let o
         try {
           o = JSON.parse(line)
@@ -9176,6 +9226,12 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
         if (ok && proof) {
           emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — have-based proof verified sorry-free." })
           send({ type: "text-delta", content: `✅ **Verified proof** (in-context \`have\` decomposition, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+        } else if (usageBlocked()) {
+          // Distinct from a proof failure on purpose: reporting "did not verify"
+          // for a run that was never allowed to run its stages is a false
+          // negative, and it is the kind that quietly poisons a benchmark.
+          emit({ type: "message-annotation", subtype: "error", thought: `🛑 Run abandoned — ${usageBlock.message}. The problem was NOT attempted; this is not evidence about its difficulty.` })
+          send({ type: "text-delta", content: `🛑 **Not attempted** — ${usageBlock.message}. The run stopped as soon as the account was refused, so no conclusion about this problem should be drawn. Re-run it after the reset.` })
         } else {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the have-based proof did not verify." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the have-based run did not produce a verified, sorry-free proof of the target." })
@@ -9377,6 +9433,7 @@ const server = createServer(async (req, res) => {
       if (typeof theorem !== "string" || !theorem.trim()) {
         return json(res, 400, { error: "theorem_required" })
       }
+      clearUsageBlock() // see /prove-tree — a new run re-evaluates the quota
       proveStream(res, theorem, body.mcpServers || [], body.options || {})
       return
     }
@@ -9421,6 +9478,10 @@ const server = createServer(async (req, res) => {
       if (typeof theorem !== "string" || !theorem.trim()) {
         return json(res, 400, { error: "theorem_required" })
       }
+      // A fresh run gets a fresh verdict on the account: the previous run may
+      // have been refused hours ago and the quota has since reset. One stage
+      // re-detects it in seconds if it has not.
+      clearUsageBlock()
       proveTreeStream(res, theorem, body.mcpServers || [], body.options || {})
       return
     }
