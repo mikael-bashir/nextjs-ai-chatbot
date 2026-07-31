@@ -121,6 +121,7 @@ const STRONGHOLD_LABELS: Record<string, string> = {
   'have-tree': 'Stronghold Dark · planner+minions',
   'have-surround': 'Stronghold Surround · parallel minion waves',
   'finality-1': 'Finality I · timed refinement',
+  'stronghold-force': 'Stronghold Force · recursive decomposer',
   have: 'Have · single context',
 };
 

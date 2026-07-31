@@ -3349,6 +3349,9 @@ export function AdminPipeline() {
                   <option value="finality-1">
                     Leak Finality I (Surround + timed skeleton refinement)
                   </option>
+                  <option value="stronghold-force">
+                    Leak Stronghold Force (dedicated recursive decomposer, no finisher)
+                  </option>
                   <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
                     {RIVER_STRATEGIES.map((s) => (
                       <option key={s.value} value={s.value}>

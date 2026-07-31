@@ -2134,6 +2134,18 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "finality",
   },
+  // Leak Stronghold Force: the recursion moved OUT of the minions and into a
+  // dedicated splitter stage, because the minion-owned version never fired
+  // once in production. Small root → timed recursive expansion (verified on
+  // Leak IV at every cut) → bounded minion campaign → failed campaign goes
+  // BACK to the decomposer, never to a finisher. See proveForce.
+  "stronghold-force": {
+    label: "Leak Stronghold Force — dedicated recursive decomposer + bounded minion campaigns",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x ? `${FORCE_PLAN_NOTE}\n${x}` : FORCE_PLAN_NOTE),
+    decompose: (t, m, x) => forceSplitPrompt("<the current skeleton>", "hN", "", null, m, x),
+    search: GOV_INITIAL,
+    style: "force",
+  },
   // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
@@ -4049,13 +4061,18 @@ ${extra ? `\n${extra}\n` : ""}`
 
 // Identical to fillHole but with the parallel-etiquette minion prompt and a
 // wave-aware status line. Kept separate so Dark's path stays untouched.
-async function fillHoleSurround(skeleton, id, ctx) {
+//
+// `extra` and `ctx.lemmaPool` are both OPTIONAL and both default to nothing,
+// so Surround — which passes neither and never sets a pool — behaves exactly
+// as before and stays the clean control. Force uses them to hand a minion the
+// run's proved facts and whatever the last campaign learned about this hole.
+async function fillHoleSurround(skeleton, id, ctx, extra = "") {
   if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Surround minion working hole ⟪${id}⟫ (parallel wave)…` })
   const applied = []
   const res = await spawnProverStream(
     {
-      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, ""),
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, extra),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
       maxTurns: 0,
@@ -4065,6 +4082,7 @@ async function fillHoleSurround(skeleton, id, ctx) {
       metrics: ctx.metrics,
       signal: ctx.signal,
       searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
     },
     {
       onObject: (o) => {
@@ -4976,6 +4994,430 @@ async function proveFinality(theorem, ctx) {
 
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ===========================================================================
+// LEAK STRONGHOLD FORCE — recursion FIRST, minions second, no finisher
+// ---------------------------------------------------------------------------
+// Dark, Surround and Finality are all described as recursive decomposers, and
+// none of them has ever recursed. The reason is structural, not incidental:
+// recursion is offered to the MINION as the consolation prize for failing to
+// close its hole (`Prefer CLOSE; DECOMPOSE only when you can't`), the minion
+// has a 15-minute node budget, and before it may hand a split back it must
+// compile that split itself. So it grinds at CLOSE until the clock kills it
+// and returns nothing at all. Two logged 30-minute runs: 24 and 30
+// verify_full_script calls, 0 DECOMPOSE blocks, 0 splits. The hole count in a
+// Stronghold run has only ever gone DOWN from whatever the planner opened
+// with.
+//
+// Force fixes that by taking the recursion away from the minions entirely and
+// giving it to a stage whose ONLY job is cutting:
+//
+//   1. PLAN     — a deliberately SMALL skeleton (3–5 holes), verified on Leak
+//                 IV. This is the saved root; every later skeleton descends
+//                 from it.
+//   2. EXPAND   — dedicated splitter agents, ≤FORCE_MINIONS at a time, each
+//                 cutting ONE hole into ~FORCE_SPLIT_N sub-holes, recursively
+//                 to FORCE_DEPTH levels. Every split is re-verified on Leak IV
+//                 by the BRIDGE before it is applied, so `partial` is a
+//                 verified skeleton at every instant and its hole count only
+//                 ever rises — which is what makes "hand back the current
+//                 highest-hole-count skeleton" a one-liner at cutoff time.
+//                 Bounded by FORCE_EXPAND_MS for the phase and
+//                 FORCE_SPLIT_CALL_MS for any single agent.
+//   3. CAMPAIGN — ≤FORCE_MINIONS minions for ≤FORCE_CAMPAIGN_MS, DEEPEST holes
+//                 first (deepest = smallest goal = likeliest to fall).
+//   4. A campaign that leaves holes open has FAILED, and a failed campaign
+//      goes back to EXPAND — never to a finisher. The splitters are told what
+//      each minion tried and why it failed, and cut those holes again from
+//      depth 0. That loop is the entire strategy: keep cutting until the
+//      pieces are minion-sized.
+const FORCE_MINIONS = Number(process.env.LEAK_FORCE_MINIONS || 5)
+const FORCE_SPLIT_N = Number(process.env.LEAK_FORCE_SPLIT_N || 3)
+const FORCE_DEPTH = Number(process.env.LEAK_FORCE_DEPTH || 3)
+// The whole recursive expansion phase. Cutting is cheap relative to proving,
+// but it is not free, and an unbounded expansion would spend the entire run
+// building a tree nobody ever works.
+const FORCE_EXPAND_MS = Number(process.env.LEAK_FORCE_EXPAND_MS || 7 * 60_000)
+// Hard ceiling on ONE splitter agent. A splitter that has not produced a
+// verified cut in five minutes is not going to; killing it frees a worker slot
+// for a hole that will.
+const FORCE_SPLIT_CALL_MS = Number(process.env.LEAK_FORCE_SPLIT_CALL_MS || 5 * 60_000)
+const FORCE_CAMPAIGN_MS = Number(process.env.LEAK_FORCE_CAMPAIGN_MS || 10 * 60_000)
+// Two cycles that neither cut anything new nor closed anything mean the loop
+// has converged on a shape it cannot move. Spinning it again just re-buys the
+// same result — stop and report honestly instead.
+const FORCE_MAX_DRY_CYCLES = 2
+
+// Aim the shared planner at a SMALL root. The planner's own instinct is to lay
+// out the whole argument, which produces the 5–9 hole skeletons Surround runs
+// on; here the expansion stage is what grows the tree, so a big root only
+// means less time cutting.
+const FORCE_PLAN_MIN = 3
+const FORCE_PLAN_MAX = 5
+const FORCE_PLAN_NOTE = `FORCE MODE — KEEP THE SKELETON SMALL: aim for ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX} holes, no more. A LATER stage recursively cuts every hole you write into smaller ones, so your job is only the top-level shape of the argument: the few big moves the proof turns on. Do NOT try to reach minion-sized steps yourself — a coarse ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole skeleton that type-checks is a BETTER input to this pipeline than a fine-grained one.`
+
+// One splitter's brief. It is not asked to prove anything and is told so twice:
+// the failure mode this whole strategy exists to fix is an agent that treats
+// "split it" as "close it, and split only if you give up".
+function forceSplitPrompt(skeleton, id, prop, failNote, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are a SPLITTER in the Leak Stronghold Force pipeline. You do NOT prove this hole. You CUT it into smaller holes that other agents will prove. Producing a correct CUT is a complete success; producing a proof is not what you were called for.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE CURRENT SKELETON (compiles; every open step is \`:= by sorry --⟪tag⟫\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`${prop ? `\nIts goal: ${prop}` : ""}
+The hypotheses in scope are the theorem's binders plus every EARLIER \`have\` — available by name, and your sub-steps inherit them too.
+${failNote ? `\nA MINION ALREADY TRIED THIS HOLE AND FAILED. What it reported:\n${oneLine(String(failNote)).slice(0, 700)}\nThat is evidence about the SHAPE of this hole, not just about that minion. Cut it somewhere else than where the minion got stuck — a split that reproduces the same wall is worth nothing.\n` : ""}
+YOUR JOB — cut ⟪${id}⟫ into about ${FORCE_SPLIT_N} genuinely smaller steps:
+1. Decide the ${FORCE_SPLIT_N} intermediate facts that, taken together, make this hole's goal easy. Each must be a REAL step down in difficulty — a restatement, a triviality, or a sub-goal as hard as the original is a wasted cut.
+2. Write them as local \`have\`s with fresh tags, then close THIS hole's goal from them:
+\`\`\`lean
+have s1 : <smaller fact> := by sorry --⟪s1⟫
+have s2 : <smaller fact> := by sorry --⟪s2⟫
+have s3 : <smaller fact> := by sorry --⟪s3⟫
+<the tactics that close ⟪${id}⟫'s goal from s1, s2, s3>
+\`\`\`
+   Do NOT re-quantify the ambient variables — the \`have\`s are inside this hole's context already.
+3. CHECK IT. Splice your block in place of \`sorry --⟪${id}⟫\` in the skeleton above, leave every OTHER \`sorry --⟪…⟫\` exactly as it is, and verify_full_script. It MUST compile with the ONLY diagnostics being \`sorry\` warnings (your new ones plus the untouched others) and NO errors. Iterate until it does. An unverified cut is thrown away by the system.
+4. OUTPUT exactly:
+DECOMPOSE ⟪${id}⟫
+\`\`\`lean
+<your block, from the left margin>
+\`\`\`
+
+THE ONE ESCAPE HATCH: if this goal is already so small that cutting it would produce sub-steps no easier than the goal itself (a single \`rw\`, one library lemma, a pure computation), do not force a pointless split — output the single line:
+ATOMIC ⟪${id}⟫
+Use it honestly and sparingly. It sends the hole straight to a minion; if that minion then fails, you will be asked to cut it after all${failNote ? ", and you are being asked now precisely because that already happened — so ATOMIC is almost certainly the wrong answer this time" : ""}.
+
+RULES:
+- The master theorem's signature is IMMUTABLE. Do not touch any other hole.
+- Every new hole needs a DISTINCT tag matching \`--⟪…⟫\` exactly; the system renames them to stay globally unique.
+- The closing tactics must be \`sorry\`-FREE — the only holes you introduce are the tagged \`have … := by sorry --⟪…⟫\` lines.
+- NEVER call \`cleanup_memory\` with no arguments — the Pantograph service is SHARED and a bare call wipes every agent's states. Free each state you made individually: \`cleanup_memory(state_id)\`.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// A splitter run. Returns { body, atomic } — `body` is the unverified block
+// (the bridge re-verifies before applying), `atomic` means the splitter
+// declined to cut and the hole should go straight to a minion.
+async function splitHoleForce(skeleton, id, ctx, failNote) {
+  if (ctx.signal?.aborted) return { body: null, atomic: false }
+  const info = holeHaveInfo(skeleton, id)
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Splitter cutting ⟪${id}⟫${info ? ` — ${oneLine(info.prop).slice(0, 140)}` : ""}` })
+  const res = await spawnProverStream(
+    {
+      prompt: forceSplitPrompt(skeleton, id, info?.prop || "", failNote, ctx.mcpServers, lemmaPoolBlock(ctx.lemmaPool, info?.prop || skeleton)),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      // The system-enforced 5-minute ceiling the strategy promises. Distinct
+      // from ctx.nodeTimeoutMs (15 min) on purpose: a minion's clock buys
+      // proof search, and a splitter is not doing proof search.
+      timeoutMs: FORCE_SPLIT_CALL_MS,
+      getDeadline: ctx.getDeadline,
+      stage: `⚒️⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: () => false, emit: ctx.emit },
+  )
+  const t = res.finalText || ""
+  if (new RegExp("ATOMIC\\s*⟪\\s*" + id + "\\s*⟫").test(t)) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ declared ATOMIC — going straight to a minion.` })
+    return { body: null, atomic: true }
+  }
+  return { body: parseDecomposeBlock(t, id), atomic: false }
+}
+
+// EXPAND. Grows `skeleton` by recursive verified cuts until the phase clock
+// runs out or the frontier is exhausted. Returns the grown skeleton (always a
+// Leak IV-verified one) plus the depth map the campaign orders its queue by.
+async function forceExpand(skeleton, ctx, sig, failNotes) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  let cutoff = false
+  const timer = setTimeout(() => {
+    cutoff = true
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Expansion window (${Math.round(FORCE_EXPAND_MS / 60000)} min) spent — freezing the skeleton at ${parseHoleIds(partial).length} hole(s) and dispatching minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_EXPAND_MS))
+
+  const roots = parseHoleIds(partial)
+  const depth = new Map(roots.map((id) => [id, 0]))
+  const queue = roots.map((id) => ({ id, d: 0 }))
+  let splits = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const item = queue.shift()
+      if (!item) {
+        if (inFlight === 0) return // frontier exhausted and nobody can extend it
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        const { id, d } = item
+        const r = await splitHoleForce(partial, id, ectx, failNotes?.[id]?.text)
+        if (!r.body) continue // ATOMIC, cut off, or no usable block — the hole simply stays
+        await withApplyLock(async () => {
+          // The run clock and an explicit abort still win; the PHASE clock does
+          // not discard a cut that already came back, because the verify is
+          // seconds and throwing away a finished split to save them is the
+          // opposite of the trade this phase is making.
+          if (ctx.signal?.aborted || deadlinePassed(ctx)) return
+          if (!parseHoleIds(partial).includes(id)) return
+          const { body: freshBody, tags } = freshenTags(r.body, parseHoleIds(partial))
+          const trial = spliceHole(partial, id, freshBody)
+          if (trial === partial) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut could not be spliced into the skeleton — hole left intact.` })
+            return
+          }
+          const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+          if (!(v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig))) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut rejected by Leak IV — hole left intact.` })
+            return
+          }
+          partial = trial
+          splits++
+          for (const t of tags) {
+            depth.set(t, d + 1)
+            if (d + 1 < FORCE_DEPTH) queue.push({ id: t, d: d + 1 })
+          }
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ → ${tags.length} hole(s) at depth ${d + 1}/${FORCE_DEPTH}${d + 1 < FORCE_DEPTH ? "" : " (leaf)"} — skeleton now ${parseHoleIds(partial).length} hole(s).` })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  if (!cutoff && !ctx.signal?.aborted)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Expansion exhausted the frontier (depth ${FORCE_DEPTH}) with time to spare — ${parseHoleIds(partial).length} hole(s).` })
+  return { skeleton: partial, splits, depth }
+}
+
+// CAMPAIGN. Up to FORCE_MINIONS minions for at most FORCE_CAMPAIGN_MS, deepest
+// holes first. Holes it fails on come back as notes for the next expansion —
+// there is no finisher to hand them to.
+async function forceCampaign(skeleton, ctx, depth, banked) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  const timer = setTimeout(() => {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Campaign window (${Math.round(FORCE_CAMPAIGN_MS / 60000)} min) spent — recalling the minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_CAMPAIGN_MS))
+
+  // Deepest first: a depth-3 hole is the smallest goal in the tree and the one
+  // most likely to fall inside a campaign window. Filling it also shrinks its
+  // parent's remaining work, so the tree collapses from the leaves up.
+  const queue = parseHoleIds(partial).sort((a, b) => (depth.get(b) ?? 0) - (depth.get(a) ?? 0))
+  const notes = {}
+  let closed = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const id = queue.shift()
+      if (id === undefined) {
+        if (inFlight === 0) return
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        if (!parseHoleIds(partial).includes(id)) continue
+        const info = holeHaveInfo(partial, id)
+        const r = await fillHoleSurround(partial, id, ectx, lemmaPoolBlock(ctx.lemmaPool, info?.prop || partial))
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted) return
+          if (r.fill == null) {
+            // Includes the DECOMPOSE case: a Force minion that wants to split
+            // does not get to, because splitting is the expansion stage's job
+            // and its notes route there anyway.
+            if (r.notes) notes[id] = r.notes
+            return
+          }
+          const next = spliceHole(partial, id, r.fill)
+          if (next === partial) {
+            if (r.notes) notes[id] = r.notes
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ was proved but could not be spliced — back to the decomposer.` })
+            return
+          }
+          partial = next
+          closed++
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Closed hole ⟪${id}⟫ (Force campaign).` })
+          const openNow = parseHoleIds(partial)
+          ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked + closed, total: banked + closed + openNow.length })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  return { skeleton: partial, closed, notes }
+}
+
+async function proveForce(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "⚒️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Leak Stronghold Force: a ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root, then ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion (×${FORCE_SPLIT_N}, depth ${FORCE_DEPTH}) and ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions. A failed campaign goes back to the decomposer, never to a finisher.` })
+
+  // Shared across every splitter and minion for the whole run — the same
+  // run-scoped pool Finality uses. Cheap: it is harvested from compiles that
+  // were already paid for.
+  ctx.lemmaPool = makeLemmaPool()
+
+  // ---- 1) PLANNER — the shared planner, aimed at a SMALL root ---------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          if (isStructurallyValidDecomposition(parseVerifyOutput(t)) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) skeleton = script
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, FORCE_PLAN_NOTE),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "⚒️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it outright — no decomposition needed." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  // The ONE finisher-shaped path left in Force, and it is not the campaign
+  // escape hatch the strategy forbids: with no skeleton there is nothing to
+  // cut and nothing to dispatch, so the alternative is returning nothing at
+  // all.
+  if (!skeleton || !parseHoleIds(skeleton).length) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ Planner produced no tagged skeleton — nothing to decompose; falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+
+  let partial = skeleton
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Root skeleton verified — ${parseHoleIds(partial).length} hole(s): ${parseHoleIds(partial).map((h) => `⟪${h}⟫`).join(" ")}. Saved; expansion starts now.` })
+  ctx.emit({ type: "checkpoint", skeleton: partial, filled: 0, total: parseHoleIds(partial).length })
+
+  // ---- 2) EXPAND → CAMPAIGN → (failed? EXPAND again) ------------------------
+  let failNotes = {}
+  let banked = 0
+  let cycle = 0
+  let dry = 0
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    cycle++
+    const before = parseHoleIds(partial).length
+    const ex = await forceExpand(partial, ctx, sig, failNotes)
+    partial = ex.skeleton
+    const after = parseHoleIds(partial).length
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle} expansion: ${ex.splits} verified cut(s), ${before} → ${after} hole(s). Dispatching ×${Math.min(FORCE_MINIONS, after)} minions for ${Math.round(FORCE_CAMPAIGN_MS / 60000)} min.` })
+    ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + after })
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+
+    const camp = await forceCampaign(partial, ctx, ex.depth, banked)
+    partial = camp.skeleton
+    banked += camp.closed
+    failNotes = camp.notes
+    const left = parseHoleIds(partial)
+    if (!left.length) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle} campaign closed every remaining hole (${banked} total).` })
+      break
+    }
+    dry = ex.splits === 0 && camp.closed === 0 ? dry + 1 : 0
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `↩︎ Cycle ${cycle} campaign closed ${camp.closed}/${after} hole(s); ${left.length} still open — returning them to the decomposer (no finisher).`,
+    })
+    if (dry >= FORCE_MAX_DRY_CYCLES) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `🛑 ${FORCE_MAX_DRY_CYCLES} consecutive cycles cut nothing and closed nothing — the loop has converged on a shape it cannot move. Stopping rather than re-buying the same result.` })
+      break
+    }
+  }
+
+  // ---- 3) ASSEMBLE ----------------------------------------------------------
+  const remaining = parseHoleIds(partial)
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Stronghold Force assembled a verified proof: ${banked} hole(s) closed across ${cycle} cycle(s).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚒️ Out of clock with ${remaining.length} hole(s) still open after ${cycle} cycle(s) (${banked} closed). Force has no finisher by design — the partial skeleton is checkpointed for a resume.` })
+  }
+  return { verified: false, proof: "" }
 }
 
 // ===========================================================================
@@ -9132,6 +9574,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             surroundHoleFillPrompt("<the current skeleton>", "hN", mcpServers) +
             "\n\n=== REFINER PROMPT (system-summoned every cadence) ===\n" +
             finalityRefinerPrompt(theorem, "<the current skeleton>", [], {}, {}, [], mcpServers)
+          : style === "force"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Force (${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root · ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion ×${FORCE_SPLIT_N} to depth ${FORCE_DEPTH} · ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions · failed campaigns return to the decomposer) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (small root) ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers, FORCE_PLAN_NOTE) +
+            "\n\n=== SPLITTER PROMPT (recursive decomposer) ===\n" +
+            forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
+            "\n\n=== HOLE-FILL (CAMPAIGN MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -9254,7 +9703,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -9275,7 +9724,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                 ? await proveHaveSurround(theorem, ctx)
                 : style === "finality"
                   ? await proveFinality(theorem, ctx)
-                  : await proveHaveFlat(theorem, ctx)
+                  : style === "force"
+                    ? await proveForce(theorem, ctx)
+                    : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

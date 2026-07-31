@@ -78,6 +78,17 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     label: 'Leak Finality I (Surround + timed skeleton refinement)',
     note: "Stronghold Surround's parallel waves plus a system-summoned refinement loop on a 10-minute cadence: the refiner sees the current skeleton, every lemma proven so far (a run-scoped bank, restored for free where kept), and all live Pantograph proof states from cut-off minions — reassigning or decimating each. Requires the ghost-army Leak II. Resumable from a banked checkpoint.",
   },
+  {
+    // Dark/Surround/Finality all advertise recursive decomposition and none of
+    // them has ever produced a single split in production: recursion is the
+    // MINION's consolation prize for failing to close, and a minion with a
+    // 15-minute budget grinds at closing until the clock kills it. Force moves
+    // the recursion into a stage of its own that does nothing else, and
+    // deletes the finisher so a failed campaign can only go back to it.
+    value: 'stronghold-force',
+    label: 'Leak Stronghold Force (dedicated recursive decomposer, no finisher)',
+    note: 'A deliberately small root skeleton (3–5 holes), then a 7-minute recursive expansion in which dedicated splitter agents cut every hole into ~3 sub-holes, three levels deep, each cut re-verified on Leak IV by the bridge before it is applied (so the skeleton is always valid and its hole count only rises; no single splitter exceeds 5 minutes). Then ≤5 minions get ≤10 minutes on the leaves, deepest first. A campaign that leaves holes open goes BACK to the decomposer — with what each minion tried — never to a finisher. Requires the ghost-army Leak II.',
+  },
 ];
 
 // The Leak River variants — each an ablation of the previous one.
@@ -139,6 +150,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',
+  'stronghold-force': 'Leak Stronghold Force',
 };
 
 export function enforcerLabelFor(strategy: string): string {
@@ -176,6 +188,20 @@ export function strategyNote(strategy: string): string | null {
 export const BENCHMARK_ARCHITECT_BUDGET_MS = 30 * 60_000;
 export const BENCHMARK_VINTAGE_MAX_ITERS = 5;
 export const BENCHMARK_ARCHITECT_MAX_ITERS = 8;
+/**
+ * The heavy multi-stage provers — every Stronghold variant (Dark, Surround,
+ * Finality I, Force) and Leak Ultra — get a full hour. 30 minutes was measured
+ * to be the binding constraint rather than the difficulty of the problem:
+ * Finality I runs spent 11–20% of the clock in refinement and reached the
+ * finisher with 3 seconds left, and Force needs room for at least two
+ * expand→campaign cycles (7 + 10 minutes each) before it has said anything.
+ *
+ * River deliberately KEEPS the 30-minute architect budget. Its four variants
+ * are an ablation ladder whose numbers are only comparable to each other and
+ * to the rows already recorded at 30 minutes; moving it would invalidate that
+ * table without telling us anything the Ultra rows won't.
+ */
+export const BENCHMARK_DEEP_BUDGET_MS = 60 * 60_000;
 /** Every OTHER non-architect decomposition strategy keeps the ACG pipeline's own clock. */
 export const BENCHMARK_TREE_BUDGET_MS = 30 * 60_000;
 
@@ -191,24 +217,30 @@ export function benchmarkBudgetFor(strategy: string): {
 } {
   if (isArchitectStrategy(strategy)) {
     return {
-      computeBudgetMs: BENCHMARK_ARCHITECT_BUDGET_MS,
+      // Ultra moves to the deep budget with the Stronghold family; River stays
+      // on the architect budget so its ablation ladder stays self-comparable.
+      computeBudgetMs: isUltraStrategy(strategy)
+        ? BENCHMARK_DEEP_BUDGET_MS
+        : BENCHMARK_ARCHITECT_BUDGET_MS,
       maxIters:
         strategy === 'river-vintage'
           ? BENCHMARK_VINTAGE_MAX_ITERS
           : BENCHMARK_ARCHITECT_MAX_ITERS,
     };
   }
-  // Leak Stronghold Dark (and its parallel-minion variant Surround, and their
-  // refinement-loop child Finality I) is the direct capability comparison
-  // against Leak Ultra (same isolated-decomposition shape, different driver)
-  // — deliberately pinned to the SAME constant, not just the same value, so
-  // none of them can drift out of sync if the architect budget changes later.
+  // Leak Stronghold Dark (and its parallel-minion variant Surround, their
+  // refinement-loop child Finality I, and the dedicated-decomposer Force) is
+  // the direct capability comparison against Leak Ultra (same isolated-
+  // decomposition shape, different driver) — deliberately pinned to the SAME
+  // constant, not just the same value, so none of them can drift out of sync
+  // if that budget changes later.
   if (
     strategy === 'have-tree' ||
     strategy === 'have-surround' ||
-    strategy === 'finality-1'
+    strategy === 'finality-1' ||
+    strategy === 'stronghold-force'
   ) {
-    return { computeBudgetMs: BENCHMARK_ARCHITECT_BUDGET_MS };
+    return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }
   if (usesTreeEndpoint(strategy)) {
     return { computeBudgetMs: BENCHMARK_TREE_BUDGET_MS };

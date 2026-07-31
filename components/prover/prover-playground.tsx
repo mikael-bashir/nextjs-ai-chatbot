@@ -281,6 +281,9 @@ export function ProverPlayground() {
               <option value="finality-1">
                 Leak Finality I (Surround + timed skeleton refinement)
               </option>
+              <option value="stronghold-force">
+                Leak Stronghold Force (dedicated recursive decomposer, no finisher)
+              </option>
               <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
                 <option value="ultra-fleeting">
                   Leak Ultra Fleeting (model from the selector)
