@@ -3713,7 +3713,11 @@ function freshenTags(body, existing) {
     }
     return `⟪${map.get(t)}⟫`
   })
-  return { body: out, tags: [...map.values()] }
+  // `rename` is the ORIGINAL tag -> fresh tag mapping. Callers that also parse
+  // tag-addressed side-channels out of the same agent message (Force's ASSIGN
+  // and BRIEF lines, which name s1/s2/s3) need it: without it they compare the
+  // agent's own tags against the renamed ones and silently never match.
+  return { body: out, tags: [...map.values()], rename: map }
 }
 
 // Replace hole `id`'s `:= by sorry --⟪id⟫` with the minion's tactics, re-indented
@@ -5074,6 +5078,43 @@ const FORCE_CAMPAIGN_MS = Number(process.env.LEAK_FORCE_CAMPAIGN_MS || 10 * 60_0
 // has converged on a shape it cannot move. Spinning it again just re-buys the
 // same result — stop and report honestly instead.
 const FORCE_MAX_DRY_CYCLES = 2
+// Same reasoning as FINALITY_REFINE_EFFORT: a splitter is doing STRUCTURE, not
+// proof search, and the deliberation it would otherwise spend is the deliberation
+// that produced 0 verified cuts in a 7-minute window on the first live run.
+const FORCE_SPLIT_EFFORT = process.env.LEAK_FORCE_SPLIT_EFFORT || "medium"
+
+// Ghost-army housekeeping, shared by the campaign and the expansion. Force is
+// one of several agents on a SHARED Pantograph, so every state a cut-off minion
+// leaves behind is a leak until someone frees it by id — which is exactly what
+// the first Force run did to states 3e690f3e, b66413e9 and 6bdd697c.
+async function freeForceStates(ctx, ids) {
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  if (!pantoUrl) return
+  for (const id of ids)
+    await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, { state_id: id }, { timeoutMs: 15000 }).catch(() => {})
+}
+const forceLedgeredIds = (stateReg) => {
+  const out = new Set()
+  for (const r of stateReg.values()) for (const i of r.ids) out.add(i)
+  return out
+}
+// The tactic sequence each ledgered state has ALREADY accepted, fetched once
+// before the splitter runs. Without this the splitter has to guess which state
+// matters and spend a call to look — last run it guessed wrong and inspected a
+// `True` scratch probe. Bounded and failure-tolerant.
+async function forceStateScripts(ctx, ids) {
+  const out = new Map()
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  if (!pantoUrl || !ids.length) return out
+  await Promise.all(
+    ids.slice(0, MAX_STATE_SCRIPTS).map(async (id) => {
+      const r = await callRemoteMcpTool(pantoUrl, /get.*current.*proof.*state|get_current_proof_state/i, { state_id: id }, { timeoutMs: 15000 }).catch(() => null)
+      const s = proofScriptOfState(r?.text)
+      if (s) out.set(id, s)
+    }),
+  )
+  return out
+}
 
 // Aim the shared planner at a SMALL root. The planner's own instinct is to lay
 // out the whole argument, which produces the 5–9 hole skeletons Surround runs
@@ -5086,8 +5127,36 @@ const FORCE_PLAN_NOTE = `FORCE MODE — KEEP THE SKELETON SMALL: aim for ${FORCE
 // One splitter's brief. It is not asked to prove anything and is told so twice:
 // the failure mode this whole strategy exists to fix is an agent that treats
 // "split it" as "close it, and split only if you give up".
-function forceSplitPrompt(skeleton, id, prop, failNote, mcpServers = [], extra = "") {
+// `hist` is everything earlier agents learned about THIS hole:
+//   { failed, cutoff, scripts:[{id,script}], lastGoal, tactics:[], priorCuts:[] }
+// Every field is optional; an empty hist renders nothing.
+function forceSplitPrompt(skeleton, id, prop, hist, mcpServers = [], extra = "") {
   const toolSection = mcpToolSection(mcpServers)
+  const h = hist || {}
+  const noteBlock = (label, n, guidance) =>
+    !n ? "" : `\n${label}\n${oneLine(String(n.text || "no notes")).slice(0, 700)}${
+      n.tactics?.length ? `\n  tactics it applied: ${n.tactics.slice(-16).join(" ; ").slice(0, 500)}` : ""
+    }\n${guidance}\n`
+  const failedBlock = noteBlock(
+    "A MINION ALREADY TRIED THIS HOLE AND WAS DEFEATED. What it reported:",
+    h.failed,
+    "That is evidence about the SHAPE of this hole, not just about that minion. Cut it somewhere else than where it got stuck — a split that reproduces the same wall is worth nothing.",
+  )
+  const cutoffBlock = noteBlock(
+    "A MINION WAS WORKING THIS HOLE AND RAN OUT OF CLOCK — it was NOT defeated:",
+    h.cutoff,
+    "Its approach was still live and may well have been the right one. Do NOT read this as evidence that it fails. Prefer a cut that lets the next minion CONTINUE it.",
+  )
+  const scriptBlock = (h.scripts || []).length
+    ? `\nLIVE PARTIAL PROGRESS — proof states a minion built on this hole and did not finish. The tactic sequence each has ALREADY accepted is printed here, so read it rather than spending a call on get_current_proof_state. A long script is real, part-built work: shape your cut so it still applies.${h.lastGoal ? `\n  last goal seen: ${oneLine(h.lastGoal).slice(0, 400)}` : ""}\n${h.scripts
+        .map((s) => `  state ${s.id}:\n\`\`\`lean\n${s.script}\n\`\`\``)
+        .join("\n")}\n`
+    : ""
+  const priorBlock = (h.priorCuts || []).length
+    ? `\nCUTS ALREADY ATTEMPTED ON THIS HOLE BY EARLIER SPLITTERS — all of them were REJECTED or never produced a verified block. Do not re-walk these:\n${h.priorCuts
+        .map((c) => `  - ${oneLine(String(c)).slice(0, 300)}`)
+        .join("\n")}\n`
+    : ""
   return `You are a SPLITTER in the Leak Stronghold Force pipeline. You do NOT prove this hole. You CUT it into smaller holes that other agents will prove. Producing a correct CUT is a complete success; producing a proof is not what you were called for.
 
 ${toolSection}
@@ -5101,7 +5170,7 @@ ${skeleton}
 
 YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`${prop ? `\nIts goal: ${prop}` : ""}
 The hypotheses in scope are the theorem's binders plus every EARLIER \`have\` — available by name, and your sub-steps inherit them too.
-${failNote ? `\nA MINION ALREADY TRIED THIS HOLE AND FAILED. What it reported:\n${oneLine(String(failNote)).slice(0, 700)}\nThat is evidence about the SHAPE of this hole, not just about that minion. Cut it somewhere else than where the minion got stuck — a split that reproduces the same wall is worth nothing.\n` : ""}
+${failedBlock}${cutoffBlock}${scriptBlock}${priorBlock}
 YOUR JOB — cut ⟪${id}⟫ into about ${FORCE_SPLIT_N} genuinely smaller steps:
 1. Decide the ${FORCE_SPLIT_N} intermediate facts that, taken together, make this hole's goal easy. Each must be a REAL step down in difficulty — a restatement, a triviality, or a sub-goal as hard as the original is a wasted cut.
 2. Write them as local \`have\`s with fresh tags, then close THIS hole's goal from them:
@@ -5117,11 +5186,21 @@ have s3 : <smaller fact> := by sorry --⟪s3⟫
 DECOMPOSE ⟪${id}⟫
 \`\`\`lean
 <your block, from the left margin>
-\`\`\`
+\`\`\`${
+    (h.scripts || []).length
+      ? `\n5. THEN, for every live state listed above whose part-built work still applies under ONE of your new sub-holes, add a line:
+ASSIGN <state_id> ⟪s1⟫
+   The next minion on that sub-hole resumes from that exact state instead of starting cold. Any state you do NOT assign is FREED — its tactic script is destroyed permanently and the listing above was the last copy, so if the work still matters, either assign it or shape a sub-hole it fits.`
+      : ""
+  }
+${(h.scripts || []).length ? "6" : "5"}. FINALLY, brief the minions who will work your new sub-holes. They see ONLY the skeleton and their own hole — this is the ONLY channel by which anything you just learned reaches them. One block per sub-hole you want to brief:
+BRIEF ⟪s1⟫
+<what you found out that bears on this sub-step: which lemma names turned out NOT to exist, which ones did, what an earlier minion already tried and how far it got, and WHY you cut here — what this shape is meant to make easier>
+   Write nothing you would not want acted on: the minion treats it as established fact and will not re-verify it. Omit the block entirely for a sub-hole where you have nothing real to say.
 
 THE ONE ESCAPE HATCH: if this goal is already so small that cutting it would produce sub-steps no easier than the goal itself (a single \`rw\`, one library lemma, a pure computation), do not force a pointless split — output the single line:
 ATOMIC ⟪${id}⟫
-Use it honestly and sparingly. It sends the hole straight to a minion; if that minion then fails, you will be asked to cut it after all${failNote ? ", and you are being asked now precisely because that already happened — so ATOMIC is almost certainly the wrong answer this time" : ""}.
+Use it honestly and sparingly. It sends the hole straight to a minion; if that minion then fails, you will be asked to cut it after all${h.failed ? ", and you are being asked now precisely because that already happened — so ATOMIC is almost certainly the wrong answer this time" : ""}.
 
 RULES:
 - The master theorem's signature is IMMUTABLE. Do not touch any other hole.
@@ -5136,13 +5215,24 @@ ${extra ? `\n${extra}\n` : ""}`
 // A splitter run. Returns { body, atomic } — `body` is the unverified block
 // (the bridge re-verifies before applying), `atomic` means the splitter
 // declined to cut and the hole should go straight to a minion.
-async function splitHoleForce(skeleton, id, ctx, failNote) {
+async function splitHoleForce(skeleton, id, ctx, hist) {
   if (ctx.signal?.aborted) return { body: null, atomic: false }
   const info = holeHaveInfo(skeleton, id)
-  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Splitter cutting ⟪${id}⟫${info ? ` — ${oneLine(info.prop).slice(0, 140)}` : ""}` })
+  const carried = [
+    hist?.failed && "a defeated minion's notes",
+    hist?.cutoff && "a cut-off minion's notes",
+    hist?.scripts?.length && `${hist.scripts.length} live proof state(s)`,
+    hist?.priorCuts?.length && `${hist.priorCuts.length} rejected cut(s)`,
+  ].filter(Boolean)
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `⚒️ Splitter cutting ⟪${id}⟫${info ? ` — ${oneLine(info.prop).slice(0, 140)}` : ""}${carried.length ? ` [carrying ${carried.join(", ")}]` : ""}`,
+  })
   const res = await spawnProverStream(
     {
-      prompt: forceSplitPrompt(skeleton, id, info?.prop || "", failNote, ctx.mcpServers, lemmaPoolBlock(ctx.lemmaPool, info?.prop || skeleton)),
+      prompt: forceSplitPrompt(skeleton, id, info?.prop || "", hist, ctx.mcpServers, lemmaPoolBlock(ctx.lemmaPool, info?.prop || skeleton)),
+      effort: FORCE_SPLIT_EFFORT,
       mcpServers: ctx.mcpServers,
       model: ctx.model,
       maxTurns: 0,
@@ -5162,15 +5252,31 @@ async function splitHoleForce(skeleton, id, ctx, failNote) {
   const t = res.finalText || ""
   if (new RegExp("ATOMIC\\s*⟪\\s*" + id + "\\s*⟫").test(t)) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ declared ATOMIC — going straight to a minion.` })
-    return { body: null, atomic: true }
+    return { body: null, atomic: true, summary: null, assigns: [] }
   }
-  return { body: parseDecomposeBlock(t, id), atomic: false }
+  return {
+    body: parseDecomposeBlock(t, id),
+    atomic: false,
+    // The tail of what it said, kept ONLY so a failed splitter's direction can
+    // be shown to the next one. Cheap, and the alternative is re-buying the
+    // same dead end every cycle.
+    summary: t ? t.slice(-600) : null,
+    assigns: parseAssignLines(t),
+    briefs: parseBriefBlocks(t),
+  }
 }
 
 // EXPAND. Grows `skeleton` by recursive verified cuts until the phase clock
 // runs out or the frontier is exhausted. Returns the grown skeleton (always a
 // Leak IV-verified one) plus the depth map the campaign orders its queue by.
-async function forceExpand(skeleton, ctx, sig, failNotes) {
+// `hist` is a Map: hole tag -> { failed, cutoff, scripts, lastGoal, tactics,
+// priorCuts }. It ACCUMULATES across cycles (proveForce owns it), so a splitter
+// that fails on a hole leaves its dead end behind for its successor rather than
+// letting cycle N+1 re-walk the identical search — which is what produced the
+// repeated `loogle "doubleCoset, Nat.card"` seventeen minutes apart on the
+// first live run. `stateReg` is the campaign's Pantograph ledger: states a cut
+// destroys are freed here, and states a kept hole still owns are carried.
+async function forceExpand(skeleton, ctx, sig, hist, stateReg) {
   let partial = skeleton
   const ac = new AbortController()
   const onParentAbort = () => ac.abort()
@@ -5206,8 +5312,16 @@ async function forceExpand(skeleton, ctx, sig, failNotes) {
       inFlight++
       try {
         const { id, d } = item
-        const r = await splitHoleForce(partial, id, ectx, failNotes?.[id]?.text)
-        if (!r.body) continue // ATOMIC, cut off, or no usable block — the hole simply stays
+        const r = await splitHoleForce(partial, id, ectx, hist?.get(id))
+        if (!r.body) {
+          // ATOMIC, cut off, or no usable block. Record the miss so the NEXT
+          // splitter on this hole does not repeat the same dead end.
+          if (!r.atomic && r.summary) {
+            const e = hist?.get(id)
+            if (e) (e.priorCuts ||= []).push(r.summary)
+          }
+          continue
+        }
         await withApplyLock(async () => {
           // The run clock and an explicit abort still win; the PHASE clock does
           // not discard a cut that already came back, because the verify is
@@ -5215,7 +5329,11 @@ async function forceExpand(skeleton, ctx, sig, failNotes) {
           // opposite of the trade this phase is making.
           if (ctx.signal?.aborted || deadlinePassed(ctx)) return
           if (!parseHoleIds(partial).includes(id)) return
-          const { body: freshBody, tags } = freshenTags(r.body, parseHoleIds(partial))
+          const { body: freshBody, tags, rename } = freshenTags(r.body, parseHoleIds(partial))
+          // The splitter addresses its sub-holes by ITS OWN names (s1/s2/s3);
+          // freshenTags renamed them to be globally unique. Translate before
+          // matching, or ASSIGN and BRIEF silently never apply.
+          const fresh = (t) => rename.get(t) || t
           const trial = spliceHole(partial, id, freshBody)
           if (trial === partial) {
             ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut could not be spliced into the skeleton — hole left intact.` })
@@ -5228,11 +5346,56 @@ async function forceExpand(skeleton, ctx, sig, failNotes) {
           }
           partial = trial
           splits++
+          // The parent hole is gone. Its Pantograph states either move to a
+          // sub-hole the splitter ASSIGNed them to, or they are freed — never
+          // left dangling on the shared service, and never silently discarded
+          // while still holding a real part-built proof.
+          const reg = stateReg?.get(id)
+          if (reg) {
+            const kept = new Set()
+            for (const { stateId, tag: raw } of r.assigns || []) {
+              const tag = fresh(raw)
+              if (!tags.includes(tag) || !reg.ids.has(stateId)) continue
+              let nr = stateReg.get(tag)
+              if (!nr) {
+                nr = { ids: new Set(), lastGoal: reg.lastGoal, tactics: [...reg.tactics], resume: stateId }
+                stateReg.set(tag, nr)
+              }
+              nr.ids.add(stateId)
+              nr.resume = nr.resume || stateId
+              nr.script = nr.script || hist?.get(id)?.scripts?.find((s) => s.id === stateId)?.script
+              kept.add(stateId)
+            }
+            const dropped = [...reg.ids].filter((i) => !kept.has(i))
+            stateReg.delete(id)
+            if (dropped.length) freeForceStates(ctx, dropped)
+            if (kept.size)
+              ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ handed ${kept.size} live proof state(s) down to its sub-hole(s); freed ${dropped.length}.` })
+          }
+          // Whatever the splitter learned while cutting reaches the sub-hole's
+          // minion — the only channel there is, since a minion sees just the
+          // skeleton and its own hole. Attaches whether or not a state came
+          // with it, so a reshaped sub-step is still briefed.
+          let briefed = 0
+          for (const [raw, text] of Object.entries(r.briefs || {})) {
+            const tag = fresh(raw)
+            if (!tags.includes(tag)) continue
+            let nr = stateReg?.get(tag)
+            if (!nr && stateReg) {
+              nr = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+              stateReg.set(tag, nr)
+            }
+            if (nr) {
+              nr.brief = text
+              briefed++
+            }
+          }
+          hist?.delete(id)
           for (const t of tags) {
             depth.set(t, d + 1)
             if (d + 1 < FORCE_DEPTH) queue.push({ id: t, d: d + 1 })
           }
-          ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ → ${tags.length} hole(s) at depth ${d + 1}/${FORCE_DEPTH}${d + 1 < FORCE_DEPTH ? "" : " (leaf)"} — skeleton now ${parseHoleIds(partial).length} hole(s).` })
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ → ${tags.length} hole(s) at depth ${d + 1}/${FORCE_DEPTH}${d + 1 < FORCE_DEPTH ? "" : " (leaf)"} — skeleton now ${parseHoleIds(partial).length} hole(s)${briefed ? `, ${briefed} briefed` : ""}.` })
         })
       } finally {
         inFlight--
@@ -5250,7 +5413,14 @@ async function forceExpand(skeleton, ctx, sig, failNotes) {
 // CAMPAIGN. Up to FORCE_MINIONS minions for at most FORCE_CAMPAIGN_MS, deepest
 // holes first. Holes it fails on come back as notes for the next expansion —
 // there is no finisher to hand them to.
-async function forceCampaign(skeleton, ctx, depth, banked) {
+//
+// Uses fillHoleFinality, NOT fillHoleSurround. The first cut of Force used
+// Surround's minion because its signature was shorter, and that single
+// substitution silently deleted the entire Pantograph hand-off layer: state
+// ids were never ledgered, so a cut-off minion's live proof state was neither
+// shown to the splitter nor freed on the SHARED service, and its tactic trail
+// died with it. `reg` is what carries all of that.
+async function forceCampaign(skeleton, ctx, depth, banked, stateReg) {
   let partial = skeleton
   const ac = new AbortController()
   const onParentAbort = () => ac.abort()
@@ -5264,7 +5434,13 @@ async function forceCampaign(skeleton, ctx, depth, banked) {
   // most likely to fall inside a campaign window. Filling it also shrinks its
   // parent's remaining work, so the tree collapses from the leaves up.
   const queue = parseHoleIds(partial).sort((a, b) => (depth.get(b) ?? 0) - (depth.get(a) ?? 0))
-  const notes = {}
+  // Two SEPARATE note maps, exactly as Finality keeps them. A minion the
+  // campaign clock killed is not a minion that was defeated, and telling a
+  // splitter "this already failed" about an approach that was still in flight
+  // is how it talks itself off the direction that was about to work. The first
+  // Force run did precisely that to hole ⟪d1⟫.
+  const notes = {} // genuinely tried and failed
+  const cutoff = {} // still working when the window closed
   let closed = 0
   let inFlight = 0
   let applyLock = Promise.resolve()
@@ -5286,15 +5462,23 @@ async function forceCampaign(skeleton, ctx, depth, banked) {
       inFlight++
       try {
         if (!parseHoleIds(partial).includes(id)) continue
-        const info = holeHaveInfo(partial, id)
-        const r = await fillHoleSurround(partial, id, ectx, lemmaPoolBlock(ctx.lemmaPool, info?.prop || partial))
+        // Ledger this hole's Pantograph states so the splitter can read (or
+        // inherit) whatever the minion built, and so nothing leaks on the
+        // shared service if the clock kills it mid-tactic.
+        let reg = stateReg.get(id)
+        if (!reg) {
+          reg = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+          stateReg.set(id, reg)
+        }
+        const r = await fillHoleFinality(partial, id, ectx, reg)
         await withApplyLock(async () => {
           if (ctx.signal?.aborted) return
           if (r.fill == null) {
             // Includes the DECOMPOSE case: a Force minion that wants to split
             // does not get to, because splitting is the expansion stage's job
             // and its notes route there anyway.
-            if (r.notes) notes[id] = r.notes
+            if (ac.signal.aborted && !ctx.signal?.aborted) cutoff[id] = r.notes || { text: "(cut off before it reported)" }
+            else if (r.notes) notes[id] = r.notes
             return
           }
           const next = spliceHole(partial, id, r.fill)
@@ -5305,6 +5489,11 @@ async function forceCampaign(skeleton, ctx, depth, banked) {
           }
           partial = next
           closed++
+          // Closed: its ledgered states are dead weight — free them now rather
+          // than carrying them to the end of the run.
+          const dead = [...reg.ids]
+          stateReg.delete(id)
+          freeForceStates(ctx, dead)
           ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Closed hole ⟪${id}⟫ (Force campaign).` })
           const openNow = parseHoleIds(partial)
           ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked + closed, total: banked + closed + openNow.length })
@@ -5317,7 +5506,7 @@ async function forceCampaign(skeleton, ctx, depth, banked) {
   await Promise.all(workers)
   clearTimeout(timer)
   ctx.signal?.removeEventListener?.("abort", onParentAbort)
-  return { skeleton: partial, closed, notes }
+  return { skeleton: partial, closed, notes, cutoff }
 }
 
 async function proveForce(theorem, ctx) {
@@ -5395,24 +5584,53 @@ async function proveForce(theorem, ctx) {
   ctx.emit({ type: "checkpoint", skeleton: partial, filled: 0, total: parseHoleIds(partial).length })
 
   // ---- 2) EXPAND → CAMPAIGN → (failed? EXPAND again) ------------------------
-  let failNotes = {}
+  // Run-scoped and disposed with the run. `hist` accumulates per hole ACROSS
+  // cycles — it is never reassigned — so nothing a minion or a splitter learned
+  // is lost at a stage boundary. `stateReg` is the Pantograph ledger.
+  const hist = new Map() // hole tag -> { failed, cutoff, scripts, lastGoal, tactics, priorCuts }
+  const stateReg = new Map() // hole tag -> { ids:Set, lastGoal, tactics, resume, script }
+  const histFor = (id) => {
+    let e = hist.get(id)
+    if (!e) {
+      e = { failed: null, cutoff: null, scripts: [], lastGoal: "", tactics: [], priorCuts: [] }
+      hist.set(id, e)
+    }
+    return e
+  }
   let banked = 0
   let cycle = 0
   let dry = 0
   while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
     cycle++
     const before = parseHoleIds(partial).length
-    const ex = await forceExpand(partial, ctx, sig, failNotes)
+    // Read every ledgered state's actual tactic script BEFORE the splitters
+    // run, so each one sees the part-built proof rather than guessing which
+    // state matters and burning a call to look.
+    const scriptById = await forceStateScripts(ctx, [...forceLedgeredIds(stateReg)])
+    for (const [tag, reg] of stateReg) {
+      const e = histFor(tag)
+      e.scripts = [...reg.ids].map((sid) => ({ id: sid, script: scriptById.get(sid) })).filter((s) => s.script)
+      e.lastGoal = reg.lastGoal || e.lastGoal
+      if (reg.tactics?.length) e.tactics = reg.tactics
+    }
+    const liveStates = [...stateReg.values()].reduce((n, r) => n + r.ids.size, 0)
+    if (liveStates)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle}: ${liveStates} live proof state(s) from cut-off minions handed to the decomposer (${scriptById.size} with a readable script).` })
+    const ex = await forceExpand(partial, ctx, sig, hist, stateReg)
     partial = ex.skeleton
     const after = parseHoleIds(partial).length
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle} expansion: ${ex.splits} verified cut(s), ${before} → ${after} hole(s). Dispatching ×${Math.min(FORCE_MINIONS, after)} minions for ${Math.round(FORCE_CAMPAIGN_MS / 60000)} min.` })
     ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + after })
     if (ctx.signal?.aborted || deadlinePassed(ctx)) break
 
-    const camp = await forceCampaign(partial, ctx, ex.depth, banked)
+    const camp = await forceCampaign(partial, ctx, ex.depth, banked, stateReg)
     partial = camp.skeleton
     banked += camp.closed
-    failNotes = camp.notes
+    // MERGE, never replace. Overwriting is how cycle N+1 forgets what cycle N
+    // paid for; and a hole the clock cut off must NOT be reported to the next
+    // splitter as one that was defeated.
+    for (const [id, n] of Object.entries(camp.notes)) histFor(id).failed = n
+    for (const [id, n] of Object.entries(camp.cutoff)) histFor(id).cutoff = n
     const left = parseHoleIds(partial)
     if (!left.length) {
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle} campaign closed every remaining hole (${banked} total).` })
@@ -5432,6 +5650,10 @@ async function proveForce(theorem, ctx) {
 
   // ---- 3) ASSEMBLE ----------------------------------------------------------
   const remaining = parseHoleIds(partial)
+  // Dispose the ghost ledger with the run — Pantograph is SHARED, and a state
+  // this run created is nobody else's to collect.
+  await freeForceStates(ctx, [...forceLedgeredIds(stateReg)])
+  stateReg.clear()
   if (remaining.length === 0 && !ctx.signal?.aborted) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
     const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
