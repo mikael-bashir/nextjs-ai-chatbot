@@ -1213,10 +1213,14 @@ function parseLemmaDecl(block) {
   if (i < 0) return null
   const statement = s.slice(0, i).replace(/\s+/g, " ").trim()
   const proof = s.slice(i + 2).trim()
-  // `sorry` cannot reach here (it is a warning and warnings fail the daemon) —
-  // this is the belt to that braces, so a future daemon that downgrades the
-  // check can never silently seed the pool with holes.
-  if (!statement || !proof || /\bsorry\b/.test(proof)) return null
+  // THE soundness filter, not a backstop. Since the harvest trigger accepts
+  // any error-free compile (a skeleton compile carries sorry warnings by
+  // construction — see the capture site), this line is what separates the
+  // declarations that are genuinely CLOSED from the one that still has holes
+  // in it. The master theorem's `have … := by sorry --⟪hN⟫` lines are indented
+  // inside its own block, so it is rejected whole and only the sorry-free
+  // helper lemmas beside it reach the pool.
+  if (!statement || !proof || /\b(?:sorry|admit)\b/.test(proof)) return null
   const colon = topLevelColon(statement)
   if (colon < 0) return null
   const concl = statement.slice(colon + 1).trim()
@@ -3065,14 +3069,36 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
                 const t = Array.isArray(c.content)
                   ? c.content.map((x) => x.text || "").join("\n")
                   : String(c.content ?? "")
-                // A successful verify is a CLOSED Lean fact (the daemon fails on
-                // any warning, and `sorry` is a warning) — bank it for the rest
-                // of the run. The compile has already been paid for; keeping the
-                // result costs nothing and is the only way this agent's side
-                // lemmas outlive its context. Normalized, so what we store is
-                // byte-identical to what the daemon actually compiled.
-                if (lemmaPool && /Compilation Successful|100% verified/i.test(t))
-                  harvestVerifiedLemmas(lemmaPool, normalizeProofScript(t, verifyCalls.get(c.tool_use_id)))
+                // Bank every CLOSED Lean fact this compile establishes. The
+                // compile is already paid for; keeping the result costs nothing
+                // and is the only way an agent's side lemmas outlive its
+                // context.
+                //
+                // The trigger used to be "Compilation Successful", which sounds
+                // right and is in fact unreachable for every decomposition
+                // strategy: a minion validates its work by compiling the WHOLE
+                // skeleton, which still holds the other holes' `sorry`, and the
+                // daemon fails on any warning. Two logged 30-minute Finality
+                // runs: 41 verify calls after the planner, 0 "Successful", 0
+                // lemmas banked. The pool only ever held planner scraps.
+                //
+                // So accept any compile with NO errors, and let parseLemmaDecl
+                // do the filtering per declaration — it drops anything whose
+                // proof still contains `sorry`/`admit`, which throws away the
+                // master theorem (the holes live inside it) and keeps exactly
+                // the sorry-free helper lemmas beside it. Those helpers are real
+                // closed proofs: they compiled, in this script, with no errors.
+                //
+                // `success || sorryWarnings.length` is the guard against
+                // unparseable daemon output: a failure whose diagnostics don't
+                // match the Line-N grammar would otherwise read as error-free.
+                // Requiring positive evidence — a clean success, or a sorry
+                // warning we actually parsed — means garbage banks nothing.
+                if (lemmaPool) {
+                  const pv = parseVerifyOutput(t)
+                  if (!pv.serverError && !pv.errors.length && (pv.success || pv.sorryWarnings.length))
+                    harvestVerifiedLemmas(lemmaPool, normalizeProofScript(t, verifyCalls.get(c.tool_use_id)))
+                }
                 // Refill ONLY when a genuine proof attempt hit an unknown name —
                 // never for a `#check @guess` probe (that would reward guessing).
                 if (verifyTextIsSyntaxError(t) && isRealProofScript(verifyCalls.get(c.tool_use_id))) {
