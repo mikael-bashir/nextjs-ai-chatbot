@@ -7313,14 +7313,31 @@ function closedHoleProposition(skeleton, id) {
 // A small sweep on ONE hole, cached across the run by the hole's alpha-key so
 // two holes with the same shape are probed once. Returns "" when it has nothing
 // worth saying — the minion prompt is then exactly Surround's.
+// Every exit reports itself. A silent per-hole sweep is the same blindness the
+// root sweep had before its briefing was emitted: from a run log you could not
+// tell a hole that was briefed from one that was skipped, from one that was
+// briefed and ignored — and that is the only question worth asking of this arm.
+// The skip reasons are distinct on purpose; each points at a different fix.
 async function holeRecon(skeleton, id, ctx) {
+  const say = (thought, subtype = "status") => ctx.emit({ type: "message-annotation", subtype, thought })
   const rb = ctx.reconBudget
-  if (rb && rb.spentMs >= rb.capMs) return ""
+  if (rb && rb.spentMs >= rb.capMs) {
+    say(`🔭 ⟪${id}⟫ no hole sweep — the run's recon budget is spent (${Math.round(rb.spentMs / 1000)}s of ${Math.round(rb.capMs / 1000)}s). Minion proceeds as plain Surround.`)
+    return ""
+  }
   const prop = closedHoleProposition(skeleton, id)
-  if (!prop) return ""
+  if (!prop) {
+    say(`🔭 ⟪${id}⟫ no hole sweep — could not lift this hole to a closed proposition (unreadable \`have\`, or tactic context this lifter does not model).`, "error")
+    return ""
+  }
   const key = alphaKey(prop)
-  if (ctx.reconCache?.has(key)) return ctx.reconCache.get(key)
+  if (ctx.reconCache?.has(key)) {
+    const cached = ctx.reconCache.get(key)
+    say(`🔭 ⟪${id}⟫ reusing a cached sweep — an earlier hole had the same goal shape${cached ? "" : " (and it found nothing)"}.`)
+    return cached
+  }
   let brief = ""
+  let stats = null
   try {
     const r = await reconSweep(null, ctx, {
       proposition: prop,
@@ -7329,17 +7346,25 @@ async function holeRecon(skeleton, id, ctx) {
       budgetMs: IMPEN_HOLE_MS,
     })
     if (r?.ran) {
+      stats = { expanded: r.expanded, suggestions: [...new Set(r.suggestions || [])].length, closed: !!r.closed }
       const closedNote = r.closed
         ? `\n\nTHIS HOLE'S GOAL WAS CLOSED OUTRIGHT by [${r.closed.path.join(" ; ")}] on an over-abstracted version of it (every earlier step was assumed, so your real goal is no harder). Try that first, inline, and do not decompose this hole.`
         : ""
       brief = reconBriefing(r) + closedNote
+    } else {
+      say(`🔭 ⟪${id}⟫ hole sweep did not run — the lifted proposition did not open as a live state. Lifted was: ${oneLine(prop)}`, "error")
     }
-  } catch {
+  } catch (e) {
+    say(`🔭 ⟪${id}⟫ hole sweep errored (${oneLine(e?.message || e)}) — minion proceeds without it.`, "error")
     brief = ""
   }
   const note = brief
     ? `${brief}\n\nThis is EVIDENCE about your hole, not instructions. It was measured on your goal with every earlier step assumed, so anything that closed it will close yours. If it shows nothing useful, ignore it and prove the hole your own way — and if the portfolio already closes it, just close it rather than splitting it further.`
     : ""
+  if (stats)
+    say(
+      `🔭 ⟪${id}⟫ HOLE BRIEFING (${note.length} chars — ${stats.expanded} state(s), ${stats.suggestions} apply? theorem(s)${stats.closed ? ", GOAL CLOSED OUTRIGHT" : ""}):\n${note || "(nothing worth reporting — minion gets the plain Surround prompt)"}`,
+    )
   ctx.reconCache?.set(key, note)
   return note
 }
