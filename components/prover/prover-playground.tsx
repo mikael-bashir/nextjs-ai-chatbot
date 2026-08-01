@@ -293,6 +293,10 @@ export function ProverPlayground() {
               <option value="stronghold-forte">
                 Leak Stronghold Forte (Force + reliable handoff, opening pool, duplicate-cut guard)
               </option>
+              <option value="stronghold-keep">
+                Leak Stronghold Keep (flat first, bounded gated siege, guaranteed
+                flat finisher)
+              </option>
               <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
                 <option value="ultra-fleeting">
                   Leak Ultra Fleeting (model from the selector)

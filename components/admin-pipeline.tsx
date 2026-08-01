@@ -3361,6 +3361,10 @@ export function AdminPipeline() {
                   <option value="stronghold-forte">
                     Leak Stronghold Forte (Force + reliable handoff, opening pool, duplicate-cut guard)
                   </option>
+                  <option value="stronghold-keep">
+                    Leak Stronghold Keep (flat first, bounded gated siege,
+                    guaranteed flat finisher)
+                  </option>
                   <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
                     {RIVER_STRATEGIES.map((s) => (
                       <option key={s.value} value={s.value}>

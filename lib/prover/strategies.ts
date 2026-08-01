@@ -122,6 +122,17 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     label: 'Leak Stronghold Forte (Force + reliable handoff, cross-hole opening pool, duplicate-cut guard)',
     note: "Force's exact root/expand/campaign shape, plus three additions: (1) a cut-off minion's accepted tactics are tracked locally from its own tool-call stream as they happen, so handoff to the next decomposer cycle never depends on a live Pantograph re-query succeeding right after a mass recall; (2) a run-wide pool of accepted opening sequences is surfaced as a hint to any hole with a similarly-shaped goal, so siblings stop re-deriving the same opening moves from scratch; (3) a cheap local token-overlap check rejects a splitter's cut if its own child restates the parent goal almost verbatim, before it is ever spliced in. Requires the ghost-army Leak II.",
   },
+  {
+    // Branches off SURROUND, not Force/Forte — deliberately. On the FATE-X
+    // problems attempted so far Surround is the family's strongest arm (it
+    // proved fatex_001/_002/_004), while every arm built on top of it scored
+    // below it, and Force/Forte removed the flat finisher outright. Keep adds
+    // exactly two things to Surround, both about where the clock goes.
+    value: 'stronghold-keep',
+    label:
+      'Leak Stronghold Keep (flat first, bounded gated siege, guaranteed flat finisher)',
+    note: "Surround's planner, parallel minion queue and assembler, unchanged — but the shared clock is split three ways so decomposition can never consume the endgame. Phase 1 VANGUARD (~35%): one agent attacks the WHOLE theorem flat, with the full tool surface; a problem that yields to a single unfragmented context is taken there and never decomposed. Phase 2 SIEGE (~40%): Surround's queue, seeded with the vanguard's last compiled script and the compiler's verdict on it, and gated by a progress check that rejects a proposed cut whose child restates its parent or an ancestor up to bound-variable renaming (a vacuous cut type-checks, so the structural gate alone waves it through and the run then re-proves the goal it started with). Phase 3 KEEP (the guaranteed remainder, plus any clock extension): the flat prover again on the whole theorem, handed the partially filled skeleton and every minion's scratch notes. Requires the ghost-army Leak II.",
+  },
 ];
 
 // The Leak River variants — each an ablation of the previous one.
@@ -187,6 +198,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   'finality-1': 'Leak Finality I',
   'stronghold-force': 'Leak Stronghold Force',
   'stronghold-forte': 'Leak Stronghold Forte',
+  'stronghold-keep': 'Leak Stronghold Keep',
 };
 
 export function enforcerLabelFor(strategy: string): string {
@@ -276,7 +288,8 @@ export function benchmarkBudgetFor(strategy: string): {
     strategy === 'have-surround' ||
     strategy === 'finality-1' ||
     strategy === 'stronghold-force' ||
-    strategy === 'stronghold-forte'
+    strategy === 'stronghold-forte' ||
+    strategy === 'stronghold-keep'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }

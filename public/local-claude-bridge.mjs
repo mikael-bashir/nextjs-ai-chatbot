@@ -2208,6 +2208,19 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "forte",
   },
+  // Leak Stronghold Keep: Surround's planner/queue/assembler unchanged, but the
+  // clock is split three ways — a FLAT attack on the whole theorem first, then a
+  // bounded decomposition siege with a progress gate that rejects a cut whose
+  // child restates its parent or an ancestor, then a FLAT finisher that is
+  // guaranteed the remaining time. Built on Surround (3/4) rather than on
+  // Force/Forte (0/3), which deleted the finisher. See proveStrongholdKeep.
+  "stronghold-keep": {
+    label: "Leak Stronghold Keep — flat first, bounded gated siege, guaranteed flat finisher",
+    node: (t, m, x) => haveProvePrompt(t, m, x),
+    decompose: (t, m, x) => surroundHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "keep",
+  },
   // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
@@ -3580,7 +3593,12 @@ async function proveNode(node, ctx) {
 // tree: the agent's self-reported success is RE-VERIFIED independently on the
 // daemon before acceptance. Bounded outer retries feed the last compile failure
 // back in (like #2) so a stuck run gets a fresh, informed attempt.
-async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
+// `carry`, when supplied, is an out-parameter: the flat prover writes its LAST
+// compiled script and the error that script produced into it before returning
+// unproven. Stronghold Keep uses it to hand a failed direct attack's real
+// artefacts to the decomposition that follows, instead of restarting cold.
+// Undefined for every existing caller, so their behaviour is unchanged.
+async function proveHaveFlat(theorem, ctx, { seed, hints, carry } = {}) {
   const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
   // When the have-tree banked some holes, it hands us the partially-filled
   // skeleton here so that proven work is never thrown away — the agent only has
@@ -3627,20 +3645,27 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
             : `🧩 Proving in one context via local \`have\` decomposition (${remainingLabel(ctx)}).`,
     })
     const gate = makeProofGate(theorem)
-    const verifyIds = new Set()
+    // id -> the script that call compiled. Was a Set; it holds the script now
+    // only so `carry` can hand the last real attempt forward (see above). The
+    // membership test below is identical either way.
+    const verifyIds = new Map()
     let lastVerifyError = ""
+    let lastVerifyScript = ""
     const onObject = (o) => {
       const ev = gate.observe(o)
       if (ev?.verified) return true
       if (o.type === "assistant" && o.message?.content) {
         for (const c of o.message.content) {
-          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyIds.add(c.id)
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyIds.set(c.id, c.input?.script ?? "")
         }
       } else if (o.type === "user" && o.message?.content) {
         for (const c of o.message.content) {
           if (c.type !== "tool_result" || !verifyIds.has(c.tool_use_id)) continue
           const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
-          if (t && !/Compilation Successful|100% verified/i.test(t) && /error|Error|Line \d+|sorry/.test(t)) lastVerifyError = t
+          if (t && !/Compilation Successful|100% verified/i.test(t) && /error|Error|Line \d+|sorry/.test(t)) {
+            lastVerifyError = t
+            lastVerifyScript = verifyIds.get(c.tool_use_id) || lastVerifyScript
+          }
         }
       }
       return false
@@ -3680,7 +3705,13 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
     // budget ⇒ Infinite deadline) keep the finite maxRetry so they can't loop
     // forever. Every retry re-verifies independently, so soundness is unchanged.
     const outOfAttempts = ctx.computeGoverned ? false : attempt >= maxRetry
-    if (outOfAttempts || ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
+    if (outOfAttempts || ctx.signal?.aborted || deadlinePassed(ctx)) {
+      if (carry) {
+        carry.lastError = lastVerifyError || carry.lastError || ""
+        carry.lastScript = lastVerifyScript || carry.lastScript || ""
+      }
+      return { verified: false, proof: "" }
+    }
     extra = lastVerifyError
       ? `YOUR PREVIOUS ATTEMPT FAILED. The last verify_full_script reported:\n${lastVerifyError.slice(0, 1400)}\n\nFix the SPECIFIC error above — adjust the failing \`have\` or the final assembly, and keep the parts that already compiled.`
       : "YOUR PREVIOUS ATTEMPT did not produce a verified proof. Start from the skeleton-first approach: lay out the `have`s, compile the skeleton, then fill them."
@@ -4199,9 +4230,18 @@ async function fillHoleSurround(skeleton, id, ctx, extra = "") {
 // through one async lock so splices and decompose-verifications never race on
 // `partial`; minion RUNS overlap freely. No global Pantograph cleanup ever
 // happens — minions free their own states (ghost-army id-scoped cleanup).
-async function proveHaveSurround(theorem, ctx) {
+// `opts` is how Stronghold Keep reuses this body without forking it (so Keep's
+// numbers isolate exactly the changes Keep makes, and Surround's arm stays the
+// untouched control). All three default off ⇒ Surround behaves exactly as before:
+//   planNote   — extra text appended to the planner prompt.
+//   cutGate    — reject a proposed split whose child restates its parent or an
+//                ancestor (see cutIsVacuous).
+//   deferFinish— return { partial, hints } instead of calling proveHaveFlat, so
+//                the caller owns the endgame and its clock.
+async function proveHaveSurround(theorem, ctx, opts = {}) {
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   const sig = theoremSignature(theorem)
+  const { planNote = "", cutGate = false, deferFinish = false } = opts
   ctx.stage = "🛰️"
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Stronghold Surround: planning a decomposition skeleton (parallel minion waves ×${SURROUND_MINIONS}).` })
 
@@ -4235,7 +4275,7 @@ async function proveHaveSurround(theorem, ctx) {
   }
   await spawnProverStream(
     {
-      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, planNote),
       mcpServers: ctx.mcpServers,
       model: ctx.model,
       maxTurns: 0,
@@ -4258,12 +4298,16 @@ async function proveHaveSurround(theorem, ctx) {
   }
 
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  // With deferFinish the caller owns the endgame, so "no usable skeleton" must
+  // hand control back rather than spend the caller's finisher clock here.
+  const noSkeleton = () =>
+    deferFinish ? { verified: false, proof: "", partial: null, hints: {} } : proveHaveFlat(theorem, ctx)
   if (!skeleton) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
-    return proveHaveFlat(theorem, ctx)
+    return noSkeleton()
   }
   const holeIds = parseHoleIds(skeleton)
-  if (!holeIds.length) return proveHaveFlat(theorem, ctx)
+  if (!holeIds.length) return noSkeleton()
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Skeleton verified — ${holeIds.length} hole(s): ${holeIds.map((h) => `⟪${h}⟫`).join(" ")}. Dispatching parallel minion waves (×${Math.min(SURROUND_MINIONS, holeIds.length)}).` })
   ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: holeIds.length })
 
@@ -4293,7 +4337,11 @@ async function proveHaveSurround(theorem, ctx) {
     applyLock = p.then(() => {}, () => {})
     return p
   }
-  const queue = parseHoleIds(skeleton).map((id) => ({ id, depth: 0 }))
+  // `anc` carries the alpha-keys of every goal ABOVE this hole in the tree, so
+  // the cut gate can reject a child that restates a grandparent, not just its
+  // immediate parent. Empty and inert unless cutGate is on.
+  const queue = parseHoleIds(skeleton).map((id) => ({ id, depth: 0, anc: [] }))
+  let vacuousCuts = 0
   let inFlight = 0
   const workers = Array.from({ length: Math.max(1, Math.min(SURROUND_MINIONS, queue.length)) }, async () => {
     while (true) {
@@ -4306,7 +4354,7 @@ async function proveHaveSurround(theorem, ctx) {
       }
       inFlight++
       try {
-        const { id, depth } = item
+        const { id, depth, anc = [] } = item
         const r = await fillHoleSurround(partial, id, ctx)
         await withApplyLock(async () => {
           if (ctx.signal?.aborted) return
@@ -4315,12 +4363,32 @@ async function proveHaveSurround(theorem, ctx) {
             banked++
             ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (parallel wave).` })
           } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
+            // PROGRESS GATE. A split that reproduces its own parent (or an
+            // ancestor) compiles perfectly — `have h : P := by sorry` followed
+            // by `exact h` is valid Lean — so the structural check below waves
+            // it through, and the run then spends its remaining minutes
+            // re-proving the goal it started with under a new tag. Observed
+            // live: a child alpha-identical to its parent burned 20 minutes.
+            // The gate is deliberately fail-OPEN: it only fires when it can
+            // positively read both propositions and they match.
+            const parentProp = cutGate ? holePropOf(partial, id) : null
+            const vacuous = cutGate ? cutIsVacuous(parentProp, decomposeChildProps(r.decompose), anc) : null
+            if (vacuous) {
+              vacuousCuts++
+              stuck.add(id)
+              rejectedNotes[id] = { text: `Split REJECTED by the progress gate: ${vacuous}. ${r.notes?.text || ""}`.trim(), tactics: r.notes?.tactics || [] }
+              ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Rejected the split of ⟪${id}⟫ — ${vacuous}. Not a decomposition; leaving the hole for the finisher.` })
+              const openNow0 = parseHoleIds(partial)
+              ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow0.length })
+              return
+            }
             const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
             const trial = spliceHole(partial, id, freshBody)
             const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
             if (v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig)) {
               partial = trial
-              for (const t of tags) queue.push({ id: t, depth: depth + 1 }) // live hand-off — idle workers start these NOW
+              const childAnc = cutGate && parentProp ? [...anc, alphaKey(parentProp)].filter(Boolean) : anc
+              for (const t of tags) queue.push({ id: t, depth: depth + 1, anc: childAnc }) // live hand-off — idle workers start these NOW
               ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Split hole ⟪${id}⟫ into ${tags.length} smaller hole(s): ${tags.map((t) => `⟪${t}⟫`).join(" ")} — queued for the next free minion.` })
             } else {
               stuck.add(id)
@@ -4356,9 +4424,82 @@ async function proveHaveSurround(theorem, ctx) {
   } else if (!ctx.signal?.aborted) {
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Banked ${filled}/${filled + remaining.length} hole(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
   }
+  if (cutGate && vacuousCuts) ctx.emit({ type: "message-annotation", subtype: "status", thought: `⛔ Progress gate rejected ${vacuousCuts} non-decreasing split(s) this siege.` })
 
-  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (ctx.signal?.aborted) return { verified: false, proof: "", partial, hints: rejectedNotes }
+  // deferFinish: hand the partially-filled skeleton back so the CALLER runs the
+  // finisher on a clock it controls. Surround itself (deferFinish off) finishes
+  // here exactly as before, on whatever time the minions left it.
+  if (deferFinish) return { verified: false, proof: "", partial, hints: rejectedNotes }
   return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ---------------------------------------------------------------------------
+// PROGRESS GATE helpers (used only when opts.cutGate is on — Stronghold Keep).
+// ---------------------------------------------------------------------------
+
+// The PROPOSITION of the `have` that carries hole `id`, i.e. the P in
+// `have h : P := by sorry -- ⟪id⟫`. Returns null when it cannot be read
+// confidently — every caller treats null as "no opinion", never as "bad".
+function holePropOf(skeleton, id) {
+  const lines = String(skeleton || "").split("\n")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return null
+  // A long statement may wrap across lines, so walk back to the `have` that
+  // opens it and re-join. Bounded to 12 lines: beyond that we'd risk swallowing
+  // a PRECEDING have and comparing the wrong proposition.
+  let start = idx
+  while (start >= 0 && idx - start < 12 && !/\bhave\b/.test(lines[start])) start--
+  if (start < 0 || !/\bhave\b/.test(lines[start] || "")) return null
+  const chunk = lines.slice(start, idx + 1).join(" ")
+  const m = chunk.match(/\bhave\b[^:]*:([\s\S]*?):=\s*by\s+sorry/)
+  const prop = m ? m[1].trim() : ""
+  return prop || null
+}
+
+// Every child proposition a DECOMPOSE body proposes.
+function decomposeChildProps(body) {
+  const out = []
+  for (const id of parseHoleIds(body)) {
+    const p = holePropOf(body, id)
+    if (p) out.push(p)
+  }
+  return out
+}
+
+// A cheap alpha-invariant fingerprint of a proposition: two statements that
+// differ ONLY in the names of bound variables produce the same key.
+//
+// Locals are approximated as undotted, lowercase-initial identifiers of at most
+// three characters (`n`, `hx`, `ih`, `abc`) that are not preceded by a dot —
+// the dot guard is what keeps `Finset.sum` and `Nat.add` intact, so genuinely
+// different lemma names never collide. The approximation can over-collapse
+// (a 3-letter GLOBAL like `gcd` also folds), which at worst rejects a good cut
+// and costs one hole its split; a missed vacuous cut costs the rest of the run,
+// so the asymmetry is deliberate.
+function alphaKey(prop) {
+  return String(prop || "")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/(^|[^.\w])([a-z][A-Za-z0-9_']{0,2})(?![\w.'])/g, "$1·")
+    .trim()
+}
+
+// Returns a human reason when the proposed cut makes no progress, else null.
+// Null on ANY uncertainty (unreadable parent, empty keys) — see holePropOf.
+function cutIsVacuous(parentProp, childProps, ancestorKeys = []) {
+  if (!parentProp || !childProps.length) return null
+  const pk = alphaKey(parentProp)
+  if (!pk) return null
+  const anc = new Set(ancestorKeys.filter(Boolean))
+  for (const cp of childProps) {
+    const ck = alphaKey(cp)
+    if (!ck) continue
+    if (ck === pk) return "a child restates the hole's own goal (identical up to bound-variable names)"
+    if (anc.has(ck)) return "a child restates an ANCESTOR goal already open higher in the tree"
+  }
+  return null
 }
 
 // ===========================================================================
@@ -6467,6 +6608,143 @@ async function proveForte(theorem, ctx) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚔️ Out of clock with ${remaining.length} hole(s) still open after ${cycle} cycle(s) (${banked} closed). Forte has no finisher by design — the partial skeleton is checkpointed for a resume.` })
   }
   return { verified: false, proof: "" }
+}
+
+// ===========================================================================
+// LEAK STRONGHOLD KEEP — Surround, with the endgame protected.
+// ---------------------------------------------------------------------------
+// WHY THIS ARM EXISTS. Head-to-head on the problems both families attempted,
+// Stronghold's ORIGINAL arm is not the weak one: Surround proved fatex_001,
+// _002 and _004 (3/4). What lost ground was everything built on top of it —
+// Finality I 1/7, Force 0/2, Forte 0/1 — and on fatex_003 every Stronghold arm
+// failed while a FLAT agent (Control I and II) closed it in ~25 min. Force ran
+// nearly an hour on that same problem and did not.
+//
+// Two structural causes, both about where the clock goes rather than how the
+// cut is chosen:
+//
+//   1. THE ENDGAME IS STARVED. Surround's minions run against the run-level
+//      deadline, so on a hard problem they consume all of it and the flat
+//      finisher that follows inherits a clock of roughly zero. Force and Forte
+//      went further and deleted the finisher outright ("no finisher by
+//      design"), which is why they can never recover a fragmented run. Some
+//      theorems — fatex_003's normal-core quotient restructuring, reached via
+//      Hall's marriage theorem — need ONE agent holding the WHOLE goal. A
+//      decomposition run must be able to return to that, with real time left.
+//   2. VACUOUS CUTS COMPILE. `have h : P := by sorry` followed by `exact h` is
+//      valid Lean, so a split that merely restates its parent passes the
+//      structural gate and is counted as progress. Observed live: a child
+//      alpha-identical to its parent absorbed 20 minutes.
+//
+// So Keep is Surround plus a clock discipline and a progress gate — three
+// phases over ONE shared deadline, no new agents, no new machinery:
+//
+//   1. VANGUARD (~35%) — the flat prover attacks the WHOLE theorem first, with
+//      the full tool surface. This is deliberately Control's shape: if a
+//      problem yields to a single unfragmented context, Keep takes it there and
+//      never fragments at all. Decomposition becomes a FALLBACK, which is also
+//      the ordering Goedel's Poetry (arXiv 2512.14252 §3.4) arrived at.
+//   2. SIEGE (~40%) — Surround's exact planner + parallel work queue, seeded
+//      with what the vanguard actually compiled, and with the progress gate on
+//      (cutIsVacuous). Bounded, so it cannot eat phase 3.
+//   3. KEEP (the remainder, ≥25%, plus any "+5 min" the operator adds) — the
+//      flat prover again, holding the whole theorem, handed the partially
+//      filled skeleton and every minion's scratch notes. The banked holes are
+//      kept; the residual hard goal finally gets a real budget in one context.
+//
+// The guarantee worth stating plainly: decomposition can no longer consume the
+// endgame, and a run can no longer end with its remaining time spent inside a
+// fragment. Phases PARTITION the operator's existing budget — none of them caps
+// the run, the run still ends only at the shared deadline, and an extension
+// lands wholly in phase 3.
+//
+// Deliberately NOT included: re-decomposition/backtracking, extra watchers,
+// campaign schedulers. Every arm that added machinery to Surround scored below
+// it; the two changes here are the two the run data actually implicates.
+// ===========================================================================
+
+// Fractions of the clock REMAINING when Keep starts. The rest is phase 3.
+const KEEP_VANGUARD_FRAC = Number(process.env.LEAK_KEEP_VANGUARD_FRAC || 0.35)
+const KEEP_SIEGE_FRAC = Number(process.env.LEAK_KEEP_SIEGE_FRAC || 0.4)
+// Used only on an UNCAPPED run (no compute budget ⇒ infinite deadline), where
+// a fraction is meaningless. These bound the phase, never the run: phase 3 then
+// inherits the same infinite clock and runs until proof or Terminate.
+const KEEP_VANGUARD_MS = Number(process.env.LEAK_KEEP_VANGUARD_MS || 15 * 60000)
+const KEEP_SIEGE_MS = Number(process.env.LEAK_KEEP_SIEGE_MS || 20 * 60000)
+
+// A ctx whose deadline is the EARLIER of the run's deadline and this phase's
+// end. Read live, so Terminate still cuts through instantly; `endAt` is fixed
+// at phase start, so a "+5 min" extension flows past the bounded phases and
+// lands entirely in the unbounded finisher — which is the point.
+function phaseCtx(ctx, endAt) {
+  const base = typeof ctx.getDeadline === "function" ? ctx.getDeadline : null
+  return { ...ctx, getDeadline: () => Math.min(base ? base() : Infinity, endAt) }
+}
+
+async function proveStrongholdKeep(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const t0 = Date.now()
+  const dl = typeof ctx.getDeadline === "function" ? ctx.getDeadline() : Infinity
+  const total = Number.isFinite(dl) ? Math.max(0, dl - t0) : Infinity
+  const capped = Number.isFinite(total)
+  const vanguardMs = capped ? total * KEEP_VANGUARD_FRAC : KEEP_VANGUARD_MS
+  const siegeMs = capped ? total * KEEP_SIEGE_FRAC : KEEP_SIEGE_MS
+  const vanguardEnd = t0 + vanguardMs
+  const siegeEnd = vanguardEnd + siegeMs
+  const mins = (ms) => Math.max(1, Math.round(ms / 60000))
+
+  // ---- 1) VANGUARD — flat, whole theorem, no decomposition ------------------
+  ctx.stage = "🏇"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🏇 Stronghold Keep — phase 1/3 VANGUARD: one agent attacks the WHOLE theorem for ~${mins(vanguardMs)} min before anything is decomposed.`,
+  })
+  const carry = {}
+  const van = await proveHaveFlat(theorem, phaseCtx(ctx, vanguardEnd), { carry })
+  if (van.verified) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Stronghold Keep closed it in the VANGUARD — the theorem never needed decomposing." })
+    return van
+  }
+  if (ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
+
+  // ---- 2) SIEGE — Surround's queue, gated, bounded --------------------------
+  // The vanguard's last compiled script and its error are handed to the planner
+  // so the decomposition is cut around what actually resisted, not around a
+  // fresh reading of the statement.
+  const planNote = [
+    `A DIRECT ATTACK ON THIS EXACT THEOREM ALREADY RAN FOR ~${mins(vanguardMs)} MIN IN ONE CONTEXT AND FAILED. Do not simply retry it — decompose around the step that resisted.`,
+    carry.lastScript ? "Its LAST compiled attempt was:\n```lean\n" + String(carry.lastScript).slice(0, 2600) + "\n```" : "",
+    carry.lastError ? "The compiler's verdict on that attempt was:\n```\n" + String(carry.lastError).slice(0, 1400) + "\n```" : "",
+    "Put your holes where THAT failure is. A hole that restates the theorem is not a decomposition and will be rejected.",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🛰️ Stronghold Keep — phase 2/3 SIEGE: decomposing for ~${mins(siegeMs)} min (progress gate on), holding ~${capped ? mins(Math.max(0, dl - siegeEnd)) + " min" : "the rest of the clock"} in reserve for the finisher.`,
+  })
+  const siege = await proveHaveSurround(theorem, phaseCtx(ctx, siegeEnd), { planNote, cutGate: true, deferFinish: true })
+  if (siege.verified) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Stronghold Keep assembled a verified proof in the SIEGE." })
+    return siege
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+
+  // ---- 3) KEEP — flat again, whole theorem, FULL remaining clock ------------
+  // This phase is why the arm exists: whatever the siege banked comes with it,
+  // but the agent holds the entire goal again and has real time to spend on it.
+  const open = siege.partial ? parseHoleIds(siege.partial).length : 0
+  ctx.stage = "🏰"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🏰 Stronghold Keep — phase 3/3 KEEP: falling back to ONE context on the whole theorem${
+      siege.partial ? ` with ${open} hole(s) still open and the banked steps kept` : ""
+    } (${remainingLabel(ctx)}).`,
+  })
+  return proveHaveFlat(theorem, ctx, { seed: siege.partial || undefined, hints: siege.hints || {} })
 }
 
 // ===========================================================================
@@ -10637,6 +10915,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
             "\n\n=== HOLE-FILL (CAMPAIGN MINION, + opening pool hint) PROMPT ===\n" +
             surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
+          : style === "keep"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Keep (phase 1 flat vanguard ~${Math.round(KEEP_VANGUARD_FRAC * 100)}% of the clock · phase 2 gated Surround siege ~${Math.round(KEEP_SIEGE_FRAC * 100)}% · phase 3 flat finisher on the guaranteed remainder) · strategy: ${strategy}]\n\n=== PHASE 1 VANGUARD / PHASE 3 KEEP PROMPT (flat, whole theorem) ===\n` +
+            haveProvePrompt(theorem, mcpServers) +
+            "\n\n=== PHASE 2 PLANNER PROMPT (seeded with the vanguard's failed attempt) ===\n" +
+            haveTreePlannerPrompt(theorem, mcpServers, "<the vanguard's last compiled script and the compiler's verdict on it>") +
+            "\n\n=== PHASE 2 HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the verified skeleton>", "hN", mcpServers)
           : style === "control"
           ? `[FLAT BASELINE — Leak Control I (one continuous agent, one-shot, Leak IV only, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
             controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url === resolveVerifyUrl(mcpServers)))
@@ -10765,7 +11050,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "control" || style === "control2") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "control" || style === "control2") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -10790,11 +11075,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                     ? await proveForce(theorem, ctx)
                     : style === "forte"
                       ? await proveForte(theorem, ctx)
-                      : style === "control"
-                        ? await proveControl(theorem, ctx, 1)
-                        : style === "control2"
-                          ? await proveControl(theorem, ctx, 2)
-                          : await proveHaveFlat(theorem, ctx)
+                      : style === "keep"
+                        ? await proveStrongholdKeep(theorem, ctx)
+                        : style === "control"
+                          ? await proveControl(theorem, ctx, 1)
+                          : style === "control2"
+                            ? await proveControl(theorem, ctx, 2)
+                            : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof
