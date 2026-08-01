@@ -4255,7 +4255,7 @@ async function fillHoleSurround(skeleton, id, ctx, extra = "") {
 async function proveHaveSurround(theorem, ctx, opts = {}) {
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   const sig = theoremSignature(theorem)
-  const { planNote = "", cutGate = false, deferFinish = false } = opts
+  const { planNote = "", cutGate = false, deferFinish = false, holeRecon: useHoleRecon = false } = opts
   ctx.stage = "🛰️"
   ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Stronghold Surround: planning a decomposition skeleton (parallel minion waves ×${SURROUND_MINIONS}).` })
 
@@ -4369,7 +4369,11 @@ async function proveHaveSurround(theorem, ctx, opts = {}) {
       inFlight++
       try {
         const { id, depth, anc = [] } = item
-        const r = await fillHoleSurround(partial, id, ctx)
+        // Recon the hole BEFORE its minion launches, so a sub-hole created by
+        // a mid-run split is briefed exactly like a root hole was. Costs
+        // nothing when useHoleRecon is off, or once the run's recon cap is hit.
+        const holeBrief = useHoleRecon ? await holeRecon(partial, id, ctx) : ""
+        const r = await fillHoleSurround(partial, id, ctx, holeBrief)
         await withApplyLock(async () => {
           if (ctx.signal?.aborted) return
           if (r.fill != null) {
@@ -6811,6 +6815,15 @@ const IMPEN_RECON_DEPTH = Number(process.env.LEAK_IMPEN_RECON_DEPTH || 3)
 const IMPEN_RECON_NODES = Number(process.env.LEAK_IMPEN_RECON_NODES || 24)
 const IMPEN_RECON_BREADTH = Number(process.env.LEAK_IMPEN_RECON_BREADTH || 5)
 const IMPEN_RECON_SUGGEST = Number(process.env.LEAK_IMPEN_RECON_SUGGEST || 4)
+// Per-hole sweeps are much smaller than the root's: one expansion round is
+// where nearly all the value is (does `apply?` name a theorem, does the
+// portfolio close it), and Leak II runs a branch serially, so breadth here is
+// paid once per hole. IMPEN_RECON_CAP_FRAC bounds ALL recon for the run as a
+// fraction of the clock, so recursion can never starve the provers.
+const IMPEN_HOLE_DEPTH = Number(process.env.LEAK_IMPEN_HOLE_DEPTH || 1)
+const IMPEN_HOLE_NODES = Number(process.env.LEAK_IMPEN_HOLE_NODES || 2)
+const IMPEN_HOLE_MS = Number(process.env.LEAK_IMPEN_HOLE_MS || 90000)
+const IMPEN_RECON_CAP_FRAC = Number(process.env.LEAK_IMPEN_RECON_CAP_FRAC || 0.25)
 
 // Cheap, high-yield, and safe under Pantograph (single tactic, no `;`-chains,
 // which it rejects). Ordered so the fast decisive ones run first — the sweep is
@@ -6936,17 +6949,30 @@ function parseBranchResults(text) {
   return out
 }
 
-// The breadth-first sweep itself.
-async function reconSweep(theorem, ctx) {
+// The breadth-first sweep itself. `opts` lets a per-hole sweep run the same
+// machinery on a different proposition and a much smaller budget.
+async function reconSweep(theorem, ctx, opts = {}) {
+  const {
+    proposition = null,
+    depthCap = IMPEN_RECON_DEPTH,
+    nodeCap = IMPEN_RECON_NODES,
+    budgetMs = IMPEN_RECON_MS,
+  } = opts
   const pantoUrl = resolvePantographUrl(ctx.mcpServers)
   const empty = { ran: false, closed: null, levels: [], suggestions: [], expanded: 0, dead: [] }
   if (!pantoUrl) return empty
-  const prop = theoremProposition(theorem)
+  const prop = proposition || theoremProposition(theorem)
   if (!prop) return empty
+  // A run-wide ceiling so per-hole sweeps can never eat the proving clock.
+  const rb = ctx.reconBudget
+  if (rb && rb.spentMs >= rb.capMs) return empty
 
   const t0 = Date.now()
   const overBudget = () =>
-    Date.now() - t0 > IMPEN_RECON_MS || ctx.signal?.aborted || deadlinePassed(ctx)
+    Date.now() - t0 > budgetMs ||
+    (rb && rb.spentMs + (Date.now() - t0) >= rb.capMs) ||
+    ctx.signal?.aborted ||
+    deadlinePassed(ctx)
 
   let root
   try {
@@ -6967,11 +6993,11 @@ async function reconSweep(theorem, ctx) {
   let expanded = 0
   let frontier = [{ id: rootId, goals: rootGoals, path: [] }]
 
-  for (let depth = 0; depth < IMPEN_RECON_DEPTH && frontier.length && !overBudget(); depth++) {
+  for (let depth = 0; depth < depthCap && frontier.length && !overBudget(); depth++) {
     const next = []
     const levelRows = []
     for (const node of frontier) {
-      if (overBudget() || expanded >= IMPEN_RECON_NODES) break
+      if (overBudget() || expanded >= nodeCap) break
       const suggestions = await harvestApplySuggestions(node.goals, ctx)
       if (suggestions.length) allSuggestions.push(...suggestions)
       const candidates = [...suggestions, ...IMPEN_BASE_TACTICS]
@@ -6992,6 +7018,7 @@ async function reconSweep(theorem, ctx) {
         const path = [...node.path, finished.tactic]
         levelRows.push({ ...node, hits: parsed.filter((p) => p.ok), closedBy: path })
         levels.push({ depth, rows: levelRows })
+        if (rb) rb.spentMs += Date.now() - t0
         return { ran: true, closed: { path, atDepth: depth, isRoot: depth === 0 && node.id === rootId }, levels, suggestions: allSuggestions, expanded, dead: [...deadTactics.entries()] , prop }
       }
 
@@ -7009,7 +7036,102 @@ async function reconSweep(theorem, ctx) {
     if (levelRows.length) levels.push({ depth, rows: levelRows })
     frontier = next.slice(0, IMPEN_RECON_BREADTH)
   }
+  if (rb) rb.spentMs += Date.now() - t0
   return { ran: true, closed: null, levels, suggestions: allSuggestions, expanded, dead: [...deadTactics.entries()], prop }
+}
+
+// ---- PER-HOLE RECON --------------------------------------------------------
+// The root sweep only ever briefed the PLANNER, so every hole a minion picked
+// up — and, worse, every sub-hole a mid-run split created — was worked with
+// none of the evidence the planner got, and Impenetrable's advantage decayed
+// with depth. Fixing that needs the hole's goal as a CLOSED proposition, which
+// is exactly the have-to-lemma lifting problem: a `have`'s statement means
+// nothing outside its enclosing binders and the earlier `have`s it may cite.
+//
+// So we lift: ∀ over (the theorem's own binders) ++ (every earlier `have`,
+// as a hypothesis), with the hole's stated proposition as the body. That
+// over-abstracts — the hole probably does not need every earlier step — but
+// over-abstraction only makes the probe's goal harder than the real one, so a
+// tactic that closes it here would certainly close it there. Under-abstracting
+// would silently probe a DIFFERENT proposition, which is the failure that
+// actually matters.
+function theoremBinderText(src) {
+  const m = String(src || "").match(/\b(?:theorem|lemma)\s+[^\s({[:]+([\s\S]*?)(?=:=)/)
+  if (!m) return ""
+  const rest = m[1]
+  let depth = 0
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === "(" || c === "{" || c === "[" || c === "⦃") depth++
+    else if (c === ")" || c === "}" || c === "]" || c === "⦄") depth--
+    else if (c === ":" && depth === 0) return rest.slice(0, i).trim()
+  }
+  return ""
+}
+
+// Every `have` STATED before hole `id`, rendered as binders. Anonymous haves
+// become `(_ : P)` so their fact is still in scope without inventing a name a
+// later step might collide with.
+function haveBindersBefore(skeleton, id) {
+  const src = String(skeleton || "")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const lines = src.split("\n")
+  const stop = lines.findIndex((l) => markRe.test(l))
+  if (stop < 0) return null
+  const out = []
+  for (const line of lines.slice(0, stop)) {
+    const m = line.match(/\bhave\b\s*([^:\s]*)\s*:([\s\S]*?):=/)
+    if (!m) continue
+    const prop = m[2].trim()
+    if (!prop) continue
+    const name = m[1].trim()
+    out.push(`(${name && /^[A-Za-z_][A-Za-z0-9_'!?]*$/.test(name) ? name : "_"} : ${prop})`)
+  }
+  return out
+}
+
+function closedHoleProposition(skeleton, id) {
+  const body = holePropOf(skeleton, id)
+  if (!body) return null
+  const binders = theoremBinderText(skeleton)
+  const haves = haveBindersBefore(skeleton, id)
+  if (haves === null) return null
+  const all = [binders, ...haves].filter(Boolean).join(" ").trim()
+  return all ? `∀ ${all}, ${body}` : body
+}
+
+// A small sweep on ONE hole, cached across the run by the hole's alpha-key so
+// two holes with the same shape are probed once. Returns "" when it has nothing
+// worth saying — the minion prompt is then exactly Surround's.
+async function holeRecon(skeleton, id, ctx) {
+  const rb = ctx.reconBudget
+  if (rb && rb.spentMs >= rb.capMs) return ""
+  const prop = closedHoleProposition(skeleton, id)
+  if (!prop) return ""
+  const key = alphaKey(prop)
+  if (ctx.reconCache?.has(key)) return ctx.reconCache.get(key)
+  let brief = ""
+  try {
+    const r = await reconSweep(null, ctx, {
+      proposition: prop,
+      depthCap: IMPEN_HOLE_DEPTH,
+      nodeCap: IMPEN_HOLE_NODES,
+      budgetMs: IMPEN_HOLE_MS,
+    })
+    if (r?.ran) {
+      const closedNote = r.closed
+        ? `\n\nTHIS HOLE'S GOAL WAS CLOSED OUTRIGHT by [${r.closed.path.join(" ; ")}] on an over-abstracted version of it (every earlier step was assumed, so your real goal is no harder). Try that first, inline, and do not decompose this hole.`
+        : ""
+      brief = reconBriefing(r) + closedNote
+    }
+  } catch {
+    brief = ""
+  }
+  const note = brief
+    ? `${brief}\n\nThis is EVIDENCE about your hole, not instructions. It was measured on your goal with every earlier step assumed, so anything that closed it will close yours. If it shows nothing useful, ignore it and prove the hole your own way — and if the portfolio already closes it, just close it rather than splitting it further.`
+    : ""
+  ctx.reconCache?.set(key, note)
+  return note
 }
 
 // Render the sweep as a BRIEFING. Written to inform without anchoring: it
@@ -7077,6 +7199,15 @@ async function proveStrongholdImpenetrable(theorem, ctx) {
     thought: `🔭 Stronghold Impenetrable — reconnaissance: breadth-first \`apply?\`-driven sweep over the ghost army (≤${IMPEN_RECON_DEPTH} levels, ≤${IMPEN_RECON_NODES} states, ≤${Math.round(IMPEN_RECON_MS / 60000)} min) before the planner sees anything.`,
   })
 
+  // One shared recon budget for the WHOLE run (root sweep + every per-hole
+  // sweep). Recon is only worth paying for if it leaves the provers their time.
+  const dl = typeof ctx.getDeadline === "function" ? ctx.getDeadline() : Infinity
+  const capMs = Number.isFinite(dl)
+    ? Math.max(IMPEN_RECON_MS, (dl - Date.now()) * IMPEN_RECON_CAP_FRAC)
+    : IMPEN_RECON_MS * 4
+  ctx.reconBudget = { capMs, spentMs: 0 }
+  ctx.reconCache = new Map()
+
   let recon = { ran: false }
   try {
     recon = await reconSweep(theorem, ctx)
@@ -7114,7 +7245,7 @@ async function proveStrongholdImpenetrable(theorem, ctx) {
     .join("\n\n")
 
   // Everything downstream is Surround, unchanged, with the progress gate on.
-  return proveHaveSurround(theorem, ctx, { planNote: note, cutGate: true })
+  return proveHaveSurround(theorem, ctx, { planNote: note, cutGate: true, holeRecon: true })
 }
 
 // ===========================================================================
