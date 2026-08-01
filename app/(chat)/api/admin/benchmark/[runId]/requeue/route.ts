@@ -8,10 +8,16 @@ async function requireAdmin() {
 }
 
 // Bulk resume controls for a run. Two shapes:
-//   { from: '<problemId>' }        — requeue that problem and everything after
-//                                    it in dataset order ("resume from here").
+//   { from: '<problemId>' }        — make that problem the NEXT one claimed and
+//                                    requeue everything after it in queue order
+//                                    ("resume from here"). Still-pending items
+//                                    BEFORE it are parked as `skipped` so the
+//                                    claim actually lands there; see
+//                                    requeueFrom for why that is required.
+//                                    Responds { requeued, parked }.
 //   { statuses: ['skipped', ...] } — requeue every item currently in those
-//                                    states (e.g. retry all skipped).
+//                                    states (e.g. retry all skipped), which is
+//                                    also how a parked item is brought back.
 // Neither ever touches an item that is still `running`.
 export async function POST(
   request: Request,
@@ -24,7 +30,8 @@ export async function POST(
   const body = await request.json().catch(() => null);
   try {
     if (typeof body?.from === 'string' && body.from) {
-      return Response.json({ ok: true, requeued: await requeueFrom(runId, body.from) });
+      const { requeued, parked } = await requeueFrom(runId, body.from);
+      return Response.json({ ok: true, requeued, parked });
     }
     if (Array.isArray(body?.statuses)) {
       const statuses = body.statuses.filter(

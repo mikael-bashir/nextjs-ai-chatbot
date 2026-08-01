@@ -1025,7 +1025,7 @@ export function BenchmarkConsole() {
                             type="button"
                             disabled={running}
                             className="text-[11px] text-muted-foreground underline-offset-2 hover:underline disabled:opacity-40"
-                            title="Requeue this problem and every one after it"
+                            title="Resume here: make this the next problem the run claims, and requeue every one after it. Anything still pending BEFORE it is parked as skipped (restore with 'requeue skipped')."
                             onClick={() =>
                               requeue(selectedRun.id, { from: it.problemId })
                             }

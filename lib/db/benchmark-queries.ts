@@ -510,28 +510,58 @@ export async function requeueByStatus(
 }
 
 /**
- * "Resume from this problem": requeue the given item and everything after it in
- * dataset order, so a pass can be restarted from a known-good point without
- * losing the results before it. Returns how many were reset.
+ * "Resume from this problem": make `problemId` the NEXT item the run claims,
+ * and requeue everything after it in queue order.
+ *
+ * Both halves are required, and the second one is the whole point. Requeueing
+ * the tail only ever ADDS to the pending set, while claimNextItem always takes
+ * the LOWEST-seq pending item — so on its own this could move the start point
+ * earlier but never later, and clicking "from here" on anything except the
+ * earliest pending item silently did nothing. In the common mid-run state
+ * (everything after the failure is still pending from the initial seeding)
+ * it was a complete no-op: the pass restarted at the earliest pending item,
+ * not at the one that was clicked.
+ *
+ * So anything still `pending` STRICTLY BEFORE the target is parked as
+ * `skipped` — the existing vocabulary for "not attempted, not scored" — which
+ * makes the target the lowest-seq pending row and therefore the next claim.
+ * Items before it that already have a RESULT (proved/unsolved/refuted) keep
+ * it; `running` is never touched; and parking is fully reversible with the
+ * existing "requeue skipped" control.
+ *
+ * Returns both counts so the caller can report what actually happened.
  */
 export async function requeueFrom(
   runId: string,
   problemId: string,
-): Promise<number> {
+): Promise<{ requeued: number; parked: number }> {
   await ensureTables();
   // coalesce on BOTH sides: rows seeded before `seq` existed have none, and a
   // NULL anywhere in a row comparison makes the whole predicate NULL (so those
-  // rows would silently never be requeued).
-  const { rowCount } = await sql`
+  // rows would silently never be matched).
+  const parked = await sql`
+    UPDATE benchmark_items
+    SET status = 'skipped',
+        error_message = ${`skipped — run resumed from ${problemId}`},
+        finished_at = now(), updated_at = now()
+    WHERE run_id = ${runId}
+      AND status = 'pending'
+      AND (coalesce(seq, 2147483647), problem_id) < (
+        SELECT coalesce(seq, 2147483647), problem_id FROM benchmark_items
+        WHERE run_id = ${runId} AND problem_id = ${problemId}
+      );
+  `;
+  const requeued = await sql`
     UPDATE benchmark_items
     SET status = 'pending', error_message = NULL, finished_at = NULL, updated_at = now()
     WHERE run_id = ${runId}
+      AND status <> 'running'
       AND (coalesce(seq, 2147483647), problem_id) >= (
         SELECT coalesce(seq, 2147483647), problem_id FROM benchmark_items
         WHERE run_id = ${runId} AND problem_id = ${problemId}
       );
   `;
-  return rowCount ?? 0;
+  return { requeued: requeued.rowCount ?? 0, parked: parked.rowCount ?? 0 };
 }
 
 /**
