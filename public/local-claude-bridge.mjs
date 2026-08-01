@@ -6909,10 +6909,13 @@ const IMPEN_RECON_SUGGEST = Number(process.env.LEAK_IMPEN_RECON_SUGGEST || 4)
 const IMPEN_HOLE_DEPTH = Number(process.env.LEAK_IMPEN_HOLE_DEPTH || 1)
 const IMPEN_HOLE_NODES = Number(process.env.LEAK_IMPEN_HOLE_NODES || 2)
 const IMPEN_HOLE_MS = Number(process.env.LEAK_IMPEN_HOLE_MS || 90000)
-// How many binders the sweep will strip before measuring. Generous: peeling is
-// bookkeeping, it is bounded by the goal's own binder count, and stopping early
-// leaves apply? staring at a ∀ again.
-const IMPEN_PEEL_MAX = Number(process.env.LEAK_IMPEN_PEEL_MAX || 12)
+// How many binders the sweep will strip before measuring. Two caps, because one
+// global counter starved deep nodes: peeling five binders at depth 0 left a
+// depth-2 node unable to strip its own, through no fault of its own. PER_NODE is
+// the real allowance — every state gets its own, sized to any realistic binder
+// prefix. TOTAL is only a runaway backstop for the whole sweep.
+const IMPEN_PEEL_PER_NODE = Number(process.env.LEAK_IMPEN_PEEL_PER_NODE || 8)
+const IMPEN_PEEL_TOTAL = Number(process.env.LEAK_IMPEN_PEEL_TOTAL || 40)
 
 // Is this goal still wrapped in binders? Only `∀` (and a leading instance
 // binder, which prints the same way) counts. A top-level `→` is deliberately
@@ -7187,6 +7190,8 @@ async function reconSweep(theorem, ctx, opts = {}) {
       // sweep a level. apply? itself is the stopping rule — we peel exactly
       // while every suggestion it offers is another intro.
       let cur = node
+      let nodePeeled = 0
+      const peelBudget = () => nodePeeled < IMPEN_PEEL_PER_NODE && peeled < IMPEN_PEEL_TOTAL
       const peelOnce = async () => {
         let r
         try {
@@ -7199,6 +7204,7 @@ async function reconSweep(theorem, ctx, opts = {}) {
         const goals = t.split(/New Goals:/)[1]?.trim() || ""
         if (!goals || goals === cur.goals) return false // nothing actually moved
         peeled++
+        nodePeeled++
         cur = { id: cur.id, goals, path: [...cur.path, "intro"] }
         return true
       }
@@ -7206,13 +7212,13 @@ async function reconSweep(theorem, ctx, opts = {}) {
       // round-trip per binder. Relying on apply? to say "intro" turned out to
       // be too fragile: on a goal still reading `∀ [inst : Group G] (H : …), …`
       // it stopped volunteering the intro and the peel stalled one binder in.
-      while (peeled < IMPEN_PEEL_MAX && goalIsQuantified(cur.goals) && !overBudget()) {
+      while (peelBudget() && goalIsQuantified(cur.goals) && !overBudget()) {
         if (!(await peelOnce())) break
       }
       let sug = await harvestApplySuggestions(cur.goals, ctx)
       // …then let apply? have the last word, for the shapes the syntactic test
       // does not model (a leading instance binder, an arrow chain).
-      for (let extra = 0; extra < 3 && sug.introOnly && peeled < IMPEN_PEEL_MAX && !overBudget(); extra++) {
+      for (let extra = 0; extra < 3 && sug.introOnly && peelBudget() && !overBudget(); extra++) {
         if (!(await peelOnce())) break
         sug = await harvestApplySuggestions(cur.goals, ctx)
       }
