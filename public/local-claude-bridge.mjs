@@ -4287,21 +4287,47 @@ async function proveHaveSurround(theorem, ctx, opts = {}) {
     }
     return false
   }
-  await spawnProverStream(
-    {
-      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, planNote),
-      mcpServers: ctx.mcpServers,
-      model: ctx.model,
-      maxTurns: 0,
-      timeoutMs: ctx.nodeTimeoutMs,
-      getDeadline: ctx.getDeadline,
-      stage: "🛰️",
-      metrics: ctx.metrics,
-      signal: ctx.signal,
-      searchBudget: ctx.searchBudget,
-    },
-    { onObject: onPlan, emit: ctx.emit },
-  )
+  // With the gate on, a skeleton that merely RESTATES the theorem is refused
+  // and the planner gets one more go with the reason. Worth exactly one retry:
+  // the second plan is cheap next to a whole run spent on a hole that is the
+  // original problem wearing a hat, and two refusals means the gate and the
+  // planner disagree, at which point the planner wins and we proceed.
+  let planFeedback = ""
+  for (let planAttempt = 0; planAttempt < (cutGate ? 2 : 1); planAttempt++) {
+    skeleton = null
+    await spawnProverStream(
+      {
+        prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, planFeedback ? `${planNote}\n\n${planFeedback}` : planNote),
+        mcpServers: ctx.mcpServers,
+        model: ctx.model,
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "🛰️",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      { onObject: onPlan, emit: ctx.emit },
+    )
+    if (gate.verifiedScript || !skeleton || !cutGate) break
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+    const bad = skeletonIsVacuous(theorem, skeleton)
+    if (!bad) break
+    if (planAttempt + 1 >= 2) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Skeleton still restates the theorem after a re-plan — proceeding with it anyway rather than spending more clock.` })
+      break
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Skeleton REFUSED — ${bad}. Re-planning once.` })
+    planFeedback = `YOUR PREVIOUS SKELETON WAS REFUSED. ${bad}.
+
+It type-checked, but type-checking is not the test: \`have h : <the whole problem> := by sorry\` followed by using \`h\` always compiles. The test is whether the HARDEST hole is meaningfully easier than the theorem you started with.
+
+Do it differently this time:
+- Split the argument into at least TWO holes that a reader would recognise as separate mathematical facts, and write the assembly between them yourself.
+- If one step really does carry everything, then that step is the proof — find the actual sub-facts INSIDE it (the construction, the injectivity, the counting, the surjectivity) and make each of those a hole.
+- Anything the machinery can already discharge belongs in the assembly, not in a hole.`
+  }
 
   if (gate.verifiedScript) {
     const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
@@ -4506,6 +4532,15 @@ function alphaKey(prop) {
 
 // Returns a human reason when the proposed cut makes no progress, else null.
 // Null on ANY uncertainty (unreadable parent, empty keys) — see holePropOf.
+// A cut can also fail by RESTATEMENT rather than repetition: one hole that says
+// the same thing in different words. Observed live — a "decomposition" of the
+// common-transversal theorem into the single hole "∃ φ bijective with common
+// representatives", which is the entire problem reworded, and which alpha-
+// equality cannot see. Only applied when there is exactly ONE hole, because
+// that is the only case where the hole must carry everything; a genuine
+// multi-way split may legitimately have one large child alongside smaller ones.
+const REFORM_SIZE = Number(process.env.LEAK_REFORM_SIZE || 0.8)
+
 function cutIsVacuous(parentProp, childProps, ancestorKeys = []) {
   if (!parentProp || !childProps.length) return null
   const pk = alphaKey(parentProp)
@@ -4518,6 +4553,57 @@ function cutIsVacuous(parentProp, childProps, ancestorKeys = []) {
     if (anc.has(ck)) return "a child restates an ANCESTOR goal already open higher in the tree"
   }
   return null
+}
+
+// The single-hole rule, applied ONLY to the planner's whole-theorem skeleton.
+//
+// Detecting a semantic reformulation syntactically does not work, and I tried:
+// the restatement observed live shares almost NO vocabulary with the theorem it
+// restates (`∃ S, IsComplement S H ∧ IsComplement H S` became `∃ φ bijective
+// with common representatives`), so token overlap scores ~0 on exactly the case
+// it was meant to catch. What IS decidable is structural: if the planner
+// emitted ONE hole and that hole is no smaller than the theorem's own goal,
+// nothing was decomposed — every bit of difficulty sits in one place, whether
+// by restating, reformulating or generalising.
+//
+// Scoped to the skeleton deliberately. A minion's cut may legitimately have one
+// large child (an induction step is often longer than what it proves), and this
+// rule would misjudge it; at the top level, "the whole theorem got exactly one
+// hole" is a much safer call. It also only ever costs one re-plan — see the
+// planner loop, which proceeds with the skeleton if the planner insists.
+function singleHoleCarriesEverything(goal, props) {
+  if (props.length !== 1) return null
+  const pk = alphaKey(goal)
+  const ck = alphaKey(props[0])
+  if (!pk || !ck) return null
+  if (ck.length < pk.length * REFORM_SIZE) return null
+  return `the skeleton has exactly ONE hole and it is ${Math.round((ck.length / pk.length) * 100)}% the size of the theorem's own goal — all of the difficulty is still in one place, so nothing has been decomposed`
+}
+
+// The PLANNER's skeleton was never gated at all: the only check was that it
+// type-checks, and a one-hole restatement type-checks perfectly. Parent = the
+// theorem's own goal; children = the props of the holes it emitted.
+function skeletonIsVacuous(theorem, skeleton) {
+  const m = String(theorem || "").match(/\b(?:theorem|lemma)\s+[^\s({[:]+([\s\S]*?)(?=:=)/)
+  if (!m) return null
+  const rest = m[1]
+  let depth = 0
+  let cut = -1
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === "(" || c === "{" || c === "[" || c === "⦃") depth++
+    else if (c === ")" || c === "}" || c === "]" || c === "⦄") depth--
+    else if (c === ":" && depth === 0) {
+      cut = i
+      break
+    }
+  }
+  if (cut < 0) return null
+  const goal = rest.slice(cut + 1).trim()
+  const ids = parseHoleIds(skeleton)
+  const props = ids.map((h) => holePropOf(skeleton, h)).filter(Boolean)
+  if (!goal || props.length !== ids.length) return null
+  return cutIsVacuous(goal, props, []) || singleHoleCarriesEverything(goal, props)
 }
 
 // ===========================================================================
@@ -6876,10 +6962,33 @@ function theoremProposition(src) {
 // Returns null on anything we cannot rebuild faithfully: inaccessible names
 // (`n✝`) cannot be written as binders, and a goal we cannot restate is one we
 // must not fabricate.
+// An INACCESSIBLE name, i.e. one Lean will not let you write: `G✝`, `inst✝¹`.
+// Every tactic that introduces binders produces them, so the previous version
+// of this function — which bailed on any block containing `✝` — could only ever
+// query the UN-INTRODUCED root goal, where `apply?` has nothing to suggest but
+// introducing the binders. That is why a live sweep harvested four "theorems"
+// that were all `refine fun G [Group G] H [...] => ?_`. Renaming them instead
+// is what lets the sweep ask about states that carry real content.
+const INACCESSIBLE_RE = /[A-Za-z_][A-Za-z0-9_']*✝[⁰¹²³⁴⁵⁶⁷⁸⁹]*/g
+
 function goalToExample(goalText, tacticSuffix) {
-  const block = String(goalText || "").split(/\n\s*\n/)[0] || ""
-  if (!block.includes("⊢")) return null
-  if (block.includes("✝")) return null
+  const raw = String(goalText || "").split(/\n\s*\n/)[0] || ""
+  if (!raw.includes("⊢")) return null
+
+  // Consistent rename across hypothesis names, their types AND the goal — a
+  // per-line rename would silently change what we are asking about.
+  const rename = new Map()
+  // Longest first: `inst✝` is a PREFIX of `inst✝³`, so substituting the short
+  // one first would rewrite the long one into `ia5³` and change the goal.
+  for (const m of [...new Set(raw.match(INACCESSIBLE_RE) || [])].sort((a, b) => b.length - a.length)) {
+    rename.set(m, `ia${rename.size}`)
+  }
+  // A collision would make us probe a different proposition, so refuse instead.
+  for (const fresh of rename.values()) if (raw.includes(fresh)) return null
+  let block = raw
+  for (const [orig, fresh] of rename) block = block.split(orig).join(fresh)
+  if (block.includes("✝")) return null // an inaccessible shape we did not model
+
   const lines = block.split("\n").map((l) => l.trim()).filter(Boolean)
   const binders = []
   let goal = ""
@@ -6891,11 +7000,43 @@ function goalToExample(goalText, tacticSuffix) {
     const h = l.match(/^([^:]+):(.+)$/)
     if (!h) return null
     const names = h[1].trim()
-    if (!/^[A-Za-z_][A-Za-z0-9_'✝ₙ₀-₉]*(\s+[A-Za-z_][A-Za-z0-9_'ₙ₀-₉]*)*$/.test(names)) return null
-    binders.push(`(${names} : ${h[2].trim()})`)
+    if (!/^[A-Za-z_][A-Za-z0-9_'ₙ₀-₉]*(\s+[A-Za-z_][A-Za-z0-9_'ₙ₀-₉]*)*$/.test(names)) return null
+    const type = h[2].trim()
+    // A renamed `inst✝` MUST come back as an instance binder: as an explicit
+    // `(ia0 : Group G)` it is in scope but invisible to instance resolution, so
+    // `G ⧸ H` and every other class-driven notation stops elaborating.
+    const isInstance = names.split(/\s+/).every((n) => /^ia\d+$/.test(n)) && [...rename].some(([o, f]) => /^inst✝/.test(o) && names.split(/\s+/).includes(f))
+    binders.push(isInstance ? `[${type}]` : `(${names} : ${type})`)
   }
   if (!goal) return null
   return `example ${binders.join(" ")} : ${goal} := by ${tacticSuffix}`
+}
+
+// `apply?` answers a goal with whatever unifies, which on a bare `∃ x, P x`
+// means generic existential plumbing — a live sweep came back with
+// `Filter.frequently_principal`, `MeasureTheory.Measure.exists_mem_of_...`,
+// `IsEmpty.exists_iff`. Presenting those under "MATHLIB THEOREMS WHOSE
+// CONCLUSION UNIFIES WITH A GOAL" is worse than presenting nothing, because the
+// briefing tells the planner to weight them above tactics. Three filters, all
+// of them about PROGRESS rather than taste:
+const SUGGESTION_PLUMBING_RE =
+  /\b(Filter|MeasureTheory|Classical\.not_forall|Decidable\.not_forall|IsEmpty|Unique\.exists|Subtype\.exists|Exists\.of_psigma|bex_def|exists_and_iff|exists_congr|existsUnique_iff|ExistsUnique\.exists|nonempty_subtype|not_forall_not|Set\.inter_nonempty|Set\.not_disjoint|Equiv\.exists|eq_of_beq_eq_true)/
+// Pure binder introduction: `refine fun x [Inst x] => ?_`. Not a theorem.
+const SUGGESTION_INTRO_RE = /^\s*(?:\[apply\]\s*)?refine\s+fun\b[\s\S]*=>\s*\?_\s*$/
+
+function usefulSuggestion(tactic, remaining, goalKey) {
+  const body = String(tactic || "").replace(/^\s*\[apply\]\s*/, "").trim()
+  if (!body) return false
+  if (SUGGESTION_INTRO_RE.test(body)) return false
+  if (SUGGESTION_PLUMBING_RE.test(body)) return false
+  if (!goalKey) return true
+  // No progress: it hands back the same goal, or every subgoal it leaves is at
+  // least as big as what we asked about.
+  const keys = remaining.map((r) => alphaKey(r)).filter(Boolean)
+  if (!keys.length) return true
+  if (keys.some((k) => k === goalKey)) return false
+  if (keys.every((k) => k.length >= goalKey.length)) return false
+  return true
 }
 
 // Ask Leak IV which Mathlib theorems unify with this goal. Returns the tactics
@@ -6913,18 +7054,34 @@ async function harvestApplySuggestions(goalText, ctx) {
   }
   const block = String(text || "").split("[[LEAK_SUGGESTIONS]]")[1]
   if (!block) return []
+  // Leak IV whitespace-collapses each diagnostic, so one suggestion arrives as
+  // a single line: "Try this: [apply] <tactic> -- Remaining subgoals: -- ⊢ A -- ⊢ B".
+  const goalLine = (String(goalText || "").split("\n").find((l) => l.trim().startsWith("⊢")) || "").replace(/^\s*⊢\s*/, "")
+  const goalKey = alphaKey(goalLine)
   const out = []
   const seen = new Set()
+  let dropped = 0
   for (const line of block.split("\n")) {
     const m = line.match(/Try this:\s*(.+?)\s*$/i)
     if (!m) continue
-    const tac = m[1].trim()
-    // `exact?` sometimes reports a term; only keep things that read as tactics.
+    const whole = m[1].trim()
+    const [tacPart, subgoalPart = ""] = whole.split(/--\s*Remaining subgoals:/)
+    const tac = tacPart.trim()
+    const remaining = subgoalPart
+      .split(/--\s*⊢/)
+      .slice(1)
+      .map((s) => s.replace(/\s*--\s*$/, "").trim())
+      .filter(Boolean)
     if (!tac || tac.length > 300 || seen.has(tac)) continue
     seen.add(tac)
+    if (!usefulSuggestion(tac, remaining, goalKey)) {
+      dropped++
+      continue
+    }
     out.push(tac)
     if (out.length >= IMPEN_RECON_SUGGEST) break
   }
+  if (dropped) console.log(`[recon] dropped ${dropped} non-progress apply? suggestion(s)`)
   return out
 }
 
