@@ -6909,6 +6909,20 @@ const IMPEN_RECON_SUGGEST = Number(process.env.LEAK_IMPEN_RECON_SUGGEST || 4)
 const IMPEN_HOLE_DEPTH = Number(process.env.LEAK_IMPEN_HOLE_DEPTH || 1)
 const IMPEN_HOLE_NODES = Number(process.env.LEAK_IMPEN_HOLE_NODES || 2)
 const IMPEN_HOLE_MS = Number(process.env.LEAK_IMPEN_HOLE_MS || 90000)
+// How many binders the sweep will strip before measuring. Generous: peeling is
+// bookkeeping, it is bounded by the goal's own binder count, and stopping early
+// leaves apply? staring at a ∀ again.
+const IMPEN_PEEL_MAX = Number(process.env.LEAK_IMPEN_PEEL_MAX || 12)
+
+// Is this goal still wrapped in binders? Only `∀` (and a leading instance
+// binder, which prints the same way) counts. A top-level `→` is deliberately
+// NOT peeled: telling it apart from the `→` inside `∃ x, P x → Q x` needs a
+// real parse, and guessing wrong strips a binder the goal never had.
+function goalIsQuantified(goalText) {
+  const line = String(goalText || "").split("\n").map((l) => l.trim()).find((l) => l.startsWith("⊢"))
+  if (!line) return false
+  return /^⊢\s*(∀|Π)\s/.test(line)
+}
 const IMPEN_RECON_CAP_FRAC = Number(process.env.LEAK_IMPEN_RECON_CAP_FRAC || 0.25)
 
 // Cheap, high-yield, and safe under Pantograph (single tactic, no `;`-chains,
@@ -6925,7 +6939,6 @@ const IMPEN_BASE_TACTICS = [
   "linarith",
   "aesop",
   "constructor",
-  "intro",
   "ext",
 ]
 
@@ -7042,18 +7055,23 @@ function usefulSuggestion(tactic, remaining, goalKey) {
 // Ask Leak IV which Mathlib theorems unify with this goal. Returns the tactics
 // it suggested (`Try this: exact foo bar` ⟶ `exact foo bar`). Empty on any
 // failure, including a Leak IV that does not yet emit [[LEAK_SUGGESTIONS]].
+// Returns { tactics, introOnly }. `introOnly` is the signal the peel loop runs
+// on: apply? had things to say, but every one of them was "introduce the
+// binders" — i.e. we asked about a goal still wrapped in ∀/→ and there is a
+// real question one `intro` further in.
 async function harvestApplySuggestions(goalText, ctx) {
   const script = goalToExample(goalText, "apply?")
-  if (!script || !ctx.verifyUrl) return []
+  const none = { tactics: [], introOnly: false }
+  if (!script || !ctx.verifyUrl) return none
   let text = ""
   try {
     const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: Math.min(ctx.verifyTimeoutMs || 120000, 90000) })
     text = v.ok ? v.text : ""
   } catch {
-    return []
+    return none
   }
   const block = String(text || "").split("[[LEAK_SUGGESTIONS]]")[1]
-  if (!block) return []
+  if (!block) return none
   // Leak IV whitespace-collapses each diagnostic, so one suggestion arrives as
   // a single line: "Try this: [apply] <tactic> -- Remaining subgoals: -- ⊢ A -- ⊢ B".
   const goalLine = (String(goalText || "").split("\n").find((l) => l.trim().startsWith("⊢")) || "").replace(/^\s*⊢\s*/, "")
@@ -7061,6 +7079,8 @@ async function harvestApplySuggestions(goalText, ctx) {
   const out = []
   const seen = new Set()
   let dropped = 0
+  let introSeen = 0
+  let considered = 0
   for (const line of block.split("\n")) {
     const m = line.match(/Try this:\s*(.+?)\s*$/i)
     if (!m) continue
@@ -7074,6 +7094,8 @@ async function harvestApplySuggestions(goalText, ctx) {
       .filter(Boolean)
     if (!tac || tac.length > 300 || seen.has(tac)) continue
     seen.add(tac)
+    considered++
+    if (SUGGESTION_INTRO_RE.test(tac.replace(/^\s*\[apply\]\s*/, "").trim())) introSeen++
     if (!usefulSuggestion(tac, remaining, goalKey)) {
       dropped++
       continue
@@ -7082,7 +7104,7 @@ async function harvestApplySuggestions(goalText, ctx) {
     if (out.length >= IMPEN_RECON_SUGGEST) break
   }
   if (dropped) console.log(`[recon] dropped ${dropped} non-progress apply? suggestion(s)`)
-  return out
+  return { tactics: out, introOnly: out.length === 0 && considered > 0 && introSeen > 0 }
 }
 
 // Parse one branch_tactics reply into per-candidate outcomes.
@@ -7148,22 +7170,62 @@ async function reconSweep(theorem, ctx, opts = {}) {
   const allSuggestions = []
   const deadTactics = new Map() // tactic -> failures
   let expanded = 0
+  let peeled = 0
   let frontier = [{ id: rootId, goals: rootGoals, path: [] }]
 
   for (let depth = 0; depth < depthCap && frontier.length && !overBudget(); depth++) {
     const next = []
     const levelRows = []
-    for (const node of frontier) {
+    for (let node of frontier) {
       if (overBudget() || expanded >= nodeCap) break
-      const suggestions = await harvestApplySuggestions(node.goals, ctx)
+      // PEEL. A `∀`/`→`-wrapped goal is the only thing `apply?` can answer with
+      // "introduce the binders", so every level the sweep spent on a wrapped
+      // goal was thrown away — observed live, three whole levels of
+      // `advanced by: norm_num, aesop, intro` and zero theorems harvested.
+      // Peeling is charged to its OWN counter, never to nodeCap: introducing a
+      // binder is bookkeeping, not exploration, and it should not cost the
+      // sweep a level. apply? itself is the stopping rule — we peel exactly
+      // while every suggestion it offers is another intro.
+      let cur = node
+      const peelOnce = async () => {
+        let r
+        try {
+          r = await callRemoteMcpTool(pantoUrl, "apply_tactic", { state_id: cur.id, tactic: "intro" }, { timeoutMs: 60000 })
+        } catch {
+          return false
+        }
+        const t = String(r?.ok ? r.text : "")
+        if (!/Tactic succeeded/i.test(t)) return false
+        const goals = t.split(/New Goals:/)[1]?.trim() || ""
+        if (!goals || goals === cur.goals) return false // nothing actually moved
+        peeled++
+        cur = { id: cur.id, goals, path: [...cur.path, "intro"] }
+        return true
+      }
+      // Strip binders SYNTACTICALLY first — cheap, certain, and no `apply?`
+      // round-trip per binder. Relying on apply? to say "intro" turned out to
+      // be too fragile: on a goal still reading `∀ [inst : Group G] (H : …), …`
+      // it stopped volunteering the intro and the peel stalled one binder in.
+      while (peeled < IMPEN_PEEL_MAX && goalIsQuantified(cur.goals) && !overBudget()) {
+        if (!(await peelOnce())) break
+      }
+      let sug = await harvestApplySuggestions(cur.goals, ctx)
+      // …then let apply? have the last word, for the shapes the syntactic test
+      // does not model (a leading instance binder, an arrow chain).
+      for (let extra = 0; extra < 3 && sug.introOnly && peeled < IMPEN_PEEL_MAX && !overBudget(); extra++) {
+        if (!(await peelOnce())) break
+        sug = await harvestApplySuggestions(cur.goals, ctx)
+      }
+      const suggestions = sug.tactics
       if (suggestions.length) allSuggestions.push(...suggestions)
       const candidates = [...suggestions, ...IMPEN_BASE_TACTICS]
       let res
       try {
-        res = await callRemoteMcpTool(pantoUrl, "branch_tactics", { state_id: node.id, tactics: candidates }, { timeoutMs: 300000 })
+        res = await callRemoteMcpTool(pantoUrl, "branch_tactics", { state_id: cur.id, tactics: candidates }, { timeoutMs: 300000 })
       } catch {
         continue
       }
+      node = cur
       expanded++
       const parsed = parseBranchResults(res?.ok ? res.text : "")
       for (const p of parsed) if (!p.ok) deadTactics.set(p.tactic, (deadTactics.get(p.tactic) || 0) + 1)
@@ -7176,10 +7238,15 @@ async function reconSweep(theorem, ctx, opts = {}) {
         levelRows.push({ ...node, hits: parsed.filter((p) => p.ok), closedBy: path })
         levels.push({ depth, rows: levelRows })
         if (rb) rb.spentMs += Date.now() - t0
-        return { ran: true, closed: { path, atDepth: depth, isRoot: depth === 0 && node.id === rootId }, levels, suggestions: allSuggestions, expanded, dead: [...deadTactics.entries()] , prop }
+        return { ran: true, closed: { path, atDepth: depth, isRoot: depth === 0 && node.id === rootId }, levels, suggestions: allSuggestions, expanded, peeled, dead: [...deadTactics.entries()] , prop }
       }
 
-      const hits = parsed.filter((p) => p.ok && p.id && p.goals)
+      // A tactic that left the goal byte-identical did not advance it —
+      // `norm_num` and `aesop` were being counted as progress on goals they
+      // never touched, filling the briefing with fake breadth and eating
+      // frontier slots. Same test the peel loop uses.
+      const norm = (g) => String(g || "").replace(/\s+/g, " ").trim()
+      const hits = parsed.filter((p) => p.ok && p.id && p.goals && norm(p.goals) !== norm(node.goals))
       levelRows.push({ ...node, hits })
       // Keep the most INFORMATIVE children: distinct goal states, widest first.
       const seenGoal = new Set()
@@ -7194,7 +7261,7 @@ async function reconSweep(theorem, ctx, opts = {}) {
     frontier = next.slice(0, IMPEN_RECON_BREADTH)
   }
   if (rb) rb.spentMs += Date.now() - t0
-  return { ran: true, closed: null, levels, suggestions: allSuggestions, expanded, dead: [...deadTactics.entries()], prop }
+  return { ran: true, closed: null, levels, suggestions: allSuggestions, expanded, peeled, dead: [...deadTactics.entries()], prop }
 }
 
 // ---- PER-HOLE RECON --------------------------------------------------------
@@ -7377,7 +7444,9 @@ function reconBriefing(recon) {
   const parts = []
   parts.push(
     "MACHINE RECONNAISSANCE (already done — it cost you nothing, and it is EVIDENCE, not a proposal).",
-    `A breadth-first sweep expanded ${recon.expanded} live goal state(s) on the interactive prover, trying \`apply?\`-suggested Mathlib theorems and a standard tactic portfolio against each, and recording what actually moved.`,
+    `A breadth-first sweep expanded ${recon.expanded} live goal state(s) on the interactive prover, trying \`apply?\`-suggested Mathlib theorems and a standard tactic portfolio against each, and recording what actually moved.${
+      recon.peeled ? ` Binders were introduced ${recon.peeled}× first, so every measurement below is of the goal UNDER its quantifiers, not of the quantifiers.` : ""
+    }`,
   )
   const uniqSug = [...new Set(recon.suggestions)]
   if (uniqSug.length) {
