@@ -167,26 +167,42 @@ const PROVER_DISALLOWED_TOOLS = ["WebSearch", "WebFetch"]
 // filesystem for it, burning turns on a pure derailment with zero proof
 // value. Stronghold's PROVER_DISALLOWED_TOOLS above is unaffected.
 const ARCHITECT_DISALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "WebSearch", "WebFetch"]
-// The CONTROLS are the strictest of all, and for a reason that is about the
-// EXPERIMENT rather than about proving. Control I's whole identity is "one
-// agent, one theorem, one tool — Leak IV's verify_full_script"; Control II adds
-// Leak I search and nothing else. Every number those arms produce is only
-// meaningful if that is literally true.
+
+// ---------------------------------------------------------------------------
+// NO LOCAL LEAN. Observed live on fatex_006: Control I hit an unknown constant,
+// ran `find / -iname "Sylow.lean"`, found the operator's own Mathlib checkouts
+// and spent six minutes reading them. The checkouts are a DIFFERENT Mathlib
+// from the one Leak IV compiles against, so every name learned that way is
+// unsound here — and for the CONTROLS specifically it is also a capability the
+// arm is defined not to have, strictly stronger than the Leak I search that is
+// supposed to be Control II's only edge over Control I.
 //
-// It was not. Observed live on fatex_006: Control I hit an unknown constant,
-// ran `find / -iname "Sylow.lean"`, discovered the operator's own Mathlib
-// checkouts, and spent the next six minutes grepping and Reading
-// ~/loogle/.lake/packages/mathlib source. That is (a) a capability the arm is
-// DEFINED not to have — strictly stronger than the Leak I search that is
-// supposed to be Control II's only advantage over Control I, collapsing the
-// one variable those two arms isolate — and (b) unsound, because that checkout
-// is a DIFFERENT Mathlib from the one Leak IV compiles against, so names read
-// there may not exist in the verifier at all.
-//
-// Note this is deliberately NOT applied to the Stronghold family, whose
-// PROVER_DISALLOWED_TOOLS keeps Bash on the stated grounds that numeric
-// witness-finding is real proof work. Changing that would change those arms.
-const CONTROL_DISALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "NotebookEdit", "WebSearch", "WebFetch"]
+// The fix is a scalpel, not the blanket tool-ban this first shipped as: Bash,
+// Read, Write and Grep all stay, because a local scratchpad, numeric probing
+// and note-keeping are legitimate proof work. ONLY invoking a local Lean
+// toolchain is refused, by a PreToolUse hook that inspects the actual command
+// string — so `cd x && lake build` and `sh -c "lean f"` are caught too, which a
+// `Bash(lake:*)` prefix pattern would miss. Verified live: the hook fires under
+// `-p --dangerously-skip-permissions`, blocks `lake --version`, and lets a
+// scratchpad write through untouched.
+const NO_LOCAL_LEAN_HOOK = join(mkdtempSync(join(tmpdir(), "leak-hook-")), "no-local-lean.mjs")
+writeFileSync(
+  NO_LOCAL_LEAN_HOOK,
+  `let s = ""
+process.stdin.on("data", (d) => (s += d)).on("end", () => {
+  let cmd = ""
+  try { cmd = (JSON.parse(s).tool_input || {}).command || "" } catch {}
+  if (/(^|[;&|(\\\`]|\\s)(lean|lake|elan|leanc|lean4)(\\s|$)/.test(String(cmd))) {
+    process.stderr.write("BLOCKED: this run may not invoke a local Lean toolchain. Compile ONLY through verify_full_script — the local checkout is a DIFFERENT Mathlib from the verifier's, so anything it tells you about which lemmas exist is unsound here. Everything else (scratchpad files, numeric probing, notes) is fine.")
+    process.exit(2)
+  }
+  process.exit(0)
+})
+`,
+)
+const NO_LOCAL_LEAN_SETTINGS = JSON.stringify({
+  hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `node ${NO_LOCAL_LEAN_HOOK}` }] }] },
+})
 
 function buildArgs(prompt, options = {}) {
   const args = ["-p", String(prompt), "--output-format", "json"]
@@ -3011,6 +3027,10 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       // of the compiler. Cut them. (Leak I loogle/moogle stay for LEAN lemma search,
       // and Bash stays — numeric witness-finding is real proof work.)
       "--disallowedTools", ...(Array.isArray(disallowedTools) ? disallowedTools : PROVER_DISALLOWED_TOOLS),
+      // Applies to EVERY strategy, not just the controls: a local Lean is a
+      // different Mathlib from the gate, so its answers are misleading for all
+      // of them. Unlike removing Bash, this takes away nothing legitimate.
+      "--settings", NO_LOCAL_LEAN_SETTINGS,
     ]
     if (model) args.push("--model", model)
     if (typeof effort === "string" && effort.trim()) args.push("--effort", effort.trim())
@@ -6105,9 +6125,6 @@ async function proveControl(theorem, ctx, tier = 1) {
         metrics: ctx.metrics,
         signal: ctx.signal,
         searchBudget: ctx.searchBudget,
-        // Enforced by the CLI, not by the prompt. Telling a control "your only
-        // tool is verify_full_script" is a request; --disallowedTools is a wall.
-        disallowedTools: CONTROL_DISALLOWED_TOOLS,
       },
       {
         onObject: (o) => {
