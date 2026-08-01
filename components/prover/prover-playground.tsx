@@ -284,6 +284,9 @@ export function ProverPlayground() {
               <option value="stronghold-force">
                 Leak Stronghold Force (dedicated recursive decomposer, no finisher)
               </option>
+              <option value="stronghold-forte">
+                Leak Stronghold Forte (Force + reliable handoff, opening pool, duplicate-cut guard)
+              </option>
               <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
                 <option value="ultra-fleeting">
                   Leak Ultra Fleeting (model from the selector)

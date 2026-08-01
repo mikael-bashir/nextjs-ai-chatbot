@@ -122,6 +122,7 @@ const STRONGHOLD_LABELS: Record<string, string> = {
   'have-surround': 'Stronghold Surround · parallel minion waves',
   'finality-1': 'Finality I · timed refinement',
   'stronghold-force': 'Stronghold Force · recursive decomposer',
+  'stronghold-forte': 'Stronghold Forte · reliable handoff + opening pool',
   have: 'Have · single context',
 };
 

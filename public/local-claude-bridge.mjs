@@ -2150,6 +2150,20 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "force",
   },
+  // Leak Stronghold Forte: Force's exact skeleton/expand/campaign shape, plus
+  // three additions audited from a real unsolved Force run — locally-tracked
+  // handoff scripts (a cut-off minion's progress no longer depends on a live
+  // Pantograph re-query succeeding right after a mass recall), a cross-hole
+  // opening pool (siblings stop re-deriving the same opening moves from
+  // scratch), and a near-duplicate cut guard (a splitter's cut is rejected if
+  // its own child restates the parent almost verbatim). See proveForte.
+  "stronghold-forte": {
+    label: "Leak Stronghold Forte — Force + reliable handoff scripts, cross-hole opening pool, duplicate-cut guard",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x ? `${FORCE_PLAN_NOTE}\n${x}` : FORCE_PLAN_NOTE),
+    decompose: (t, m, x) => forceSplitPrompt("<the current skeleton>", "hN", "", null, m, x),
+    search: GOV_INITIAL,
+    style: "forte",
+  },
   // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
@@ -5664,6 +5678,597 @@ async function proveForce(theorem, ctx) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
   } else if (!ctx.signal?.aborted) {
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚒️ Out of clock with ${remaining.length} hole(s) still open after ${cycle} cycle(s) (${banked} closed). Force has no finisher by design — the partial skeleton is checkpointed for a resume.` })
+  }
+  return { verified: false, proof: "" }
+}
+
+// ===========================================================================
+// FORTE — Force plus three additions, audited from a real unsolved Force run
+// on FATE-X (fatex_003 / exists_leftCoset_rightCoset_representative,
+// stronghold-force, 2026-07-31: 19 holes closed but 3 stuck when the hour ran
+// out). The transcript (~/.leak-runs/2026-07-31T08-34-55…jsonl) showed the
+// actual bottleneck wasn't dead search — it was wasted cycles:
+//
+//   - Cycle 3 handed the decomposer 4 live proof states from cut-off minions
+//     with ZERO readable scripts ("0 with a readable script"), because the
+//     only source for "what did this minion already accept" was a live
+//     get_current_proof_state round-trip fired at the shared Leak II daemon
+//     right after a mass recall — precisely when it is busiest and a 15s
+//     timeout is most likely. The decomposer then had almost nothing to work
+//     with and that whole cycle produced 1 hole from nothing.
+//   - Several DIFFERENT, independently-dispatched holes re-derived the exact
+//     same opening moves from scratch (`intro G _ H ι _ r c σ hrd hru hrg hc`
+//     appears verbatim against two unrelated state ids) — there is no channel
+//     for a hole to benefit from a SIBLING hole's progress, only its own
+//     lineage (hist is per-hole).
+//
+// Neither is the vacuous/circular-cut bug that motivated Force's own
+// priorCuts tracking, but a THIRD, related failure mode — an LLM-authored cut
+// whose child is a near-restatement of its own parent — is a documented risk
+// on this family of strategies (one real run lost 20 minutes to an
+// alpha-renamed parent==child hole before priorCuts existed) and had no
+// dedicated gate, so it is closed here too. Fixes, in order of the evidence
+// behind them:
+//
+//   1. LOCAL SCRIPT TRACKING (fillHoleForte) — the accepted-tactic prefix is
+//      built from the minion's OWN tool-call stream as it happens (pairing
+//      every apply_tactic with its own tool_result via applyTacticSucceeded,
+//      keeping only ACCEPTED tactics), so a cut-off minion's progress is
+//      never lost to a failed post-hoc daemon query. forceStateScripts is
+//      kept only as a fallback for states Forte itself never touched (e.g.
+//      inherited via ASSIGN from a splitter).
+//   2. RUN-WIDE OPENING POOL (openingPool) — a cross-hole cache of accepted
+//      opening sequences, ranked against a NEW hole's own goal text with the
+//      same lemmaTokens overlap the lemma pool already uses, surfaced as a
+//      hint (never asserted as fact) so a sibling hole with a similarly-shaped
+//      goal does not re-derive an opening from zero.
+//   3. NEAR-DUPLICATE CUT GUARD (forteExpand) — a cheap, local token-overlap
+//      check (no embedding call) between a proposed sub-hole and its own
+//      parent. A cut whose child restates the parent almost verbatim is
+//      rejected before it is ever spliced in, and the rejection is recorded
+//      as a priorCut so the next splitter attempt does not repeat it.
+//
+// Everything else — the planner, the expand/campaign cycle shape, the
+// dry-cycle breaker, ASSIGN/BRIEF, state ledgering, deepest-first campaign
+// ordering — is Force's, byte-for-byte reused. Force, Surround and Finality
+// are untouched; Forte is a new strategy, not an edit to theirs.
+// ===========================================================================
+
+// Ground truth for whether a Leak II apply_tactic call was accepted: the
+// daemon always answers "Tactic succeeded…" on acceptance and "Tactic
+// failed: …" (or an unknown-state error) otherwise — see Leak-II/server.py's
+// apply_tactic. fillHoleFinality (Force/Finality/Surround's shared minion)
+// pushes every ATTEMPTED tactic unconditionally; a rejected tactic could
+// therefore poison the "already accepted" script a later splitter is told to
+// build on top of. Forte's minion checks this before keeping one.
+function applyTacticSucceeded(resultText) {
+  return /^\s*Tactic succeeded/i.test(String(resultText || ""))
+}
+
+// Cheap, local stand-in for lean-collab's embedding-similarity duplicate/
+// ancestor check: containment rather than pure Jaccard, so a short
+// restatement wholly contained in a longer goal (the common shape of an
+// alpha-renamed vacuous cut) still scores high even when the two texts differ
+// in length. Reuses lemmaTokens — already tuned to drop bound-variable-like
+// short identifiers and syntax words, which is exactly what alpha-renaming
+// changes and what this check needs to see past.
+function tokenOverlapRatio(ta, tb) {
+  if (!ta.size || !tb.size) return 0
+  let inter = 0
+  for (const t of ta) if (tb.has(t)) inter++
+  return inter / Math.min(ta.size, tb.size)
+}
+const FORTE_DUP_REJECT = Number(process.env.LEAK_FORTE_DUP_REJECT || 0.92)
+const FORTE_OPENING_MIN_TACTICS = 3 // an opening worth sharing has at least this many accepted tactics
+const FORTE_OPENING_POOL_MAX = 40
+const FORTE_OPENING_MIN_SCORE = 0.5 // relevance floor for a HINT, looser than the duplicate-cut reject bar
+const FORTE_OPENING_CTX_N = 1 // one best match only — a hint, not a lemma dump
+
+function makeOpeningPool() {
+  return { entries: [] } // { prop, tokens, script, holeId, seq }
+}
+
+// Called from fillHoleForte whenever a hole's minion accepted enough tactics
+// to be worth sharing — CLOSED or cut off, either way the prefix is real,
+// paid-for work.
+function openingPoolAdd(pool, prop, tactics, holeId) {
+  if (!pool || !prop || !tactics || tactics.length < FORTE_OPENING_MIN_TACTICS) return
+  pool.entries.push({ prop, tokens: lemmaTokens(prop), script: tactics.join("\n"), holeId, seq: pool.entries.length })
+  if (pool.entries.length > FORTE_OPENING_POOL_MAX) pool.entries.shift() // oldest-first eviction, same policy as the lemma pool
+}
+
+// Best-matching opening(s) for a NEW hole's own goal, excluding its own
+// lineage — a hole should never be "reminded" of its own prior attempt here,
+// that channel is hist.scripts/priorCuts already.
+function openingPoolBest(pool, focusText, excludeHoleId, limit = FORTE_OPENING_CTX_N) {
+  if (!pool || !pool.entries.length) return []
+  const focus = lemmaTokens(focusText)
+  if (!focus.size) return []
+  return pool.entries
+    .filter((e) => e.holeId !== excludeHoleId)
+    .map((e) => ({ e, score: tokenOverlapRatio(focus, e.tokens) }))
+    .filter((x) => x.score >= FORTE_OPENING_MIN_SCORE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => x.e)
+}
+
+function openingPoolBlock(pool, focusText, excludeHoleId) {
+  const best = openingPoolBest(pool, focusText, excludeHoleId)
+  if (!best.length) return ""
+  return `\nA DIFFERENT hole elsewhere in this run had a similarly-shaped goal and reached this far before its minion moved on to something else (NOT your hole, NOT guaranteed to still apply here — a hint worth trying, not a fact to build on):\n${best
+    .map((e) => `  from ⟪${e.holeId}⟫:\n\`\`\`lean\n${e.script}\n\`\`\``)
+    .join("\n")}\n`
+}
+
+// Forte's minion. Identical to fillHoleFinality (surroundHoleFillPrompt, the
+// same resume/brief/lemma-pool channels, the same ledgering of init_proof/
+// snapshot_state/branch_tactics ids and lastGoal) except: (a) apply_tactic is
+// only counted toward the accepted script once ITS OWN tool_result confirms
+// it, and (b) a run-wide opening-pool hint is added alongside the lemma pool.
+async function fillHoleForte(skeleton, id, ctx, reg) {
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Forte minion working hole ⟪${id}⟫…` })
+  const holeProp = holeHaveInfo(skeleton, id)?.prop || ""
+  const resumeBlock = reg?.resume
+    ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. That state is LIVE and already holds the tactics below — CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over. Free it with cleanup_memory(state_id) if you abandon it.${
+        reg.script ? `\nTactics this state has already accepted:\n\`\`\`lean\n${reg.script}\n\`\`\`` : ""
+      }`
+    : ""
+  const briefBlock = reg?.brief
+    ? `CARRIED-OVER BRIEFING — the splitter that shaped this hole wrote this from what earlier agents learned BEFORE this hole existed. Treat it as established: do not re-derive what it says is known, and do not re-try what it says already failed.\n${String(reg.brief).slice(0, 2000)}`
+    : ""
+  const lemmaBlock = lemmaPoolBlock(ctx.lemmaPool, holeProp || skeleton)
+  const openingBlock = openingPoolBlock(ctx.openingPool, holeProp || skeleton, id)
+  const resumeExtra = [lemmaBlock, openingBlock, briefBlock, resumeBlock].filter(Boolean).join("\n\n")
+  if (lemmaBlock)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧠 ⟪${id}⟫ starts with the most relevant of ${ctx.lemmaPool.facts.size} lemma(s) already proved on this run.` })
+  if (openingBlock)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧭 ⟪${id}⟫ starts with a related hole's opening moves from elsewhere in this run.` })
+
+  const pendingApply = new Map() // tool_use id -> tactic text, resolved on the matching tool_result
+  const applied = [] // ACCEPTED tactics only
+  const toolNames = new Map()
+  const res = await spawnProverStream(
+    {
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, resumeExtra),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    {
+      onObject: (o) => {
+        try {
+          if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_use") continue
+              const name = String(c.name || "")
+              if (c.id) toolNames.set(c.id, name.replace(/^.*__/, ""))
+              if (name.endsWith("apply_tactic") && c.input?.tactic && c.id) pendingApply.set(c.id, String(c.input.tactic))
+              if (name.endsWith("cleanup_memory") && typeof c.input?.state_id === "string" && reg)
+                reg.ids.delete(c.input.state_id.toLowerCase())
+            }
+          } else if (o?.type === "user" && Array.isArray(o.message?.content) && reg) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_result" || !c.tool_use_id) continue
+              const tool = toolNames.get(c.tool_use_id)
+              if (!tool) continue
+              const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+              if (tool === "apply_tactic" && pendingApply.has(c.tool_use_id)) {
+                const tac = pendingApply.get(c.tool_use_id)
+                pendingApply.delete(c.tool_use_id)
+                if (applyTacticSucceeded(t)) applied.push(tac)
+              }
+              if (/init_proof|snapshot_state|branch_tactics/.test(tool)) {
+                UUID_ANY_RE.lastIndex = 0
+                let m
+                while ((m = UUID_ANY_RE.exec(t)) !== null) reg.ids.add(m[0].toLowerCase())
+              }
+              if (/init_proof|apply_tactic|branch_tactics|get_current_proof_state/.test(tool) && /⊢|Goal/i.test(t))
+                reg.lastGoal = t.slice(-700)
+            }
+          }
+        } catch {
+          /* ledgering must never crash a minion */
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
+  )
+  if (reg) {
+    reg.tactics.push(...applied)
+    // The primary source proveForte's cycle loop reads from — built locally
+    // as the stream happened, so it survives regardless of whether a live
+    // get_current_proof_state round-trip succeeds afterward. See the FORTE
+    // header comment (#1) for why this exists.
+    if (applied.length) reg.script = (reg.script ? reg.script + "\n" : "") + applied.join("\n")
+  }
+  openingPoolAdd(ctx.openingPool, holeProp, reg?.tactics, id)
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
+}
+
+// EXPAND, Forte edition. Identical to forceExpand — same splitter
+// (splitHoleForce is reused unchanged), same freshenTags/ASSIGN/BRIEF
+// handling, same state hand-down on a successful cut — plus the near-
+// duplicate cut guard (#3) between the verify check and committing the cut.
+async function forteExpand(skeleton, ctx, sig, hist, stateReg) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  let cutoff = false
+  const timer = setTimeout(() => {
+    cutoff = true
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Expansion window (${Math.round(FORCE_EXPAND_MS / 60000)} min) spent — freezing the skeleton at ${parseHoleIds(partial).length} hole(s) and dispatching minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_EXPAND_MS))
+
+  const roots = parseHoleIds(partial)
+  const depth = new Map(roots.map((id) => [id, 0]))
+  const queue = roots.map((id) => ({ id, d: 0 }))
+  let splits = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const item = queue.shift()
+      if (!item) {
+        if (inFlight === 0) return
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        const { id, d } = item
+        const r = await splitHoleForce(partial, id, ectx, hist?.get(id))
+        if (!r.body) {
+          if (!r.atomic && r.summary) {
+            const e = hist?.get(id)
+            if (e) (e.priorCuts ||= []).push(r.summary)
+          }
+          continue
+        }
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted || deadlinePassed(ctx)) return
+          if (!parseHoleIds(partial).includes(id)) return
+          const parentProp = holeHaveInfo(partial, id)?.prop || ""
+          const { body: freshBody, tags, rename } = freshenTags(r.body, parseHoleIds(partial))
+          const fresh = (t) => rename.get(t) || t
+          const trial = spliceHole(partial, id, freshBody)
+          if (trial === partial) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut could not be spliced into the skeleton — hole left intact.` })
+            return
+          }
+          const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+          if (!(v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig))) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut rejected by Leak IV — hole left intact.` })
+            return
+          }
+          // NEAR-DUPLICATE CUT GUARD (#3) — cheap local stand-in for lean-
+          // collab's embedding-similarity ancestor check. If a cut's own
+          // child restates the PARENT goal it was supposed to shrink (the
+          // alpha-renamed shape a vacuous cut takes), reject it here rather
+          // than paying a minion's clock to discover the same wall the
+          // parent already stood at.
+          if (parentProp) {
+            const parentTokens = lemmaTokens(parentProp)
+            for (const t of tags) {
+              const childProp = holeHaveInfo(trial, fresh(t))?.prop || holeHaveInfo(trial, t)?.prop || ""
+              if (!childProp) continue
+              const overlap = tokenOverlapRatio(parentTokens, lemmaTokens(childProp))
+              if (overlap >= FORTE_DUP_REJECT) {
+                ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut rejected — sub-hole ⟪${t}⟫ restates the parent goal almost verbatim (${Math.round(overlap * 100)}% token overlap), not a real step down. Hole left intact.` })
+                const e = hist?.get(id)
+                if (e) (e.priorCuts ||= []).push(`a cut whose sub-hole restated the parent goal almost verbatim (${Math.round(overlap * 100)}% overlap) — vacuous, not a real simplification`)
+                return
+              }
+            }
+          }
+          partial = trial
+          splits++
+          const reg = stateReg?.get(id)
+          if (reg) {
+            const kept = new Set()
+            for (const { stateId, tag: raw } of r.assigns || []) {
+              const tag = fresh(raw)
+              if (!tags.includes(tag) || !reg.ids.has(stateId)) continue
+              let nr = stateReg.get(tag)
+              if (!nr) {
+                nr = { ids: new Set(), lastGoal: reg.lastGoal, tactics: [...reg.tactics], resume: stateId }
+                stateReg.set(tag, nr)
+              }
+              nr.ids.add(stateId)
+              nr.resume = nr.resume || stateId
+              nr.script = nr.script || hist?.get(id)?.scripts?.find((s) => s.id === stateId)?.script
+              kept.add(stateId)
+            }
+            const dropped = [...reg.ids].filter((i) => !kept.has(i))
+            stateReg.delete(id)
+            if (dropped.length) freeForceStates(ctx, dropped)
+            if (kept.size)
+              ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ ⟪${id}⟫ handed ${kept.size} live proof state(s) down to its sub-hole(s); freed ${dropped.length}.` })
+          }
+          let briefed = 0
+          for (const [raw, text] of Object.entries(r.briefs || {})) {
+            const tag = fresh(raw)
+            if (!tags.includes(tag)) continue
+            let nr = stateReg?.get(tag)
+            if (!nr && stateReg) {
+              nr = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+              stateReg.set(tag, nr)
+            }
+            if (nr) {
+              nr.brief = text
+              briefed++
+            }
+          }
+          hist?.delete(id)
+          for (const t of tags) {
+            depth.set(t, d + 1)
+            if (d + 1 < FORCE_DEPTH) queue.push({ id: t, d: d + 1 })
+          }
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ ⟪${id}⟫ → ${tags.length} hole(s) at depth ${d + 1}/${FORCE_DEPTH}${d + 1 < FORCE_DEPTH ? "" : " (leaf)"} — skeleton now ${parseHoleIds(partial).length} hole(s)${briefed ? `, ${briefed} briefed` : ""}.` })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  if (!cutoff && !ctx.signal?.aborted)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Expansion exhausted the frontier (depth ${FORCE_DEPTH}) with time to spare — ${parseHoleIds(partial).length} hole(s).` })
+  return { skeleton: partial, splits, depth }
+}
+
+// CAMPAIGN, Forte edition. Identical to forceCampaign except it dispatches
+// fillHoleForte instead of fillHoleFinality.
+async function forteCampaign(skeleton, ctx, depth, banked, stateReg) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  const timer = setTimeout(() => {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Campaign window (${Math.round(FORCE_CAMPAIGN_MS / 60000)} min) spent — recalling the minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_CAMPAIGN_MS))
+
+  const queue = parseHoleIds(partial).sort((a, b) => (depth.get(b) ?? 0) - (depth.get(a) ?? 0))
+  const notes = {}
+  const cutoff = {}
+  let closed = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const id = queue.shift()
+      if (id === undefined) {
+        if (inFlight === 0) return
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        if (!parseHoleIds(partial).includes(id)) continue
+        let reg = stateReg.get(id)
+        if (!reg) {
+          reg = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+          stateReg.set(id, reg)
+        }
+        const r = await fillHoleForte(partial, id, ectx, reg)
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted) return
+          if (r.fill == null) {
+            if (ac.signal.aborted && !ctx.signal?.aborted) cutoff[id] = r.notes || { text: "(cut off before it reported)" }
+            else if (r.notes) notes[id] = r.notes
+            return
+          }
+          const next = spliceHole(partial, id, r.fill)
+          if (next === partial) {
+            if (r.notes) notes[id] = r.notes
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ was proved but could not be spliced — back to the decomposer.` })
+            return
+          }
+          partial = next
+          closed++
+          const dead = [...reg.ids]
+          stateReg.delete(id)
+          freeForceStates(ctx, dead)
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Closed hole ⟪${id}⟫ (Forte campaign).` })
+          const openNow = parseHoleIds(partial)
+          ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked + closed, total: banked + closed + openNow.length })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  return { skeleton: partial, closed, notes, cutoff }
+}
+
+async function proveForte(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "⚔️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Leak Stronghold Forte: Force's ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root, ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion (×${FORCE_SPLIT_N}, depth ${FORCE_DEPTH}) and ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions — plus locally-tracked handoff scripts, a cross-hole opening pool, and a near-duplicate cut guard. A failed campaign goes back to the decomposer, never to a finisher.` })
+
+  ctx.lemmaPool = makeLemmaPool()
+  ctx.openingPool = makeOpeningPool()
+
+  // ---- 1) PLANNER — identical to Force ---------------------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          if (isStructurallyValidDecomposition(parseVerifyOutput(t)) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) skeleton = script
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, FORCE_PLAN_NOTE),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "⚔️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it outright — no decomposition needed." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton || !parseHoleIds(skeleton).length) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ Planner produced no tagged skeleton — nothing to decompose; falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+
+  let partial = skeleton
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Root skeleton verified — ${parseHoleIds(partial).length} hole(s): ${parseHoleIds(partial).map((h) => `⟪${h}⟫`).join(" ")}. Saved; expansion starts now.` })
+  ctx.emit({ type: "checkpoint", skeleton: partial, filled: 0, total: parseHoleIds(partial).length })
+
+  // ---- 2) EXPAND → CAMPAIGN → (failed? EXPAND again) ------------------------
+  const hist = new Map()
+  const stateReg = new Map()
+  const histFor = (id) => {
+    let e = hist.get(id)
+    if (!e) {
+      e = { failed: null, cutoff: null, scripts: [], lastGoal: "", tactics: [], priorCuts: [] }
+      hist.set(id, e)
+    }
+    return e
+  }
+  let banked = 0
+  let cycle = 0
+  let dry = 0
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    cycle++
+    const before = parseHoleIds(partial).length
+    // PRIMARY source: the locally-tracked accepted script fillHoleForte built
+    // as it went (#1) — survives regardless of whether a live re-query
+    // succeeds. Only ids Forte never itself built a local script for (e.g.
+    // inherited via ASSIGN from a splitter, never touched by a Forte minion)
+    // fall back to forceStateScripts' live daemon query.
+    const needsLiveQuery = [...stateReg.entries()].filter(([, reg]) => !reg.script).flatMap(([, reg]) => [...reg.ids])
+    const scriptById = needsLiveQuery.length ? await forceStateScripts(ctx, needsLiveQuery) : new Map()
+    let readableLocal = 0
+    let readableLive = 0
+    for (const [tag, reg] of stateReg) {
+      const e = histFor(tag)
+      if (reg.script) {
+        e.scripts = [{ id: reg.resume || tag, script: reg.script }]
+        readableLocal++
+      } else {
+        e.scripts = [...reg.ids].map((sid) => ({ id: sid, script: scriptById.get(sid) })).filter((s) => s.script)
+        if (e.scripts.length) readableLive++
+      }
+      e.lastGoal = reg.lastGoal || e.lastGoal
+      if (reg.tactics?.length) e.tactics = reg.tactics
+    }
+    const liveStates = [...stateReg.values()].reduce((n, r) => n + r.ids.size, 0)
+    if (liveStates)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Cycle ${cycle}: ${liveStates} live proof state(s) from cut-off minions handed to the decomposer (${readableLocal} readable locally, ${readableLive} more via live query).` })
+    const ex = await forteExpand(partial, ctx, sig, hist, stateReg)
+    partial = ex.skeleton
+    const after = parseHoleIds(partial).length
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Cycle ${cycle} expansion: ${ex.splits} verified cut(s), ${before} → ${after} hole(s). Dispatching ×${Math.min(FORCE_MINIONS, after)} minions for ${Math.round(FORCE_CAMPAIGN_MS / 60000)} min.` })
+    ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + after })
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+
+    const camp = await forteCampaign(partial, ctx, ex.depth, banked, stateReg)
+    partial = camp.skeleton
+    banked += camp.closed
+    for (const [id, n] of Object.entries(camp.notes)) histFor(id).failed = n
+    for (const [id, n] of Object.entries(camp.cutoff)) histFor(id).cutoff = n
+    const left = parseHoleIds(partial)
+    if (!left.length) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Cycle ${cycle} campaign closed every remaining hole (${banked} total).` })
+      break
+    }
+    dry = ex.splits === 0 && camp.closed === 0 ? dry + 1 : 0
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `↩︎ Cycle ${cycle} campaign closed ${camp.closed}/${after} hole(s); ${left.length} still open — returning them to the decomposer (no finisher).`,
+    })
+    if (dry >= FORCE_MAX_DRY_CYCLES) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `🛑 ${FORCE_MAX_DRY_CYCLES} consecutive cycles cut nothing and closed nothing — the loop has converged on a shape it cannot move. Stopping rather than re-buying the same result.` })
+      break
+    }
+  }
+
+  // ---- 3) ASSEMBLE ----------------------------------------------------------
+  const remaining = parseHoleIds(partial)
+  await freeForceStates(ctx, [...forceLedgeredIds(stateReg)])
+  stateReg.clear()
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Stronghold Forte assembled a verified proof: ${banked} hole(s) closed across ${cycle} cycle(s).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚔️ Out of clock with ${remaining.length} hole(s) still open after ${cycle} cycle(s) (${banked} closed). Forte has no finisher by design — the partial skeleton is checkpointed for a resume.` })
   }
   return { verified: false, proof: "" }
 }
@@ -9829,6 +10434,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
             "\n\n=== HOLE-FILL (CAMPAIGN MINION) PROMPT ===\n" +
             surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
+          : style === "forte"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Forte (Force's ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root · ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion ×${FORCE_SPLIT_N} to depth ${FORCE_DEPTH} · ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions · plus locally-tracked handoff scripts, a cross-hole opening pool, and a near-duplicate cut guard) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (small root) ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers, FORCE_PLAN_NOTE) +
+            "\n\n=== SPLITTER PROMPT (recursive decomposer, + near-duplicate cut guard) ===\n" +
+            forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
+            "\n\n=== HOLE-FILL (CAMPAIGN MINION, + opening pool hint) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -9951,7 +10563,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -9974,7 +10586,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                   ? await proveFinality(theorem, ctx)
                   : style === "force"
                     ? await proveForce(theorem, ctx)
-                    : await proveHaveFlat(theorem, ctx)
+                    : style === "forte"
+                      ? await proveForte(theorem, ctx)
+                      : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

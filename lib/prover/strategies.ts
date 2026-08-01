@@ -89,6 +89,18 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     label: 'Leak Stronghold Force (dedicated recursive decomposer, no finisher)',
     note: 'A deliberately small root skeleton (3–5 holes), then a 7-minute recursive expansion in which dedicated splitter agents cut every hole into ~3 sub-holes, three levels deep, each cut re-verified on Leak IV by the bridge before it is applied (so the skeleton is always valid and its hole count only rises; no single splitter exceeds 5 minutes). Then ≤5 minions get ≤10 minutes on the leaves, deepest first. A campaign that leaves holes open goes BACK to the decomposer — with what each minion tried — never to a finisher. Requires the ghost-army Leak II.',
   },
+  {
+    // Audited from a real unsolved Force run on FATE-X (fatex_003,
+    // 2026-07-31): the bottleneck wasn't dead search, it was wasted cycles —
+    // one cycle handed the decomposer 4 live proof states with ZERO readable
+    // scripts because the only source was a live Pantograph re-query fired
+    // right after a mass recall, and several unrelated holes re-derived the
+    // identical opening tactics from scratch. Force's shape is unchanged;
+    // Force itself is untouched.
+    value: 'stronghold-forte',
+    label: 'Leak Stronghold Forte (Force + reliable handoff, cross-hole opening pool, duplicate-cut guard)',
+    note: "Force's exact root/expand/campaign shape, plus three additions: (1) a cut-off minion's accepted tactics are tracked locally from its own tool-call stream as they happen, so handoff to the next decomposer cycle never depends on a live Pantograph re-query succeeding right after a mass recall; (2) a run-wide pool of accepted opening sequences is surfaced as a hint to any hole with a similarly-shaped goal, so siblings stop re-deriving the same opening moves from scratch; (3) a cheap local token-overlap check rejects a splitter's cut if its own child restates the parent goal almost verbatim, before it is ever spliced in. Requires the ghost-army Leak II.",
+  },
 ];
 
 // The Leak River variants — each an ablation of the previous one.
@@ -151,6 +163,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',
   'stronghold-force': 'Leak Stronghold Force',
+  'stronghold-forte': 'Leak Stronghold Forte',
 };
 
 export function enforcerLabelFor(strategy: string): string {
@@ -229,16 +242,18 @@ export function benchmarkBudgetFor(strategy: string): {
     };
   }
   // Leak Stronghold Dark (and its parallel-minion variant Surround, their
-  // refinement-loop child Finality I, and the dedicated-decomposer Force) is
-  // the direct capability comparison against Leak Ultra (same isolated-
-  // decomposition shape, different driver) — deliberately pinned to the SAME
-  // constant, not just the same value, so none of them can drift out of sync
-  // if that budget changes later.
+  // refinement-loop child Finality I, the dedicated-decomposer Force, and
+  // Force's reliable-handoff descendant Forte) is the direct capability
+  // comparison against Leak Ultra (same isolated-decomposition shape,
+  // different driver) — deliberately pinned to the SAME constant, not just
+  // the same value, so none of them can drift out of sync if that budget
+  // changes later.
   if (
     strategy === 'have-tree' ||
     strategy === 'have-surround' ||
     strategy === 'finality-1' ||
-    strategy === 'stronghold-force'
+    strategy === 'stronghold-force' ||
+    strategy === 'stronghold-forte'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }

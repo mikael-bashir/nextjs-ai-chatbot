@@ -3352,6 +3352,9 @@ export function AdminPipeline() {
                   <option value="stronghold-force">
                     Leak Stronghold Force (dedicated recursive decomposer, no finisher)
                   </option>
+                  <option value="stronghold-forte">
+                    Leak Stronghold Forte (Force + reliable handoff, opening pool, duplicate-cut guard)
+                  </option>
                   <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
                     {RIVER_STRATEGIES.map((s) => (
                       <option key={s.value} value={s.value}>
