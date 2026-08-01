@@ -270,6 +270,9 @@ export function ProverPlayground() {
               <option value="sketch">Sketch (plan then formalize)</option>
               <option value="brute">Brute (automation only)</option>
               <option value="have">Have (in-context, no top-level lemmas)</option>
+              <option value="control-oneshot">
+                Leak Control (one continuous agent, one-shot, Leak IV only — no decomposition)
+              </option>
               {/* value stays `have-tree` — renaming it would orphan saved
                   checkpoints and every existing research row. */}
               <option value="have-tree">

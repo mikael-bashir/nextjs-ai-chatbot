@@ -123,6 +123,7 @@ const STRONGHOLD_LABELS: Record<string, string> = {
   'finality-1': 'Finality I · timed refinement',
   'stronghold-force': 'Stronghold Force · recursive decomposer',
   'stronghold-forte': 'Stronghold Forte · reliable handoff + opening pool',
+  'control-oneshot': 'Control · flat one-shot baseline',
   have: 'Have · single context',
 };
 

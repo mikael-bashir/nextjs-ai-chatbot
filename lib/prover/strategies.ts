@@ -48,6 +48,19 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     note: 'One agent, everything inside the proof as `have` steps; no top-level helper lemmas.',
   },
   {
+    // The flat baseline every blueprint-refinement strategy (River/Ultra)
+    // should be measured against, not just against each other: one
+    // continuous agent, one-shotting the whole theorem, Leak IV as its ONLY
+    // tool (Leak I search and Leak II interactive stepping are filtered out
+    // bridge-side even if connected). No top-level lemmas, no DECOMPOSE
+    // escape hatch, no "too hard" stopping state — it keeps resubmitting
+    // fresh attempts against the compiler's own error output until it
+    // verifies or the run's wall clock ends it.
+    value: 'control-oneshot',
+    label: 'Leak Control (one continuous agent, one-shot, Leak IV only — no decomposition)',
+    note: 'The flat baseline: one agent, one theorem, one tool (verify_full_script). No planner, no splitter, no minions, no top-level helper lemmas, and no decompose/give-up escape hatch — a repeatedly-failing approach means try something different, not split it. Loops fresh attempts until it verifies or the clock runs out.',
+  },
+  {
     // value stays `have-tree` — renaming it would orphan saved checkpoints,
     // queued items and every existing research row (matches admin-pipeline.tsx
     // and prover-playground.tsx, which already show the same display name).
@@ -159,6 +172,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   sketch: 'Leak Sketch',
   brute: 'Leak Brute',
   have: 'Leak Have',
+  'control-oneshot': 'Leak Control',
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',
