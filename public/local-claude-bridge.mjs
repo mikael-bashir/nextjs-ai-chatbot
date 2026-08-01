@@ -200,6 +200,16 @@ process.stdin.on("data", (d) => (s += d)).on("end", () => {
 })
 `,
 )
+// The hook is the wall; this is the sign on it. Without it the agent discovers
+// the block by walking into it — on fatex_006 that cost a `find /` across the
+// whole filesystem and several turns of dead-ended exploration before it gave
+// up on the idea. Telling it up front costs a few tokens once.
+const NO_LOCAL_LEAN_NOTE = `LOCAL LEAN IS NOT AVAILABLE TO YOU. This machine happens to have Lean toolchains and Mathlib checkouts on disk. Do not try to use them: \`lean\`, \`lake\`, \`elan\` and \`leanc\` are blocked before they run, so the attempt just fails and costs you a turn. Do not go looking for them either — no \`find / -name "*.lean"\`, no hunting for a local \`Mathlib/\`.
+
+The reason is soundness, not bureaucracy: any local checkout is a DIFFERENT Mathlib from the one your verifier compiles against, so what it says about which lemmas exist, what they are called, and what shape they have can simply be wrong here. A name you read off local source and then cannot compile is not a mystery — it is a version mismatch, and chasing it wastes the run. Your ONE source of truth about Lean is verify_full_script.
+
+Everything else on the machine is yours and unrestricted — shell commands, scratch files, notes, numeric experiments. A local scratchpad is fine and often useful.`
+
 const NO_LOCAL_LEAN_SETTINGS = JSON.stringify({
   hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `node ${NO_LOCAL_LEAN_HOOK}` }] }] },
 })
@@ -3038,8 +3048,13 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     // The architect stage contract (blueprint rules / prover rules / refinement
     // rules) rides as a system prompt so it outranks the conversation, matching
     // how the Grok driver sends it as role:"system".
-    if (typeof systemAppend === "string" && systemAppend.trim())
-      args.push("--append-system-prompt", systemAppend.trim())
+    // Every prover agent is told about the local-Lean block, on the same system
+    // channel as any stage contract the caller supplies (concatenated, not
+    // replaced, so neither silently drops the other).
+    const sysAppend = [typeof systemAppend === "string" ? systemAppend.trim() : "", NO_LOCAL_LEAN_NOTE]
+      .filter(Boolean)
+      .join("\n\n")
+    args.push("--append-system-prompt", sysAppend)
 
     let child
     try {
