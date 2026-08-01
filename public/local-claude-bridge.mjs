@@ -638,6 +638,15 @@ function createGovernor({ initial } = {}) {
     searchCount: 0,
     grantCount: 0,
     blockedCount: 0,
+    // Replenishment is earned by the AGENT's compile output, but the agent never
+    // sees the grant: the CLI subprocess is spawned with stdin ignored, so there
+    // is no channel to push a message into a running session. An agent that has
+    // been refused once will otherwise assume search is dead for the whole run
+    // and stop asking. So we bank the grant here and announce it on the agent's
+    // NEXT search response (and tell it, in the refusal itself, that trying
+    // again after a real compile is exactly how the allowance comes back).
+    pendingGrant: 0, // searches granted since the last time we told the agent
+    wasBlocked: false, // agent has been refused at least once since the last notice
     // Bridge-served tools: name -> { description, inputSchema, run(args) }. Used by
     // the Claude-driven architect (Leak Ultra) so the CLI's tool calls execute in
     // the bridge — same executors, same gates as the Grok loop — instead of the CLI
@@ -662,6 +671,8 @@ function grantSearch(g, why) {
   if (!g) return
   g.budget += GOV_GRANT
   g.grantCount++
+  g.pendingGrant += GOV_GRANT
+  g.lastGrantWhy = why || ""
 }
 
 // Build an MCP config where any PURE search server (all its tools are searches,
@@ -703,8 +714,13 @@ async function governedSearchCall(g, toolName, args) {
   g.searchCount++
   if (g.budget <= 0) {
     g.blockedCount++
+    g.wasBlocked = true
     console.log(`[gov ${g.id}] search BLOCKED (budget 0) tool=${toolName}`)
-    return `🛑 Search budget spent — stop searching and PROVE. You already know Lean 4; lead with strong automation (decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. To resolve a specific lemma NAME, do NOT guess it with \`#check @name\` — put the goal in \`example : <goal> := by exact?\` (or apply?/rw?/simp?); unification finds the name for free. A search allowance is earned only when a REAL proof attempt hits an unknown name. If the goal is genuinely too big, decompose it.`
+    return `⏸️ Search allowance is at 0 RIGHT NOW — this is temporary, not a ban. Go and PROVE, and the allowance comes back on its own.
+
+HOW IT COMES BACK: compile a REAL proof attempt with verify_full_script (a script with theorem/lemma/have/show/suffices or \`:= by\` in it — not a bare \`#check\`/\`#print\`/\`#eval\` probe). The moment such an attempt hits a genuine "unknown identifier" / "unknown constant" / "unknown tactic" from the compiler, you are automatically granted +${GOV_GRANT} searches, and the next search you make will tell you so. This can happen as many times as you earn it — searching is available for the whole run.
+
+MEANWHILE: you already know Lean 4; lead with strong automation (decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. To resolve a specific lemma NAME, do NOT guess it with \`#check @name\` — put the goal in \`example : <goal> := by exact?\` (or apply?/rw?/simp?); unification finds the name for free and costs no budget. If the goal is genuinely too big, decompose it.`
   }
   g.budget--
   const srv = g.searchServer
@@ -716,7 +732,14 @@ async function governedSearchCall(g, toolName, args) {
   // its warm index on a timeout, abandoning early here is now harmless.
   const r = await callRemoteMcpTool(srv.url, toolName, args, { timeoutMs: 25000 })
   const body = r.ok ? r.text : `Search error: ${r.error || "unknown"} — don't retry; prove with the compiler instead.`
-  return `${body}\n\n[search budget: ${g.budget} left — spend it on TYPE-PATTERN loogle queries (e.g. loogle "(f _)^[_] _ = _") or moogle concepts, never on a bare lemma name. To resolve a name for free, use \`exact?\`/\`apply?\` in a script. Prefer compiling.]`
+  // If the agent earned refills since we last spoke to it, say so up front —
+  // otherwise a previously-refused agent has no way to learn its budget is back.
+  const refill = g.pendingGrant
+    ? `✅ SEARCH BUDGET REPLENISHED: +${g.pendingGrant} (a real proof attempt of yours hit an unknown name, which is what earns it). You now have ${g.budget} searches left after this one. Keep compiling real attempts and you keep earning more — search stays open all run.\n\n`
+    : ""
+  g.pendingGrant = 0
+  g.wasBlocked = false
+  return `${refill}${body}\n\n[search budget: ${g.budget} left — refilled +${GOV_GRANT} whenever a real compiled attempt hits an unknown name, so this number is not a hard ceiling. Spend it on TYPE-PATTERN loogle queries (e.g. loogle "(f _)^[_] _ = _") or moogle concepts, never on a bare lemma name. To resolve a name for free, use \`exact?\`/\`apply?\` in a script. Prefer compiling.]`
 }
 
 // ---- MCP-over-SSE SERVER for the governor (the inverse of callRemoteMcpTool) --
@@ -1795,7 +1818,9 @@ const SEARCH_USAGE_NOTE = `FINDING & USING LEMMAS — do this instead of guessin
 - To get the exact name of a lemma that closes a goal, let unification find it: \`example : <goal> := by exact?\` (or \`apply?\`, \`rw?\`, \`simp?\`). THAT is the name search, and it costs no search budget.
 - loogle takes a TYPE PATTERN or a list of constants, never a lemma name: e.g. \`loogle "(fwdDiff _)^[_] _ _ = _"\` or \`loogle Nat.choose, Finset.sum, (_ ^ _)\`. A bare name like \`loogle "fwdDiff_iter_eq_shift"\` always errors.
 - The MOMENT you have a plausible lemma — from search, from \`exact?\`, or from memory — USE it in a real script: \`simpa using <lemma> …\`, \`rw [<lemma>]\`, \`exact <lemma> …\`. If the name is slightly off, the compiler's "unknown identifier — did you mean …?" corrects it in one step. Never collect lemmas you don't apply.
-- Stay in ONE workspace: drive the proof through verify_full_script. Use init_proof/apply_tactic only to LOOK at a stuck goal, ONE tactic per call (no \`;\`-chains, no \`rename'\` — Pantograph rejects them).`
+- Stay in ONE workspace: drive the proof through verify_full_script. Use init_proof/apply_tactic only to LOOK at a stuck goal, ONE tactic per call (no \`;\`-chains, no \`rename'\` — Pantograph rejects them).
+
+SEARCH BUDGET — it is a RENEWABLE allowance, not a one-time ration. You start with ${GOV_INITIAL} searches. Every time a REAL proof attempt (a script containing theorem/lemma/have/show/suffices or \`:= by\`) is compiled and the compiler reports an unknown identifier / unknown constant / unknown tactic, you are automatically granted ${GOV_GRANT} MORE searches. Probe scripts that are nothing but \`#check\`/\`#print\`/\`#eval\` earn nothing. So if you hit 0, that is TEMPORARY and self-inflicted-by-idleness only: go compile a real attempt, and the moment it names something Mathlib does not have, your allowance comes back. Search is never switched off for the run — you just have to keep proving to keep paying for it.`
 
 // The goal is to let Claude use the tools logically on its own — but a bare
 // "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
@@ -3140,7 +3165,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
                     say({
                       type: "message-annotation",
                       subtype: "status",
-                      thought: `${stage ? stage + " " : ""}🔎 Compiler flagged an unknown name — search budget +${GOV_GRANT} (now ${governor.budget}).`,
+                      thought: `${stage ? stage + " " : ""}🔎 Compiler flagged an unknown name — search budget +${GOV_GRANT} (now ${governor.budget})${governor.wasBlocked ? "; the agent was refused earlier and will be told on its next search" : ""}.`,
                     })
                 }
               }
