@@ -7240,7 +7240,7 @@ HOW TO USE THE ABOVE — read it once, then think for yourself:
 - A theorem \`apply?\` found is worth more than a tactic it found: applying it turns its hypotheses into your holes, and the closing step is the application itself, so that cut is guaranteed to compose.
 - If the sweep suggests nothing useful, ignore it entirely. It is a probe, not an authority, and it is blind to any argument requiring an idea.
 
-PACE — this is where Impenetrable wins or loses. The mechanical exploration has ALREADY been done for you; that is the entire point of the sweep. So your scarce resource is not exploration, it is JUDGEMENT — the one call the machine cannot make: where does this argument actually break? Make that call quickly and commit. A decent skeleton delivered in three minutes is worth far more than a perfect one in twenty, because every minute you deliberate is a minute taken from the minions who have to fill your holes and the finisher who has to close whatever they leave. Decide, compile the skeleton, hand it over.`
+PACE — this is where Impenetrable wins or loses. The mechanical exploration has ALREADY been done for you; that is the entire point of the sweep. So your scarce resource is not exploration, it is JUDGEMENT — the one call the machine cannot make: where does this argument actually break? Make that call deliberately, then commit. Spending around TEN minutes here is well spent if it buys a skeleton whose holes are the real mathematical content; spending thirty is not, because every minute beyond that is taken from the minions who have to fill your holes and the finisher who has to close whatever they leave. What that budget is FOR is the mathematics — reading the sweep, choosing the argument, checking the assembly compiles. It is not for filler: do not run no-op shell commands, do not re-derive what the briefing already told you, and do not polish a skeleton that already type-checks. Decide, compile the skeleton, hand it over.`
 }
 
 async function proveStrongholdImpenetrable(theorem, ctx) {
@@ -11483,7 +11483,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
           : style === "impenetrable"
           ? `[DECOMPOSITION MODE — Leak Stronghold Impenetrable (breadth-first apply?-driven recon sweep: <=${IMPEN_RECON_DEPTH} levels, <=${IMPEN_RECON_NODES} states, <=${Math.round(IMPEN_RECON_MS / 60000)} min, then Surround with the progress gate on) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (briefed by the recon sweep) ===\n` +
-            haveTreePlannerPrompt(theorem, mcpServers, impenetrablePlanNote({ ran: true, expanded: 0, levels: [], suggestions: [] })) +
+            haveTreePlannerPrompt(theorem, mcpServers, "<<< THE RECON BRIEFING IS INSERTED HERE AT RUN TIME. This capture is built BEFORE the sweep runs, so it cannot show the real thing — the actual briefing is emitted verbatim as a status event (\"BRIEFING HANDED TO THE PLANNER\") once recon finishes. >>>") +
             "\n\n=== HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
             surroundHoleFillPrompt("<the verified skeleton>", "hN", mcpServers)
           : style === "keep"
