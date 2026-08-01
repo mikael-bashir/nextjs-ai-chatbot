@@ -7090,14 +7090,67 @@ function haveBindersBefore(skeleton, id) {
   return out
 }
 
+// A real skeleton opens with tactic-level context the `have`s depend on but
+// that no binder records — observed live on a group-theory skeleton whose holes
+// referenced `Lt`/`Rt` from `set`, and needed `Fintype` instances from `letI`
+// and decidability from `classical`. Lifting without these produces a
+// proposition mentioning undefined names, which does not elaborate, which
+// silently disables the whole per-hole sweep. So:
+//   `set X := e`            ⟶ textually substitute X back to (e)
+//   `letI/haveI : T := _`   ⟶ an instance binder [T]
+//   `letI/haveI n : T := _` ⟶ a named binder (n : T)
+//   `classical`             ⟶ [∀ p, Decidable p], so Finset.filter elaborates
+function tacticContextBefore(skeleton, id) {
+  const src = String(skeleton || "")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const lines = src.split("\n")
+  const stop = lines.findIndex((l) => markRe.test(l))
+  if (stop < 0) return null
+  const subs = []
+  const binders = []
+  let classical = false
+  for (const line of lines.slice(0, stop)) {
+    const t = line.trim()
+    if (/^classical\b/.test(t)) classical = true
+    const s = t.match(/^set\s+([A-Za-z_][A-Za-z0-9_']*)\s*(?::[^:=]*)?:=\s*(.+?)(?:\s+with\s+\S+)?$/)
+    if (s) {
+      subs.push([s[1], `(${s[2].trim()})`])
+      continue
+    }
+    const li = t.match(/^(?:letI|haveI|let|have)\s+([A-Za-z_][A-Za-z0-9_']*)?\s*:\s*([\s\S]*?)\s*:=/)
+    if (li && /^(letI|haveI)\b/.test(t)) {
+      const name = li[1]
+      binders.push(name ? `(${name} : ${li[2]})` : `[${li[2]}]`)
+    }
+  }
+  return { subs, binders, classical }
+}
+
+const applySubs = (text, subs) =>
+  subs.reduce(
+    (acc, [name, val]) => acc.replace(new RegExp(`(^|[^.\\w'])${name}(?![\\w'])`, "g"), `$1${val}`),
+    String(text || ""),
+  )
+
 function closedHoleProposition(skeleton, id) {
   const body = holePropOf(skeleton, id)
   if (!body) return null
+  const ctxt = tacticContextBefore(skeleton, id)
+  if (!ctxt) return null
   const binders = theoremBinderText(skeleton)
   const haves = haveBindersBefore(skeleton, id)
   if (haves === null) return null
-  const all = [binders, ...haves].filter(Boolean).join(" ").trim()
-  return all ? `∀ ${all}, ${body}` : body
+  const all = [
+    binders,
+    ...ctxt.binders,
+    ctxt.classical ? "[∀ (p : Prop), Decidable p]" : "",
+    ...haves.map((h) => applySubs(h, ctxt.subs)),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .trim()
+  const goal = applySubs(body, ctxt.subs)
+  return all ? `∀ ${all}, ${goal}` : goal
 }
 
 // A small sweep on ONE hole, cached across the run by the hole's alpha-key so
@@ -7243,6 +7296,18 @@ async function proveStrongholdImpenetrable(theorem, ctx) {
   ]
     .filter(Boolean)
     .join("\n\n")
+
+  // Emit the ACTUAL briefing. The run's "full agent context" frame is built
+  // before the sweep runs, so it can only ever show a placeholder — without
+  // this, an operator cannot tell whether the planner was briefed at all, or
+  // whether it ignored a briefing it did receive. That distinction is the
+  // whole evaluation of this arm.
+  if (note)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🔭 BRIEFING HANDED TO THE PLANNER (verbatim, ${note.length} chars):\n${note}`,
+    })
 
   // Everything downstream is Surround, unchanged, with the progress gate on.
   return proveHaveSurround(theorem, ctx, { planNote: note, cutGate: true, holeRecon: true })
