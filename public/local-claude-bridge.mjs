@@ -2101,16 +2101,24 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have",
   },
-  // Leak Control: the flat baseline. One continuous agent, one-shots the
-  // WHOLE theorem, Leak IV only, no decompose escape hatch — see proveControl.
-  // Exists to give blueprint-refinement strategies something to beat besides
-  // each other.
+  // Leak Control I/II: the flat baselines. One continuous agent, one-shots
+  // the WHOLE theorem, no decompose escape hatch — see proveControl. Exist to
+  // give blueprint-refinement strategies something to beat besides each
+  // other. I is Leak IV only; II adds Leak I search (loogle/moogle) — see the
+  // CONTROL header comment above proveControl for the full split.
   "control-oneshot": {
-    label: "Leak Control — one continuous agent, one-shot, Leak IV only (no decomposition)",
+    label: "Leak Control I — one continuous agent, one-shot, Leak IV only (no decomposition)",
     node: (t, m, x) => controlPrompt(t, m),
     decompose: (t, m, x) => controlPrompt(t, m), // unused; keeps the registry shape
     search: 0,
     style: "control",
+  },
+  "control-oneshot-2": {
+    label: "Leak Control II — one continuous agent, one-shot, Leak IV + Leak I search (no decomposition)",
+    node: (t, m, x) => controlPrompt(t, m, 1, null, true),
+    decompose: (t, m, x) => controlPrompt(t, m, 1, null, true), // unused; keeps the registry shape
+    search: GOV_INITIAL,
+    style: "control2",
   },
   // Phase-1 linear context: planner writes a `have`-skeleton, isolated minions
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
@@ -5694,21 +5702,29 @@ async function proveForce(theorem, ctx) {
 }
 
 // ===========================================================================
-// CONTROL — the flat baseline. One continuous CLI agent, one-shotting the
-// WHOLE theorem, with Leak IV's verify_full_script as its only tool and its
-// only feedback channel. No planner, no splitter, no minions, no top-level
-// helper lemmas, and — unlike every decomposition strategy above — no
-// DECOMPOSE escape hatch and no "too hard" stopping state. Exists so
-// blueprint-refinement strategies (Leak River/Ultra) have something to be
-// compared against besides each other: does structuring the search actually
-// beat just retrying against the compiler's own error output?
+// CONTROL — the flat baselines. One continuous CLI agent, one-shotting the
+// WHOLE theorem, no planner, no splitter, no minions, no top-level helper
+// lemmas, and — unlike every decomposition strategy above — no DECOMPOSE
+// escape hatch and no "too hard" stopping state. Exists so blueprint-
+// refinement strategies (Leak River/Ultra) have something to be compared
+// against besides each other: does structuring the search actually beat just
+// retrying against the compiler's own error output?
+//
+// Two tiers, one shared implementation (proveControl's `tier` param):
+//   I  — Leak IV only. Leak I search and Leak II interactive are both
+//        filtered out of the tool inventory even if connected.
+//   II — Leak IV + Leak I search (loogle/moogle). Still no Leak II — no
+//        interactive tactic-stepping, still no decomposition; the ONLY thing
+//        that changes between tiers is the tool surface.
 // ===========================================================================
 
-// Leak Control's entire prompt: the loop, the rules, the theorem. No search
-// tools exist in its world (mcpServers is filtered to Leak IV only before
-// this is called), so there is no SEARCH_USAGE_NOTE and no RESEARCH_MODE_NOTE
-// — that note's own "BREAK IT SMALLER and hand the pieces on" language is
-// exactly the decomposition instinct this strategy is built to NOT have.
+// Leak Control's entire prompt: the loop, the rules, the theorem, and — tier
+// II only — the SAME search-usage guidance every other search-capable
+// strategy renders (SEARCH_USAGE_NOTE), not a bespoke variant, so loogle/
+// moogle usage reads identically across strategies. No RESEARCH_MODE_NOTE at
+// either tier — that note's own "BREAK IT SMALLER and hand the pieces on"
+// language is exactly the decomposition instinct Control is built to NOT
+// have.
 // `lastAttempt`, when present, is { script, result } from the LAST
 // verify_full_script call of the IMMEDIATELY PRECEDING session — not an
 // accumulated history across every attempt so far. That distinction is
@@ -5718,12 +5734,15 @@ async function proveForce(theorem, ctx) {
 // dead-end ledger) would make this a refinement strategy by another name and
 // defeat the point of a flat one-shot control — so exactly one step of
 // memory, no more.
-function controlPrompt(theorem, mcpServers, attempt = 1, lastAttempt = null) {
+function controlPrompt(theorem, mcpServers, attempt = 1, lastAttempt = null, allowSearch = false) {
   const toolSection = mcpToolSection(mcpServers)
   const lastBlock = lastAttempt
     ? `\nYOUR MOST RECENT ATTEMPT (a previous session — different context, so this block is the ONLY thing carried forward; treat it as established fact about what was already tried, not something to re-derive):\n\`\`\`lean\n${String(lastAttempt.script || "").slice(0, 4000)}\n\`\`\`\nLeak IV's response to it:\n${String(lastAttempt.result || "").slice(0, 2500)}\n\nDo not just resubmit this unchanged. Either fix precisely what that error points at, or — if this exact spot has already failed before — switch to a genuinely different proof approach for the goal.\n`
     : ""
-  return `You are proving ONE Lean 4 + Mathlib theorem, one shot, in a single continuous session. There is no decomposition here — you do not write top-level helper lemmas, you do not split this into holes for another agent to fill, and there is no "too hard, hand it off" outcome. Your only tool is Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message). That text is your entire feedback loop.
+  const toolsLine = allowSearch
+    ? `Your tools are Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message) — and Leak I's loogle_search/moogle_search for library lookups. verify_full_script is still the ONLY thing that counts as progress; search only ever supports a submission, it does not replace one.`
+    : `Your only tool is Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message). That text is your entire feedback loop.`
+  return `You are proving ONE Lean 4 + Mathlib theorem, one shot, in a single continuous session. There is no decomposition here — you do not write top-level helper lemmas, you do not split this into holes for another agent to fill, and there is no "too hard, hand it off" outcome. ${toolsLine}
 
 ${toolSection}
 
@@ -5732,7 +5751,7 @@ THE LOOP:
 2. Call verify_full_script with it.
 3. If it fails, read the compiler's error CAREFULLY — the line and message tell you exactly what broke. Fix precisely that if you can localize it; otherwise try a genuinely different approach to the same goal. Resubmit.
 4. It only counts as done when verify_full_script reports success with ZERO 'sorry' anywhere in the script. A compile that still contains 'sorry' is not a stopping point — go back to step 1 on whatever is still sorried.
-
+${allowSearch ? `\n${SEARCH_USAGE_NOTE}\n` : ""}
 RULES:
 - No top-level 'theorem'/'lemma' other than the target itself. Any intermediate fact you need is a local 'have' INSIDE the one proof of the target.
 - Never conclude a goal is "too hard", "open", "beyond reach", or ask to decompose/split it — there is no one to hand it to here. A repeatedly-failing approach means try a DIFFERENT proof strategy for the same goal, not a smaller piece of it.
@@ -5743,6 +5762,8 @@ Theorem (its signature is immutable):
 ${theorem}`
 }
 
+const CONTROL_LABELS = { 1: "Leak Control I", 2: "Leak Control II" }
+
 // Loop-until-deadline across FRESH attempts (same shape as the architect
 // stages' own attempt loop): a single spawnProverStream call is one
 // continuous agent session, but if that session ends — the model stops
@@ -5751,25 +5772,31 @@ ${theorem}`
 // just quitting. Only a verified proof or deadlinePassed()/abort ends it.
 // The one thing that crosses the session boundary is lastAttempt — see
 // controlPrompt's header comment for why it's exactly one step, not more.
-async function proveControl(theorem, ctx) {
+async function proveControl(theorem, ctx, tier = 1) {
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   ctx.stage = "🎯"
   const sig = theoremSignature(theorem)
-  // Leak-IV-only tool inventory: whatever else the operator has connected
-  // (Leak I search, Leak II interactive), the control never sees it — one
-  // agent, one tool, matching the strategy's own name.
-  const verifyOnlyServers = (ctx.mcpServers || []).filter((s) => s?.url === ctx.verifyUrl)
+  const label = CONTROL_LABELS[tier] || CONTROL_LABELS[1]
+  const allowSearch = tier === 2
+  // Tier I: keep only whichever connected server resolveVerifyUrl picked
+  // (Leak IV). Tier II: keep everything EXCEPT the Pantograph server (Leak
+  // II) — i.e. Leak IV + Leak I search, whatever else is connected. Either
+  // way the interactive tactic-stepping tool never reaches this strategy.
+  const pantographUrl = resolvePantographUrl(ctx.mcpServers)
+  const allowedServers = allowSearch
+    ? (ctx.mcpServers || []).filter((s) => s?.url && s.url !== pantographUrl)
+    : (ctx.mcpServers || []).filter((s) => s?.url === ctx.verifyUrl)
   ctx.emit({
     type: "message-annotation",
     subtype: "status",
-    thought: "🎯 Leak Control: one continuous agent one-shots the whole theorem against Leak IV only — no decomposition, no other tools, no give-up state. It keeps resubmitting against the compiler's own error output until it verifies or the clock runs out.",
+    thought: `🎯 ${label}: one continuous agent one-shots the whole theorem against Leak IV${allowSearch ? " + Leak I search" : " only"} — no decomposition, no give-up state. It keeps resubmitting against the compiler's own error output until it verifies or the clock runs out.`,
   })
   let attempt = 0
   let lastAttempt = null // { script, result } from the previous session's LAST verify_full_script call
   while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
     attempt++
     if (attempt > 1)
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt} — fresh context, same theorem, same Leak IV gate${lastAttempt ? ", carrying forward the last attempt's final script + compiler response" : ""}.` })
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt} — fresh context, same theorem, same gate(s)${lastAttempt ? ", carrying forward the last attempt's final script + compiler response" : ""}.` })
     const gate = makeProofGate(theorem)
     // Passively track the LAST verify_full_script call this session made,
     // overwriting each time — only the most recent one survives to seed the
@@ -5778,8 +5805,8 @@ async function proveControl(theorem, ctx) {
     const pendingVerify = new Map()
     await spawnProverStream(
       {
-        prompt: controlPrompt(theorem, verifyOnlyServers, attempt, lastAttempt),
-        mcpServers: verifyOnlyServers,
+        prompt: controlPrompt(theorem, allowedServers, attempt, lastAttempt, allowSearch),
+        mcpServers: allowedServers,
         model: ctx.model,
         maxTurns: 0,
         timeoutMs: ctx.nodeTimeoutMs,
@@ -5787,7 +5814,7 @@ async function proveControl(theorem, ctx) {
         stage: "🎯",
         metrics: ctx.metrics,
         signal: ctx.signal,
-        searchBudget: 0,
+        searchBudget: ctx.searchBudget,
       },
       {
         onObject: (o) => {
@@ -5816,13 +5843,13 @@ async function proveControl(theorem, ctx) {
     if (gate.verifiedScript) {
       const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
       if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
-        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Control closed it on attempt ${attempt} — verified sorry-free against Leak IV.` })
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ ${label} closed it on attempt ${attempt} — verified sorry-free against Leak IV.` })
         return { verified: true, proof: gate.verifiedScript }
       }
     }
   }
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
-  ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 Leak Control ran out of clock after ${attempt} attempt(s) without a verified proof.` })
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 ${label} ran out of clock after ${attempt} attempt(s) without a verified proof.` })
   return { verified: false, proof: "" }
 }
 
@@ -10586,8 +10613,11 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             "\n\n=== HOLE-FILL (CAMPAIGN MINION, + opening pool hint) PROMPT ===\n" +
             surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
           : style === "control"
-          ? `[FLAT BASELINE — Leak Control (one continuous agent, one-shot, Leak IV only, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
+          ? `[FLAT BASELINE — Leak Control I (one continuous agent, one-shot, Leak IV only, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
             controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url === resolveVerifyUrl(mcpServers)))
+          : style === "control2"
+          ? `[FLAT BASELINE — Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
+            controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url && s.url !== resolvePantographUrl(mcpServers)), 1, null, true)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -10710,7 +10740,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "control") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "control" || style === "control2") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -10736,8 +10766,10 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                     : style === "forte"
                       ? await proveForte(theorem, ctx)
                       : style === "control"
-                        ? await proveControl(theorem, ctx)
-                        : await proveHaveFlat(theorem, ctx)
+                        ? await proveControl(theorem, ctx, 1)
+                        : style === "control2"
+                          ? await proveControl(theorem, ctx, 2)
+                          : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

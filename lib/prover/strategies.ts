@@ -48,17 +48,25 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     note: 'One agent, everything inside the proof as `have` steps; no top-level helper lemmas.',
   },
   {
-    // The flat baseline every blueprint-refinement strategy (River/Ultra)
+    // The flat baselines every blueprint-refinement strategy (River/Ultra)
     // should be measured against, not just against each other: one
-    // continuous agent, one-shotting the whole theorem, Leak IV as its ONLY
-    // tool (Leak I search and Leak II interactive stepping are filtered out
-    // bridge-side even if connected). No top-level lemmas, no DECOMPOSE
-    // escape hatch, no "too hard" stopping state — it keeps resubmitting
-    // fresh attempts against the compiler's own error output until it
-    // verifies or the run's wall clock ends it.
+    // continuous agent, one-shotting the whole theorem. No top-level lemmas,
+    // no DECOMPOSE escape hatch, no "too hard" stopping state — it keeps
+    // resubmitting fresh attempts against the compiler's own error output
+    // until it verifies or the run's wall clock ends it. I is Leak IV only;
+    // II (below) adds Leak I search — Leak II interactive stepping is
+    // filtered out bridge-side for both, even if connected.
     value: 'control-oneshot',
-    label: 'Leak Control (one continuous agent, one-shot, Leak IV only — no decomposition)',
+    label: 'Leak Control I (one continuous agent, one-shot, Leak IV only — no decomposition)',
     note: 'The flat baseline: one agent, one theorem, one tool (verify_full_script). No planner, no splitter, no minions, no top-level helper lemmas, and no decompose/give-up escape hatch — a repeatedly-failing approach means try something different, not split it. Loops fresh attempts until it verifies or the clock runs out.',
+  },
+  {
+    // Same shape as Control I, plus Leak I search (loogle/moogle) — isolates
+    // exactly one variable (does having a library search tool change the
+    // flat-baseline's results) rather than also reintroducing decomposition.
+    value: 'control-oneshot-2',
+    label: 'Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search — no decomposition)',
+    note: 'Control I plus Leak I search (loogle/moogle) — still one agent, one theorem, no decomposition, no give-up state. Isolates whether library search alone (without any structuring of the search itself) moves the needle versus Control I.',
   },
   {
     // value stays `have-tree` — renaming it would orphan saved checkpoints,
@@ -172,7 +180,8 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   sketch: 'Leak Sketch',
   brute: 'Leak Brute',
   have: 'Leak Have',
-  'control-oneshot': 'Leak Control',
+  'control-oneshot': 'Leak Control I',
+  'control-oneshot-2': 'Leak Control II',
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',

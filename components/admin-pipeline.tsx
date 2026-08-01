@@ -3339,7 +3339,10 @@ export function AdminPipeline() {
                   <option value="brute">Brute (automation only)</option>
                   <option value="have">Have (in-context, no top-level lemmas)</option>
                   <option value="control-oneshot">
-                    Leak Control (one continuous agent, one-shot, Leak IV only — no decomposition)
+                    Leak Control I (one continuous agent, one-shot, Leak IV only — no decomposition)
+                  </option>
+                  <option value="control-oneshot-2">
+                    Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search — no decomposition)
                   </option>
                   {/* value stays `have-tree` — renaming it would orphan saved
                       checkpoints, queued items and every existing research row. */}
