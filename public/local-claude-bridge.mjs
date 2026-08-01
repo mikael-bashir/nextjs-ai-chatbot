@@ -167,6 +167,26 @@ const PROVER_DISALLOWED_TOOLS = ["WebSearch", "WebFetch"]
 // filesystem for it, burning turns on a pure derailment with zero proof
 // value. Stronghold's PROVER_DISALLOWED_TOOLS above is unaffected.
 const ARCHITECT_DISALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "WebSearch", "WebFetch"]
+// The CONTROLS are the strictest of all, and for a reason that is about the
+// EXPERIMENT rather than about proving. Control I's whole identity is "one
+// agent, one theorem, one tool — Leak IV's verify_full_script"; Control II adds
+// Leak I search and nothing else. Every number those arms produce is only
+// meaningful if that is literally true.
+//
+// It was not. Observed live on fatex_006: Control I hit an unknown constant,
+// ran `find / -iname "Sylow.lean"`, discovered the operator's own Mathlib
+// checkouts, and spent the next six minutes grepping and Reading
+// ~/loogle/.lake/packages/mathlib source. That is (a) a capability the arm is
+// DEFINED not to have — strictly stronger than the Leak I search that is
+// supposed to be Control II's only advantage over Control I, collapsing the
+// one variable those two arms isolate — and (b) unsound, because that checkout
+// is a DIFFERENT Mathlib from the one Leak IV compiles against, so names read
+// there may not exist in the verifier at all.
+//
+// Note this is deliberately NOT applied to the Stronghold family, whose
+// PROVER_DISALLOWED_TOOLS keeps Bash on the stated grounds that numeric
+// witness-finding is real proof work. Changing that would change those arms.
+const CONTROL_DISALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "NotebookEdit", "WebSearch", "WebFetch"]
 
 function buildArgs(prompt, options = {}) {
   const args = ["-p", String(prompt), "--output-format", "json"]
@@ -6085,6 +6105,9 @@ async function proveControl(theorem, ctx, tier = 1) {
         metrics: ctx.metrics,
         signal: ctx.signal,
         searchBudget: ctx.searchBudget,
+        // Enforced by the CLI, not by the prompt. Telling a control "your only
+        // tool is verify_full_script" is a request; --disallowedTools is a wall.
+        disallowedTools: CONTROL_DISALLOWED_TOOLS,
       },
       {
         onObject: (o) => {
