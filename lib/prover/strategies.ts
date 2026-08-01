@@ -133,6 +133,17 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
       'Leak Stronghold Keep (flat first, bounded gated siege, guaranteed flat finisher)',
     note: "Surround's planner, parallel minion queue and assembler, unchanged — but the shared clock is split three ways so decomposition can never consume the endgame. Phase 1 VANGUARD (~35%): one agent attacks the WHOLE theorem flat, with the full tool surface; a problem that yields to a single unfragmented context is taken there and never decomposed. Phase 2 SIEGE (~40%): Surround's queue, seeded with the vanguard's last compiled script and the compiler's verdict on it, and gated by a progress check that rejects a proposed cut whose child restates its parent or an ancestor up to bound-variable renaming (a vacuous cut type-checks, so the structural gate alone waves it through and the run then re-proves the goal it started with). Phase 3 KEEP (the guaranteed remainder, plus any clock extension): the flat prover again on the whole theorem, handed the partially filled skeleton and every minion's scratch notes. Requires the ghost-army Leak II.",
   },
+  {
+    // Same Surround core as Keep, but the change is upstream of the planner
+    // rather than around it: the bridge sweeps the goal with `apply?` + the
+    // ghost army FIRST and hands the planner measured evidence. Kept as a
+    // separate arm from Keep so the two changes (clock discipline vs. planning
+    // input) stay independently attributable.
+    value: 'stronghold-impenetrable',
+    label:
+      'Leak Stronghold Impenetrable (apply?-driven recon sweep, then Surround)',
+    note: "Before the planner sees the theorem, the bridge runs a breadth-first reconnaissance sweep on the ghost army: it opens the goal as a live state, asks `apply?` (via Leak IV) which Mathlib theorems unify with it, races those plus a standard tactic portfolio against the state with branch_tactics, and expands EVERY state that advanced — mapping the neighbourhood rather than tunnelling down one line (default \u22643 levels, \u226424 states, \u22644 min). The planner is then briefed with what actually moved each goal, which theorems `apply?` named (their hypotheses are a decomposition that composes by construction), and which states resisted everything \u2014 the last being where the proof is genuinely hard. The briefing is framed as evidence, not a proposal, and the planner is told to decide fast, because the mechanical exploration is already done and its scarce resource is judgement. Downstream is Surround unchanged, with the progress gate on. Fail-soft: no Pantograph, an unreadable proposition, or a Leak IV without the suggestion patch each degrade it toward plain Surround. Requires the ghost-army Leak II; `apply?` harvesting additionally needs the Leak IV severity-3 suggestion patch deployed.",
+  },
 ];
 
 // The Leak River variants — each an ablation of the previous one.
@@ -199,6 +210,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   'stronghold-force': 'Leak Stronghold Force',
   'stronghold-forte': 'Leak Stronghold Forte',
   'stronghold-keep': 'Leak Stronghold Keep',
+  'stronghold-impenetrable': 'Leak Stronghold Impenetrable',
 };
 
 export function enforcerLabelFor(strategy: string): string {
@@ -289,7 +301,8 @@ export function benchmarkBudgetFor(strategy: string): {
     strategy === 'finality-1' ||
     strategy === 'stronghold-force' ||
     strategy === 'stronghold-forte' ||
-    strategy === 'stronghold-keep'
+    strategy === 'stronghold-keep' ||
+    strategy === 'stronghold-impenetrable'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }

@@ -297,6 +297,10 @@ export function ProverPlayground() {
                 Leak Stronghold Keep (flat first, bounded gated siege, guaranteed
                 flat finisher)
               </option>
+              <option value="stronghold-impenetrable">
+                Leak Stronghold Impenetrable (apply?-driven recon sweep, then
+                Surround)
+              </option>
               <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
                 <option value="ultra-fleeting">
                   Leak Ultra Fleeting (model from the selector)

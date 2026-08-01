@@ -3365,6 +3365,10 @@ export function AdminPipeline() {
                     Leak Stronghold Keep (flat first, bounded gated siege,
                     guaranteed flat finisher)
                   </option>
+                  <option value="stronghold-impenetrable">
+                    Leak Stronghold Impenetrable (apply?-driven recon sweep, then
+                    Surround)
+                  </option>
                   <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
                     {RIVER_STRATEGIES.map((s) => (
                       <option key={s.value} value={s.value}>

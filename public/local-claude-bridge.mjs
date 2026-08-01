@@ -2221,6 +2221,20 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "keep",
   },
+  // Leak Stronghold Impenetrable: Surround, but the planner is briefed by a
+  // breadth-first machine reconnaissance sweep first — `apply?` names the
+  // Mathlib theorems that unify with each goal, the ghost army measures which
+  // tactics actually move it, and the planner gets evidence instead of a cold
+  // reading. Fail-soft: no Pantograph / unreadable proposition / un-patched
+  // Leak IV each degrade it back toward plain Surround. See
+  // proveStrongholdImpenetrable.
+  "stronghold-impenetrable": {
+    label: "Leak Stronghold Impenetrable — apply?-driven recon sweep, then Surround",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => surroundHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "impenetrable",
+  },
   // ---- Leak River family -----------------------------------------------------
   // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
   // isolated node provers -> global blueprint refinement, on the real
@@ -6748,6 +6762,362 @@ async function proveStrongholdKeep(theorem, ctx) {
 }
 
 // ===========================================================================
+// LEAK STRONGHOLD IMPENETRABLE — Surround, planned from machine reconnaissance.
+// ---------------------------------------------------------------------------
+// The premise: Stronghold's planner is asked to invent a decomposition from a
+// cold reading of the statement, which is the one thing an LLM is WORST at, and
+// it gets exactly one sample. Meanwhile the ghost army can try a tactic on a
+// snapshotted state for a few hundred milliseconds — elaboration, not search, is
+// >99% of the cost (Shen & Shi, arXiv 2605.25556) — and `apply?` will name the
+// Mathlib theorems whose CONCLUSION unifies with the goal. So before the planner
+// says a word, the bridge runs a breadth-first reconnaissance sweep:
+//
+//   root = init_proof(theorem)
+//   repeat, breadth-first, until a depth/node/time cap:
+//     for every state on the frontier:
+//       ask `apply?` (via Leak IV) which Mathlib theorems close this goal
+//       branch_tactics(state, [those suggestions] ++ [a fixed portfolio])
+//       every tactic that advanced becomes a child state on the next frontier
+//
+// This is expansion, not descent: every frontier state is expanded at each
+// level, so the sweep maps the neighbourhood instead of tunnelling down one
+// line. What comes back is empirical rather than imagined — which tactics
+// actually move this goal, which sub-goals a real Mathlib theorem reduces it
+// to, and (occasionally) a closed proof found by nothing but the portfolio.
+//
+// Two properties worth stating:
+//   • `apply?`-derived cuts COMPOSE BY CONSTRUCTION. Unification found a
+//     theorem whose conclusion is the goal, so its hypotheses are a valid
+//     decomposition and the closing step is the application itself. There is no
+//     vacuous-cut failure mode available to it.
+//   • The sweep is a difficulty probe. A hole that four tactics close in 200ms
+//     is not where the proof is hard; a frontier state nothing moves is. That
+//     is the signal the planner has never had.
+//
+// FAIL-SOFT BY CONSTRUCTION. Every stage degrades instead of breaking: no
+// Pantograph ⇒ no sweep; a proposition that will not elaborate ⇒ no sweep; a
+// Leak IV that predates the suggestion patch ⇒ no `apply?` names, portfolio
+// only. In the worst case Impenetrable is exactly Surround with the progress
+// gate on, which is the floor it is designed to have.
+//
+// NOTE: harvesting `apply?` requires the Leak IV change that surfaces
+// severity-3 ("Try this: …") diagnostics behind a [[LEAK_SUGGESTIONS]] marker.
+// Until that Space is redeployed the sweep still runs — it just plans from the
+// fixed portfolio alone.
+// ===========================================================================
+
+const IMPEN_RECON_MS = Number(process.env.LEAK_IMPEN_RECON_MS || 4 * 60000)
+const IMPEN_RECON_DEPTH = Number(process.env.LEAK_IMPEN_RECON_DEPTH || 3)
+const IMPEN_RECON_NODES = Number(process.env.LEAK_IMPEN_RECON_NODES || 24)
+const IMPEN_RECON_BREADTH = Number(process.env.LEAK_IMPEN_RECON_BREADTH || 5)
+const IMPEN_RECON_SUGGEST = Number(process.env.LEAK_IMPEN_RECON_SUGGEST || 4)
+
+// Cheap, high-yield, and safe under Pantograph (single tactic, no `;`-chains,
+// which it rejects). Ordered so the fast decisive ones run first — the sweep is
+// serial inside one Leak II worker, so ordering is the cost control.
+const IMPEN_BASE_TACTICS = [
+  "exact?",
+  "simp_all",
+  "omega",
+  "norm_num",
+  "positivity",
+  "ring",
+  "field_simp",
+  "linarith",
+  "aesop",
+  "constructor",
+  "intro",
+  "ext",
+]
+
+// `theorem f (a : α) (h : P a) : Q a := by …`  ⟶  `∀ (a : α) (h : P a), Q a`,
+// i.e. the CLOSED proposition init_proof wants. Returns null when the shape is
+// not confidently readable — the sweep is skipped rather than run on a guess.
+function theoremProposition(src) {
+  const m = String(src || "").match(/\b(?:theorem|lemma)\s+[^\s({[:]+([\s\S]*?)(?=:=)/)
+  if (!m) return null
+  const rest = m[1]
+  let depth = 0
+  let cut = -1
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === "(" || c === "{" || c === "[" || c === "⦃") depth++
+    else if (c === ")" || c === "}" || c === "]" || c === "⦄") depth--
+    else if (c === ":" && depth === 0) {
+      cut = i
+      break
+    }
+  }
+  if (cut < 0) return null
+  const binders = rest.slice(0, cut).trim()
+  const goal = rest.slice(cut + 1).trim()
+  if (!goal) return null
+  return binders ? `∀ ${binders}, ${goal}` : goal
+}
+
+// A Pantograph goal block —
+//   n : ℕ
+//   h : P n
+//   ⊢ Q n
+// — rendered as a standalone `example` we can ask `apply?` about on Leak IV.
+// Returns null on anything we cannot rebuild faithfully: inaccessible names
+// (`n✝`) cannot be written as binders, and a goal we cannot restate is one we
+// must not fabricate.
+function goalToExample(goalText, tacticSuffix) {
+  const block = String(goalText || "").split(/\n\s*\n/)[0] || ""
+  if (!block.includes("⊢")) return null
+  if (block.includes("✝")) return null
+  const lines = block.split("\n").map((l) => l.trim()).filter(Boolean)
+  const binders = []
+  let goal = ""
+  for (const l of lines) {
+    if (l.startsWith("⊢")) {
+      goal = l.replace(/^⊢\s*/, "").trim()
+      continue
+    }
+    const h = l.match(/^([^:]+):(.+)$/)
+    if (!h) return null
+    const names = h[1].trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_'✝ₙ₀-₉]*(\s+[A-Za-z_][A-Za-z0-9_'ₙ₀-₉]*)*$/.test(names)) return null
+    binders.push(`(${names} : ${h[2].trim()})`)
+  }
+  if (!goal) return null
+  return `example ${binders.join(" ")} : ${goal} := by ${tacticSuffix}`
+}
+
+// Ask Leak IV which Mathlib theorems unify with this goal. Returns the tactics
+// it suggested (`Try this: exact foo bar` ⟶ `exact foo bar`). Empty on any
+// failure, including a Leak IV that does not yet emit [[LEAK_SUGGESTIONS]].
+async function harvestApplySuggestions(goalText, ctx) {
+  const script = goalToExample(goalText, "apply?")
+  if (!script || !ctx.verifyUrl) return []
+  let text = ""
+  try {
+    const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: Math.min(ctx.verifyTimeoutMs || 120000, 90000) })
+    text = v.ok ? v.text : ""
+  } catch {
+    return []
+  }
+  const block = String(text || "").split("[[LEAK_SUGGESTIONS]]")[1]
+  if (!block) return []
+  const out = []
+  const seen = new Set()
+  for (const line of block.split("\n")) {
+    const m = line.match(/Try this:\s*(.+?)\s*$/i)
+    if (!m) continue
+    const tac = m[1].trim()
+    // `exact?` sometimes reports a term; only keep things that read as tactics.
+    if (!tac || tac.length > 300 || seen.has(tac)) continue
+    seen.add(tac)
+    out.push(tac)
+    if (out.length >= IMPEN_RECON_SUGGEST) break
+  }
+  return out
+}
+
+// Parse one branch_tactics reply into per-candidate outcomes.
+function parseBranchResults(text) {
+  const out = []
+  const src = String(text || "")
+  const re = /^\[(\d+)\]\s*(✅|❌)\s*([\s\S]*?)\s*→\s*([\s\S]*?)$/gm
+  let m
+  while ((m = re.exec(src)) !== null) {
+    const ok = m[2] === "✅"
+    const tactic = m[3].trim()
+    const tail = m[4]
+    const done = /PROOF COMPLETE/i.test(tail)
+    const id = (tail.match(/New State ID:\s*(\S+)/) || [])[1] || null
+    // The goals for this candidate run from just after its header to the next
+    // `[n]` header (or the trailing summary line).
+    const after = src.slice(re.lastIndex)
+    const goalsRaw = (after.match(/^\s*Goals:\s*\n([\s\S]*?)(?=\n\[\d+\]|\n\d+\/\d+ candidates|$)/) || [])[1] || ""
+    out.push({ ok, tactic, done, id, goals: goalsRaw.trim() })
+  }
+  return out
+}
+
+// The breadth-first sweep itself.
+async function reconSweep(theorem, ctx) {
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  const empty = { ran: false, closed: null, levels: [], suggestions: [], expanded: 0, dead: [] }
+  if (!pantoUrl) return empty
+  const prop = theoremProposition(theorem)
+  if (!prop) return empty
+
+  const t0 = Date.now()
+  const overBudget = () =>
+    Date.now() - t0 > IMPEN_RECON_MS || ctx.signal?.aborted || deadlinePassed(ctx)
+
+  let root
+  try {
+    root = await callRemoteMcpTool(pantoUrl, "init_proof", { proposition: prop }, { timeoutMs: 120000 })
+  } catch {
+    return empty
+  }
+  const rootId = root?.ok ? (String(root.text || "").match(/State ID:\s*(\S+)/) || [])[1] : null
+  if (!rootId) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: "🔭 Recon skipped — the theorem's proposition did not open as a live state." })
+    return empty
+  }
+  const rootGoals = String(root.text || "").split(/Current Goal\(s\):/)[1]?.trim() || ""
+
+  const levels = []
+  const allSuggestions = []
+  const deadTactics = new Map() // tactic -> failures
+  let expanded = 0
+  let frontier = [{ id: rootId, goals: rootGoals, path: [] }]
+
+  for (let depth = 0; depth < IMPEN_RECON_DEPTH && frontier.length && !overBudget(); depth++) {
+    const next = []
+    const levelRows = []
+    for (const node of frontier) {
+      if (overBudget() || expanded >= IMPEN_RECON_NODES) break
+      const suggestions = await harvestApplySuggestions(node.goals, ctx)
+      if (suggestions.length) allSuggestions.push(...suggestions)
+      const candidates = [...suggestions, ...IMPEN_BASE_TACTICS]
+      let res
+      try {
+        res = await callRemoteMcpTool(pantoUrl, "branch_tactics", { state_id: node.id, tactics: candidates }, { timeoutMs: 300000 })
+      } catch {
+        continue
+      }
+      expanded++
+      const parsed = parseBranchResults(res?.ok ? res.text : "")
+      for (const p of parsed) if (!p.ok) deadTactics.set(p.tactic, (deadTactics.get(p.tactic) || 0) + 1)
+
+      const finished = parsed.find((p) => p.ok && p.done)
+      if (finished) {
+        // The portfolio closed this state outright. If it is the ROOT, that is
+        // a whole proof; the caller re-verifies it on Leak IV before believing.
+        const path = [...node.path, finished.tactic]
+        levelRows.push({ ...node, hits: parsed.filter((p) => p.ok), closedBy: path })
+        levels.push({ depth, rows: levelRows })
+        return { ran: true, closed: { path, atDepth: depth, isRoot: depth === 0 && node.id === rootId }, levels, suggestions: allSuggestions, expanded, dead: [...deadTactics.entries()] , prop }
+      }
+
+      const hits = parsed.filter((p) => p.ok && p.id && p.goals)
+      levelRows.push({ ...node, hits })
+      // Keep the most INFORMATIVE children: distinct goal states, widest first.
+      const seenGoal = new Set()
+      for (const h of hits) {
+        const key = h.goals.replace(/\s+/g, " ").slice(0, 400)
+        if (seenGoal.has(key)) continue
+        seenGoal.add(key)
+        next.push({ id: h.id, goals: h.goals, path: [...node.path, h.tactic] })
+      }
+    }
+    if (levelRows.length) levels.push({ depth, rows: levelRows })
+    frontier = next.slice(0, IMPEN_RECON_BREADTH)
+  }
+  return { ran: true, closed: null, levels, suggestions: allSuggestions, expanded, dead: [...deadTactics.entries()], prop }
+}
+
+// Render the sweep as a BRIEFING. Written to inform without anchoring: it
+// reports what the machine measured and explicitly refuses to recommend a plan,
+// because a planner handed a plan stops planning.
+function reconBriefing(recon) {
+  if (!recon?.ran) return ""
+  const parts = []
+  parts.push(
+    "MACHINE RECONNAISSANCE (already done — it cost you nothing, and it is EVIDENCE, not a proposal).",
+    `A breadth-first sweep expanded ${recon.expanded} live goal state(s) on the interactive prover, trying \`apply?\`-suggested Mathlib theorems and a standard tactic portfolio against each, and recording what actually moved.`,
+  )
+  const uniqSug = [...new Set(recon.suggestions)]
+  if (uniqSug.length) {
+    parts.push(
+      "MATHLIB THEOREMS WHOSE CONCLUSION UNIFIES WITH A GOAL IN THIS PROOF (from `apply?` — these are real, they type-check against the goal, and their own hypotheses are a ready-made decomposition):\n" +
+        uniqSug.map((s) => `  • ${s}`).join("\n"),
+    )
+  }
+  for (const lvl of recon.levels) {
+    const rows = []
+    for (const r of lvl.rows) {
+      const moved = (r.hits || []).map((h) => h.tactic)
+      const goal = String(r.goals || "").split("\n").filter((l) => l.trim().startsWith("⊢"))[0] || String(r.goals || "").split("\n")[0] || ""
+      rows.push(
+        `  state${r.path?.length ? ` after [${r.path.join(" ; ")}]` : " (the theorem itself)"}: ${oneLine(goal)}\n` +
+          `    advanced by: ${moved.length ? moved.map((t) => `\`${t}\``).join(", ") : "NOTHING in the portfolio"}`,
+      )
+    }
+    if (rows.length) parts.push(`DEPTH ${lvl.depth}:\n${rows.join("\n")}`)
+  }
+  const stubborn = recon.levels.flatMap((l) => l.rows.filter((r) => !(r.hits || []).length))
+  if (stubborn.length)
+    parts.push(
+      `${stubborn.length} state(s) resisted EVERY tactic tried. Those are where this proof is actually hard — a decomposition that does not address them has not decomposed anything.`,
+    )
+  return parts.join("\n\n")
+}
+
+// The plan note. Two jobs beyond delivering the briefing: keep the planner from
+// anchoring on the sweep, and keep it from deliberating. Both are stated as
+// where Impenetrable's advantage comes from, because a planner told WHY a
+// constraint exists honours it better than one merely told to obey.
+function impenetrablePlanNote(recon) {
+  const briefing = reconBriefing(recon)
+  if (!briefing) return ""
+  return `${briefing}
+
+HOW TO USE THE ABOVE — read it once, then think for yourself:
+- It is a map of the neighbourhood, NOT a proposal and NOT a ranking. It shows what cheap machinery can and cannot do; it says nothing about what the RIGHT argument is. Do not build your skeleton by stitching these tactics together.
+- The parts it closed instantly are, by definition, NOT where the difficulty is. Do not spend holes on them — close them inline.
+- The states nothing moved are the real content of this theorem. Your holes belong there.
+- A theorem \`apply?\` found is worth more than a tactic it found: applying it turns its hypotheses into your holes, and the closing step is the application itself, so that cut is guaranteed to compose.
+- If the sweep suggests nothing useful, ignore it entirely. It is a probe, not an authority, and it is blind to any argument requiring an idea.
+
+PACE — this is where Impenetrable wins or loses. The mechanical exploration has ALREADY been done for you; that is the entire point of the sweep. So your scarce resource is not exploration, it is JUDGEMENT — the one call the machine cannot make: where does this argument actually break? Make that call quickly and commit. A decent skeleton delivered in three minutes is worth far more than a perfect one in twenty, because every minute you deliberate is a minute taken from the minions who have to fill your holes and the finisher who has to close whatever they leave. Decide, compile the skeleton, hand it over.`
+}
+
+async function proveStrongholdImpenetrable(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🔭"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🔭 Stronghold Impenetrable — reconnaissance: breadth-first \`apply?\`-driven sweep over the ghost army (≤${IMPEN_RECON_DEPTH} levels, ≤${IMPEN_RECON_NODES} states, ≤${Math.round(IMPEN_RECON_MS / 60000)} min) before the planner sees anything.`,
+  })
+
+  let recon = { ran: false }
+  try {
+    recon = await reconSweep(theorem, ctx)
+  } catch (e) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `🔭 Recon aborted (${oneLine(e?.message || e)}) — planning without it.` })
+  }
+
+  // The sweep occasionally just closes the theorem. Never trust it on its own
+  // word: rebuild the script and put it through the same independent Leak IV
+  // gate every other proof goes through.
+  if (recon?.closed?.isRoot && recon.prop) {
+    const script = `theorem ${declName(theoremSignature(theorem)) || "recon_proof"}_recon : ${recon.prop} := by\n  ${recon.closed.path.join("\n  ")}`
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔭 The sweep CLOSED the goal with [${recon.closed.path.join(" ; ")}] — re-verifying independently.` })
+    const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text))) {
+      // It proves the PROPOSITION, not necessarily the target's exact signature,
+      // so hand it to the planner as a gift rather than claiming the run.
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Recon's closing tactic sequence verified — handing it to the planner as a proven opening." })
+      recon.verifiedOpening = script
+    }
+  }
+
+  if (recon?.ran)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🔭 Recon done — ${recon.expanded} state(s) expanded, ${[...new Set(recon.suggestions || [])].length} \`apply?\` theorem(s) harvested. Planning from evidence.`,
+    })
+
+  const note = [
+    impenetrablePlanNote(recon),
+    recon?.verifiedOpening ? "AN ALREADY-VERIFIED OPENING (compiles today, use it if it helps):\n```lean\n" + recon.verifiedOpening + "\n```" : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+
+  // Everything downstream is Surround, unchanged, with the progress gate on.
+  return proveHaveSurround(theorem, ctx, { planNote: note, cutGate: true })
+}
+
+// ===========================================================================
 // ARCHITECT — Goedel-Architect pipeline (arXiv 2606.06468), style: "architect"
 // ---------------------------------------------------------------------------
 // Faithful replication of the paper's three-stage loop on the Leak stack:
@@ -10915,6 +11285,11 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
             "\n\n=== HOLE-FILL (CAMPAIGN MINION, + opening pool hint) PROMPT ===\n" +
             surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
+          : style === "impenetrable"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Impenetrable (breadth-first apply?-driven recon sweep: <=${IMPEN_RECON_DEPTH} levels, <=${IMPEN_RECON_NODES} states, <=${Math.round(IMPEN_RECON_MS / 60000)} min, then Surround with the progress gate on) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (briefed by the recon sweep) ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers, impenetrablePlanNote({ ran: true, expanded: 0, levels: [], suggestions: [] })) +
+            "\n\n=== HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the verified skeleton>", "hN", mcpServers)
           : style === "keep"
           ? `[DECOMPOSITION MODE — Leak Stronghold Keep (phase 1 flat vanguard ~${Math.round(KEEP_VANGUARD_FRAC * 100)}% of the clock · phase 2 gated Surround siege ~${Math.round(KEEP_SIEGE_FRAC * 100)}% · phase 3 flat finisher on the guaranteed remainder) · strategy: ${strategy}]\n\n=== PHASE 1 VANGUARD / PHASE 3 KEEP PROMPT (flat, whole theorem) ===\n` +
             haveProvePrompt(theorem, mcpServers) +
@@ -11050,7 +11425,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "control" || style === "control2") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "impenetrable" || style === "control" || style === "control2") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -11077,11 +11452,13 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                       ? await proveForte(theorem, ctx)
                       : style === "keep"
                         ? await proveStrongholdKeep(theorem, ctx)
-                        : style === "control"
-                          ? await proveControl(theorem, ctx, 1)
-                          : style === "control2"
-                            ? await proveControl(theorem, ctx, 2)
-                            : await proveHaveFlat(theorem, ctx)
+                        : style === "impenetrable"
+                          ? await proveStrongholdImpenetrable(theorem, ctx)
+                          : style === "control"
+                            ? await proveControl(theorem, ctx, 1)
+                            : style === "control2"
+                              ? await proveControl(theorem, ctx, 2)
+                              : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof
