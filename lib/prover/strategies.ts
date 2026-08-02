@@ -289,12 +289,26 @@ export function benchmarkBudgetFor(strategy: string): {
     };
   }
   // Leak Stronghold Dark (and its parallel-minion variant Surround, their
-  // refinement-loop child Finality I, the dedicated-decomposer Force, and
-  // Force's reliable-handoff descendant Forte) is the direct capability
-  // comparison against Leak Ultra (same isolated-decomposition shape,
-  // different driver) — deliberately pinned to the SAME constant, not just
-  // the same value, so none of them can drift out of sync if that budget
-  // changes later.
+  // refinement-loop child Finality I, the dedicated-decomposer Force,
+  // Force's reliable-handoff descendant Forte, and the Keep/Impenetrable
+  // arms) is the direct capability comparison against Leak Ultra (same
+  // isolated-decomposition shape, different driver) — deliberately pinned to
+  // the SAME constant, not just the same value, so none of them can drift out
+  // of sync if that budget changes later.
+  //
+  // The CONTROLS belong here too, and their absence was a fall-through bug
+  // rather than a decision: they matched neither this list nor the architect
+  // branch, so they landed on BENCHMARK_TREE_BUDGET_MS and had been running
+  // every benchmark item on HALF the clock of the arms they are the baseline
+  // for. A baseline on a different clock measures the clock, not the
+  // strategy. (River is the one deliberate 30-minute holdout — its four
+  // variants are an ablation ladder whose rows are only comparable to each
+  // other, and moving it would invalidate that table.)
+  //
+  // Effect on rows already recorded: a control PROOF at 30 minutes is still a
+  // proof, so those stand. Control FAILURES recorded under this bug were
+  // half-budget failures and should not be read as 60-minute failures — re-run
+  // them before they go in any comparison.
   if (
     strategy === 'have-tree' ||
     strategy === 'have-surround' ||
@@ -302,7 +316,9 @@ export function benchmarkBudgetFor(strategy: string): {
     strategy === 'stronghold-force' ||
     strategy === 'stronghold-forte' ||
     strategy === 'stronghold-keep' ||
-    strategy === 'stronghold-impenetrable'
+    strategy === 'stronghold-impenetrable' ||
+    strategy === 'control-oneshot' ||
+    strategy === 'control-oneshot-2'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }
