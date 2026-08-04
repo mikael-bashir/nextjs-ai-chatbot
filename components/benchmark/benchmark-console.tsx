@@ -72,6 +72,13 @@ const STRATEGY_GROUPS: { label: string; options: { value: string; label: string 
 // specific problem.
 const MAX_ATTEMPTS = 2;
 
+// Upper bound on parallel workers. Each worker is a full prover attempt on the
+// shared bridge (its own claude processes, its own Leak IV verifies), so the
+// cap is where the bridge and the Claude Max quota stay comfortable — not
+// where the queue math breaks: claims are row-locked server-side
+// (FOR UPDATE SKIP LOCKED), so any worker count is race-free.
+const MAX_PARALLEL = 4;
+
 // Detect Claude's usage/session-limit message so the loop pauses (never scores
 // the current item) instead of mis-marking it a prover failure — same
 // heuristic as admin-pipeline.tsx's detectSessionLimit.
@@ -129,6 +136,13 @@ interface RunRow {
   unsolved: number;
   skipped: number;
   costUsd: number;
+}
+
+// One parallel worker's console state, keyed by slot index. Kept after the
+// pass ends so the last log of each worker stays readable.
+interface WorkerSlot {
+  problemId: string | null;
+  events: ProverEvent[];
 }
 
 interface ItemRow {
@@ -345,12 +359,23 @@ export function BenchmarkConsole() {
   const [poolPicked, setPoolPicked] = useState<Set<string>>(new Set());
   const [adding, setAdding] = useState(false);
 
-  const [events, setEvents] = useState<ProverEvent[]>([]);
+  const [slots, setSlots] = useState<Record<number, WorkerSlot>>({});
   const [running, setRunning] = useState(false);
   const [pauseMessage, setPauseMessage] = useState<string | null>(null);
-  const [currentProblemId, setCurrentProblemId] = useState<string | null>(null);
+  const [parallel, setParallel] = useState(1);
   const stopRef = useRef(false);
-  const abortRef = useRef<AbortController | null>(null);
+  const abortsRef = useRef<Map<number, AbortController>>(new Map());
+
+  // Remember the worker count across visits — a time-boxed benchmark night
+  // shouldn't have to re-pick it every session. Read in an effect (not the
+  // useState initializer) so SSR and the first client render agree.
+  useEffect(() => {
+    const v = Number(window.localStorage.getItem('benchmark:parallel'));
+    if (Number.isInteger(v) && v >= 1 && v <= MAX_PARALLEL) setParallel(v);
+  }, []);
+  useEffect(() => {
+    window.localStorage.setItem('benchmark:parallel', String(parallel));
+  }, [parallel]);
 
   const loadRuns = useCallback(async () => {
     const res = await fetch('/api/admin/benchmark');
@@ -517,14 +542,18 @@ export function BenchmarkConsole() {
     [selected, patchItem, loadRun, loadRuns],
   );
 
-  // The resumable loop: claim the next pending problem, prove it on the
-  // admin's connected bridge, persist the outcome AND a research row, repeat.
+  // The resumable loop, now N workers wide: each worker independently claims
+  // the next pending problem, proves it on the admin's connected bridge,
+  // persists the outcome AND a research row, and claims again — so up to N
+  // problems are in flight at once. The claim is row-locked server-side
+  // (FOR UPDATE SKIP LOCKED), so two workers can never grab the same item.
   //
-  // Failures are triaged (see isCatastrophic): a quota/connectivity failure
-  // pauses the whole loop and hands the claim back unscored, so a flat battery
-  // never scores 60 problems as misses. A failure specific to this problem is
-  // retried once and then SKIPPED, so one pathological statement cannot stall
-  // an overnight pass.
+  // Failure triage is unchanged (see isCatastrophic), but in parallel a
+  // quota/connectivity failure pauses EVERY worker: the one that hit it flips
+  // stopRef and aborts its siblings, and each in-flight claim is handed back
+  // unscored — a flat battery still never scores problems as misses. A failure
+  // specific to one problem is retried once and then SKIPPED by that worker
+  // alone; the others never notice.
   const runLoop = useCallback(async () => {
     if (!selected) return;
     const run = runs?.find((r) => r.id === selected);
@@ -536,37 +565,52 @@ export function BenchmarkConsole() {
       computeBudgetMs: run.computeBudgetMs ?? undefined,
       maxIters: run.maxIters ?? undefined,
     };
+    const workerCount = Math.min(Math.max(parallel, 1), MAX_PARALLEL);
 
     stopRef.current = false;
     setRunning(true);
     setPauseMessage(null);
-    try {
-      const mcpServers: ProverMcpServer[] = await fetchProverMcpServers();
+    setSlots({});
+
+    const setSlot = (slot: number, update: (prev: WorkerSlot) => WorkerSlot) =>
+      setSlots((prev) => ({
+        ...prev,
+        [slot]: update(prev[slot] ?? { problemId: null, events: [] }),
+      }));
+
+    // Abort every OTHER worker's in-flight attempt. stopRef is already true by
+    // the time this is called, so each sibling's catch releases its claim
+    // unscored rather than retrying or skipping it.
+    const abortSiblings = (except: number) => {
+      for (const [slot, ctrl] of abortsRef.current) {
+        if (slot !== except) ctrl.abort();
+      }
+    };
+
+    const worker = async (slot: number, mcpServers: ProverMcpServer[]) => {
       while (!stopRef.current) {
         const claimRes = await fetch(`/api/admin/benchmark/${selected}/claim`, {
           method: 'POST',
-        });
-        if (!claimRes.ok) {
-          setPauseMessage('Could not reach the benchmark API — paused.');
+        }).catch(() => null);
+        if (!claimRes?.ok) {
+          setPauseMessage(
+            (prev) => prev ?? 'Could not reach the benchmark API — paused.',
+          );
           break;
         }
         const { item } = (await claimRes.json()) as { item: ItemRow | null };
-        if (!item) {
-          setPauseMessage(null);
-          break; // run complete
-        }
-        setCurrentProblemId(item.problemId);
-        setEvents([]);
+        if (!item) break; // queue drained — this worker is done
+        setSlot(slot, () => ({ problemId: item.problemId, events: [] }));
         let content = '';
         let metrics: ProverOutcome['metrics'];
         const ctrl = new AbortController();
-        abortRef.current = ctrl;
+        abortsRef.current.set(slot, ctrl);
 
         // Safety net, NOT a cap on the prover: the bridge owns the run's real
         // deadline (runBudget.computeBudgetMs, which the operator chose). This
         // only fires well past it, when the stream has wedged and the bridge
         // has failed to honour its own budget — otherwise one hung socket
-        // would stall the pass indefinitely.
+        // would stall the worker indefinitely.
         const watchdogMs = runBudget.computeBudgetMs
           ? runBudget.computeBudgetMs + 5 * 60_000
           : 0;
@@ -581,7 +625,7 @@ export function BenchmarkConsole() {
             model: runModel || undefined,
             signal: ctrl.signal,
             onEvent: (ev) => {
-              setEvents((prev) => [...prev, ev]);
+              setSlot(slot, (s) => ({ ...s, events: [...s.events, ev] }));
               content += ` ${ev.label || ''} ${ev.detail || ''}`;
               if (ev.metrics) metrics = ev.metrics;
             },
@@ -640,15 +684,21 @@ export function BenchmarkConsole() {
           });
         } catch (e) {
           const msg = e instanceof Error ? e.message : String(e);
-          // Operator pressed Pause: never score, never count the attempt.
+          // Operator pressed Pause (or a sibling hit a catastrophic failure
+          // and aborted us): never score, never count the attempt. The `prev
+          // ??` keeps a sibling's more specific message if it got there first.
           if (stopRef.current) {
             await patchItem(selected, { action: 'release', itemId: item.id });
             setPauseMessage(
-              `Paused on ${item.problemId} — progress saved, nothing scored. Click Resume to continue.`,
+              (prev) =>
+                prev ??
+                `Paused on ${item.problemId} — progress saved, nothing scored. Click Resume to continue.`,
             );
             break;
           }
           if (isCatastrophic(msg, content)) {
+            stopRef.current = true; // pause the whole pass, not just this worker
+            abortSiblings(slot);
             await patchItem(selected, { action: 'release', itemId: item.id });
             setPauseMessage(
               detectSessionLimit(content) || detectSessionLimit(msg)
@@ -671,18 +721,28 @@ export function BenchmarkConsole() {
           }
         } finally {
           if (watchdog) clearTimeout(watchdog);
+          abortsRef.current.delete(slot);
         }
         await loadRuns();
       }
+    };
+
+    try {
+      const mcpServers: ProverMcpServer[] = await fetchProverMcpServers();
+      await Promise.all(
+        Array.from({ length: workerCount }, (_, slot) =>
+          worker(slot, mcpServers),
+        ),
+      );
     } finally {
+      abortsRef.current.clear();
       setRunning(false);
-      setCurrentProblemId(null);
       if (selected) {
         loadRun(selected);
         loadRuns();
       }
     }
-  }, [selected, runs, loadRuns, loadRun, patchItem]);
+  }, [selected, runs, parallel, loadRuns, loadRun, patchItem]);
 
   return (
     <div className="space-y-6">
@@ -694,7 +754,8 @@ export function BenchmarkConsole() {
       <div className="rounded-lg border p-4">
         <h2 className="text-sm font-semibold">New session</h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          Runs on your connected bridge, one problem at a time, fully resumable —
+          Runs on your connected bridge — up to {MAX_PARALLEL} problems at once
+          (pick the worker count next to Start) — fully resumable —
           a usage limit or a closed laptop pauses the pass without scoring
           anything. Every attempt files a research row and stores its proof.
           A session starts empty — pick exactly the problems you want below
@@ -833,6 +894,21 @@ export function BenchmarkConsole() {
               >
                 {pickerOpen ? 'Close picker' : '+ Add problems'}
               </Button>
+              <select
+                value={parallel}
+                onChange={(e) => setParallel(Number(e.target.value))}
+                disabled={running}
+                title="How many problems to prove at once — each worker claims its own problem from the queue, so the pass finishes roughly this many times sooner"
+                className="h-8 rounded-md border bg-background px-1.5 text-xs disabled:opacity-50"
+              >
+                {Array.from({ length: MAX_PARALLEL }, (_, i) => i + 1).map(
+                  (n) => (
+                    <option key={n} value={n}>
+                      {n === 1 ? '1 worker' : `${n} workers`}
+                    </option>
+                  ),
+                )}
+              </select>
               {!running ? (
                 <Button
                   size="sm"
@@ -853,11 +929,12 @@ export function BenchmarkConsole() {
                   size="sm"
                   variant="outline"
                   onClick={() => {
-                    // Stop claiming new items AND abort whatever's in flight —
-                    // a proof can run for its full budget, so without the abort
-                    // this button would do nothing until the attempt finished.
+                    // Stop claiming new items AND abort every in-flight
+                    // attempt — a proof can run for its full budget, so
+                    // without the aborts this button would do nothing until
+                    // the slowest worker finished.
                     stopRef.current = true;
-                    abortRef.current?.abort();
+                    for (const ctrl of abortsRef.current.values()) ctrl.abort();
                   }}
                 >
                   Pause
@@ -916,14 +993,39 @@ export function BenchmarkConsole() {
             />
           )}
 
-          <ProverConsole
-            events={events}
-            running={running}
-            title={
-              currentProblemId ? `Proving ${currentProblemId}` : 'Prover activity'
-            }
-            emptyHint="Click Start/Resume to begin proving pending problems."
-          />
+          {Object.keys(slots).length ? (
+            <div
+              className={cn(
+                'grid gap-3',
+                Object.keys(slots).length > 1 && 'lg:grid-cols-2',
+              )}
+            >
+              {Object.entries(slots)
+                .sort(([a], [b]) => Number(a) - Number(b))
+                .map(([slot, s]) => (
+                  <ProverConsole
+                    key={slot}
+                    events={s.events}
+                    running={running}
+                    title={
+                      s.problemId
+                        ? Object.keys(slots).length > 1
+                          ? `Worker ${Number(slot) + 1} — ${s.problemId}`
+                          : `Proving ${s.problemId}`
+                        : `Worker ${Number(slot) + 1}`
+                    }
+                    emptyHint="Waiting for a claim…"
+                  />
+                ))}
+            </div>
+          ) : (
+            <ProverConsole
+              events={[]}
+              running={running}
+              title="Prover activity"
+              emptyHint="Click Start/Resume to begin proving pending problems."
+            />
+          )}
 
           <Separator />
 
