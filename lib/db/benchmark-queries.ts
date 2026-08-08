@@ -511,7 +511,9 @@ export async function requeueByStatus(
 
 /**
  * "Resume from this problem": make `problemId` the NEXT item the run claims,
- * and requeue everything after it in queue order.
+ * and requeue every UN-SCORED item after it in queue order (pending/skipped).
+ * Scored attempts (proved/unsolved/refuted) are NEVER touched — this is a resume
+ * control, not a re-run, so it can never clear a benchmarked result.
  *
  * Both halves are required, and the second one is the whole point. Requeueing
  * the tail only ever ADDS to the pending set, while claimNextItem always takes
@@ -551,11 +553,16 @@ export async function requeueFrom(
         WHERE run_id = ${runId} AND problem_id = ${problemId}
       );
   `;
+  // Only ever requeue items that were NOT scored: pending (not yet reached) or
+  // skipped (parked, never scored). A proved/unsolved/refuted result at or after
+  // the target is a real attempt and is left untouched — "resume from here" is a
+  // resume control, not a re-run, so it must never wipe scored attempts. (Re-running
+  // a scored item is what the per-item retry / "requeue unsolved" controls are for.)
   const requeued = await sql`
     UPDATE benchmark_items
     SET status = 'pending', error_message = NULL, finished_at = NULL, updated_at = now()
     WHERE run_id = ${runId}
-      AND status <> 'running'
+      AND status IN ('pending', 'skipped')
       AND (coalesce(seq, 2147483647), problem_id) >= (
         SELECT coalesce(seq, 2147483647), problem_id FROM benchmark_items
         WHERE run_id = ${runId} AND problem_id = ${problemId}

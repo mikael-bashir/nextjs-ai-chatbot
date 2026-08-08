@@ -1127,7 +1127,7 @@ export function BenchmarkConsole() {
                             type="button"
                             disabled={running}
                             className="text-[11px] text-muted-foreground underline-offset-2 hover:underline disabled:opacity-40"
-                            title="Resume here: make this the next problem the run claims, and requeue every one after it. Anything still pending BEFORE it is parked as skipped (restore with 'requeue skipped')."
+                            title="Resume here: make this the next problem the run claims, and requeue only the UN-SCORED (pending/skipped) items after it. Already-scored attempts (proved/unsolved/refuted) are never touched. Anything still pending BEFORE it is parked as skipped (restore with 'requeue skipped')."
                             onClick={() =>
                               requeue(selectedRun.id, { from: it.problemId })
                             }
