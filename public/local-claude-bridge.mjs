@@ -2488,11 +2488,14 @@ function runProve(theorem, mcpServers, opts = {}) {
         ? 0
         : Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 21600000)
     let timedOut = false
+    // SIGINT (via stopChild) not SIGKILL, so the CLI flushes its final `result`
+    // frame carrying total_cost_usd before it exits — otherwise a timed-out run
+    // records $0. stopChild is defined below; the timer fires long after.
     const timer =
       timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true
-            child.kill("SIGKILL")
+            stopChild("SIGINT")
           }, timeoutMs)
         : null
 
@@ -2570,6 +2573,11 @@ function runProve(theorem, mcpServers, opts = {}) {
     child.on("close", (code) => {
       clearTimeout(timer)
       const verifiedScript = gate.verifiedScript
+      // If it was killed before flushing a `result` frame (rare now that timeout
+      // uses SIGINT), fall back to the per-turn estimate so spend is still
+      // recorded rather than lost as $0.
+      const costEstimated = costUsd <= 0 && runningCostUsd > 0
+      const finalCostUsd = costEstimated ? Math.round(runningCostUsd * 1e6) / 1e6 : costUsd
       resolve({
         // ok = the process ran cleanly; verified = the daemon-gated proof exists.
         ok: (code === 0 || !!verifiedScript) && !timedOut,
@@ -2580,7 +2588,8 @@ function runProve(theorem, mcpServers, opts = {}) {
         durationMs: Date.now() - start,
         timedOut,
         budgetExceeded,
-        costUsd, // authoritative total_cost_usd for billing
+        costUsd: finalCostUsd, // authoritative total_cost_usd, or per-turn estimate on a hard kill
+        costEstimated,
         stderr: budgetExceeded
           ? "aborted: run cost would exceed remaining balance"
           : stderr,
@@ -3076,6 +3085,19 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         /* gone */
       }
     }
+    // Deadline / cap expiry uses SIGINT (not a hard kill) so the CLI flushes its
+    // final `result` frame — the SOLE carrier of total_cost_usd. Without this a
+    // timed-out attempt records $0 (the LC-II / every-timed-strategy cost gap:
+    // budget-killed unsolved rows had no cost). Hard SIGKILL only as a grace
+    // fallback if the CLI doesn't exit promptly after flushing.
+    const softKill = () => {
+      try {
+        child.kill("SIGINT")
+        setTimeout(kill, PROOF_STOP_GRACE_MS).unref?.()
+      } catch {
+        /* gone */
+      }
+    }
     // Two ways to bound a stage. A live `getDeadline()` (extendable wall-clock
     // budget) is POLLED so the UI's "+5 min" push takes effect on the RUNNING
     // subprocess; a plain `cap` is the legacy fixed one-shot timer. Deadline wins
@@ -3087,13 +3109,13 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         const dl = getDeadline()
         if (Number.isFinite(dl) && Date.now() >= dl) {
           timedOut = true
-          kill()
+          softKill()
         }
       }, 3000)
     } else if (cap > 0) {
       timer = setTimeout(() => {
         timedOut = true
-        kill()
+        softKill()
       }, cap)
     }
     const clearTimers = () => {
@@ -3160,6 +3182,13 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     // metrics.cost_usd before/after its own call double-counts every sibling
     // call that lands in between (see claudeArchitectLoop).
     let costUsd = 0
+    // Per-turn cost estimate from `assistant` usage frames — the fallback when a
+    // sub-run is hard-killed before it can flush its authoritative `result`
+    // frame (operator abort, usage block, a crash). Priced from the same
+    // MODEL_PRICE table the mid-run spend guard uses. Only consulted at close if
+    // no authoritative total_cost_usd was seen (costUsd === 0), so it never
+    // double-counts a run that DID flush.
+    let runningCostUsd = 0
     child.stdout.on("data", (chunk) => {
       buf += chunk.toString("utf8")
       let nl
@@ -3257,6 +3286,9 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           /* budget accounting must never crash the run */
         }
         if (emit) mapObjectToEvents(o, emit, stage, metrics)
+        if (o.type === "assistant" && o.message?.usage) {
+          runningCostUsd += priceUsageUsd(o.message.usage, o.message.model || model)
+        }
         if (o.type === "result") {
           finalText = o.result || finalText
           // Sum this sub-run's cost into the shared tree metrics (ctx.metrics),
@@ -3289,12 +3321,29 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     child.on("error", (e) => {
       clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
+      if (costUsd <= 0 && runningCostUsd > 0) {
+        costUsd = Math.round(runningCostUsd * 1e6) / 1e6
+        if (metrics) {
+          metrics.cost_usd = (metrics.cost_usd || 0) + costUsd
+          metrics.cost_estimated = true
+        }
+      }
       destroyGovernor(governor)
       resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message, costUsd })
     })
     child.on("close", (code) => {
       clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
+      // Hard-killed before it could flush its `result` frame → no authoritative
+      // total_cost_usd landed. Record the per-turn estimate so the spend is
+      // captured instead of lost as $0 (the timed-out-attempt cost gap).
+      if (costUsd <= 0 && runningCostUsd > 0) {
+        costUsd = Math.round(runningCostUsd * 1e6) / 1e6
+        if (metrics) {
+          metrics.cost_usd = (metrics.cost_usd || 0) + costUsd
+          metrics.cost_estimated = true
+        }
+      }
       if (governor.searchCount)
         say({
           type: "message-annotation",
