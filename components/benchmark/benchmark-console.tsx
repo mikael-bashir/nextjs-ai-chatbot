@@ -218,6 +218,20 @@ function fmtDuration(from: string | null, to: string | null): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
 }
 
+// The attempt's real duration is the prover's own measured `time_elapsed`
+// (seconds) — NOT finished_at − started_at, which is DB wall-clock and can be
+// wildly wrong for a resumed/requeued item (finished_at gets rewritten by
+// requeue while started_at stays at the original claim, yielding day-long
+// bogus values). Prefer the metric; fall back to wall-clock only when absent.
+function fmtAttemptTime(it: BenchmarkItemRow): string {
+  const te = it.metrics?.time_elapsed;
+  if (typeof te === 'number' && Number.isFinite(te) && te >= 0) {
+    const s = Math.round(te);
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+  }
+  return fmtDuration(it.startedAt, it.finishedAt);
+}
+
 // The "add exactly the problems you want" picker — ACG-style click-to-add
 // (no drag-and-drop library needed; ACG's own queue is click-based too, see
 // admin-pipeline.tsx's enqueueVerify). Pool is whatever the SELECTED run's
@@ -1066,7 +1080,7 @@ export function BenchmarkConsole() {
                         {it.costUsd != null ? `$${it.costUsd.toFixed(3)}` : '—'}
                       </td>
                       <td className="px-2 py-1 font-mono">
-                        {fmtDuration(it.startedAt, it.finishedAt)}
+                        {fmtAttemptTime(it)}
                       </td>
                       <td className="px-2 py-1">{it.attempts}</td>
                       <td className="px-2 py-1">
