@@ -3023,7 +3023,7 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort, lemmaPool }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort, lemmaPool, omitLeanNote }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
@@ -3072,7 +3072,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     // Every prover agent is told about the local-Lean block, on the same system
     // channel as any stage contract the caller supplies (concatenated, not
     // replaced, so neither silently drops the other).
-    const sysAppend = [typeof systemAppend === "string" ? systemAppend.trim() : "", NO_LOCAL_LEAN_NOTE]
+    const sysAppend = [typeof systemAppend === "string" ? systemAppend.trim() : "", omitLeanNote ? "" : NO_LOCAL_LEAN_NOTE]
       .filter(Boolean)
       .join("\n\n")
     args.push("--append-system-prompt", sysAppend)
@@ -6250,15 +6250,23 @@ function extractLeanScript(text) {
   return s.trim()
 }
 
+// Environment note for Leak Control III, in place of the tool-oriented
+// NO_LOCAL_LEAN_NOTE (which names verify_full_script — a tool this blind control
+// does NOT have). Same local-Lean block + no-internet as every other run, but
+// states plainly there is no verifier and no error feedback. Shell/scratch stay
+// enabled (parity with Control II); only internet + local Lean are off.
+const BLIND_CONTROL_ENV_NOTE = `You are working BLIND. There is NO verifier and NO compiler available to you here: you cannot check whether a proof is correct, and a failed attempt comes back only as "incorrect" — never with an error message, a line number, or any diagnostic. Local Lean/Mathlib on this machine is NOT available and is blocked (\`lean\`, \`lake\`, \`elan\`, \`leanc\` will not run) — do not use or hunt for them; any local checkout is a DIFFERENT Mathlib and its answers can simply be wrong here. You have no internet. You DO have a normal shell and scratch files for your OWN working notes and numeric experiments — use them freely, but nothing on this machine can compile or check Lean for you. Your only deliverable is the proof text itself.`
+
 // Leak Control III — the BLIND baseline. The prover is given ONLY the theorem
-// and asked for a complete Lean 4 proof, with NO tools: no verify_full_script,
-// no compiler, no search — so it never sees an error message.
+// and asked for a complete Lean 4 proof. It has NO verifier, NO compiler, and NO
+// error feedback (see BLIND_CONTROL_ENV_NOTE); local shell/scratch tools stay
+// enabled (matching Control II), but there is no Lean for it to run.
 function blindControlPrompt(theorem, attempt = 1) {
   const retry =
     attempt > 1
       ? `\nYour previous ${attempt - 1} attempt(s) were checked and were INCORRECT. You are not told why — no error message, no diagnostic, no line number. Produce a fresh, genuinely different complete proof.\n`
       : ""
-  return `You are proving ONE Lean 4 + Mathlib theorem. Provide a COMPLETE, self-contained Lean 4 script that proves the theorem below: include any imports you need, and a full proof with NO 'sorry' and NO 'admit'. You have no tools here — you cannot run, search, or check anything yourself; produce your best complete proof from reasoning alone.
+  return `You are proving ONE Lean 4 + Mathlib theorem. Provide a COMPLETE, self-contained Lean 4 script that proves the theorem below: include any imports you need, and a full proof with NO 'sorry' and NO 'admit'. There is no verifier or compiler here and you will get no error feedback — produce your best complete proof from reasoning alone.
 
 Your submitted script is handed VERBATIM to a Lean 4 verification service (real Lean 4 + Mathlib — it is the compiler). So it must be valid Lean 4 that compiles exactly as written: real tactics and lemma names, correct syntax, no natural-language steps, no pseudocode, no placeholders, nothing but Lean.
 
@@ -6286,19 +6294,23 @@ async function proveControlBlind(theorem, ctx) {
     thought:
       "🎯 Leak Control III: a BLIND agent is asked only for a complete Lean 4 proof — no tools, no compiler, no error feedback. A separate Leak IV gate checks each attempt; on failure the prover is told only that it was wrong, never why. It repeats until it verifies or the clock runs out.",
   })
-  const BLIND_DISALLOWED = ["Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "Task", "NotebookEdit", "WebSearch", "WebFetch"]
+  // Only the internet is off (WebSearch/WebFetch) — same policy as Control II.
+  // Bash/Read/Write/etc. stay ENABLED for scratch + numeric work; local Lean is
+  // still blocked at the settings level, and no MCP servers means no verifier.
+  const BLIND_DISALLOWED = ["WebSearch", "WebFetch"]
   let attempt = 0
   while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
     attempt++
     if (attempt > 1)
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt} — fresh blind attempt (the prover is NOT shown why the last one failed).` })
-    // Role 1: the blind prover. Toolless, so it cannot verify or see errors.
+    // Role 1: the blind prover. No MCP servers (so no verify_full_script / no
+    // Leak IV / no compiler feedback) and no internet, but a normal shell for
+    // scratch; unbounded turns per attempt (bounded by the node/run clock).
     const r = await spawnProverStream(
       {
         prompt: blindControlPrompt(theorem, attempt),
         mcpServers: [],
         model: ctx.model,
-        maxTurns: 1,
         timeoutMs: ctx.nodeTimeoutMs,
         getDeadline: ctx.getDeadline,
         stage: "🎯",
@@ -6306,6 +6318,8 @@ async function proveControlBlind(theorem, ctx) {
         signal: ctx.signal,
         searchBudget: 0,
         disallowedTools: BLIND_DISALLOWED,
+        systemAppend: BLIND_CONTROL_ENV_NOTE,
+        omitLeanNote: true,
       },
       { onObject: () => false, emit: ctx.emit },
     )
