@@ -2191,13 +2191,17 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "control2",
   },
-  // Leak Control III: the BLIND baseline. Two roles — a toolless prover asked
+  // Leak Control III: the BLIND arm. Two roles — a toolless prover asked
   // only for a Lean 4 proof (no verify tool, no compiler, no error feedback),
   // and a separate Leak IV gate that checks each attempt and returns only
   // pass/fail. On failure the prover is told only that it was wrong, never why.
-  // Isolates the value of the compiler-feedback loop itself. See proveControlBlind.
+  // Since the continuous-session change, all attempts share ONE resumed CLI
+  // conversation (auto-compacted when it outgrows the window), so the prover
+  // remembers its own past attempts — memory WITHOUT error feedback. Sits
+  // between blind resampling and Control II (memory + real compiler errors).
+  // See proveControlBlind.
   "control-oneshot-3": {
-    label: "Leak Control III — blind prover (no tools / no error feedback) + separate Leak IV gate (no decomposition)",
+    label: "Leak Control III — blind prover, ONE continuous session (no tools / no error feedback) + separate Leak IV gate (no decomposition)",
     node: (t, m, x) => blindControlPrompt(t),
     decompose: (t, m, x) => blindControlPrompt(t), // unused; keeps the registry shape
     search: 0,
@@ -3023,7 +3027,7 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort, lemmaPool, omitLeanNote }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort, lemmaPool, omitLeanNote, resumeSessionId }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
@@ -3064,6 +3068,11 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       "--settings", NO_LOCAL_LEAN_SETTINGS,
     ]
     if (model) args.push("--model", model)
+    // Continue an existing CLI conversation instead of opening a fresh one
+    // (Control III's continuous-session mode). The CLI may fork the resumed
+    // conversation under a NEW session id — callers must always chase the
+    // sessionId returned by THIS call, never cache the first one.
+    if (typeof resumeSessionId === "string" && resumeSessionId.trim()) args.push("--resume", resumeSessionId.trim())
     if (typeof effort === "string" && effort.trim()) args.push("--effort", effort.trim())
     if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
     // The architect stage contract (blueprint rules / prover rules / refinement
@@ -3194,6 +3203,11 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     // metrics.cost_usd before/after its own call double-counts every sibling
     // call that lands in between (see claudeArchitectLoop).
     let costUsd = 0
+    // The CLI conversation's identity, read off every frame that carries one
+    // (init + result both do). Returned to the caller so a follow-up call can
+    // --resume this conversation; updated continuously because a resume can
+    // fork to a fresh id.
+    let sessionId = ""
     // Per-turn cost estimate from `assistant` usage frames — the fallback when a
     // sub-run is hard-killed before it can flush its authoritative `result`
     // frame (operator abort, usage block, a crash). Priced from the same
@@ -3229,6 +3243,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         }
         lastObjectAt = Date.now()
         objectCount++
+        if (typeof o.session_id === "string" && o.session_id) sessionId = o.session_id
         let stop = false
         try {
           stop = onObject ? onObject(o) : false
@@ -3341,7 +3356,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         }
       }
       destroyGovernor(governor)
-      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message, costUsd })
+      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message, costUsd, sessionId })
     })
     child.on("close", (code) => {
       clearTimers()
@@ -3363,7 +3378,7 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           thought: `${stage ? stage + " " : ""}🔎 Search used ${governor.searchCount}× (${governor.blockedCount} blocked, ${governor.grantCount} refills).`,
         })
       destroyGovernor(governor)
-      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr, costUsd })
+      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr, costUsd, sessionId })
     })
   })
 }
@@ -6257,10 +6272,15 @@ function extractLeanScript(text) {
 // enabled (parity with Control II); only internet + local Lean are off.
 const BLIND_CONTROL_ENV_NOTE = `You are working BLIND. There is NO verifier and NO compiler available to you here: you cannot check whether a proof is correct, and a failed attempt comes back only as "incorrect" — never with an error message, a line number, or any diagnostic. Local Lean/Mathlib on this machine is NOT available and is blocked (\`lean\`, \`lake\`, \`elan\`, \`leanc\` will not run) — do not use or hunt for them; any local checkout is a DIFFERENT Mathlib and its answers can simply be wrong here. You have no internet. You DO have a normal shell and scratch files for your OWN working notes and numeric experiments — use them freely, but nothing on this machine can compile or check Lean for you. Your only deliverable is the proof text itself.`
 
-// Leak Control III — the BLIND baseline. The prover is given ONLY the theorem
+// Leak Control III — the BLIND arm. The prover is given ONLY the theorem
 // and asked for a complete Lean 4 proof. It has NO verifier, NO compiler, and NO
 // error feedback (see BLIND_CONTROL_ENV_NOTE); local shell/scratch tools stay
 // enabled (matching Control II), but there is no Lean for it to run.
+// This prompt OPENS the run's single continuous conversation (attempt 1);
+// retries normally ride blindControlFollowup on a --resume of that same
+// conversation. The attempt>1 branch here survives only as the fallback for a
+// LOST session (the CLI died before reporting a session id), where the old
+// one-step "you failed N times" memory is all that can be reconstructed.
 function blindControlPrompt(theorem, attempt = 1) {
   const retry =
     attempt > 1
@@ -6276,6 +6296,22 @@ Theorem (its signature is immutable — prove exactly this):
 ${theorem}`
 }
 
+// Follow-up turn for the RESUMED blind conversation (attempt ≥ 2). Unlike the
+// session-lost restart, the prover keeps its whole history — every past proof,
+// every scratch note — but still learns nothing about WHY an attempt failed.
+// Memory across attempts is the ONE variable this arm isolates: Control II
+// gets memory + real compiler errors; blind resampling gets neither. The CLI
+// auto-compacts the conversation when it outgrows the context window, so long
+// runs summarize their history instead of dying.
+function blindControlFollowup(hadScript = true) {
+  const verdict = hadScript
+    ? "That attempt was checked and is INCORRECT. As always, you are not told why — no error message, no diagnostic, no line number."
+    : "Your last reply contained no parseable Lean script, so nothing could be checked."
+  return `${verdict} You have your full history above — reason about what is most likely wrong with your previous attempt(s) and produce a corrected COMPLETE Lean 4 script (imports included, NO 'sorry', NO 'admit').
+
+Output ONLY the script, as a single \`\`\`lean fenced code block. No explanation before or after.`
+}
+
 // Leak Control III driver: a two-role control. Role 1 (prover) is deliberately
 // TOOLLESS — no MCP servers (so no verify_full_script, no Leak IV, no search)
 // and every built-in execution tool disallowed, so it has zero channel to the
@@ -6284,6 +6320,13 @@ ${theorem}`
 // the prover is told only that it was wrong — never why. Cost/metrics accrue on
 // ctx.metrics exactly like the other controls; the gate itself is a free daemon
 // compile. Parallel-worker behaviour is inherited (one problem per worker).
+//
+// Continuous-session mode: every attempt after the first --resumes the SAME
+// CLI conversation (each attempt is still its own process, so the per-attempt
+// clock, SIGINT cost-flush and metrics all work unchanged). The resumed id is
+// re-read from every call's result because a resume can fork to a fresh id.
+// Only if a call dies without reporting any session id does the loop fall back
+// to a cold blindControlPrompt restart.
 async function proveControlBlind(theorem, ctx) {
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   ctx.stage = "🎯"
@@ -6292,23 +6335,32 @@ async function proveControlBlind(theorem, ctx) {
     type: "message-annotation",
     subtype: "status",
     thought:
-      "🎯 Leak Control III: a BLIND agent is asked only for a complete Lean 4 proof — no tools, no compiler, no error feedback. A separate Leak IV gate checks each attempt; on failure the prover is told only that it was wrong, never why. It repeats until it verifies or the clock runs out.",
+      "🎯 Leak Control III: ONE BLIND agent in ONE continuous conversation is asked for a complete Lean 4 proof — no tools, no compiler, no error feedback. A separate Leak IV gate checks each attempt; on failure the same conversation resumes, told only that it was wrong, never why — it remembers all its past attempts and repeats until it verifies or the clock runs out.",
   })
   // Only the internet is off (WebSearch/WebFetch) — same policy as Control II.
   // Bash/Read/Write/etc. stay ENABLED for scratch + numeric work; local Lean is
   // still blocked at the settings level, and no MCP servers means no verifier.
   const BLIND_DISALLOWED = ["WebSearch", "WebFetch"]
   let attempt = 0
+  let sessionId = "" // the single continuous conversation; "" until attempt 1 opens it (or after a lost session)
+  let lastHadScript = true // shapes the follow-up: "incorrect" vs "no parseable script"
   while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
     attempt++
     if (attempt > 1)
-      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt} — fresh blind attempt (the prover is NOT shown why the last one failed).` })
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought: sessionId
+          ? `🎯 Attempt ${attempt} — resuming the SAME conversation: the prover sees all its past attempts, but is still never told why they failed.`
+          : `🎯 Attempt ${attempt} — previous session was lost; opening a fresh conversation (only the failure count carries over).`,
+      })
     // Role 1: the blind prover. No MCP servers (so no verify_full_script / no
     // Leak IV / no compiler feedback) and no internet, but a normal shell for
     // scratch; unbounded turns per attempt (bounded by the node/run clock).
     const r = await spawnProverStream(
       {
-        prompt: blindControlPrompt(theorem, attempt),
+        prompt: sessionId ? blindControlFollowup(lastHadScript) : blindControlPrompt(theorem, attempt),
+        resumeSessionId: sessionId || undefined,
         mcpServers: [],
         model: ctx.model,
         timeoutMs: ctx.nodeTimeoutMs,
@@ -6323,11 +6375,14 @@ async function proveControlBlind(theorem, ctx) {
       },
       { onObject: () => false, emit: ctx.emit },
     )
+    if (r.sessionId) sessionId = r.sessionId
     const proof = extractLeanScript(r.finalText)
     if (!proof) {
+      lastHadScript = false
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: the prover produced no parseable Lean script — retrying.` })
       continue
     }
+    lastHadScript = true
     // Role 2: the Leak IV gate — same authoritative daemon check (hole-free
     // compile + proves the exact target) as every other run. No text fed back.
     ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: submitting the blind proof to the Leak IV gate…` })
