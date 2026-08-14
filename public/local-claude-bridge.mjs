@@ -2191,6 +2191,18 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "control2",
   },
+  // Leak Control III: the BLIND baseline. Two roles — a toolless prover asked
+  // only for a Lean 4 proof (no verify tool, no compiler, no error feedback),
+  // and a separate Leak IV gate that checks each attempt and returns only
+  // pass/fail. On failure the prover is told only that it was wrong, never why.
+  // Isolates the value of the compiler-feedback loop itself. See proveControlBlind.
+  "control-oneshot-3": {
+    label: "Leak Control III — blind prover (no tools / no error feedback) + separate Leak IV gate (no decomposition)",
+    node: (t, m, x) => blindControlPrompt(t),
+    decompose: (t, m, x) => blindControlPrompt(t), // unused; keeps the registry shape
+    search: 0,
+    style: "control3",
+  },
   // Phase-1 linear context: planner writes a `have`-skeleton, isolated minions
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
   // agent; falls back to `have` on any failure. See proveHaveTree.
@@ -6224,6 +6236,94 @@ async function proveControl(theorem, ctx, tier = 1) {
   }
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 ${label} ran out of clock after ${attempt} attempt(s) without a verified proof.` })
+  return { verified: false, proof: "" }
+}
+
+// Pull the Lean script a BLIND prover emitted: the LAST ```lean (or bare ```)
+// fenced block in its output, else the whole text if it wrote no fence. The
+// blind control has no verify tool, so this text is the proof's only path to
+// the gate.
+function extractLeanScript(text) {
+  const s = String(text || "")
+  const fences = [...s.matchAll(/```(?:lean4?|lean)?\s*\n([\s\S]*?)```/gi)]
+  if (fences.length) return fences[fences.length - 1][1].trim()
+  return s.trim()
+}
+
+// Leak Control III — the BLIND baseline. The prover is given ONLY the theorem
+// and asked for a complete Lean 4 proof, with NO tools: no verify_full_script,
+// no compiler, no search — so it never sees an error message.
+function blindControlPrompt(theorem, attempt = 1) {
+  const retry =
+    attempt > 1
+      ? `\nYour previous ${attempt - 1} attempt(s) were checked and were INCORRECT. You are not told why — no error message, no diagnostic, no line number. Produce a fresh, genuinely different complete proof.\n`
+      : ""
+  return `You are proving ONE Lean 4 + Mathlib theorem. Provide a COMPLETE, self-contained Lean 4 script that proves the theorem below: include any imports you need, and a full proof with NO 'sorry' and NO 'admit'. You have no tools and no compiler here — produce your best complete proof from reasoning alone.
+
+Output ONLY the script, as a single \`\`\`lean fenced code block. No explanation before or after.
+${retry}
+Theorem (its signature is immutable — prove exactly this):
+${theorem}`
+}
+
+// Leak Control III driver: a two-role control. Role 1 (prover) is deliberately
+// TOOLLESS — no MCP servers (so no verify_full_script, no Leak IV, no search)
+// and every built-in execution tool disallowed, so it has zero channel to the
+// compiler; its proof reaches the gate only as text. Role 2 (gate) is the SAME
+// authoritative Leak IV daemon check every other run gates on. On a failed gate
+// the prover is told only that it was wrong — never why. Cost/metrics accrue on
+// ctx.metrics exactly like the other controls; the gate itself is a free daemon
+// compile. Parallel-worker behaviour is inherited (one problem per worker).
+async function proveControlBlind(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🎯"
+  const sig = theoremSignature(theorem)
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought:
+      "🎯 Leak Control III: a BLIND agent is asked only for a complete Lean 4 proof — no tools, no compiler, no error feedback. A separate Leak IV gate checks each attempt; on failure the prover is told only that it was wrong, never why. It repeats until it verifies or the clock runs out.",
+  })
+  const BLIND_DISALLOWED = ["Bash", "Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "Task", "NotebookEdit", "WebSearch", "WebFetch"]
+  let attempt = 0
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    attempt++
+    if (attempt > 1)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt} — fresh blind attempt (the prover is NOT shown why the last one failed).` })
+    // Role 1: the blind prover. Toolless, so it cannot verify or see errors.
+    const r = await spawnProverStream(
+      {
+        prompt: blindControlPrompt(theorem, attempt),
+        mcpServers: [],
+        model: ctx.model,
+        maxTurns: 1,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "🎯",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: 0,
+        disallowedTools: BLIND_DISALLOWED,
+      },
+      { onObject: () => false, emit: ctx.emit },
+    )
+    const proof = extractLeanScript(r.finalText)
+    if (!proof) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: the prover produced no parseable Lean script — retrying.` })
+      continue
+    }
+    // Role 2: the Leak IV gate — same authoritative daemon check (hole-free
+    // compile + proves the exact target) as every other run. No text fed back.
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: submitting the blind proof to the Leak IV gate…` })
+    const v = await verifyViaDaemon(proof, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(proof, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Control III closed it on attempt ${attempt} — verified sorry-free against Leak IV.` })
+      return { verified: true, proof }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: the Leak IV gate rejected it. The prover is told only "incorrect, try again" — retrying.` })
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 Leak Control III ran out of clock after ${attempt} attempt(s) without a verified proof.` })
   return { verified: false, proof: "" }
 }
 
@@ -11860,6 +11960,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           : style === "control2"
           ? `[FLAT BASELINE — Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
             controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url && s.url !== resolvePantographUrl(mcpServers)), 1, null, true)
+          : style === "control3"
+          ? `[BLIND BASELINE — Leak Control III (toolless prover, no compiler feedback; separate Leak IV gate returns only pass/fail) · strategy: ${strategy}]\n\n=== BLIND PROVER PROMPT ===\n` +
+            blindControlPrompt(theorem)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -11982,7 +12085,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "impenetrable" || style === "control" || style === "control2") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "impenetrable" || style === "control" || style === "control2" || style === "control3") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -12015,7 +12118,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                             ? await proveControl(theorem, ctx, 1)
                             : style === "control2"
                               ? await proveControl(theorem, ctx, 2)
-                              : await proveHaveFlat(theorem, ctx)
+                              : style === "control3"
+                                ? await proveControlBlind(theorem, ctx)
+                                : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

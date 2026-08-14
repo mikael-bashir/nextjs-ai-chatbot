@@ -69,6 +69,13 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     note: 'Control I plus Leak I search (loogle/moogle) — still one agent, one theorem, no decomposition, no give-up state. Isolates whether library search alone (without any structuring of the search itself) moves the needle versus Control I.',
   },
   {
+    // The BLIND baseline: split the prover from the verifier. Isolates the value
+    // of the compiler-feedback loop itself — the prover never sees an error.
+    value: 'control-oneshot-3',
+    label: 'Leak Control III (blind prover — no tools / no error feedback — + separate Leak IV gate)',
+    note: 'Two roles: a toolless prover asked only for a Lean 4 proof (no verify_full_script, no compiler, no search — it never sees an error message), and a separate Leak IV gate that checks each attempt and returns only pass/fail. On failure the prover is told only that it was wrong, never why. Isolates how much the compiler-feedback loop is worth versus pure blind resampling. Same logged data + parallel workers as the other controls.',
+  },
+  {
     // value stays `have-tree` — renaming it would orphan saved checkpoints,
     // queued items and every existing research row (matches admin-pipeline.tsx
     // and prover-playground.tsx, which already show the same display name).
@@ -204,6 +211,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   have: 'Leak Have',
   'control-oneshot': 'Leak Control I',
   'control-oneshot-2': 'Leak Control II',
+  'control-oneshot-3': 'Leak Control III',
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',
@@ -318,7 +326,8 @@ export function benchmarkBudgetFor(strategy: string): {
     strategy === 'stronghold-keep' ||
     strategy === 'stronghold-impenetrable' ||
     strategy === 'control-oneshot' ||
-    strategy === 'control-oneshot-2'
+    strategy === 'control-oneshot-2' ||
+    strategy === 'control-oneshot-3'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }

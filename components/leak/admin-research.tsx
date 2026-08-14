@@ -127,6 +127,7 @@ const STRONGHOLD_LABELS: Record<string, string> = {
   'stronghold-impenetrable': 'Stronghold Impenetrable · apply? recon sweep → Surround',
   'control-oneshot': 'Control I · flat one-shot, Leak IV only',
   'control-oneshot-2': 'Control II · flat one-shot, + Leak I search',
+  'control-oneshot-3': 'Control III · blind prover + Leak IV gate',
   have: 'Have · single context',
 };
 

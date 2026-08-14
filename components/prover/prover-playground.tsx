@@ -276,6 +276,9 @@ export function ProverPlayground() {
               <option value="control-oneshot-2">
                 Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search — no decomposition)
               </option>
+              <option value="control-oneshot-3">
+                Leak Control III (blind prover — no tools / no error feedback — + separate Leak IV gate)
+              </option>
               {/* value stays `have-tree` — renaming it would orphan saved
                   checkpoints and every existing research row. */}
               <option value="have-tree">
