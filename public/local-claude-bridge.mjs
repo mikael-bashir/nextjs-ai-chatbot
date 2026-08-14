@@ -6258,7 +6258,9 @@ function blindControlPrompt(theorem, attempt = 1) {
     attempt > 1
       ? `\nYour previous ${attempt - 1} attempt(s) were checked and were INCORRECT. You are not told why — no error message, no diagnostic, no line number. Produce a fresh, genuinely different complete proof.\n`
       : ""
-  return `You are proving ONE Lean 4 + Mathlib theorem. Provide a COMPLETE, self-contained Lean 4 script that proves the theorem below: include any imports you need, and a full proof with NO 'sorry' and NO 'admit'. You have no tools and no compiler here — produce your best complete proof from reasoning alone.
+  return `You are proving ONE Lean 4 + Mathlib theorem. Provide a COMPLETE, self-contained Lean 4 script that proves the theorem below: include any imports you need, and a full proof with NO 'sorry' and NO 'admit'. You have no tools here — you cannot run, search, or check anything yourself; produce your best complete proof from reasoning alone.
+
+Your submitted script is handed VERBATIM to a Lean 4 verification service (real Lean 4 + Mathlib — it is the compiler). So it must be valid Lean 4 that compiles exactly as written: real tactics and lemma names, correct syntax, no natural-language steps, no pseudocode, no placeholders, nothing but Lean.
 
 Output ONLY the script, as a single \`\`\`lean fenced code block. No explanation before or after.
 ${retry}
