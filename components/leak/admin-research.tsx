@@ -128,6 +128,7 @@ const STRONGHOLD_LABELS: Record<string, string> = {
   'control-oneshot': 'Control I · flat one-shot, Leak IV only',
   'control-oneshot-2': 'Control II · flat one-shot, + Leak I search',
   'control-oneshot-3': 'Control III · blind prover + Leak IV gate',
+  'control-oneshot-4': 'Control IV · Control II + Leak II Pantograph',
   have: 'Have · single context',
 };
 

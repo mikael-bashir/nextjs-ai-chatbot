@@ -2207,6 +2207,18 @@ const STRATEGIES = {
     search: 0,
     style: "control3",
   },
+  // Leak Control IV: Control II's exact surface (Leak IV verify + Leak I
+  // search, one continuous flat agent, no decomposition) PLUS Leak II — the
+  // interactive Pantograph tactic-stepper (init_proof/apply_tactic). Isolates
+  // one variable over Control II: does interactive goal-state stepping help a
+  // flat agent. See proveControl tier IV.
+  "control-oneshot-4": {
+    label: "Leak Control IV — one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph (no decomposition)",
+    node: (t, m, x) => controlPrompt(t, m, 1, null, true, true),
+    decompose: (t, m, x) => controlPrompt(t, m, 1, null, true, true), // unused; keeps the registry shape
+    search: GOV_INITIAL,
+    style: "control4",
+  },
   // Phase-1 linear context: planner writes a `have`-skeleton, isolated minions
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
   // agent; falls back to `have` on any failure. See proveHaveTree.
@@ -6111,12 +6123,15 @@ async function proveForce(theorem, ctx) {
 // against besides each other: does structuring the search actually beat just
 // retrying against the compiler's own error output?
 //
-// Two tiers, one shared implementation (proveControl's `tier` param):
+// Three tiers, one shared implementation (proveControl's `tier` param):
 //   I  — Leak IV only. Leak I search and Leak II interactive are both
 //        filtered out of the tool inventory even if connected.
 //   II — Leak IV + Leak I search (loogle/moogle). Still no Leak II — no
-//        interactive tactic-stepping, still no decomposition; the ONLY thing
-//        that changes between tiers is the tool surface.
+//        interactive tactic-stepping.
+//   IV — Control II's surface PLUS Leak II (Pantograph init_proof/apply_tactic).
+//        The one control that gets interactive tactic-stepping.
+// No tier decomposes; the ONLY thing that changes between tiers is the tool
+// surface.
 // ===========================================================================
 
 // Leak Control's entire prompt: the loop, the rules, the theorem, and — tier
@@ -6135,13 +6150,13 @@ async function proveForce(theorem, ctx) {
 // dead-end ledger) would make this a refinement strategy by another name and
 // defeat the point of a flat one-shot control — so exactly one step of
 // memory, no more.
-function controlPrompt(theorem, mcpServers, attempt = 1, lastAttempt = null, allowSearch = false) {
+function controlPrompt(theorem, mcpServers, attempt = 1, lastAttempt = null, allowSearch = false, allowPantograph = false) {
   const toolSection = mcpToolSection(mcpServers)
   const lastBlock = lastAttempt
     ? `\nYOUR MOST RECENT ATTEMPT (a previous session — different context, so this block is the ONLY thing carried forward; treat it as established fact about what was already tried, not something to re-derive):\n\`\`\`lean\n${String(lastAttempt.script || "").slice(0, 4000)}\n\`\`\`\nLeak IV's response to it:\n${String(lastAttempt.result || "").slice(0, 2500)}\n\nDo not just resubmit this unchanged. Either fix precisely what that error points at, or — if this exact spot has already failed before — switch to a genuinely different proof approach for the goal.\n`
     : ""
   const toolsLine = allowSearch
-    ? `Your tools are Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message) — and Leak I's loogle_search/moogle_search for library lookups. verify_full_script is still the ONLY thing that counts as progress; search only ever supports a submission, it does not replace one.`
+    ? `Your tools are Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message) — and Leak I's loogle_search/moogle_search for library lookups. verify_full_script is still the ONLY thing that counts as progress; search only ever supports a submission, it does not replace one.${allowPantograph ? " You ALSO have Leak II's interactive proof assistant (init_proof / apply_tactic) — step a goal ONE tactic at a time to watch the live goal state evolve, then fold the tactics that worked into your verify_full_script submission. Pantograph never certifies a proof; only verify_full_script does." : ""}`
     : `Your only tool is Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message). That text is your entire feedback loop.`
   return `You are proving ONE Lean 4 + Mathlib theorem, one shot, in a single continuous session. There is no decomposition here — you do not write top-level helper lemmas, you do not split this into holes for another agent to fill, and there is no "too hard, hand it off" outcome. ${toolsLine}
 
@@ -6152,7 +6167,7 @@ THE LOOP:
 2. Call verify_full_script with it.
 3. If it fails, read the compiler's error CAREFULLY — the line and message tell you exactly what broke. Fix precisely that if you can localize it; otherwise try a genuinely different approach to the same goal. Resubmit.
 4. It only counts as done when verify_full_script reports success with ZERO 'sorry' anywhere in the script. A compile that still contains 'sorry' is not a stopping point — go back to step 1 on whatever is still sorried.
-${allowSearch ? `\n${SEARCH_USAGE_NOTE}\n` : ""}
+${allowSearch ? `\n${SEARCH_USAGE_NOTE}\n` : ""}${allowPantograph ? `\nINTERACTIVE (Leak II): when an error is opaque or a subgoal is fiddly, init_proof the goal and apply_tactic ONE tactic at a time to read the real goal state, then fold the working tactics back into the full script and verify_full_script it. Never put 'sorry' in an apply_tactic — a goal you cannot close means try a different tactic, not stop.\n` : ""}
 RULES:
 - No top-level 'theorem'/'lemma' other than the target itself. Any intermediate fact you need is a local 'have' INSIDE the one proof of the target.
 - Never conclude a goal is "too hard", "open", "beyond reach", or ask to decompose/split it — there is no one to hand it to here. A repeatedly-failing approach means try a DIFFERENT proof strategy for the same goal, not a smaller piece of it.
@@ -6163,7 +6178,7 @@ Theorem (its signature is immutable):
 ${theorem}`
 }
 
-const CONTROL_LABELS = { 1: "Leak Control I", 2: "Leak Control II" }
+const CONTROL_LABELS = { 1: "Leak Control I", 2: "Leak Control II", 4: "Leak Control IV" }
 
 // Loop-until-deadline across FRESH attempts (same shape as the architect
 // stages' own attempt loop): a single spawnProverStream call is one
@@ -6178,19 +6193,23 @@ async function proveControl(theorem, ctx, tier = 1) {
   ctx.stage = "🎯"
   const sig = theoremSignature(theorem)
   const label = CONTROL_LABELS[tier] || CONTROL_LABELS[1]
-  const allowSearch = tier === 2
+  const allowSearch = tier === 2 || tier === 4
+  const allowPantograph = tier === 4
   // Tier I: keep only whichever connected server resolveVerifyUrl picked
-  // (Leak IV). Tier II: keep everything EXCEPT the Pantograph server (Leak
-  // II) — i.e. Leak IV + Leak I search, whatever else is connected. Either
-  // way the interactive tactic-stepping tool never reaches this strategy.
+  // (Leak IV). Tier II: everything EXCEPT the Pantograph server (Leak II) —
+  // i.e. Leak IV + Leak I search. Tier IV: Control II's surface PLUS Leak II —
+  // the ONE control where the interactive tactic-stepper reaches the agent.
   const pantographUrl = resolvePantographUrl(ctx.mcpServers)
-  const allowedServers = allowSearch
-    ? (ctx.mcpServers || []).filter((s) => s?.url && s.url !== pantographUrl)
-    : (ctx.mcpServers || []).filter((s) => s?.url === ctx.verifyUrl)
+  const allowedServers =
+    tier === 1
+      ? (ctx.mcpServers || []).filter((s) => s?.url === ctx.verifyUrl)
+      : allowPantograph
+        ? (ctx.mcpServers || []).filter((s) => s?.url)
+        : (ctx.mcpServers || []).filter((s) => s?.url && s.url !== pantographUrl)
   ctx.emit({
     type: "message-annotation",
     subtype: "status",
-    thought: `🎯 ${label}: one continuous agent one-shots the whole theorem against Leak IV${allowSearch ? " + Leak I search" : " only"} — no decomposition, no give-up state. It keeps resubmitting against the compiler's own error output until it verifies or the clock runs out.`,
+    thought: `🎯 ${label}: one continuous agent one-shots the whole theorem against Leak IV${allowSearch ? " + Leak I search" : " only"}${allowPantograph ? " + Leak II (Pantograph)" : ""} — no decomposition, no give-up state. It keeps resubmitting against the compiler's own error output until it verifies or the clock runs out.`,
   })
   let attempt = 0
   let lastAttempt = null // { script, result } from the previous session's LAST verify_full_script call
@@ -6206,7 +6225,7 @@ async function proveControl(theorem, ctx, tier = 1) {
     const pendingVerify = new Map()
     await spawnProverStream(
       {
-        prompt: controlPrompt(theorem, allowedServers, attempt, lastAttempt, allowSearch),
+        prompt: controlPrompt(theorem, allowedServers, attempt, lastAttempt, allowSearch, allowPantograph),
         mcpServers: allowedServers,
         model: ctx.model,
         maxTurns: 0,
@@ -12034,6 +12053,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           : style === "control3"
           ? `[BLIND BASELINE — Leak Control III (toolless prover, no compiler feedback; separate Leak IV gate returns only pass/fail) · strategy: ${strategy}]\n\n=== BLIND PROVER PROMPT ===\n` +
             blindControlPrompt(theorem)
+          : style === "control4"
+          ? `[FLAT BASELINE — Leak Control IV (one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
+            controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url), 1, null, true, true)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -12156,7 +12178,7 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
         }
-      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "impenetrable" || style === "control" || style === "control2" || style === "control3") {
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "impenetrable" || style === "control" || style === "control2" || style === "control3" || style === "control4") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
         // `have-surround`: have-tree with the minion phase parallelized over
@@ -12191,7 +12213,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                               ? await proveControl(theorem, ctx, 2)
                               : style === "control3"
                                 ? await proveControlBlind(theorem, ctx)
-                                : await proveHaveFlat(theorem, ctx)
+                                : style === "control4"
+                                  ? await proveControl(theorem, ctx, 4)
+                                  : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof

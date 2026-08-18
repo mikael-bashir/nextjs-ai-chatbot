@@ -76,6 +76,14 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     note: 'Two roles: a toolless prover asked only for a Lean 4 proof (no verify_full_script, no compiler, no search — it never sees an error message), and a separate Leak IV gate that checks each attempt and returns only pass/fail. On failure the prover is told only that it was wrong, never why. Isolates how much the compiler-feedback loop is worth versus pure blind resampling. Same logged data + parallel workers as the other controls.',
   },
   {
+    // Control II's exact surface plus Leak II (Pantograph). Isolates one
+    // variable over Control II: does interactive tactic-stepping help a flat
+    // agent. Needs Leak II connected; without it, degrades to Control II.
+    value: 'control-oneshot-4',
+    label: 'Leak Control IV (one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph — no decomposition)',
+    note: 'Control II plus Leak II (Pantograph): the same flat one-shot agent — Leak IV verify + Leak I search, no decomposition — now also given the interactive proof assistant (init_proof/apply_tactic) to step a goal one tactic at a time. Isolates whether interactive goal-state stepping alone moves the needle over Control II. Requires the Leak II server to be connected.',
+  },
+  {
     // value stays `have-tree` — renaming it would orphan saved checkpoints,
     // queued items and every existing research row (matches admin-pipeline.tsx
     // and prover-playground.tsx, which already show the same display name).
@@ -212,6 +220,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   'control-oneshot': 'Leak Control I',
   'control-oneshot-2': 'Leak Control II',
   'control-oneshot-3': 'Leak Control III',
+  'control-oneshot-4': 'Leak Control IV',
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',
@@ -327,7 +336,8 @@ export function benchmarkBudgetFor(strategy: string): {
     strategy === 'stronghold-impenetrable' ||
     strategy === 'control-oneshot' ||
     strategy === 'control-oneshot-2' ||
-    strategy === 'control-oneshot-3'
+    strategy === 'control-oneshot-3' ||
+    strategy === 'control-oneshot-4'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }
