@@ -23,16 +23,16 @@ The agent never self-reports success: every proof is re-verified by an independe
 
 ## The 6 MCP services
 
-Two verifier **groups**, pinned to different toolchains:
+All six are collected under the [**`leak-services`**](https://github.com/mikael-bashir/leak-services) umbrella repo (each its own repo, mirrored from its Hugging Face Space). Two verifier **groups**, pinned to different toolchains:
 
 | Service | Group | Role | Toolchain | Source |
 |---|---|---|---|---|
 | **Leak I** | 4.29.1 | Loogle / Moogle library search | Lean 4.29.1 | [`leak-i`](https://github.com/mikael-bashir/leak-i) |
 | **Leak II** | 4.29.1 | Pantograph — interactive `init_proof`/`apply_tactic` (ghost-daemon snapshot layer) | Lean 4.29.1 | [`leak-ii`](https://github.com/mikael-bashir/leak-ii) |
-| **Leak IV** | 4.29.1 | `verify_full_script` — the whole-script compile gate | Lean 4.29.1 | HF Space `BarkingTree/Leak-IV` |
-| **Leak XI** | 4.32.0 | Loogle / Moogle search (architect group) | Lean 4.32.0 | `services/leak-xi` |
-| **Leak XII** | 4.32.0 | `lean_compile` — compile + elaborate blueprints, `#eval` readback | Lean 4.32.0 | HF Space `utterfool/Leak-XII` |
-| **Leak XIV** | 4.32.0 | `verify_full_script` for the architect group | Lean 4.32.0 | `services/leak-xiv` |
+| **Leak IV** | 4.29.1 | `verify_full_script` — the whole-script compile gate | Lean 4.29.1 | [`leak-iv`](https://github.com/mikael-bashir/leak-iv) |
+| **Leak XI** | 4.32.0 | Loogle / Moogle search (architect group) | Lean 4.32.0 | [`leak-xi`](https://github.com/mikael-bashir/leak-xi) |
+| **Leak XII** | 4.32.0 | `lean_compile` — compile + elaborate blueprints, `#eval` readback | Lean 4.32.0 | [`leak-xii`](https://github.com/mikael-bashir/leak-xii) |
+| **Leak XIV** | 4.32.0 | `verify_full_script` for the architect group | Lean 4.32.0 | [`leak-xiv`](https://github.com/mikael-bashir/leak-xiv) |
 
 > The Leak I/II/IV group gates the flat control arms; the XI/XII/XIV group serves the decomposition (architect) pipeline. A run only ever uses one group.
 
