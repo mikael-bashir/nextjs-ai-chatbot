@@ -1,0 +1,51 @@
+# Leak Architect stack — Leak XI (mathlib_search), XII (lean_compile gateway),
+# XIV (assembly verifier). Build ON the Oracle VM (native arm64):
+#
+#   docker build -t leak-lean-base ../leak-lean-base     # once (slow: Mathlib cache)
+#   docker compose up -d --build
+#
+# RAM plan. One warm Lean daemon with all of Mathlib imported sits at roughly
+# 4-6 GB RSS, so on the 12 GB Always Free shape the defaults are ONE warm
+# daemon in XII plus a LAZY one in XIV (warms on first /verify, reaped after
+# 15 min idle) — with the 8 GB swapfile from bootstrap.sh absorbing the
+# overlap when a certification lands while XII is busy.
+#
+# Node-proving parallelism is NOT lost at POOL_SIZE=1: the model conversations
+# run concurrently and only serialise at the compile call, so one node can be
+# reasoning while another compiles. If you move to a bigger shape (PAYG
+# 4 OCPU/24 GB), set XII_POOL_SIZE=2 or 3 and raise ARCHITECT_NODE_CONCURRENCY
+# on the bridge to match.
+services:
+  leak-xi:
+    build: ../leak-xi
+    restart: unless-stopped
+    ports:
+      - "8011:8011"
+    environment:
+      LEAK_SERVICE_TOKEN: "${LEAK_SERVICE_TOKEN:-}"
+    mem_limit: 768m
+
+  leak-xii:
+    build: ../leak-xii
+    restart: unless-stopped
+    ports:
+      - "8012:8012"
+    environment:
+      LEAK_SERVICE_TOKEN: "${LEAK_SERVICE_TOKEN:-}"
+      POOL_SIZE: "${XII_POOL_SIZE:-1}"
+      BLUEPRINT_TIMEOUT_S: "600"
+      NODE_TIMEOUT_S: "300"
+    mem_limit: 8g
+
+  leak-xiv:
+    build: ../leak-xiv
+    restart: unless-stopped
+    ports:
+      - "8014:8014"
+    environment:
+      LEAK_SERVICE_TOKEN: "${LEAK_SERVICE_TOKEN:-}"
+      POOL_SIZE: "1"
+      LAZY: "1"
+      IDLE_SHUTDOWN_S: "900"
+      VERIFY_TIMEOUT_S: "600"
+    mem_limit: 6g

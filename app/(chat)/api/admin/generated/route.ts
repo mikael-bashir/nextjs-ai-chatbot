@@ -136,6 +136,12 @@ export async function POST(request: NextRequest) {
       // Whether it should sit in the (DB-backed) verification queue.
       queued: !!body.queued,
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+      // Generation provenance: which mode produced it, the trapdoor key
+      // (hidden layer chain — server-side only, never shown to solvers), and
+      // the Sonnet-gauntlet verdict. See lib/generation/trapdoor.ts.
+      genMode: body.genMode ?? null,
+      chain: Array.isArray(body.chain) ? body.chain : null,
+      gauntlet: body.gauntlet ?? null,
     };
     const item = await saveGenerated(record);
     // Verified ones additionally enter the promotable review queue.
@@ -172,6 +178,10 @@ export async function PATCH(request: NextRequest) {
     if ('proof' in body) patch.proof = body.proof ?? '';
     if ('error' in body) patch.error = body.error ?? null;
     if ('queued' in body) patch.queued = !!body.queued;
+    // Hand-corrected Lean text (e.g. an elaboration bug found post-generation).
+    // Editing this invalidates any prior verdict, so callers should also clear
+    // verified/proof/error in the same PATCH when fixing a broken statement.
+    if ('lean' in body && typeof body.lean === 'string') patch.lean = body.lean;
     // Cost-estimator display fields — persisted so the estimate/actual survive a
     // refresh (they mirror the proof_cost_history row driving the scoreboard).
     for (const k of [
@@ -185,6 +195,23 @@ export async function PATCH(request: NextRequest) {
       'proofCheckpoint',
       'proofCheckpointFilled',
       'proofCheckpointTotal',
+      // Certificate provenance, minted the instant the kernel verified. These
+      // were previously absent from this allowlist, so the pipeline's signature
+      // and verification timestamp were silently dropped here and CompeteMath
+      // re-signed at ingestion — stamping the cron's run time as the proof time.
+      'verifiedAt',
+      'signature',
+      'signatureKeyId',
+      'certMintedAt',
+      // Which Lean/Mathlib ACTUALLY certified this proof (the armed verifier
+      // group), so staging → prod can state it instead of assuming one.
+      'toolchain',
+      'mathlib',
+      // Which specific strategy enforced this proof, for the certificate's
+      // Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak").
+      'enforcer',
+      // Every distinct-toolchain certificate accumulated pre-publish.
+      'certs',
     ] as const) {
       if (k in body) patch[k] = body[k];
     }

@@ -26,6 +26,57 @@ export interface ProverMetrics {
   cost_usd?: number;
   /** Running total tokens across all sub-runs. */
   tokens?: number;
+  /** Architect (Leak River) only: latest blueprint iteration reached. */
+  blueprint_iterations?: number;
+  /** Architect only: refinement-iteration budget this run was given. */
+  max_iters?: number;
+  /** Architect only: cost split — driver (Grok, from tokens) vs NL seed
+   *  (local Sonnet, from the CLI's reported total_cost_usd). Sums to cost_usd. */
+  cost_driver_usd?: number;
+  cost_seed_usd?: number;
+  /** Architect only: cumulative driver token counts, so cost can be recomputed
+   *  independently of whatever prices were in effect at run time. */
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cached_tokens?: number;
+  /** Every model that actually served a call (incl. ladder fallbacks + seed). */
+  models_used?: string[];
+  /** Architect only: whether an NL proof seeded blueprint generation. */
+  nl_seed_used?: boolean;
+  /** river-gate / river-delta only: dead-end facts injected into node prompts,
+   *  and distinct facts the run learned. Absent on the control (no ledger). */
+  dead_ends_shared?: number;
+  dead_ends_known?: number;
+  /** river-vintage only: the oversight watchers ran, and their activity —
+   *  interceptor notes/aborts, mechanic notes, consultant fires. Absent on
+   *  stone/gate/delta, which run without watchers. */
+  watchers?: boolean;
+  interceptor_notes?: number;
+  interceptor_aborts?: number;
+  mechanic_notes?: number;
+  consults?: number;
+  /** Architect only: provable node count in the current/final blueprint. */
+  nodes_total?: number;
+  /** Architect only: nodes with a registered solve (proof or negation). */
+  nodes_solved?: number;
+  /** Architect only: nodes that ran out of budget without solving/disproving. */
+  nodes_forfeited?: number;
+  /** Architect only: nodes machine-disproved (negation registered). */
+  nodes_negated?: number;
+  /** Architect only: true once the run stopped because it hit the hard dollar cap. */
+  cost_cap_hit?: boolean;
+  /** Free-text tag identifying the bridge build/experiment batch (BRIDGE_BUILD_TAG). */
+  bridge_build?: string;
+  /** Which LLM drove an architect run: 'grok' (River, xAI API) or 'claude'
+   *  (Leak Ultra, local CLI). Absent on the non-architect paths. */
+  driver?: string;
+  /** Lean toolchain + Mathlib version that ACTUALLY certified this run, from the
+   *  armed verifier group — Leak XI/XII/XIV run 4.32.0, Leak I/II/IV run 4.29.1.
+   *  Carried per run so a certificate never claims the wrong one. */
+  lean_toolchain?: string;
+  mathlib_version?: string;
+  /** Human label for that group, e.g. "Leak XI/XII/XIV". */
+  verifier_group?: string;
 }
 
 export interface ProverEvent {
@@ -63,4 +114,8 @@ export interface ProverOutcome {
   counterexample?: string;
   /** The machine-checked `¬theorem` disproof script. */
   disproof?: string;
+  /** Terminal metrics snapshot from the `done` frame (llm/tool counts, time
+   *  elapsed, and — architect runs only — blueprint/node stats). Used to
+   *  populate the Leak River / Leak Stronghold research tables. */
+  metrics?: ProverMetrics;
 }

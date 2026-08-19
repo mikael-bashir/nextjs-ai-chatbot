@@ -17,16 +17,75 @@ import {
   extendProverRun,
 } from '@/lib/prover/run-prover-stream';
 import { ProverConsole } from '@/components/prover/prover-console';
-import type { ProverEvent } from '@/lib/prover/types';
+import type {
+  ProverEvent,
+  ProverEventKind,
+  ProverMetrics,
+} from '@/lib/prover/types';
 import {
   estimateCost,
   extractFeatures,
   type EstimateResult,
 } from '@/lib/cost/estimator';
+import {
+  GAUNTLET_JUDGE_SYSTEM_PROMPT,
+  GAUNTLET_MODEL,
+  GAUNTLET_SAMPLES,
+  GAUNTLET_SOLVER_SYSTEM_PROMPT,
+  GAUNTLET_TIMEOUT_MS,
+  LEVEL_ASSESSOR_SYSTEM_PROMPT,
+  gauntletJudgePrompt,
+  gauntletSolverPrompt,
+  levelAssessorPrompt,
+  normalizeIntString,
+  parseAssessedLevel,
+  parseJudgeVerdict,
+  sampleChain,
+  trapdoorPrompt,
+  type GauntletMeta,
+} from '@/lib/generation/trapdoor';
+import {
+  ElaborationUnavailableError,
+  MAX_REFORMALIZE_ATTEMPTS,
+  REFORMALIZER_SYSTEM_PROMPT,
+  checkStatementElaborates,
+  parseReformalized,
+  reformalizePrompt,
+} from '@/lib/generation/elaboration';
+import {
+  INTEGRAL_VERIFIER_SYSTEM_PROMPT,
+  integralSetterPrompt,
+  integralVerifierPrompt,
+  parseIntegralVerdict,
+  prefilterProblem,
+  sampleIntegralRecipe,
+  type IntegralCertificate,
+} from '@/lib/generation/integral';
+import {
+  MIRAGE_SETTER_SYSTEM_PROMPT,
+  mirageExactFields,
+  mirageSetterPrompt,
+  sampleThresholdMirage,
+  type MirageInstance,
+} from '@/lib/generation/mirage';
 
 // Per-item cost state (session-scoped): the estimate made on enqueue and the
 // actual recorded once the proof finishes. Persisted rows live in
 // proof_cost_history; this map drives the live per-card display.
+// What the bridge's /run returns (and /run-stream's terminal `result` event
+// carries) — the shape every generation-phase caller consumes.
+interface BridgeRunResult {
+  ok?: boolean;
+  text?: string;
+  usage?: unknown;
+  costUsd?: number | null;
+  exitCode?: number | null;
+  durationMs?: number;
+  timedOut?: boolean;
+  aborted?: boolean;
+  stderr?: string;
+}
+
 interface ItemCost {
   estimating?: boolean;
   estFailed?: boolean;
@@ -54,7 +113,24 @@ const fmtPct = (n: number | null | undefined) =>
   n == null ? '—' : `${(n * 100).toFixed(0)}%`;
 import { MathMarkdown } from '@/components/math-markdown';
 
-const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
+// Lean pins per verifier group, the strategy catalogue and the strategy-family
+// predicates all live in lib/prover/strategies.ts — shared with the benchmark
+// console so the two can't drift apart. The pins are NOT interchangeable: the
+// original Leak group (I/II/IV, gate = verify_full_script) runs 4.29.1, while
+// the architect group (XI/XII/XIV, gate = Leak XIV) runs 4.32.0.
+import {
+  ARCHITECT_MATHLIB_VERSION,
+  ARCHITECT_TOOLCHAIN,
+  MATHLIB_VERSION,
+  RIVER_STRATEGIES,
+  TOOLCHAIN,
+  ULTRA_STRATEGIES,
+  enforcerLabelFor,
+  isArchitectStrategy,
+  isRiverStrategy,
+  isUltraStrategy,
+} from '@/lib/prover/strategies';
+import { recordResearchRun as postResearchRun } from '@/lib/research/record-run';
 
 // Generation needs no tools/MCP — run claude lean so each call carries ~4k
 // tokens of context instead of ~17k (default system prompt + tool schemas),
@@ -75,33 +151,108 @@ const GEN_RUN_OPTIONS = {
   maxOutputTokens: 64000,
 };
 
-// Reverse mode builds problems from exact arithmetic (products, modular
-// exponentiation, witness evaluation) that a tool-less model would otherwise
+// Reverse and trapdoor modes build problems from exact arithmetic (products,
+// modular exponentiation, chain walks) that a tool-less model would otherwise
 // grind out by hand — slow (10-20 min of thinking) AND error-prone, so the
-// certificate often ends up wrong. Give ONLY reverse mode a python tool so it
-// computes and self-verifies the certificate exactly, in seconds. The other
-// modes stay tool-free (lean context = less rate-limit pressure when looping).
+// answer often ends up wrong. Give those modes a python tool so they compute
+// the construction exactly, in seconds. The other modes stay tool-free (lean
+// context = less rate-limit pressure when looping).
+// Drop Bash from the denylist; keep everything else blocked. Headless run on
+// the user's own local bridge — auto-approve the tool so it can actually
+// execute python without an interactive prompt.
+const BASH_TOOL_OPTIONS = {
+  disallowedTools:
+    'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
+  allowedTools: 'Bash',
+  permissionMode: 'bypassPermissions',
+};
+
 function genRunOptionsFor(mode: GenMode, model?: string) {
-  const withModel = model ? { ...GEN_RUN_OPTIONS, model } : GEN_RUN_OPTIONS;
-  if (mode !== 'reverse') return withModel;
-  return {
-    ...withModel,
-    // Drop Bash from the denylist; keep everything else blocked.
-    disallowedTools:
-      'Read Edit Write Glob Grep WebFetch WebSearch Task TodoWrite NotebookEdit',
-    allowedTools: 'Bash',
-    // Headless run on the user's own local bridge — auto-approve the tool so it
-    // can actually execute python without an interactive prompt.
-    permissionMode: 'bypassPermissions',
-  };
+  // Trapdoor defaults the GENERATOR to Opus 4.8: the gauntlet adversary is
+  // Sonnet 5 + tools, and a generator of equal strength to its adversary
+  // produces problems the adversary solves (measured live: 3/3 cracked with
+  // full derivations). The asymmetry is the point — an explicit model pick
+  // in the UI still overrides this. Integral mode doesn't need it: its
+  // difficulty comes from the backward construction, and the gauntlet tiers
+  // it honestly either way.
+  const effective =
+    model || (mode === 'trapdoor' ? 'claude-opus-4-8' : undefined);
+  const withModel = effective
+    ? { ...GEN_RUN_OPTIONS, model: effective }
+    : GEN_RUN_OPTIONS;
+  if (mode !== 'reverse' && mode !== 'trapdoor' && mode !== 'integral')
+    return withModel;
+  return { ...withModel, ...BASH_TOOL_OPTIONS };
 }
+
+// The integral hard verifier (VHG Appendix E.3): an independent run whose
+// verdict comes from executed sympy, never from the setter's own transcript.
+const INTEGRAL_VERIFIER_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  ...BASH_TOOL_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: INTEGRAL_VERIFIER_SYSTEM_PROMPT,
+  timeoutMs: 10 * 60 * 1000,
+};
+
+// Mirage: the LLM only writes prose around a TS-solved instance — no tools, no
+// math, so this is a short completion. Opus for the quality of the disguise.
+const MIRAGE_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: 'claude-opus-4-8',
+  systemPrompt: MIRAGE_SETTER_SYSTEM_PROMPT,
+  timeoutMs: 5 * 60 * 1000,
+};
+
+// The gauntlet solver: a mid-tier Claude attacking the problem cold, WITH a
+// Bash/python tool (denying it would test mental arithmetic, not insight —
+// see lib/generation/trapdoor.ts) and no forced output format. Timeout is
+// generation-side only (a solver that can't crack it in time has failed to
+// crack it, which is the pass condition).
+const GAUNTLET_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  ...BASH_TOOL_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: GAUNTLET_SOLVER_SYSTEM_PROMPT,
+  timeoutMs: GAUNTLET_TIMEOUT_MS,
+};
+
+// The gauntlet judge: also tool-equipped, so it can RUN any code the solver
+// produced and verify what it actually prints rather than trust the
+// transcript.
+const GAUNTLET_JUDGE_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  ...BASH_TOOL_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: GAUNTLET_JUDGE_SYSTEM_PROMPT,
+  timeoutMs: GAUNTLET_TIMEOUT_MS,
+};
+
+// Re-formalization: rewrite a Lean statement that failed to compile, keeping
+// the problem. Pure formalization work against a concrete compiler error, so a
+// mid-tier model is enough and no tools are needed — the daemon re-checks the
+// result anyway, which is the real verdict.
+const REFORMALIZER_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: REFORMALIZER_SYSTEM_PROMPT,
+  timeoutMs: 5 * 60 * 1000,
+};
+
+// Post-hoc level assessment: one cheap classification call per problem.
+const ASSESSOR_RUN_OPTIONS = {
+  ...GEN_RUN_OPTIONS,
+  model: GAUNTLET_MODEL,
+  systemPrompt: LEVEL_ASSESSOR_SYSTEM_PROMPT,
+  timeoutMs: 5 * 60 * 1000,
+};
 
 // Models selectable for the local `claude` runs (available on the Claude Max
 // plan). '' = the CLI/bridge default. Generation and verification pick one each,
 // independently.
 const PROVER_MODELS: { value: string; label: string }[] = [
   { value: '', label: 'Default' },
-  { value: 'claude-opus-4-8', label: 'Opus 4.8' },
+  { value: 'claude-opus-5', label: 'Opus 5' },
   { value: 'claude-sonnet-5', label: 'Sonnet 5' },
   { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
   { value: 'claude-fable-5', label: 'Fable 5' },
@@ -170,7 +321,26 @@ function fmtCountdown(ms: number): string {
   return h > 0 ? `${h}h ${m}m` : `${m}m ${s % 60}s`;
 }
 
-type GenMode = 'easy' | 'medium' | 'hard' | 'insane' | 'reverse';
+type GenMode =
+  | 'easy'
+  | 'medium'
+  | 'hard'
+  | 'insane'
+  | 'reverse'
+  | 'trapdoor'
+  | 'integral'
+  | 'mirage';
+
+// Whether a generated Lean statement is compiled before we spend anything on
+// it. 'leak' runs it on the connected Lean daemon via the MCP connection
+// manager; 'off' skips the check entirely, for generating problems without any
+// verification. See lib/generation/elaboration.ts for why this gate exists.
+type StatementCheck = 'leak' | 'off';
+
+const STATEMENT_CHECK_LABEL: Record<StatementCheck, string> = {
+  leak: 'Leak IV',
+  off: 'Off',
+};
 
 const MODE_LABEL: Record<GenMode, string> = {
   easy: 'Easy',
@@ -178,6 +348,9 @@ const MODE_LABEL: Record<GenMode, string> = {
   hard: 'Hard',
   insane: 'Insane',
   reverse: 'Reverse-built',
+  trapdoor: 'Trapdoor',
+  integral: 'Integral',
+  mirage: 'Mirage',
 };
 
 const BASE_REQS = `You are a creative competition-math problem setter. Invent ONE original problem.
@@ -204,9 +377,25 @@ Core requirements:
   2 = knowledge content up to early high / secondary school;
   3 = knowledge up to the end of sixth form / college;
   4 = built around a single advanced, university-level concept;
-  5 = several advanced concepts combined together.`;
+  5 = several advanced concepts combined together.
 
-const MODE_BLOCKS: Record<GenMode, string> = {
+DO NOT PROVE THE LEAN THEOREM. You write the STATEMENT only; its body must be
+exactly \`:= by sorry\`. Never emit \`decide\`, \`native_decide\`, \`norm_num\`,
+\`simp\`, \`rfl\` or any other tactic or term as the proof, and never try to
+discharge the goal in your head. State-of-the-art provers run downstream and
+that is their entire job — proving is not merely unnecessary here, it is a
+waste of your budget and it hands them a target that is not a clean goal.
+Note this is about the BODY only: where a mode below asks for a statement that
+is "decidable by decide/native_decide", that constrains the SHAPE OF THE CLAIM
+(a finite, checkable domain) — it is not permission to write the tactic.`;
+
+// Trapdoor, Integral and Mirage modes have no static block — their prompts are
+// built per-run around code-sampled recipes/instances (see the lib/generation
+// modules).
+const MODE_BLOCKS: Record<
+  Exclude<GenMode, 'trapdoor' | 'integral' | 'mirage'>,
+  string
+> = {
   easy: `
 - EASY. A quick, approachable problem: a single clear elementary observation or a short direct computation solves it. No deep trick and no long chain of steps — it should feel like a warm-up.
 - Provide a Lean 4 theorem stating the exact answer, provable in Mathlib. Prefer a statement decidable by decide/native_decide over a SMALL finite domain (Fin n, Finset.range/Icc, functions between small Fin types) so it is machine-checkable. It should be true (the Lean prover verifies it afterward — don't re-derive it in your head).
@@ -261,54 +450,16 @@ const MODE_BLOCKS: Record<GenMode, string> = {
 
 const RESPONSE_FORMAT = `
 
+LEAN SELF-CONTAINMENT (hard requirement, no exceptions): "lean" must be ONE single declaration — the theorem itself. NEVER split it into a separate top-level \`def\`/\`abbrev\`/\`structure\`/etc. that the theorem then references (e.g. a helper recursive function \`f\`). Any auxiliary function, sequence, or recurrence the statement needs must be folded INTO the theorem's own signature instead — as a bound variable plus hypotheses stating its defining equations, e.g. \`theorem foo (f : ℕ → ℕ) (hf0 : f 0 = 0) (hf : ∀ n, f (n + 1) = n + 1 + f ((n + 1) / 2)) : f 2026 = 9769\`. The verifier that later checks a submitted proof compares the target's signature verbatim against nothing but this one declaration — a leading def makes the problem permanently unprovable, not just harder.
+
 Assume "import Mathlib" is present; do NOT include imports.
 Respond with ONLY this JSON object, nothing else:
 {"questionTitle":"<curious, alluring hook — a question / scenario / teaser; NEVER 'The <Adjective> <Noun>'>","subtitle":"<1-3 word tagline>","problem":"<self-contained statement>","answer":<integer>,"difficulty":"Easy|Medium|Hard|Insane","points":<50|100|150|200>,"level":<1-5>,"insight":"<key trick(s), 1-3 sentences>","lean":"theorem name : <statement encoding the integer answer> := by sorry"}`;
 
-// CompeteMath knowledge tiers (1-5). Selectable in the admin UI to TARGET the
-// prerequisite KNOWLEDGE of a generated problem. This is ORTHOGONAL to how hard
-// the problem is to solve — a Level-1 problem (primary-school knowledge) can
-// still be fiendishly hard. Difficulty/ingenuity is set by the mode, not here.
-// Level 0 = "Any" (the model assigns the level).
-const LEVELS: { value: number; label: string; need: string }[] = [
-  {
-    value: 1,
-    label: 'Foundational',
-    need: 'the base knowledge of a first-year primary-school student — basic arithmetic, counting, simple patterns',
-  },
-  {
-    value: 2,
-    label: 'Early secondary',
-    need: 'up to early high / secondary school — fractions, basic algebra, simple geometry, elementary number facts',
-  },
-  {
-    value: 3,
-    label: 'Sixth form / college',
-    need: 'up to the end of sixth form / college — algebra, functions, sequences, basic combinatorics/number theory, introductory calculus',
-  },
-  {
-    value: 4,
-    label: 'One advanced concept',
-    need: 'a single advanced, university-level concept (e.g. group theory, linear algebra, real analysis, advanced number theory)',
-  },
-  {
-    value: 5,
-    label: 'Multiple advanced concepts',
-    need: 'several advanced, university-level concepts combined',
-  },
-];
-
-// Prompt block that caps the PREREQUISITE KNOWLEDGE to a target tier. It must NOT
-// touch difficulty — that stays owned entirely by the mode block above.
-function levelBlock(level: number): string {
-  const L = LEVELS.find((l) => l.value === level);
-  if (!L) return '';
-  return `\n\nTARGET KNOWLEDGE LEVEL — CompeteMath Level ${level} (${L.label}). This constrains ONLY the prerequisite knowledge, NOT the difficulty:
-- A solver must be able to UNDERSTAND and attempt the problem with at most: ${L.need}. Do not require, in the statement or the intended human solution, any concept beyond this tier. (The Lean formalisation may still use whatever Mathlib needs — that is separate and does not count.)
-- This says NOTHING about how hard the problem is. Difficulty and ingenuity are governed entirely by the mode above and remain fully in force. A Level-${level} problem must be exactly as hard to SOLVE as the mode demands — e.g. a Level-1 HARD problem is a genuinely fiendish insight over elementary objects (arithmetic, counting, simple patterns), NOT an easy question.
-- Set "level" in your output to exactly ${level}. Set "difficulty"/"points" to reflect how hard the problem is to SOLVE (per the mode) — NEVER downgrade the difficulty just because the level is low.
-You must still produce a specific INTEGER answer and a machine-checkable Lean 4 theorem as specified below.`;
-}
+// The level (prerequisite-knowledge tier, 1-5) is no longer a generation
+// constraint: the generator works unconstrained, and the tier is judged
+// AFTER the fact by a cheap post-hoc assessor call (see generateOne). The
+// rubric lives in lib/generation/trapdoor.ts.
 
 interface LiveProblem {
   title: string;
@@ -357,11 +508,19 @@ function buildAvoidContext(
   return parts.join('\n\n');
 }
 
-function buildPrompt(mode: GenMode, level: number, avoid: string): string {
+function buildPrompt(mode: GenMode, avoid: string): string {
+  // Trapdoor and Integral build their prompts around per-run sampled recipes.
+  // Mirage is handled entirely in generateOne (it needs the sampled instance
+  // for the exact-field overwrite), so it never reaches buildPrompt.
+  if (mode === 'trapdoor') return trapdoorPrompt(sampleChain(), avoid);
+  if (mode === 'integral')
+    return integralSetterPrompt(sampleIntegralRecipe(), avoid);
+  if (mode === 'mirage')
+    throw new Error('mirage prompt is built in generateOne, not buildPrompt');
   const avoidBlock = avoid
     ? `\n\nAVOID DUPLICATION. Do NOT create anything close in topic, structure, or mechanism to the problems below — choose a genuinely different area of mathematics and a fresh device:\n${avoid}`
     : '';
-  return BASE_REQS + MODE_BLOCKS[mode] + levelBlock(level) + avoidBlock + RESPONSE_FORMAT;
+  return BASE_REQS + MODE_BLOCKS[mode] + avoidBlock + RESPONSE_FORMAT;
 }
 
 interface GenProblem {
@@ -374,12 +533,48 @@ interface GenProblem {
   level?: number;
   insight?: string;
   lean?: string;
+  // Trapdoor mode only: the hidden layer-by-layer construction (the key).
+  // Stored server-side, never shown to solvers.
+  chain?: string[];
+  // Integral mode only: the certificate consumed by the hard verifier at
+  // generation time (sympy syntax). The human-facing copy of the certificate
+  // lives in `insight`; these raw fields are not persisted.
+  integrand?: string;
+  antiderivative?: string;
+  lowerBound?: string;
+  upperBound?: string;
+  exactValue?: string;
+}
+
+// One independently-signed certificate for one toolchain. The flat fields on
+// StagedItem below (proof/toolchain/mathlib/...) always mirror the MOST
+// RECENT verify, for every existing UI read that expects a single proof;
+// `certs` is the full accumulated set — one entry per DISTINCT toolchain the
+// item has ever been successfully verified+signed on, upserted (not
+// appended) so re-verifying the SAME toolchain replaces its entry rather
+// than duplicating it. This is what lets an admin verify a problem on
+// several toolchains BEFORE ever promoting it, and have all of them ship as
+// independent certificates the first time it goes live.
+interface CertEntry {
+  toolchain: string;
+  mathlib?: string | null;
+  enforcer?: string | null;
+  proof: string;
+  verifiedAt?: string | null;
+  signature?: string | null;
+  signatureKeyId?: string | null;
+  certMintedAt?: string | null;
 }
 
 interface StagedItem extends GenProblem {
   id: string;
   proof?: string;
+  /** Lean toolchain + Mathlib version of the group that certified this proof. */
   toolchain?: string;
+  mathlib?: string;
+  /** Specific strategy that enforced this proof, for the certificate's
+   *  Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak"). */
+  enforcer?: string;
   createdAt?: string;
   // ISO time the Lean kernel confirmed the proof (set by the verify loop),
   // threaded to the prod payload so the certificate's "verified" time is real.
@@ -389,6 +584,9 @@ interface StagedItem extends GenProblem {
   signature?: string | null;
   signatureKeyId?: string | null;
   certMintedAt?: string | null;
+  // Every distinct-toolchain certificate accumulated across re-verifies of
+  // THIS item, pre-publish. See CertEntry.
+  certs?: CertEntry[];
 }
 
 interface GeneratedItem extends StagedItem {
@@ -407,6 +605,10 @@ interface GeneratedItem extends StagedItem {
   proofCheckpoint?: string;
   proofCheckpointFilled?: number;
   proofCheckpointTotal?: number;
+  // Which generation mode produced this item.
+  genMode?: string;
+  // Sonnet-gauntlet verdict (Insane problems only) — see lib/generation/trapdoor.
+  gauntlet?: GauntletMeta;
 }
 
 interface Health {
@@ -557,17 +759,119 @@ function connFor(useWork: boolean) {
 // a manual "+5 min" nudge. Generous — deep proofs (e.g. lucas_nresidue_prime)
 // legitimately take a while — and always extendable live.
 const VERIFY_COMPUTE_BUDGET_MS = 30 * 60_000;
+// The Leak River strategies are deliberately governed much tighter: they're the
+// experimental Goedel-Architect pipeline under test, so runs should fail fast
+// and cheap rather than idle for 30 minutes — extend one minute at a time
+// instead of five once you've confirmed it's making real progress.
+const ARCHITECT_COMPUTE_BUDGET_MS = 5 * 60_000;
+const ARCHITECT_EXTEND_MS = 1 * 60_000;
+// Grok is the only driver the pipeline supports (see proveArchitect in
+// public/local-claude-bridge.mjs) — the model selector is locked to this value
+// whenever a River strategy is active. river-delta additionally makes one local
+// Sonnet 5 call for its NL-proof seed, which is not a driver choice.
+const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
+// Refinement-iteration budget: the paper's Figure 2 shows solve rate climbing
+// log-linearly with refinement iterations, so this is the main quality dial.
+// Starts at 5, +1 per click.
+const ARCHITECT_DEFAULT_ITERS = 5;
+
+// The no-op strategy: problems are generated and saved, but no prover ever
+// runs. Kept as a strategy VALUE (rather than a separate toggle) so that the
+// single `verifyStrategyRef` read inside runVerifier is the only gate the whole
+// pipeline needs — every dispatch path already funnels through it.
+const VERIFY_OFF = 'off';
+
+// RIVER_STRATEGIES / ULTRA_STRATEGIES and the family predicates are imported
+// from lib/prover/strategies.ts (shared with the benchmark console).
+
+// enforcerLabelFor is imported from lib/prover/strategies.ts.
+
+// Replace this toolchain's entry (re-verifying the same toolchain updates it
+// in place) or append a new one (a genuinely new toolchain). Never grows
+// unbounded — one entry per distinct toolchain, always.
+function upsertCertEntry(certs: CertEntry[] | undefined, entry: CertEntry): CertEntry[] {
+  const next = (certs ?? []).filter((c) => c.toolchain !== entry.toolchain);
+  next.push(entry);
+  return next;
+}
+// certs[] is the source of truth once populated; an item that only ever had
+// ONE verify (certs never touched) falls back to synthesizing a single-entry
+// list from the flat fields, so every downstream consumer can just read
+// certs() and get the right answer regardless of how the item got there.
+function certsOrFallback(item: StagedItem): CertEntry[] {
+  if (item.certs?.length) return item.certs;
+  if (!item.proof) return [];
+  return [{
+    toolchain: item.toolchain || TOOLCHAIN,
+    mathlib: item.mathlib ?? null,
+    enforcer: item.enforcer ?? null,
+    proof: item.proof,
+    verifiedAt: item.verifiedAt ?? null,
+    signature: item.signature ?? null,
+    signatureKeyId: item.signatureKeyId ?? null,
+    certMintedAt: item.certMintedAt ?? null,
+  }];
+}
+
+// Would this proof text make a HONEST certificate for `target`? A certificate
+// asserts "sorry-free Lean proof of THIS theorem", so both claims are checked
+// here rather than trusted from whichever orchestrator produced the text. This is
+// deliberately shape-only — the kernel already ruled on correctness; this catches
+// a proof of the wrong statement, or one that still has a hole, before it gets
+// signed and published. Returns null when the proof is fit to certify.
+//
+// Whitespace-insensitive on the signature: the architect path re-emits the
+// declaration with its own formatting, and the certified file legitimately opens
+// with `import Mathlib` where the have-path proofs are import-less.
+function certifiableProof(target: string, proof: string): string | null {
+  const norm = (s: string) => s.replace(/\s+/g, ' ').trim();
+  const name = /(?:theorem|lemma)\s+([A-Za-z_][\w'.]*)/.exec(target)?.[1];
+  if (!name) return null; // no target declaration to compare against
+  if (!new RegExp(`(?:theorem|lemma)\\s+${name.replace(/\./g, '\\.')}\\b`).test(proof))
+    return `proof does not declare the target theorem \`${name}\``;
+  // The signature is everything up to the `:=` that opens the proof body.
+  const sig = norm(
+    target.replace(/:=\s*by[\s\S]*$/, '').replace(/:=\s*sorry[\s\S]*$/, ''),
+  );
+  if (sig && !norm(proof).includes(sig))
+    return `proof's declaration does not match the target signature byte-for-byte`;
+  if (/\bsorry\b/.test(proof)) return 'proof still contains `sorry`';
+  return null;
+}
+
+// A generated "lean" field must be exactly one declaration — the theorem
+// itself. If the generator split it into a separate top-level def/abbrev/etc.
+// (typically to define a helper recursive sequence) the problem is
+// permanently unprovable downstream: every verifier compares the target
+// signature verbatim against that ONE declaration's own parsed signature,
+// never the surrounding file — a leading def can never match, no matter what
+// gets submitted. Prompt instructions alone aren't a reliable enough gate
+// (models improvise this shape when a statement genuinely needs a helper
+// function), so this is caught here, deterministically, before it's queued.
+const LEADING_DECL_RE =
+  /^\s*(?:private\s+|protected\s+|noncomputable\s+|public\s+)*(?:def|abbrev|structure|instance|inductive)\b/m;
+function leanSplitsIntoSeparateDecl(lean: string): boolean {
+  return LEADING_DECL_RE.test(lean);
+}
 
 export function AdminPipeline() {
   const [work, setWork] = useState(false);
-  const [genStage, setGenStage] = useState<'idle' | 'generating' | 'saving'>(
-    'idle',
-  );
+  const [genStage, setGenStage] = useState<
+    | 'idle'
+    | 'generating'
+    | 'elaborating'
+    | 'reformalizing'
+    | 'validating'
+    | 'gauntlet'
+    | 'assessing'
+    | 'saving'
+  >('idle');
   const [stats, setStats] = useState({
     generated: 0,
     verified: 0,
     failed: 0,
     errors: 0,
+    downgraded: 0,
   });
   const [log, setLog] = useState<LogEntry[]>([]);
   const [logOpen, setLogOpen] = useState<Set<number>>(new Set());
@@ -624,8 +928,12 @@ export function AdminPipeline() {
   const [genFilter, setGenFilter] = useState<GenFilter>('all');
   const [previewIds, setPreviewIds] = useState<string[]>([]);
   const [mode, setMode] = useState<GenMode>('medium');
-  // Target CompeteMath knowledge tier for generation (0 = Any / model decides).
-  const [targetLevel, setTargetLevel] = useState(0);
+  // Statement pre-check + the banner shown when it can't run (Leak IV not
+  // connected). The banner is separate from the activity console because a
+  // missing daemon is an infrastructure problem the user must act on, not a
+  // verdict scrolling past in a log.
+  const [statementCheck, setStatementCheck] = useState<StatementCheck>('leak');
+  const [checkError, setCheckError] = useState<string | null>(null);
   // Generation model — independent from the verification model. '' = default.
   const [genModel, setGenModel] = useState('');
   const genModelRef = useRef(genModel);
@@ -648,6 +956,36 @@ export function AdminPipeline() {
   // Full, normalized prover activity for the shared <ProverConsole> (thinking,
   // tool calls, tool results/errors, verify attempts, metrics) — not just names.
   const [verifyEvents, setVerifyEvents] = useState<ProverEvent[]>([]);
+  // Same console, fed by generation: the generator's own run, every gauntlet
+  // solver/judge exchange, mutation repairs, and the final save/scrap — so a
+  // stuck or looping run can be watched live and copy-pasted whole.
+  const [genEvents, setGenEvents] = useState<ProverEvent[]>([]);
+  const genEventIdRef = useRef(0);
+  // Accumulates across EVERY attempt in a Work-loop session — never cleared
+  // per-attempt, or a fast-failing attempt's error would vanish the instant
+  // the next attempt starts (which is exactly what made a real stuck run look
+  // like "nothing is happening": the one attempt that mattered got wiped).
+  // Capped so an unattended overnight Work loop can't grow this unbounded.
+  const GEN_EVENTS_CAP = 500;
+  const pushGenEvent = useCallback(
+    (kind: ProverEventKind, label: string, extra?: Partial<ProverEvent>) => {
+      genEventIdRef.current += 1;
+      const ev: ProverEvent = {
+        id: genEventIdRef.current,
+        ts: Date.now(),
+        kind,
+        label,
+        ...extra,
+      };
+      setGenEvents((prev) => {
+        const next = [...prev, ev];
+        return next.length > GEN_EVENTS_CAP
+          ? next.slice(next.length - GEN_EVENTS_CAP)
+          : next;
+      });
+    },
+    [],
+  );
   // Decompose mode: when on, ACG verification drives the /prove-tree orchestrator
   // (prove-or-split) instead of the single-agent /prove-stream. Held in a ref so
   // proveStream can read the latest value without re-creating the verify loop.
@@ -670,6 +1008,20 @@ export function AdminPipeline() {
   useEffect(() => {
     verifyModelRef.current = verifyModel;
   }, [verifyModel]);
+  // The Leak River strategies always drive Grok directly — force the model and
+  // lock the selector while one is active; fall back to the default the moment
+  // the operator switches to any other strategy.
+  useEffect(() => {
+    if (isRiverStrategy(verifyStrategy)) setVerifyModel(ARCHITECT_MODEL);
+    else setVerifyModel((m) => (m === ARCHITECT_MODEL ? '' : m));
+  }, [verifyStrategy]);
+  // Refinement-iteration budget for River runs (the "+1 iter" button). Held in a
+  // ref too so the async verify loop reads the value at dispatch time.
+  const [verifyMaxIters, setVerifyMaxIters] = useState(ARCHITECT_DEFAULT_ITERS);
+  const verifyMaxItersRef = useRef(verifyMaxIters);
+  useEffect(() => {
+    verifyMaxItersRef.current = verifyMaxIters;
+  }, [verifyMaxIters]);
 
   // Live monitoring: start timestamps drive elapsed timers; usage accumulates
   // token/cost metadata reported by the bridge.
@@ -683,6 +1035,7 @@ export function AdminPipeline() {
     budgetMs: number;
   } | null>(null);
   const [extending, setExtending] = useState(false);
+  const [extendingIters, setExtendingIters] = useState(false);
   const runIdRef = useRef<string | null>(null);
   // item.id -> saved checkpoint to resume from, set by "Resume from saved" and
   // consumed once by the verify loop (so a plain re-verify still starts fresh).
@@ -739,7 +1092,7 @@ export function AdminPipeline() {
   // Refs so generateOne reads the latest mode + existing problems for the prompt
   // without depending on that state (which would restart the Work loop).
   const modeRef = useRef<GenMode>('medium');
-  const targetLevelRef = useRef(0);
+  const statementCheckRef = useRef<StatementCheck>('leak');
   const generatedRef = useRef<GeneratedItem[]>([]);
   const liveRef = useRef<LiveProblem[]>([]);
 
@@ -749,8 +1102,8 @@ export function AdminPipeline() {
     modeRef.current = mode;
   }, [mode]);
   useEffect(() => {
-    targetLevelRef.current = targetLevel;
-  }, [targetLevel]);
+    statementCheckRef.current = statementCheck;
+  }, [statementCheck]);
   useEffect(() => {
     generatedRef.current = generated;
   }, [generated]);
@@ -796,6 +1149,113 @@ export function AdminPipeline() {
       });
     },
     [],
+  );
+
+  // Streaming twin of callBridge('/run'): drives the bridge's /run-stream SSE,
+  // mirroring EVERY live step (thinking deltas, tool calls, tool output, model
+  // status) into the generation console via pushGenEvent — so a 15-minute
+  // generator/solver run reads as a living transcript instead of dead air —
+  // and resolves with exactly the JSON /run would have returned. Falls back to
+  // the blocking /run on an older bridge (404), so an un-updated bridge still
+  // works; you just don't get live progress until it's re-downloaded.
+  const runBridgeStream = useCallback(
+    async (
+      useWork: boolean,
+      payload: { prompt: string; options: Record<string, unknown> },
+      tag: string,
+      signal: AbortSignal,
+    ): Promise<BridgeRunResult> => {
+      const res = await callBridge(useWork, '/run-stream', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        signal,
+      });
+      if (res.status === 404) {
+        // Old bridge without /run-stream — degrade to the silent blocking call.
+        pushGenEvent(
+          'system',
+          `${tag}: bridge has no /run-stream — re-download the bridge for live progress`,
+        );
+        const r = await callBridge(useWork, '/run', {
+          method: 'POST',
+          body: JSON.stringify(payload),
+          signal,
+        });
+        if (!r.ok)
+          throw Object.assign(new Error(`Bridge /run failed (${r.status})`), {
+            httpStatus: r.status,
+            body: await r.text().catch(() => ''),
+          });
+        return (await r.json()) as BridgeRunResult;
+      }
+      if (!res.ok || !res.body)
+        throw Object.assign(
+          new Error(`Bridge /run-stream failed (${res.status})`),
+          { httpStatus: res.status, body: await res.text().catch(() => '') },
+        );
+
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '';
+      let result: BridgeRunResult | null = null;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        const frames = buf.split('\n\n');
+        buf = frames.pop() || '';
+        for (const f of frames) {
+          if (!f.startsWith('data:')) continue;
+          let d: Record<string, any>;
+          try {
+            d = JSON.parse(f.replace(/^data:\s*/, ''));
+          } catch {
+            continue;
+          }
+          switch (d.type) {
+            case 'thinking':
+              pushGenEvent('thinking', `${tag} — thinking`, {
+                detail: String(d.text || ''),
+              });
+              break;
+            case 'system':
+              if (d.model) pushGenEvent('system', `${tag} — model ${d.model}`);
+              break;
+            case 'message-annotation':
+              if (d.subtype === 'tool_intent')
+                pushGenEvent('tool_call', `${tag} → ${d.tool}`, {
+                  tool: d.tool,
+                  input: typeof d.input === 'string' ? d.input : undefined,
+                });
+              else if (d.subtype === 'tool_result')
+                pushGenEvent('tool_result', `${tag} ← tool output`, {
+                  detail: String(d.output ?? ''),
+                });
+              else if (d.thought)
+                pushGenEvent(
+                  'text',
+                  `${tag}: ${String(d.thought).split('\n')[0].slice(0, 160)}`,
+                  { detail: String(d.thought) },
+                );
+              break;
+            case 'result':
+              result = d as BridgeRunResult;
+              break;
+            default:
+              // heartbeat — liveness only, nothing to render
+              break;
+          }
+        }
+      }
+      if (!result) {
+        if (signal.aborted) throw new Error('Terminated by you');
+        throw new Error(
+          `${tag}: stream ended without a result — the bridge process likely died mid-run`,
+        );
+      }
+      return result;
+    },
+    [callBridge, pushGenEvent],
   );
 
   const fetchMcp = (): Promise<ProverMcpServer[]> => fetchProverMcpServers();
@@ -869,7 +1329,7 @@ export function AdminPipeline() {
       lean: string,
       mcpServers: ProverMcpServer[],
       signal?: AbortSignal,
-      opts?: { itemId?: string; seed?: string },
+      opts?: { itemId?: string; seed?: string; nlProof?: string },
     ) => {
       const conn = connFor(false); // shared (verification) bridge
       let content = ''; // accumulate text to detect a session-limit message
@@ -898,12 +1358,25 @@ export function AdminPipeline() {
           endpoint: decompose ? 'prove-tree' : 'prove-stream',
           strategy: decompose ? strategy : undefined,
           seed: opts?.seed,
+          nlProof: opts?.nlProof,
           // Tree path runs under an extendable wall-clock budget; the single-agent
           // path ignores it (and never fires onRunId), so the indicator stays off.
-          computeBudgetMs: decompose ? VERIFY_COMPUTE_BUDGET_MS : undefined,
+          // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
+          computeBudgetMs: decompose
+            ? isArchitectStrategy(strategy)
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : VERIFY_COMPUTE_BUDGET_MS
+            : undefined,
+          // Architect pipeline only (River + Ultra): refinement budget from the
+          // "+1 iter" control.
+          maxIters: isArchitectStrategy(strategy)
+            ? verifyMaxItersRef.current
+            : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
-            setComputeLimit({ deadlineMs, budgetMs });
+            // River runs report a runId even on an uncapped clock (the "+1 iter"
+            // button needs one), so only show the time indicator for a real budget.
+            if (budgetMs > 0) setComputeLimit({ deadlineMs, budgetMs });
           },
           // Auto-save: persist the newest banked checkpoint on the item so ANY
           // stop (usage-limit / Terminate / crash) can resume from it later.
@@ -942,12 +1415,50 @@ export function AdminPipeline() {
     }
   };
 
+  // Research telemetry: one row per verification ATTEMPT into whichever table
+  // matches the strategy that ran — Leak River / Leak Ultra (architect) or Leak
+  // Stronghold (every other Claude-driven strategy). The row is built and filed
+  // by lib/research/record-run.ts, shared with the benchmark console so both
+  // produce identical rows. Fire-and-forget: it must never affect the verify loop.
+  const recordResearchRun = useCallback(
+    (args: {
+      item: GeneratedItem;
+      strategy: string;
+      model: string;
+      verified: boolean;
+      refuted: boolean;
+      costUsd?: number;
+      computeBudgetMs?: number;
+      metrics?: ProverMetrics;
+      finalProof: string;
+      error: string | null;
+      nlSeedUsed: boolean;
+      seedUsed: boolean;
+    }) => {
+      const { item, ...rest } = args;
+      void postResearchRun({
+        ...rest,
+        generatedItemId: item.id,
+        problemTitle: item.questionTitle ?? item.problem?.slice(0, 80) ?? null,
+        difficulty: item.difficulty ?? null,
+        sorriedTheorem: item.lean || '',
+      });
+    },
+    [],
+  );
+
   // The single verifier: pulls the head of the queue, proves it on the shared
   // bridge, persists the outcome (clearing the DB `queued` flag), and moves on.
   // A connectivity/protocol failure PAUSES the loop and leaves the item queued —
   // so a bridge that's down never mis-marks problems as failed.
   const runVerifier = useCallback(async () => {
     if (runningRef.current) return;
+    // Strategy "off" — generate only, never prove. Guarding the one entry point
+    // covers every caller (post-generation, manual enqueue, resume-from-
+    // checkpoint, rebuild-on-load, usage-limit auto-resume), so no path can
+    // start a prover run behind the operator's back. Items already queued stay
+    // queued; they simply wait until a real strategy is selected.
+    if (verifyStrategyRef.current === VERIFY_OFF) return;
     runningRef.current = true;
     setVerifyPaused(null);
     try {
@@ -969,6 +1480,13 @@ export function AdminPipeline() {
         let refuted = false;
         let counterexample = '';
         let actualUsd: number | undefined;
+        // Captured for the research row regardless of outcome (verified or not).
+        const strategyAtStart = verifyStrategyRef.current;
+        const modelAtStart = verifyModelRef.current;
+        let outMetrics: ProverMetrics | undefined;
+        let nlSeedUsed = false;
+        let seedUsed = false;
+        let computeBudgetMsAtStart: number | undefined;
         try {
           const mcpServers = await fetchMcp();
           // If this item was enqueued via "Resume from saved", hand its checkpoint
@@ -976,11 +1494,28 @@ export function AdminPipeline() {
           // so a later plain re-verify starts fresh.
           const seed = resumeSeedRef.current[item.id];
           delete resumeSeedRef.current[item.id];
+          seedUsed = !!seed;
+          // NL guidance is NOT injected here. This used to hand every architect
+          // run the item's own problem statement, answer and solution sketch,
+          // which wrecked the whole comparison: Stone stopped being a control,
+          // and Delta's local Sonnet seed never fired (the bridge only generates
+          // one when none was supplied), so Delta was silently identical to Gate.
+          // Whether a variant gets an informal proof — and where it comes from —
+          // is now decided solely by the variant (see architectConfigFor).
+          const nlProof = undefined;
+          nlSeedUsed = false;
+          // Mirrors proveStream's own decompose check exactly (a resumed seed
+          // always runs the tree path, even with the toggle off).
+          computeBudgetMsAtStart = verifyDecomposeRef.current || seedUsed
+            ? isArchitectStrategy(strategyAtStart)
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : VERIFY_COMPUTE_BUDGET_MS
+            : undefined;
           const out = await proveStream(
             item.lean as string,
             mcpServers,
             ctrl.signal,
-            { itemId: item.id, seed },
+            { itemId: item.id, seed, nlProof },
           );
           verified = out.verified;
           // Actual dollar cost of the whole run (summed across sub-runs on the
@@ -991,6 +1526,7 @@ export function AdminPipeline() {
           proof = out.refuted ? out.disproof || '' : out.proof;
           refuted = !!out.refuted;
           counterexample = out.counterexample || '';
+          outMetrics = out.metrics;
         } catch (e) {
           const title =
             item.questionTitle || item.problem?.slice(0, 60) || item.id;
@@ -1026,6 +1562,18 @@ export function AdminPipeline() {
         // distinct marker so it reads as a BAD problem, not a hard one.
         // The exact moment the Lean kernel confirmed this proof.
         const verifiedAt = verified ? new Date().toISOString() : undefined;
+        // The toolchain that ACTUALLY certified this proof, straight from the
+        // bridge. Architect runs are certified by Leak XIV on 4.32.0, the others
+        // by the Leak II/IV daemon on 4.29.1 — the certificate must not claim one
+        // when the other did the work.
+        const runToolchain =
+          outMetrics?.lean_toolchain ??
+          (isArchitectStrategy(strategyAtStart) ? ARCHITECT_TOOLCHAIN : TOOLCHAIN);
+        const runMathlib =
+          outMetrics?.mathlib_version ??
+          (isArchitectStrategy(strategyAtStart)
+            ? ARCHITECT_MATHLIB_VERSION
+            : MATHLIB_VERSION);
         // Mint the SIGNED certificate right now — as close to kernel verification
         // as possible, so the signed bytes are provably what the kernel saw. The
         // private key never leaves the server (this hits /api/admin/certificate/
@@ -1033,7 +1581,26 @@ export function AdminPipeline() {
         let cert:
           | { signature?: string | null; keyId?: string | null; certMintedAt?: string | null }
           | null = null;
-        if (verified && proof) {
+        // Shape gate before signing. A certificate asserts "this text is a
+        // sorry-free Lean proof of THIS theorem", so refuse to sign anything that
+        // doesn't carry the target declaration or still contains a hole — cheap
+        // insurance that holds for every strategy, including new ones whose
+        // assembly step the certificate layer knows nothing about.
+        const certShapeError = verified && proof ? certifiableProof(item.lean || '', proof) : null;
+        if (certShapeError) {
+          pushLog(
+            'warn',
+            `Not signing ${item.questionTitle || item.id}: ${certShapeError}`,
+          );
+        }
+        // Accumulated once signing is attempted below — every DISTINCT toolchain
+        // this item has ever been verified on, upserted by toolchain (a re-verify
+        // of the SAME toolchain replaces its entry, never duplicates it). This is
+        // what lets an admin verify a problem on several toolchains before ever
+        // promoting it, and ship all of them as independent certificates the
+        // first time it goes live — see certsOrFallback/upsertCertEntry.
+        let updatedCerts: CertEntry[] | undefined;
+        if (verified && proof && !certShapeError) {
           try {
             const r = await fetch('/api/admin/certificate/sign', {
               method: 'POST',
@@ -1042,17 +1609,72 @@ export function AdminPipeline() {
                 title: item.questionTitle,
                 proof,
                 verifiedAt,
+                // Signed INTO the certificate bytes, so the toolchain claim is
+                // covered by the signature rather than being loose metadata.
+                toolchain: runToolchain,
+                mathlib: runMathlib,
+                // Which specific strategy enforced this proof — shown on the
+                // certificate instead of the bland "Leak".
+                enforcer: enforcerLabelFor(strategyAtStart),
               }),
             });
             if (r.ok) cert = await r.json();
           } catch {
             /* signing best-effort — the proof is still recorded either way */
           }
+          updatedCerts = upsertCertEntry(item.certs, {
+            toolchain: runToolchain,
+            mathlib: runMathlib,
+            enforcer: enforcerLabelFor(strategyAtStart),
+            proof,
+            verifiedAt,
+            signature: cert?.signature ?? null,
+            signatureKeyId: cert?.keyId ?? null,
+            certMintedAt: cert?.certMintedAt ?? null,
+          });
+          // Robustness feature, backend-only (no UI change): if this title is
+          // ALREADY published and this toolchain doesn't have a certificate
+          // for it yet, push this one straight to prod as an additional
+          // certificate. No-ops if never published, or if this toolchain is
+          // already covered. Fire-and-forget — never blocks the verify loop.
+          if (cert?.signature) {
+            fetch('/api/admin/problems/attach-certificate', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({
+                id: item.id,
+                questionTitle: item.questionTitle,
+                subtitle: item.subtitle,
+                problem: item.problem,
+                difficulty: item.difficulty,
+                points: item.points,
+                answer: item.answer,
+                level: item.level,
+                insight: item.insight,
+                lean: item.lean,
+                proof,
+                toolchain: runToolchain,
+                mathlib: runMathlib,
+                enforcer: enforcerLabelFor(strategyAtStart),
+                verifiedAt,
+                signature: cert.signature,
+                signatureKeyId: cert.keyId,
+                certMintedAt: cert.certMintedAt,
+              }),
+            }).catch(() => {
+              /* best-effort — a failed attach just means this stays local */
+            });
+          }
         }
         await patchGenerated(item.id, {
           verified,
           proof,
           ...(verified ? { verifiedAt } : {}),
+          // Carried so staging → promote → CompeteMath ship the toolchain that
+          // actually certified THIS proof, not the pipeline's default.
+          ...(verified
+            ? { toolchain: runToolchain, mathlib: runMathlib, enforcer: enforcerLabelFor(strategyAtStart) }
+            : {}),
           // Signature + the moment it was minted, carried through staging → prod
           // so CompeteMath stores this exact signature instead of re-signing.
           ...(cert?.signature
@@ -1062,6 +1684,8 @@ export function AdminPipeline() {
                 certMintedAt: cert.certMintedAt,
               }
             : {}),
+          // The full accumulated set of per-toolchain certificates (see above).
+          ...(updatedCerts ? { certs: updatedCerts } : {}),
           error: verified
             ? null
             : refuted
@@ -1090,6 +1714,26 @@ export function AdminPipeline() {
             item.questionTitle || item.problem?.slice(0, 60) || item.id
           }`,
         );
+        // Research telemetry: one row per attempt into Leak River or Leak
+        // Stronghold, whichever strategy actually ran this attempt.
+        recordResearchRun({
+          item,
+          strategy: strategyAtStart,
+          model: modelAtStart,
+          verified,
+          refuted,
+          costUsd: actualUsd,
+          computeBudgetMs: computeBudgetMsAtStart,
+          metrics: outMetrics,
+          finalProof: proof,
+          error: verified
+            ? null
+            : refuted
+              ? `REFUTED — ${counterexample || 'counterexample verified by Lean'}`
+              : 'Lean proof did not verify',
+          nlSeedUsed,
+          seedUsed,
+        });
         // Record the actual cost against this item's estimate. The estimate
         // runs concurrently, so join its promise for the history row id, then
         // PATCH the actual and refresh the scoreboard.
@@ -1131,7 +1775,7 @@ export function AdminPipeline() {
       setVerifyStartedAt(null);
       runningRef.current = false;
     }
-  }, [proveStream, pushLog, pauseForLimit]);
+  }, [proveStream, pushLog, pauseForLimit, recordResearchRun]);
 
   const terminateVerification = () => verifyAbortRef.current?.abort();
 
@@ -1145,7 +1789,9 @@ export function AdminPipeline() {
       const conn = connFor(false); // shared (verification) bridge
       const r = await extendProverRun({
         runId,
-        addMs: 5 * 60_000,
+        addMs: isArchitectStrategy(verifyStrategyRef.current)
+          ? ARCHITECT_EXTEND_MS
+          : 5 * 60_000,
         bridgeUrl: conn.bridgeUrl,
         token: conn.token,
       });
@@ -1154,6 +1800,36 @@ export function AdminPipeline() {
       setExtending(false);
     }
   }, [extending]);
+
+  // "+1 iter": raise the Leak River refinement budget. Always bumps the value the
+  // next run starts with, AND — when a River run is in flight — the live budget of
+  // that run, since the bridge reads it per iteration. A stale runId just 404s
+  // (the bridge drops finished runs), leaving the local bump in place.
+  const extendIterations = useCallback(async () => {
+    if (extendingIters) return;
+    setExtendingIters(true);
+    try {
+      const next = Math.min(32, verifyMaxItersRef.current + 1);
+      verifyMaxItersRef.current = next;
+      setVerifyMaxIters(next);
+      const runId = runIdRef.current;
+      if (!runId) return;
+      const conn = connFor(false); // shared (verification) bridge
+      const r = await extendProverRun({
+        runId,
+        addIters: 1, // no addMs — never buy wall-clock time from this button
+        bridgeUrl: conn.bridgeUrl,
+        token: conn.token,
+      });
+      // Trust the bridge's number over ours if the run is live (it clamps).
+      if (r?.maxIters) {
+        verifyMaxItersRef.current = r.maxIters;
+        setVerifyMaxIters(r.maxIters);
+      }
+    } finally {
+      setExtendingIters(false);
+    }
+  }, [extendingIters]);
 
   const resumeNow = useCallback(() => {
     limitPausedRef.current = false;
@@ -1291,9 +1967,19 @@ export function AdminPipeline() {
     setWorkBridgeUrl(localStorage.getItem('lca.workBridgeUrl') || '');
     const savedMode = localStorage.getItem('lca.genMode') as GenMode | null;
     if (savedMode && savedMode in MODE_LABEL) setMode(savedMode);
-    const savedLevel = Number(localStorage.getItem('lca.targetLevel'));
-    if (Number.isInteger(savedLevel) && savedLevel >= 0 && savedLevel <= 5)
-      setTargetLevel(savedLevel);
+    const savedCheck = localStorage.getItem(
+      'lca.statementCheck',
+    ) as StatementCheck | null;
+    if (savedCheck && savedCheck in STATEMENT_CHECK_LABEL)
+      setStatementCheck(savedCheck);
+    const savedStrategy = localStorage.getItem('lca.verifyStrategy');
+    if (savedStrategy) {
+      setVerifyStrategy(savedStrategy);
+      // Sync the ref immediately too — loadAll() above can reach rebuildQueue →
+      // runVerifier before the ref's own effect flushes, and a restored "off"
+      // must not lose that race and start proving the restored queue.
+      verifyStrategyRef.current = savedStrategy;
+    }
     // Pull already-live CompeteMath problems so generation can avoid them.
     fetch('/api/admin/live-problems')
       .then((r) => (r.ok ? r.json() : { problems: [] }))
@@ -1312,9 +1998,24 @@ export function AdminPipeline() {
     localStorage.setItem('lca.genMode', m);
   };
 
-  const persistLevel = (n: number) => {
-    setTargetLevel(n);
-    localStorage.setItem('lca.targetLevel', String(n));
+  // Persisted, because a verification off-switch that silently reverted to a
+  // real strategy on reload would start burning prover runs unannounced.
+  const persistVerifyStrategy = (s: string) => {
+    setVerifyStrategy(s);
+    // Set the ref HERE rather than waiting for its sync effect: that effect
+    // runs after the next render, so the runVerifier() call below would still
+    // read the OLD strategy and bail out when switching off -> on.
+    verifyStrategyRef.current = s;
+    localStorage.setItem('lca.verifyStrategy', s);
+    // Switching back on picks up anything queued while it was off.
+    if (s !== VERIFY_OFF && queueRef.current.length > 0) runVerifier();
+  };
+
+  const persistStatementCheck = (c: StatementCheck) => {
+    setStatementCheck(c);
+    localStorage.setItem('lca.statementCheck', c);
+    // Turning the check off clears a stale "not connected" banner.
+    if (c === 'off') setCheckError(null);
   };
 
   const persistWorkBridgeUrl = (value: string) => {
@@ -1325,6 +2026,145 @@ export function AdminPipeline() {
 
   // ---- generation (produces unverified problems, enqueues them) ---------
 
+  // The Sonnet gauntlet: k cold-solve attempts against the problem statement
+  // alone. Following VHG (arXiv 2605.06660), the gauntlet is a difficulty
+  // METER, not a gate: it measures whether a tool-equipped mid-tier Claude
+  // cracks the problem, and the caller TIERS the item accordingly (cracked
+  // claimed-Insane → Hard; held integral → Insane). Nothing valid is ever
+  // discarded, and there is no repair loop — a fresh generation is the
+  // better spend than repairing a cracked design (measured live).
+  const runGauntlet = useCallback(
+    async (
+      gen: GenProblem,
+      signal: AbortSignal,
+    ): Promise<{ meta: GauntletMeta }> => {
+      setGenStage('gauntlet');
+      const expected = normalizeIntString(gen.answer) ?? String(gen.answer ?? '');
+      pushGenEvent(
+        'system',
+        `Gauntlet: up to ${GAUNTLET_SAMPLES}× ${GAUNTLET_MODEL}`,
+        { input: `expected answer: ${expected}` },
+      );
+      const runSample = async (i: number) => {
+          const empty = { cracked: false, claimedAnswer: null, reason: 'solver run failed' };
+          // 1. Solver attempts the problem cold, with a Bash/python tool —
+          // every tool call and thought streams into the console live.
+          let sData: BridgeRunResult;
+          try {
+            sData = await runBridgeStream(
+              true,
+              {
+                prompt: gauntletSolverPrompt(gen.problem || ''),
+                options: GAUNTLET_RUN_OPTIONS,
+              },
+              `Solver #${i + 1}`,
+              signal,
+            );
+          } catch (e) {
+            pushGenEvent('error', `Solver #${i + 1} — bridge call failed`, {
+              detail: String((e as { httpStatus?: number })?.httpStatus ?? e),
+            });
+            return { transcript: '', verdict: empty };
+          }
+          recordUsage(
+            sData.usage as Parameters<typeof recordUsage>[0],
+            (sData.costUsd as number | undefined) ?? null,
+          );
+          const transcript = String(sData.text || '');
+          pushGenEvent('text', `Solver #${i + 1} final (${GAUNTLET_MODEL})`, {
+            detail: transcript || '(empty output)',
+          });
+
+          // 2. A separate, tool-equipped judge rules on the transcript —
+          // running any code it contains rather than trusting it.
+          let jData: BridgeRunResult;
+          try {
+            jData = await runBridgeStream(
+              true,
+              {
+                prompt: gauntletJudgePrompt(gen.problem || '', expected, transcript),
+                options: GAUNTLET_JUDGE_RUN_OPTIONS,
+              },
+              `Judge #${i + 1}`,
+              signal,
+            );
+          } catch (e) {
+            pushGenEvent('error', `Judge #${i + 1} — bridge call failed`, {
+              detail: String((e as { httpStatus?: number })?.httpStatus ?? e),
+            });
+            return { transcript, verdict: { ...empty, reason: 'judge run failed' } };
+          }
+          recordUsage(
+            jData.usage as Parameters<typeof recordUsage>[0],
+            (jData.costUsd as number | undefined) ?? null,
+          );
+          const verdict = parseJudgeVerdict(String(jData.text || ''));
+          pushGenEvent(
+            verdict.cracked ? 'rejected' : 'verified',
+            `Judge #${i + 1}: ${verdict.cracked ? 'CRACKED' : 'HELD'}${verdict.claimedAnswer ? ` (claimed ${verdict.claimedAnswer})` : ''}`,
+            { detail: verdict.reason || String(jData.text || '') },
+          );
+          return { transcript, verdict };
+        };
+
+        // Sequential with early exit: one CRACKED verdict decides the whole
+        // round, so a cracked problem costs one solver+judge, not two. The
+        // price is serialized wall-clock on survivors — worth it while the
+        // crack rate is high.
+        const samples: Awaited<ReturnType<typeof runSample>>[] = [];
+        for (let i = 0; i < GAUNTLET_SAMPLES; i++) {
+          const s = await runSample(i);
+          samples.push(s);
+          if (s.verdict.cracked) {
+            if (i + 1 < GAUNTLET_SAMPLES)
+              pushGenEvent(
+                'system',
+                `Remaining sample(s) skipped — round already cracked`,
+              );
+            break;
+          }
+        }
+
+        const solved = samples.some((s) => s.verdict.cracked);
+        // Every HELD sample's judge nonetheless converging on the SAME
+        // (wrong) answer is a strong smell the INTENDED answer is wrong —
+        // flag for human review, don't auto-pass it silently.
+        const heldClaims = samples
+          .filter((s) => !s.verdict.cracked)
+          .map((s) => s.verdict.claimedAnswer)
+          .filter((a): a is string => a != null);
+        const suspect =
+          !solved &&
+          heldClaims.length === GAUNTLET_SAMPLES &&
+          heldClaims.every((a) => a === heldClaims[0]) &&
+          heldClaims[0] !== expected
+            ? heldClaims[0]
+            : undefined;
+        const meta: GauntletMeta = {
+          model: GAUNTLET_MODEL,
+          // Actual samples run — fewer than GAUNTLET_SAMPLES when the round
+          // early-exited on a crack.
+          samples: samples.length,
+          verdicts: samples.map((s) => s.verdict),
+          solved,
+          ...(suspect ? { suspectAnswer: suspect } : {}),
+        };
+        if (suspect)
+          pushGenEvent(
+            'text',
+            `Suspect: every HELD sample converged on ${suspect}, not the intended ${expected}`,
+          );
+        pushGenEvent(
+          solved ? 'rejected' : 'verified',
+          solved
+            ? 'Gauntlet cracked — the item ships at a lower tier (VHG: measure difficulty, never discard valid problems)'
+            : 'Gauntlet held — full marks',
+        );
+        return { meta };
+    },
+    [runBridgeStream, recordUsage, pushGenEvent],
+  );
+
   // Generate ONE problem on the work bridge, save it unverified, and enqueue it
   // for verification. Returns nothing; throws on generation failure.
   const generateOne = useCallback(async () => {
@@ -1334,54 +2174,80 @@ export function AdminPipeline() {
     genAbortRef.current = ctrl;
     setGenStartedAt(Date.now());
     setGenStage('generating');
+    // Never clears — each attempt appends after a divider so a fast-failing
+    // attempt's error survives long enough to actually read, instead of being
+    // wiped the instant the next attempt starts.
+    pushGenEvent(
+      'received',
+      `── Generating (${MODE_LABEL[modeRef.current]}) ──`,
+    );
     try {
-      const prompt = buildPrompt(
-        modeRef.current,
-        targetLevelRef.current,
-        buildAvoidContext(generatedRef.current, liveRef.current),
-      );
-      let genRes: Response;
+      // Mirage: TS samples a fully-solved instance; the LLM only writes the
+      // disguised prose. The exact answer + Lean certificate come from the
+      // instance and overwrite whatever the model emits (see below), so the
+      // model is never authoritative for the mathematics.
+      const mirageInst: MirageInstance | null =
+        modeRef.current === 'mirage' ? sampleThresholdMirage() : null;
+      const avoid = buildAvoidContext(generatedRef.current, liveRef.current);
+      const prompt = mirageInst
+        ? mirageSetterPrompt(mirageInst, avoid)
+        : buildPrompt(modeRef.current, avoid);
+      const genOptions = mirageInst
+        ? MIRAGE_RUN_OPTIONS
+        : genRunOptionsFor(modeRef.current, genModelRef.current || undefined);
+      let genData: BridgeRunResult;
       try {
-        genRes = await callBridge(true, '/run', {
-          method: 'POST',
-          body: JSON.stringify({
-            prompt,
-            options: genRunOptionsFor(
-              modeRef.current,
-              genModelRef.current || undefined,
-            ),
-          }),
-          signal: ctrl.signal,
-        });
-      } catch {
+        genData = await runBridgeStream(
+          true,
+          { prompt, options: genOptions },
+          'Generator',
+          ctrl.signal,
+        );
+      } catch (e) {
         if (ctrl.signal.aborted)
           throw new Error('Generation terminated by you');
+        const httpStatus = (e as { httpStatus?: number })?.httpStatus;
+        if (httpStatus) {
+          const body = (e as { body?: string })?.body || '';
+          const detail = `${JSON.stringify(
+            { bridge: bridgeUrl, httpStatus, mode: modeRef.current },
+            null,
+            2,
+          )}\n\n----- response body -----\n${body || '(empty)'}`;
+          throw Object.assign(
+            new Error(`Bridge /run-stream failed (${httpStatus})`),
+            { detail },
+          );
+        }
+        // Stream died mid-run (bridge crash) — surface that as-is; a plain
+        // fetch failure means the bridge was never reachable at all.
+        if (e instanceof Error && /stream ended without a result/.test(e.message))
+          throw e;
         throw new Error(
           `Couldn't reach the generation bridge at ${bridgeUrl}. Check a bridge is running there, the URL is a full http:// URL, and you're on Chrome/Edge/Firefox.`,
         );
       }
-      if (!genRes.ok) {
-        const body = await genRes.text().catch(() => '');
-        const detail = `${JSON.stringify(
-          {
-            bridge: bridgeUrl,
-            httpStatus: genRes.status,
-            mode: modeRef.current,
-          },
-          null,
-          2,
-        )}\n\n----- response body -----\n${body || '(empty)'}`;
-        throw Object.assign(
-          new Error(`Bridge /run failed (${genRes.status})`),
-          {
-            detail,
-          },
+      recordUsage(
+        genData.usage as Parameters<typeof recordUsage>[0],
+        genData.costUsd ?? null,
+      );
+      const raw = String(genData.text || '');
+      const gen = extractJson(raw);
+      // Mirage: overwrite the mathematics with the exact TS-computed values.
+      // The setter only supplied prose (title/problem/insight) — it never
+      // produced a Lean statement, so inject the certificate here too, before
+      // the lean check below.
+      if (mirageInst && gen) {
+        const ex = mirageExactFields(mirageInst);
+        gen.answer = Number(ex.answer);
+        gen.lean = ex.lean;
+        gen.difficulty = ex.difficulty;
+        gen.points = ex.points;
+        pushGenEvent(
+          'text',
+          `Mirage exact answer ${ex.answer} injected (break index B=${mirageInst.breakIndex})`,
         );
       }
-      const genData = await genRes.json();
-      recordUsage(genData.usage, genData.costUsd);
-      const raw = String(genData.text || genData.proof || '');
-      const gen = extractJson(raw);
       if (!gen?.lean) {
         // Rich diagnostic: the bridge's own metadata explains an empty/failed run
         // (timeout, non-zero exit, claude stderr like a rate limit) — the actual
@@ -1412,7 +2278,6 @@ export function AdminPipeline() {
         const meta = {
           mode: modeRef.current,
           bridge: bridgeUrl,
-          httpStatus: genRes.status,
           ok: genData.ok,
           exitCode: genData.exitCode,
           timedOut: genData.timedOut,
@@ -1426,8 +2291,257 @@ export function AdminPipeline() {
         throw Object.assign(new Error(`Discarded — ${reason}`), { detail });
       }
       setStats((s) => ({ ...s, generated: s.generated + 1 }));
+      pushGenEvent('text', `Generated: ${gen.questionTitle ?? 'untitled'}`, {
+        detail: raw,
+      });
+
+      // Trapdoor problems are Insane by contract, whatever the model emitted.
+      if (modeRef.current === 'trapdoor') {
+        gen.difficulty = 'Insane';
+        gen.points = 200;
+      }
+
+      // VHG local pre-filter (format/answer/degeneracy) — pure code, free,
+      // BEFORE any expensive verification or solving.
+      const preReason = prefilterProblem(gen);
+      if (preReason) {
+        throw Object.assign(new Error(`Discarded — pre-filter: ${preReason}`), {
+          detail: JSON.stringify(gen, null, 2),
+        });
+      }
+
+      // STATEMENT PRE-CHECK, then REPAIR — never discard the mathematics.
+      //
+      // A failed elaboration condemns the Lean RENDERING, not the problem. The
+      // statement, answer, insight and hidden chain are all still good and are
+      // the expensive part; the theorem is a cheap re-derivable view of them.
+      // So a compile failure feeds the exact compiler errors back and asks for
+      // a corrected statement for the SAME problem, up to
+      // MAX_REFORMALIZE_ATTEMPTS times. Binning a sound problem over a
+      // typeclass slip would also contradict the doctrine this pipeline already
+      // took from VHG: nothing valid is ever discarded.
+      //
+      // Running it before the paid stages still matters — a statement that
+      // never typechecks is unprovable (the prover's target signature is
+      // immutable, so refinement cannot repair the theorem's own opening line)
+      // and would forfeit a whole prover run.
+      const checkRemote = statementCheckRef.current !== 'off';
+      const leanFailures: { lean: string; errors: string }[] = [];
+      let leanOk = false;
+      for (let attempt = 0; ; attempt++) {
+        // Free, local, and the same repair fixes it, so it shares the loop.
+        const structural = leanSplitsIntoSeparateDecl(gen.lean)
+          ? 'The submission was split into a separate top-level declaration plus the theorem. It must be ONE self-contained theorem: fold the helper into the signature as a bound variable plus hypotheses giving its defining equations.'
+          : '';
+        let errText = structural;
+        if (!structural) {
+          if (!checkRemote) {
+            leanOk = true;
+            break;
+          }
+          setGenStage('elaborating');
+          let verdict: Awaited<ReturnType<typeof checkStatementElaborates>>;
+          try {
+            // Through the Work bridge — the same one that just generated this,
+            // so the check needs nothing running that generation didn't.
+            verdict = await checkStatementElaborates(gen.lean, (path, init) =>
+              callBridge(true, path, init),
+            );
+          } catch (e) {
+            if (e instanceof ElaborationUnavailableError) {
+              // Infrastructure, not a verdict — surface it and stop WITHOUT
+              // touching the problem. Re-formalizing here would rewrite a
+              // statement that was never actually found wanting.
+              setCheckError(e.message);
+              pushGenEvent('error', 'Statement check unavailable', {
+                detail: e.message,
+              });
+              throw new Error(`Statement check unavailable — ${e.message}`);
+            }
+            throw e;
+          }
+          setCheckError(null);
+          pushGenEvent(
+            verdict.elaborates ? 'verified' : 'rejected',
+            `Statement check (${verdict.serverUrl ? new URL(verdict.serverUrl).host : 'Leak'}): ${
+              verdict.elaborates ? 'elaborates' : `${verdict.errors.length} error(s)`
+            }`,
+            { detail: verdict.raw },
+          );
+          if (verdict.elaborates) {
+            leanOk = true;
+            break;
+          }
+          errText = verdict.errors.join('\n') || verdict.raw;
+        }
+        leanFailures.push({ lean: gen.lean, errors: errText });
+        if (attempt >= MAX_REFORMALIZE_ATTEMPTS - 1) break;
+
+        setGenStage('reformalizing');
+        pushGenEvent(
+          'text',
+          `Re-formalizing (${attempt + 1}/${MAX_REFORMALIZE_ATTEMPTS - 1}) — keeping the problem, rewriting only the Lean`,
+          { detail: errText },
+        );
+        let rf: BridgeRunResult;
+        try {
+          rf = await runBridgeStream(
+            true,
+            {
+              prompt: reformalizePrompt(
+                gen.problem || '',
+                gen.answer ?? '',
+                leanFailures,
+              ),
+              options: REFORMALIZER_RUN_OPTIONS,
+            },
+            'Re-formalizer',
+            ctrl.signal,
+          );
+        } catch (e) {
+          if (ctrl.signal.aborted) throw new Error('Generation terminated by you');
+          pushGenEvent('error', 'Re-formalizer bridge call failed', {
+            detail: String(e),
+          });
+          break;
+        }
+        recordUsage(
+          rf.usage as Parameters<typeof recordUsage>[0],
+          (rf.costUsd as number | undefined) ?? null,
+        );
+        const fixed = parseReformalized(String(rf.text || ''));
+        if (!fixed) {
+          pushGenEvent('error', 'Re-formalizer returned no usable statement', {
+            detail: String(rf.text || ''),
+          });
+          break;
+        }
+        gen.lean = fixed.lean;
+        pushGenEvent('text', `New statement — ${fixed.fix || '(no note)'}`, {
+          detail: fixed.lean,
+        });
+      }
+      // Still broken after every repair attempt. The MATHEMATICS is untouched
+      // and worth keeping, so the problem is saved anyway — just held out of
+      // the prover queue, with the compiler output recorded so the Lean can be
+      // fixed by hand (the admin PATCH accepts `lean`). Discarding here is what
+      // this loop exists to prevent.
+      const leanNeedsHand = !leanOk;
+      if (leanNeedsHand) {
+        pushGenEvent(
+          'rejected',
+          `Lean still not elaborating after ${leanFailures.length} attempt(s) — saving the problem unqueued for a manual fix`,
+          { detail: leanFailures.at(-1)?.errors ?? '' },
+        );
+      }
+
+      // Integral mode: HARD verification (VHG Appendix E.3) before anything
+      // else — an independent run whose verdict comes from executed sympy
+      // (derivative match, exact value, numeric cross-check, answer
+      // extraction). Invalid pairs are discarded; validity is never assumed
+      // from the setter's own transcript.
+      if (modeRef.current === 'integral') {
+        setGenStage('validating');
+        const cert: IntegralCertificate = {
+          integrand: gen.integrand,
+          antiderivative: gen.antiderivative,
+          lowerBound: gen.lowerBound,
+          upperBound: gen.upperBound,
+          exactValue: gen.exactValue,
+        };
+        let vData: BridgeRunResult;
+        try {
+          vData = await runBridgeStream(
+            true,
+            {
+              prompt: integralVerifierPrompt(cert, gen.answer, gen.problem || ''),
+              options: INTEGRAL_VERIFIER_RUN_OPTIONS,
+            },
+            'Hard verifier',
+            ctrl.signal,
+          );
+        } catch (e) {
+          if (ctrl.signal.aborted) throw new Error('Generation terminated by you');
+          throw new Error(
+            `Integral verifier bridge call failed (${(e as { httpStatus?: number })?.httpStatus ?? e})`,
+          );
+        }
+        recordUsage(
+          vData.usage as Parameters<typeof recordUsage>[0],
+          (vData.costUsd as number | undefined) ?? null,
+        );
+        const verdict = parseIntegralVerdict(String(vData.text || ''));
+        pushGenEvent(
+          verdict.valid ? 'verified' : 'rejected',
+          `Hard verifier: ${verdict.valid ? 'VALID' : 'INVALID'}${verdict.checkedAnswer ? ` (checked answer ${verdict.checkedAnswer})` : ''}`,
+          { detail: verdict.reason || String(vData.text || '') },
+        );
+        if (!verdict.valid) {
+          throw Object.assign(
+            new Error(`Discarded — integral failed hard verification: ${verdict.reason}`),
+            { detail: String(vData.text || '') },
+          );
+        }
+      }
+
+      // The gauntlet as difficulty METER (VHG): runs for every claimed-Insane
+      // problem and every integral. The verdict tiers the item; nothing valid
+      // is discarded and nothing is repaired.
+      let gauntlet: GauntletMeta | undefined;
+      const claimedInsane = (gen.difficulty || '').toLowerCase() === 'insane';
+      if (claimedInsane || modeRef.current === 'integral') {
+        const { meta } = await runGauntlet(gen, ctrl.signal);
+        gauntlet = meta;
+        if (claimedInsane && meta.solved) {
+          // Cracked "Insane" is a mislabelled Hard — tier down and ship.
+          gen.difficulty = 'Hard';
+          gen.points = 150;
+          setStats((s) => ({ ...s, downgraded: s.downgraded + 1 }));
+          pushGenEvent('text', 'Tiered down to Hard (cracked by the gauntlet)');
+        } else if (modeRef.current === 'integral' && !meta.solved) {
+          // An integral even a tool-equipped solver failed — that is Insane.
+          gen.difficulty = 'Insane';
+          gen.points = 200;
+          pushGenEvent('text', 'Promoted to Insane (held against the gauntlet)');
+        }
+      }
+
+      // Post-hoc level assessment: the generator ran unconstrained, so the
+      // knowledge tier is judged after the fact. Best-effort — on any failure
+      // the generator's own estimate stands.
+      setGenStage('assessing');
+      try {
+        const d = await runBridgeStream(
+          true,
+          {
+            prompt: levelAssessorPrompt(gen.problem || '', gen.insight),
+            options: ASSESSOR_RUN_OPTIONS,
+          },
+          'Assessor',
+          ctrl.signal,
+        );
+        recordUsage(
+          d.usage as Parameters<typeof recordUsage>[0],
+          (d.costUsd as number | undefined) ?? null,
+        );
+        const assessed = parseAssessedLevel(String(d.text || ''));
+        if (assessed) gen.level = assessed;
+        pushGenEvent('text', `Level assessed: ${assessed ?? '(kept generator estimate)'}`, {
+          detail: String(d.text || ''),
+        });
+      } catch {
+        /* keep the generator's own level */
+      }
 
       setGenStage('saving');
+      // Strategy "off": save the problem but leave it OUT of the verification
+      // queue entirely. Queueing it would silently bank work that starts
+      // proving the moment a real strategy is picked — the opposite of "just
+      // generate". It stays in the generated history and can be queued by hand
+      // later with "Verify again".
+      // A statement that never elaborated is also held back — proving it is
+      // impossible, so queueing it would only burn a forfeited run.
+      const verifyOff = verifyStrategyRef.current === VERIFY_OFF || leanNeedsHand;
       const res = await fetch('/api/admin/generated', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -1435,21 +2549,38 @@ export function AdminPipeline() {
           ...gen,
           verified: false,
           proof: '',
-          error: null,
-          queued: true,
+          error: leanNeedsHand
+            ? `Lean statement does not elaborate after ${leanFailures.length} re-formalization attempt(s) — the problem is kept; edit the Lean and re-queue. Last compiler output:\n${leanFailures.at(-1)?.errors ?? ''}`
+            : null,
+          queued: !verifyOff,
           toolchain: TOOLCHAIN,
+          genMode: modeRef.current,
+          ...(gauntlet ? { gauntlet } : {}),
         }),
       });
       if (res.ok) {
         const j = await res.json();
         if (j.item) {
           setGenerated((g) => [j.item, ...g.filter((x) => x.id !== j.item.id)]);
-          // Already persisted queued=true; just add to the in-memory queue.
-          if (!queueRef.current.some((x) => x.id === j.item.id)) {
-            queueRef.current = [...queueRef.current, j.item];
-            syncQueue();
+          if (verifyOff) {
+            pushGenEvent(
+              'done',
+              leanNeedsHand
+                ? 'Saved — problem kept, Lean needs a manual fix (not queued)'
+                : 'Saved — verification off, not queued',
+              { verified: !gauntlet || !gauntlet.solved },
+            );
+          } else {
+            // Already persisted queued=true; just add to the in-memory queue.
+            if (!queueRef.current.some((x) => x.id === j.item.id)) {
+              queueRef.current = [...queueRef.current, j.item];
+              syncQueue();
+            }
+            pushGenEvent('done', `Saved — queued for verification`, {
+              verified: !gauntlet || !gauntlet.solved,
+            });
+            runVerifier();
           }
-          runVerifier();
         }
       }
     } finally {
@@ -1457,7 +2588,15 @@ export function AdminPipeline() {
       setGenStartedAt(null);
       setGenStage('idle');
     }
-  }, [callBridge, runVerifier, recordUsage]);
+  }, [
+    runBridgeStream,
+    callBridge,
+    runVerifier,
+    recordUsage,
+    runGauntlet,
+    pushLog,
+    pushGenEvent,
+  ]);
 
   const terminateGeneration = () => genAbortRef.current?.abort();
 
@@ -1470,10 +2609,11 @@ export function AdminPipeline() {
       const err = e as Error & { detail?: string };
       setStats((s) => ({ ...s, errors: s.errors + 1 }));
       pushLog('error', err.message, err.detail);
+      pushGenEvent('error', err.message, { detail: err.detail });
     } finally {
       setGeneratingOne(false);
     }
-  }, [generateOne, pushLog]);
+  }, [generateOne, pushLog, pushGenEvent]);
 
   // The Work loop: keep generating (each generation enqueues itself).
   useEffect(() => {
@@ -1502,6 +2642,7 @@ export function AdminPipeline() {
           } else {
             setStats((s) => ({ ...s, errors: s.errors + 1 }));
             pushLog('error', err.message, err.detail);
+            pushGenEvent('error', err.message, { detail: err.detail });
           }
           await new Promise((res) => setTimeout(res, 3000));
         }
@@ -1511,7 +2652,7 @@ export function AdminPipeline() {
     return () => {
       cancelled = true;
     };
-  }, [work, generateOne, pushLog, pauseForLimit]);
+  }, [work, generateOne, pushLog, pauseForLimit, pushGenEvent]);
 
   // ---- per-item actions -------------------------------------------------
 
@@ -1522,6 +2663,15 @@ export function AdminPipeline() {
 
   const addToStaging = useCallback(async (item: GeneratedItem | StagedItem) => {
     if (!item.lean) return;
+    // A cracked Insane problem is a mislabelled Hard — it never ships as-is.
+    const gauntlet = (item as GeneratedItem).gauntlet;
+    if ((item.difficulty || '').toLowerCase() === 'insane' && gauntlet?.solved) {
+      pushLog(
+        'warn',
+        `Blocked staging "${item.questionTitle ?? 'untitled'}" — the gauntlet cracked it; regenerate instead.`,
+      );
+      return;
+    }
     setBusy(`stage:${item.id}`);
     try {
       const res = await fetch('/api/admin/problems', {
@@ -1538,11 +2688,18 @@ export function AdminPipeline() {
           insight: item.insight ?? null,
           lean: item.lean,
           proof: item.proof ?? '',
+          // Whatever certified this item, recorded at verify time. The fallback
+          // only applies to rows proved before toolchain was carried per run.
           toolchain: item.toolchain ?? TOOLCHAIN,
+          mathlib: item.mathlib ?? MATHLIB_VERSION,
+          enforcer: item.enforcer ?? null,
           verifiedAt: item.verifiedAt ?? null,
           signature: item.signature ?? null,
           signatureKeyId: item.signatureKeyId ?? null,
           certMintedAt: item.certMintedAt ?? null,
+          // Every distinct-toolchain certificate accumulated pre-publish, so
+          // promote can ship all of them the first time this problem goes live.
+          certs: certsOrFallback(item),
         }),
       });
       if (res.ok) {
@@ -1737,7 +2894,18 @@ export function AdminPipeline() {
         <div className="mt-3">
           <Label className="text-xs">Difficulty mode</Label>
           <div className="mt-1 flex flex-wrap gap-1 text-xs">
-            {(['easy', 'medium', 'hard', 'insane', 'reverse'] as GenMode[]).map(
+            {(
+              [
+                'easy',
+                'medium',
+                'hard',
+                'insane',
+                'reverse',
+                'trapdoor',
+                'integral',
+                'mirage',
+              ] as GenMode[]
+            ).map(
               (m) => (
                 <button
                   key={m}
@@ -1755,22 +2923,47 @@ export function AdminPipeline() {
               ),
             )}
           </div>
-          <label className="mt-2 flex items-center gap-1 text-xs text-muted-foreground">
-            Target level
-            <select
-              value={targetLevel}
-              onChange={(e) => persistLevel(Number(e.target.value))}
-              className="rounded-md border bg-background px-1.5 py-1 text-xs"
-              title="Target CompeteMath knowledge tier — drives how easy or hard the generated problem is. 'Any' lets the model decide."
-            >
-              <option value={0}>Any (model decides)</option>
-              {LEVELS.map((l) => (
-                <option key={l.value} value={l.value}>
-                  {l.value} · {l.label}
-                </option>
+          <div className="mt-3">
+            <Label className="text-xs">Statement check</Label>
+            <div className="mt-1 flex flex-wrap items-center gap-1 text-xs">
+              {(['leak', 'off'] as StatementCheck[]).map((c) => (
+                <button
+                  key={c}
+                  type="button"
+                  onClick={() => persistStatementCheck(c)}
+                  className={cn(
+                    'rounded border px-2 py-1',
+                    statementCheck === c
+                      ? 'border-foreground bg-foreground text-background'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {STATEMENT_CHECK_LABEL[c]}
+                </button>
               ))}
-            </select>
-          </label>
+            </div>
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              {statementCheck === 'leak'
+                ? 'Compiles each generated Lean statement on your Lean daemon — through the bridge, so nothing extra needs to be running — before anything is spent on it. A statement that does not elaborate is unprovable (the prover cannot edit its own target signature), so it is discarded here instead of forfeiting a full prover run.'
+                : 'No statement check. Problems are generated and queued without compiling their Lean, so a statement that does not elaborate will only surface once the prover forfeits on it.'}
+            </p>
+          </div>
+          {checkError && (
+            <div className="mt-2 rounded border border-destructive/50 bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive">
+              <div className="flex items-start justify-between gap-2">
+                <span>
+                  <strong>Statement check unavailable.</strong> {checkError}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setCheckError(null)}
+                  className="shrink-0 underline opacity-70 hover:opacity-100"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
           <label className="mt-2 inline-flex items-center gap-1 text-xs text-muted-foreground">
             Generation model
             <select
@@ -1797,6 +2990,19 @@ export function AdminPipeline() {
               'Chains multiple distinct insights (or one very deep idea); general (non-decide) Lean statement. Hardest to prove automatically. Emits difficulty Insane.'}
             {mode === 'reverse' &&
               'Easy to VERIFY (a one-step Lean certificate), hard to SOLVE even by computer — built backward from a secret (factoring / discrete-log / subset-witness style). Answer correct by construction; scaled so brute force fails but insight wins.'}
+            {mode === 'trapdoor' &&
+              'Code samples a random chain of hidden transformations (the trapdoor key); the model instantiates it forward — trivial to construct, but solving requires re-discovering every layer. Claims Insane; the gauntlet tiers it. Generates with Opus 4.8 unless you pick a model.'}
+            {mode === 'integral' &&
+              'VHG-style (arXiv 2605.06660): the antiderivative is chosen FIRST, differentiated, and disguised — the answer is correct by construction, and an independent hard verifier re-checks everything with executed sympy before the item can queue. Ships at Hard; promoted to Insane if the gauntlet fails to crack it.'}
+            {mode === 'mirage' &&
+              'Anti-inductive: TS plants a threshold-mirage instance where computing the accessible cases and extrapolating gives the WRONG answer (the break sits below numerical-detection noise) — the solver’s own tool misleads it. Code does the exact math in milliseconds; the model only writes the disguise. Answer + certificate are TS-authoritative, never the model’s.'}
+          </p>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            The gauntlet (up to {GAUNTLET_SAMPLES}× cold solves by{' '}
+            {GAUNTLET_MODEL}) is a difficulty METER, not a gate: cracked
+            Insane → ships at Hard; an integral that holds → promoted to
+            Insane. Nothing valid is discarded. Level is assessed after
+            generation, unconstrained.
           </p>
           <p className="mt-1 text-[11px] text-muted-foreground">
             De-duplicating against {generated.length} generated +{' '}
@@ -1821,7 +3027,7 @@ export function AdminPipeline() {
           </p>
         </div>
 
-        <div className="mt-4 grid grid-cols-4 gap-2 text-center">
+        <div className="mt-4 grid grid-cols-5 gap-2 text-center">
           <Stat label="Generated" value={stats.generated} />
           <Stat
             label="Verified"
@@ -1830,6 +3036,11 @@ export function AdminPipeline() {
           />
           <Stat label="Failed" value={stats.failed} />
           <Stat label="Queued" value={queuedForVerify} />
+          <Stat
+            label="Downgraded"
+            value={stats.downgraded}
+            tone="text-amber-600"
+          />
         </div>
 
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
@@ -1862,6 +3073,26 @@ export function AdminPipeline() {
             {generatingOne ? 'Generating…' : '+ Generate one → queue'}
           </Button>
         </div>
+
+        {genEvents.length > 0 && (
+          <>
+            <div className="mt-2 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setGenEvents([])}
+                className="text-[11px] text-muted-foreground underline-offset-2 hover:underline"
+              >
+                Clear generation log
+              </button>
+            </div>
+            <ProverConsole
+              events={genEvents}
+              running={genStartedAt != null}
+              title="Generation activity"
+              emptyHint="No activity yet — generate a problem."
+            />
+          </>
+        )}
 
         {/* Usage / metadata */}
         <div className="mt-3 grid grid-cols-3 gap-2 rounded-md border p-2 text-center text-[11px]">
@@ -2053,37 +3284,116 @@ export function AdminPipeline() {
             <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
               Model
               <select
-                value={verifyModel}
+                value={isRiverStrategy(verifyStrategy) ? ARCHITECT_MODEL : verifyModel}
                 onChange={(e) => setVerifyModel(e.target.value)}
-                className="rounded-md border bg-background px-1.5 py-1 text-xs"
-                title="Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default."
+                disabled={isRiverStrategy(verifyStrategy)}
+                className="rounded-md border bg-background px-1.5 py-1 text-xs disabled:opacity-60"
+                title={
+                  isRiverStrategy(verifyStrategy)
+                    ? 'Leak River strategies always drive Grok directly — model is locked.'
+                    : isUltraStrategy(verifyStrategy)
+                      ? 'Leak Ultra inherits this model as its blueprint-pipeline driver (passed to claude --model).'
+                      : 'Which model the prover runs on (passed to claude --model), independent of the generation model. Default uses the bridge/CLI default.'
+                }
               >
-                {PROVER_MODELS.map((m) => (
-                  <option key={m.value} value={m.value}>
-                    {m.label}
+                {isRiverStrategy(verifyStrategy) ? (
+                  <option value={ARCHITECT_MODEL}>
+                    Grok 4.1 Fast Reasoning (forced)
                   </option>
-                ))}
+                ) : (
+                  PROVER_MODELS.map((m) => (
+                    <option key={m.value} value={m.value}>
+                      {m.label}
+                    </option>
+                  ))
+                )}
               </select>
             </label>
-            {verifyDecompose && (
-              <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
+            {/* Always rendered — unlike the proving strategies, "Off" has to be
+                reachable with Decompose off too. The other options are inert
+                without Decompose (strategy is only sent on tree runs), which
+                the title spells out. */}
+            <label className="inline-flex items-center gap-1 text-xs text-muted-foreground">
                 Strategy
                 <select
                   value={verifyStrategy}
-                  onChange={(e) => setVerifyStrategy(e.target.value)}
-                  className="rounded-md border bg-background px-1.5 py-1 text-xs"
-                  title="A/B-test proof strategies; runs are tagged acg-tree:<strategy> in the agent debug log"
+                  onChange={(e) => persistVerifyStrategy(e.target.value)}
+                  className={cn(
+                    'rounded-md border bg-background px-1.5 py-1 text-xs',
+                    verifyStrategy === VERIFY_OFF &&
+                      'border-amber-500/60 text-amber-600 dark:text-amber-400',
+                  )}
+                  title={
+                    verifyStrategy === VERIFY_OFF
+                      ? 'Verification is OFF — problems are generated and saved, but no prover ever runs.'
+                      : verifyDecompose
+                        ? 'A/B-test proof strategies; runs are tagged acg-tree:<strategy> in the agent debug log'
+                        : 'Turn Decompose on to use a proving strategy — with it off, a single agent run is used and this setting is ignored (except "Off", which always applies).'
+                  }
                 >
+                  <option value={VERIFY_OFF}>Off — generate only, never prove</option>
                   <option value="hacker">Hacker (compiler-driven)</option>
                   <option value="pantograph">Pantograph (interactive Leak II)</option>
                   <option value="librarian">Librarian (search-first control)</option>
                   <option value="sketch">Sketch (plan then formalize)</option>
                   <option value="brute">Brute (automation only)</option>
                   <option value="have">Have (in-context, no top-level lemmas)</option>
-                  <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
+                  <option value="control-oneshot">
+                    Leak Control I (one continuous agent, one-shot, Leak IV only — no decomposition)
+                  </option>
+                  <option value="control-oneshot-2">
+                    Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search — no decomposition)
+                  </option>
+                  <option value="control-oneshot-4">
+                    Leak Control IV (one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph — no decomposition)
+                  </option>
+                  <option value="control-oneshot-3">
+                    Leak Control III (blind prover, one continuous session — no tools / no error feedback — + separate Leak IV gate)
+                  </option>
+                  {/* value stays `have-tree` — renaming it would orphan saved
+                      checkpoints, queued items and every existing research row. */}
+                  <option value="have-tree">
+                    Leak Stronghold Dark (planner + isolated per-hole minions)
+                  </option>
+                  <option value="have-surround">
+                    Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)
+                  </option>
+                  <option value="finality-1">
+                    Leak Finality I (Surround + timed skeleton refinement)
+                  </option>
+                  <option value="stronghold-force">
+                    Leak Stronghold Force (dedicated recursive decomposer, no finisher)
+                  </option>
+                  <option value="stronghold-forte">
+                    Leak Stronghold Forte (Force + reliable handoff, opening pool, duplicate-cut guard)
+                  </option>
+                  <option value="stronghold-keep">
+                    Leak Stronghold Keep (flat first, bounded gated siege,
+                    guaranteed flat finisher)
+                  </option>
+                  <option value="stronghold-impenetrable">
+                    Leak Stronghold Impenetrable (apply?-driven recon sweep, then
+                    Surround)
+                  </option>
+                  <optgroup label="Leak River (Goedel blueprint · grok driver · Leak XI/XII/XIV)">
+                    {RIVER_STRATEGIES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </optgroup>
+                  <optgroup label="Leak Ultra (Goedel blueprint · claude driver · Leak XI/XII/XIV)">
+                    {ULTRA_STRATEGIES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </optgroup>
                 </select>
               </label>
-            )}
+            {/* The refinement-iteration budget lives on the verifier console
+                itself (next to the "+1 min" clock control), so it can be raised
+                MID-FLIGHT rather than only configured before a run. */}
             {verifyPaused && verifyQueue.length > 0 && !verifyingId && (
               <Button
                 size="sm"
@@ -2096,11 +3406,56 @@ export function AdminPipeline() {
             )}
           </div>
         </div>
-        {verifyDecompose && (
+        {verifyStrategy === VERIFY_OFF && (
+          <p className="mb-2 rounded border border-amber-500/40 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-400">
+            <strong>Verification is off.</strong> Problems are generated and
+            saved to history, but no prover runs and new problems are not
+            queued.
+            {verifyQueue.length > 0 && (
+              <>
+                {' '}
+                {verifyQueue.length} item
+                {verifyQueue.length === 1 ? '' : 's'} already in the queue will
+                stay put until you pick a strategy.
+              </>
+            )}
+          </p>
+        )}
+        {verifyStrategy !== VERIFY_OFF &&
+          verifyDecompose &&
+          !isArchitectStrategy(verifyStrategy) && (
           <p className="mb-2 text-xs text-muted-foreground">
             Decompose mode: each generated problem is proved-or-split into
             toolchain-verified sub-lemmas (recursively) and assembled into one
             sorry-free proof. Slower but closes goals a single run stalls on.
+            Verified on{' '}
+            <span className="font-mono">{TOOLCHAIN.replace(/^.*:/, '')}</span> ·
+            Mathlib {MATHLIB_VERSION} (Leak I/II/IV).
+          </p>
+        )}
+        {verifyDecompose && isArchitectStrategy(verifyStrategy) && (
+          <p className="mb-2 text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">
+              {[...RIVER_STRATEGIES, ...ULTRA_STRATEGIES].find(
+                (s) => s.value === verifyStrategy,
+              )?.label ?? 'Leak River Stone (control)'}
+              {': '}
+            </span>
+            {[...RIVER_STRATEGIES, ...ULTRA_STRATEGIES].find(
+              (s) => s.value === verifyStrategy,
+            )?.note ?? RIVER_STRATEGIES[0].note}{' '}
+            Certified on{' '}
+            <span className="font-mono">
+              {ARCHITECT_TOOLCHAIN.replace(/^.*:/, '')}
+            </span>{' '}
+            · Mathlib {ARCHITECT_MATHLIB_VERSION} (Leak XI/XII/XIV) — a different
+            Lean from the {MATHLIB_VERSION} group, and recorded per row. Results
+            are logged to the{' '}
+            <Link href="/admin/research" className="underline">
+              {isUltraStrategy(verifyStrategy) ? 'Leak Ultra' : 'Leak River'}{' '}
+              research table
+            </Link>
+            .
           </p>
         )}
         {verifyPaused && (
@@ -2123,7 +3478,10 @@ export function AdminPipeline() {
             </button>
           </div>
         )}
-        {verifyEvents.length > 0 && (
+        {/* Rendered for a selected architect strategy (River or Ultra) even with no events yet, so the
+            refinement-budget control has a home before the first run too. */}
+        {(verifyEvents.length > 0 ||
+          (verifyDecompose && isArchitectStrategy(verifyStrategy))) && (
           <ProverConsole
             events={verifyEvents}
             running={!!verifyingId}
@@ -2132,6 +3490,19 @@ export function AdminPipeline() {
             computeLimit={computeLimit}
             onExtend={extendVerification}
             extending={extending}
+            extendLabel={isArchitectStrategy(verifyStrategy) ? '1 min' : '5 min'}
+            iterLimit={
+              verifyDecompose && isArchitectStrategy(verifyStrategy)
+                ? { budget: verifyMaxIters }
+                : null
+            }
+            onExtendIters={extendIterations}
+            extendingIters={extendingIters}
+            onResetIters={
+              verifyMaxIters === ARCHITECT_DEFAULT_ITERS
+                ? undefined
+                : () => setVerifyMaxIters(ARCHITECT_DEFAULT_ITERS)
+            }
           />
         )}
         <div className="space-y-1.5">
@@ -2262,6 +3633,31 @@ export function AdminPipeline() {
                           title="Promoted to prod — awaiting the CompeteMath publish cron, or already published"
                         >
                           Prod
+                        </span>
+                      )}
+                      {g.gauntlet && (
+                        <span
+                          className={cn(
+                            'shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase',
+                            g.gauntlet.solved
+                              ? 'bg-amber-500/15 text-amber-600'
+                              : 'bg-emerald-500/15 text-emerald-600',
+                          )}
+                          title={
+                            g.gauntlet.solved
+                              ? `Cracked by ${g.gauntlet.model} — tiered to its measured difficulty`
+                              : `Survived ${g.gauntlet.samples} cold solve(s) by ${g.gauntlet.model}`
+                          }
+                        >
+                          {g.gauntlet.solved ? '🛡 cracked' : '🛡 held'}
+                        </span>
+                      )}
+                      {g.gauntlet?.suspectAnswer != null && (
+                        <span
+                          className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium uppercase bg-amber-500/15 text-amber-600"
+                          title={`All ${g.gauntlet.samples} gauntlet samples agreed on ${g.gauntlet.suspectAnswer}, which differs from the intended answer ${g.answer} — the INTENDED answer may be wrong. Review before staging.`}
+                        >
+                          ans suspect
                         </span>
                       )}
                       <span className="truncate font-medium">

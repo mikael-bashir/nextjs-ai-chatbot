@@ -19,10 +19,10 @@
 
 import { createServer } from "node:http"
 import { spawn } from "node:child_process"
-import { randomBytes, timingSafeEqual, randomUUID } from "node:crypto"
-import { mkdtempSync, writeFileSync } from "node:fs"
-import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { randomBytes, timingSafeEqual, randomUUID, createHash } from "node:crypto"
+import { mkdtempSync, writeFileSync, readFileSync, renameSync, mkdirSync, appendFileSync } from "node:fs"
+import { tmpdir, homedir } from "node:os"
+import { join, basename } from "node:path"
 
 // --- Resilience: never let a dropped socket take down the whole bridge. -------
 // The relay connection and remote MCP servers (HF Spaces sleep, tunnels reset)
@@ -66,6 +66,10 @@ process.on("uncaughtException", (err) => {
 
 const PORT = Number(process.env.PORT || 4123)
 const CLAUDE_BIN = process.env.CLAUDE_BIN || "claude"
+// Free-text tag for the research tables (Leak River / Leak Stronghold) — set it
+// when launching the bridge to label a batch of runs as belonging to a
+// particular experiment/fix version, so before/after data isn't conflated.
+const BRIDGE_BUILD = process.env.BRIDGE_BUILD_TAG || null
 // When the proof gate confirms mid-stream we interrupt the CLI (SIGINT) so it
 // flushes its final `result` frame — the sole carrier of total_cost_usd. This is
 // the grace window before we hard-kill a CLI that didn't exit after flushing.
@@ -150,6 +154,65 @@ function readBody(req) {
 // agent "discover" a goal is an open conjecture and stop proving — cut them so it
 // stays in the compiler. Tune here (e.g. add "Bash" to also cut numeric probing).
 const PROVER_DISALLOWED_TOOLS = ["WebSearch", "WebFetch"]
+// The architect pipeline (Leak Ultra) is stricter: EVERY real action must go
+// through the bridge-served lean_compile/loogle_search/moogle_search (that's
+// what keeps the compile gate bridge-side instead of trusting the model's
+// self-report). Bash/Read/Write/Edit/Glob/Grep/Task buy nothing there — a
+// Bash-computed value still has to round-trip through lean_compile to count
+// for anything — and cost real damage in practice: a session shelled out to
+// Python to precompute a huge memoized lemma table instead of writing a
+// direct proof (inflating both the blueprint size and the bill), and a
+// separate session mistook "import Architect" (the local blueprint-attribute
+// macro) for a real package and started `find /`-ing the operator's own
+// filesystem for it, burning turns on a pure derailment with zero proof
+// value. Stronghold's PROVER_DISALLOWED_TOOLS above is unaffected.
+const ARCHITECT_DISALLOWED_TOOLS = ["Bash", "Read", "Write", "Edit", "Glob", "Grep", "Task", "WebSearch", "WebFetch"]
+
+// ---------------------------------------------------------------------------
+// NO LOCAL LEAN. Observed live on fatex_006: Control I hit an unknown constant,
+// ran `find / -iname "Sylow.lean"`, found the operator's own Mathlib checkouts
+// and spent six minutes reading them. The checkouts are a DIFFERENT Mathlib
+// from the one Leak IV compiles against, so every name learned that way is
+// unsound here — and for the CONTROLS specifically it is also a capability the
+// arm is defined not to have, strictly stronger than the Leak I search that is
+// supposed to be Control II's only edge over Control I.
+//
+// The fix is a scalpel, not the blanket tool-ban this first shipped as: Bash,
+// Read, Write and Grep all stay, because a local scratchpad, numeric probing
+// and note-keeping are legitimate proof work. ONLY invoking a local Lean
+// toolchain is refused, by a PreToolUse hook that inspects the actual command
+// string — so `cd x && lake build` and `sh -c "lean f"` are caught too, which a
+// `Bash(lake:*)` prefix pattern would miss. Verified live: the hook fires under
+// `-p --dangerously-skip-permissions`, blocks `lake --version`, and lets a
+// scratchpad write through untouched.
+const NO_LOCAL_LEAN_HOOK = join(mkdtempSync(join(tmpdir(), "leak-hook-")), "no-local-lean.mjs")
+writeFileSync(
+  NO_LOCAL_LEAN_HOOK,
+  `let s = ""
+process.stdin.on("data", (d) => (s += d)).on("end", () => {
+  let cmd = ""
+  try { cmd = (JSON.parse(s).tool_input || {}).command || "" } catch {}
+  if (/(^|[;&|(\\\`]|\\s)(lean|lake|elan|leanc|lean4)(\\s|$)/.test(String(cmd))) {
+    process.stderr.write("BLOCKED: this run may not invoke a local Lean toolchain. Compile ONLY through verify_full_script — the local checkout is a DIFFERENT Mathlib from the verifier's, so anything it tells you about which lemmas exist is unsound here. Everything else (scratchpad files, numeric probing, notes) is fine.")
+    process.exit(2)
+  }
+  process.exit(0)
+})
+`,
+)
+// The hook is the wall; this is the sign on it. Without it the agent discovers
+// the block by walking into it — on fatex_006 that cost a `find /` across the
+// whole filesystem and several turns of dead-ended exploration before it gave
+// up on the idea. Telling it up front costs a few tokens once.
+const NO_LOCAL_LEAN_NOTE = `LOCAL LEAN IS NOT AVAILABLE TO YOU. This machine happens to have Lean toolchains and Mathlib checkouts on disk. Do not try to use them: \`lean\`, \`lake\`, \`elan\` and \`leanc\` are blocked before they run, so the attempt just fails and costs you a turn. Do not go looking for them either — no \`find / -name "*.lean"\`, no hunting for a local \`Mathlib/\`.
+
+The reason is soundness, not bureaucracy: any local checkout is a DIFFERENT Mathlib from the one your verifier compiles against, so what it says about which lemmas exist, what they are called, and what shape they have can simply be wrong here. A name you read off local source and then cannot compile is not a mystery — it is a version mismatch, and chasing it wastes the run. Your ONE source of truth about Lean is verify_full_script.
+
+Everything else on the machine is yours and unrestricted — shell commands, scratch files, notes, numeric experiments. A local scratchpad is fine and often useful.`
+
+const NO_LOCAL_LEAN_SETTINGS = JSON.stringify({
+  hooks: { PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `node ${NO_LOCAL_LEAN_HOOK}` }] }] },
+})
 
 function buildArgs(prompt, options = {}) {
   const args = ["-p", String(prompt), "--output-format", "json"]
@@ -296,6 +359,227 @@ function runClaude(args, { cwd, timeoutMs, killSignal, maxOutputTokens }) {
   })
 }
 
+// Streaming twin of /run: identical contract (prompt + options) but instead of
+// one silent multi-minute POST, runs claude with stream-json (+ partial message
+// deltas) and mirrors EVERY step over SSE — thinking, tool calls/results, text —
+// in the same event shapes /prove-stream emits, so the app's existing console
+// plumbing renders it unchanged. Ends with a terminal {type:"result"} event
+// carrying EXACTLY what /run would have returned ({ok, text, usage, costUsd,
+// exitCode, durationMs, timedOut, aborted, stderr}), so callers keep their
+// result-handling logic and only gain live progress.
+function runStream(res, body) {
+  const prompt = body.prompt
+  if (typeof prompt !== "string" || !prompt.trim()) {
+    return json(res, 400, { error: "prompt_required" })
+  }
+  const options = body.options || {}
+  // Same timeout semantics as /run: 0 = uncapped (client Terminate governs).
+  const timeoutMs =
+    Number(options.timeoutMs) === 0
+      ? 0
+      : Math.min(Math.max(Number(options.timeoutMs) || 120000, 5000), 1800000)
+  const cwd =
+    typeof options.workingDirectory === "string" && options.workingDirectory.trim()
+      ? options.workingDirectory.trim()
+      : undefined
+
+  const args = buildArgs(prompt, options)
+  // Swap the blocking `json` output for frame-per-line streaming, with partial
+  // message deltas: a tool-less single-completion run (e.g. the problem
+  // generator) would otherwise emit its ONE assistant frame only at the very
+  // end — the exact silence this endpoint exists to kill.
+  const fmtIdx = args.indexOf("--output-format")
+  args[fmtIdx + 1] = "stream-json"
+  args.splice(fmtIdx + 2, 0, "--verbose", "--include-partial-messages")
+
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache, no-transform" })
+  const send = (obj) => {
+    try {
+      res.write(`data: ${JSON.stringify(obj)}\n\n`)
+    } catch {
+      /* client gone */
+    }
+  }
+
+  const start = Date.now()
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+
+  let child
+  try {
+    child = spawn(CLAUDE_BIN, args, {
+      cwd: cwd || process.cwd(),
+      shell: false,
+      stdio: ["ignore", "pipe", "pipe"],
+      env:
+        Number(options.maxOutputTokens) > 0
+          ? { ...process.env, CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(Number(options.maxOutputTokens)) }
+          : process.env,
+    })
+  } catch (err) {
+    send({ type: "result", ok: false, text: "", exitCode: null, durationMs: 0, timedOut: false, aborted: false, stderr: `Failed to launch "${CLAUDE_BIN}": ${String(err)}` })
+    res.end()
+    return
+  }
+
+  let timedOut = false
+  let aborted = false
+  const timer =
+    timeoutMs > 0
+      ? setTimeout(() => {
+          timedOut = true
+          child.kill("SIGKILL")
+        }, timeoutMs)
+      : null
+  // Terminate = client disconnect kills claude, same contract as /run.
+  res.on("close", () => {
+    if (!res.writableEnded) {
+      aborted = true
+      try {
+        child.kill("SIGKILL")
+      } catch {
+        /* gone */
+      }
+    }
+  })
+
+  // Liveness during silent stretches + keeps proxies from idling the socket.
+  const heartbeat = setInterval(() => {
+    metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    send({ type: "heartbeat", metrics })
+  }, 15000)
+  heartbeat.unref?.()
+
+  // Partial-delta throttle: batch thinking/text deltas and flush at most every
+  // 2s, so the console shows the model literally writing without an SSE flood.
+  let pendingThinking = ""
+  let pendingText = ""
+  let streamedChars = 0
+  let lastFlush = 0
+  const flushDeltas = (force = false) => {
+    const now = Date.now()
+    if (!force && now - lastFlush < 2000) return
+    if (!pendingThinking && !pendingText) return
+    lastFlush = now
+    metrics.time_elapsed = Math.round((now - start) / 1000)
+    if (pendingThinking) {
+      send({ type: "thinking", text: pendingThinking.slice(-2000), metrics })
+      pendingThinking = ""
+    }
+    if (pendingText) {
+      send({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `✍️ writing… (${streamedChars} chars)\n…${pendingText.slice(-300)}`,
+        metrics,
+      })
+      pendingText = ""
+    }
+  }
+
+  let buf = ""
+  let stderr = ""
+  let finalText = ""
+  let usage = null
+  let costUsd = null
+
+  child.stdout.on("data", (chunk) => {
+    buf += chunk.toString("utf8")
+    let nl
+    while ((nl = buf.indexOf("\n")) !== -1) {
+      const line = buf.slice(0, nl)
+      buf = buf.slice(nl + 1)
+      if (!line.trim()) continue
+      let o
+      try {
+        o = JSON.parse(line)
+      } catch {
+        continue
+      }
+      metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+      if (o.type === "result") {
+        finalText = String(o.result || "").slice(0, MAX_OUTPUT_BYTES)
+        if (typeof o.total_cost_usd === "number") costUsd = o.total_cost_usd
+        if (o.usage) usage = o.usage
+      } else if (o.type === "system" && (o.subtype === "init" || o.model)) {
+        send({ type: "system", model: o.model, metrics })
+      } else if (o.type === "stream_event") {
+        // Token-level deltas (--include-partial-messages): the ONLY live signal
+        // during a long single completion. Batched via flushDeltas above.
+        const ev = o.event
+        if (ev?.type === "content_block_delta") {
+          if (ev.delta?.type === "thinking_delta" && ev.delta.thinking) {
+            pendingThinking += ev.delta.thinking
+            streamedChars += ev.delta.thinking.length
+          } else if (ev.delta?.type === "text_delta" && ev.delta.text) {
+            pendingText += ev.delta.text
+            streamedChars += ev.delta.text.length
+          }
+          flushDeltas()
+        }
+      } else if (o.type === "assistant" && o.message?.content) {
+        // Full frames: flush any buffered deltas first so ordering reads right.
+        flushDeltas(true)
+        metrics.llm_invocations++
+        for (const c of o.message.content) {
+          if (c.type === "tool_use") {
+            metrics.tools_invoked++
+            const name = String(c.name || "").replace(/^mcp__[a-z0-9-]+__/i, "")
+            send({
+              type: "message-annotation",
+              subtype: "tool_intent",
+              thought: `Using ${name}`,
+              tool: name,
+              input: typeof c.input === "string" ? c.input : JSON.stringify(c.input),
+              metrics,
+            })
+          }
+          // Full text/thinking blocks are NOT re-emitted here: their content
+          // already streamed via the deltas above — re-sending would duplicate.
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_result") {
+            const t = Array.isArray(c.content)
+              ? c.content.map((x) => x.text || "").join("\n")
+              : String(c.content ?? "")
+            send({ type: "message-annotation", subtype: "tool_result", thought: "Tool output", output: t.slice(0, 8000), metrics })
+          }
+        }
+      }
+    }
+  })
+
+  child.stderr.on("data", (c) => {
+    stderr += c.toString("utf8")
+  })
+  child.on("error", (err) => {
+    if (timer) clearTimeout(timer)
+    clearInterval(heartbeat)
+    send({ type: "result", ok: false, text: "", exitCode: null, durationMs: Date.now() - start, timedOut: false, aborted: false, stderr: `Failed to launch "${CLAUDE_BIN}": ${err.message}` })
+    res.end()
+  })
+  child.on("close", (code) => {
+    if (timer) clearTimeout(timer)
+    clearInterval(heartbeat)
+    flushDeltas(true)
+    metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    send({
+      type: "result",
+      ok: code === 0 && !timedOut && !aborted,
+      text: finalText,
+      usage,
+      costUsd,
+      exitCode: code,
+      durationMs: Date.now() - start,
+      timedOut,
+      aborted,
+      stderr: stderr.slice(0, 4000),
+      metrics,
+    })
+    res.end()
+  })
+}
+
 function getVersion() {
   return new Promise((resolve) => {
     let out = ""
@@ -400,6 +684,20 @@ function createGovernor({ initial } = {}) {
     searchCount: 0,
     grantCount: 0,
     blockedCount: 0,
+    // Replenishment is earned by the AGENT's compile output, but the agent never
+    // sees the grant: the CLI subprocess is spawned with stdin ignored, so there
+    // is no channel to push a message into a running session. An agent that has
+    // been refused once will otherwise assume search is dead for the whole run
+    // and stop asking. So we bank the grant here and announce it on the agent's
+    // NEXT search response (and tell it, in the refusal itself, that trying
+    // again after a real compile is exactly how the allowance comes back).
+    pendingGrant: 0, // searches granted since the last time we told the agent
+    wasBlocked: false, // agent has been refused at least once since the last notice
+    // Bridge-served tools: name -> { description, inputSchema, run(args) }. Used by
+    // the Claude-driven architect (Leak Ultra) so the CLI's tool calls execute in
+    // the bridge — same executors, same gates as the Grok loop — instead of the CLI
+    // talking to Leak XII/XIV directly, where the bridge could not see the results.
+    handlers: new Map(),
   }
   governors.set(id, g)
   return g
@@ -419,6 +717,8 @@ function grantSearch(g, why) {
   if (!g) return
   g.budget += GOV_GRANT
   g.grantCount++
+  g.pendingGrant += GOV_GRANT
+  g.lastGrantWhy = why || ""
 }
 
 // Build an MCP config where any PURE search server (all its tools are searches,
@@ -447,6 +747,10 @@ function buildGovernedMcpConfig(mcpServers, governor) {
       servers[s.name] = { type: "sse", url: s.url }
     }
   }
+  // Bridge-served tools get their own entry so the CLI can reach the architect
+  // executors. Named "architect" so tools surface as mcp__architect__lean_compile.
+  if (governor?.handlers?.size)
+    servers.architect = { type: "sse", url: `http://127.0.0.1:${PORT}/gov/${governor.id}/sse` }
   return { mcpServers: servers }
 }
 
@@ -456,8 +760,13 @@ async function governedSearchCall(g, toolName, args) {
   g.searchCount++
   if (g.budget <= 0) {
     g.blockedCount++
+    g.wasBlocked = true
     console.log(`[gov ${g.id}] search BLOCKED (budget 0) tool=${toolName}`)
-    return `🛑 Search budget spent — stop searching and PROVE. You already know Lean 4; lead with strong automation (decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. To resolve a specific lemma NAME, do NOT guess it with \`#check @name\` — put the goal in \`example : <goal> := by exact?\` (or apply?/rw?/simp?); unification finds the name for free. A search allowance is earned only when a REAL proof attempt hits an unknown name. If the goal is genuinely too big, decompose it.`
+    return `⏸️ Search allowance is at 0 RIGHT NOW — this is temporary, not a ban. Go and PROVE, and the allowance comes back on its own.
+
+HOW IT COMES BACK: compile a REAL proof attempt with verify_full_script (a script with theorem/lemma/have/show/suffices or \`:= by\` in it — not a bare \`#check\`/\`#print\`/\`#eval\` probe). The moment such an attempt hits a genuine "unknown identifier" / "unknown constant" / "unknown tactic" from the compiler, you are automatically granted +${GOV_GRANT} searches, and the next search you make will tell you so. This can happen as many times as you earn it — searching is available for the whole run.
+
+MEANWHILE: you already know Lean 4; lead with strong automation (decide / native_decide / omega / simp / nlinarith / induction) and call verify_full_script. To resolve a specific lemma NAME, do NOT guess it with \`#check @name\` — put the goal in \`example : <goal> := by exact?\` (or apply?/rw?/simp?); unification finds the name for free and costs no budget. If the goal is genuinely too big, decompose it.`
   }
   g.budget--
   const srv = g.searchServer
@@ -469,7 +778,14 @@ async function governedSearchCall(g, toolName, args) {
   // its warm index on a timeout, abandoning early here is now harmless.
   const r = await callRemoteMcpTool(srv.url, toolName, args, { timeoutMs: 25000 })
   const body = r.ok ? r.text : `Search error: ${r.error || "unknown"} — don't retry; prove with the compiler instead.`
-  return `${body}\n\n[search budget: ${g.budget} left — spend it on TYPE-PATTERN loogle queries (e.g. loogle "(f _)^[_] _ = _") or moogle concepts, never on a bare lemma name. To resolve a name for free, use \`exact?\`/\`apply?\` in a script. Prefer compiling.]`
+  // If the agent earned refills since we last spoke to it, say so up front —
+  // otherwise a previously-refused agent has no way to learn its budget is back.
+  const refill = g.pendingGrant
+    ? `✅ SEARCH BUDGET REPLENISHED: +${g.pendingGrant} (a real proof attempt of yours hit an unknown name, which is what earns it). You now have ${g.budget} searches left after this one. Keep compiling real attempts and you keep earning more — search stays open all run.\n\n`
+    : ""
+  g.pendingGrant = 0
+  g.wasBlocked = false
+  return `${refill}${body}\n\n[search budget: ${g.budget} left — refilled +${GOV_GRANT} whenever a real compiled attempt hits an unknown name, so this number is not a hard ceiling. Spend it on TYPE-PATTERN loogle queries (e.g. loogle "(f _)^[_] _ = _") or moogle concepts, never on a bare lemma name. To resolve a name for free, use \`exact?\`/\`apply?\` in a script. Prefer compiling.]`
 }
 
 // ---- MCP-over-SSE SERVER for the governor (the inverse of callRemoteMcpTool) --
@@ -546,10 +862,27 @@ async function governorMessage(req, res, govId, sid) {
         required: [t.argKey],
       },
     }))
+    for (const [name, h] of g.handlers)
+      tools.push({ name, description: h.description || name, inputSchema: h.inputSchema || { type: "object", properties: {} } })
     reply({ tools })
   } else if (method === "tools/call") {
-    const text = await governedSearchCall(g, msg.params?.name, msg.params?.arguments || {})
-    reply({ content: [{ type: "text", text }] })
+    const name = msg.params?.name
+    const h = g.handlers.get(name)
+    if (h) {
+      // Bridge-served tool (architect stage executor). Errors come back as tool
+      // TEXT, never as a JSON-RPC error: the driver has to be able to read and
+      // react to a failure the same way it reads a compile report.
+      let text
+      try {
+        text = await h.run(msg.params?.arguments || {})
+      } catch (e) {
+        text = `Tool error: ${String(e?.message || e)}`
+      }
+      reply({ content: [{ type: "text", text: String(text ?? "") }] })
+    } else {
+      const text = await governedSearchCall(g, name, msg.params?.arguments || {})
+      reply({ content: [{ type: "text", text }] })
+    }
   } else if (msg.id != null) {
     reply({})
   }
@@ -670,8 +1003,10 @@ function makeProofGate(theorem) {
         ) {
           const okScript = verifyCalls[c.tool_use_id]
           if (gateAccepts(okScript)) {
-            verifiedScript = okScript
-            return { verified: okScript }
+            // Persist what the daemon actually compiled (import-complete),
+            // not necessarily the raw argument the model sent.
+            verifiedScript = normalizeProofScript(t, okScript)
+            return { verified: verifiedScript }
           }
           return { rejected: okScript }
         }
@@ -816,6 +1151,206 @@ function stripImports(script) {
     .filter((l) => !/^\s*import\b/.test(l))
     .join("\n")
     .trim()
+}
+
+// Recover the SELF-CONTAINED version of a script we're about to persist as a
+// "final proof". The daemon (Leak IV) injects "import Mathlib" internally to
+// compile a script that lacks one, but historically only returned a plain
+// success sentence — so a caller that stored `script` (what it SENT, not what
+// actually got compiled) ended up with a certificate that silently depended
+// on the daemon's injection to ever compile standalone. Leak IV now appends
+// a `[[LEAK_NORMALIZED_SCRIPT_B64:<base64>]]` marker to a successful verify's
+// text carrying the EXACT compiled bytes — this only ever returns that, byte-
+// identical to what the daemon actually checked. No client-side guessing: if
+// the marker isn't present (an un-redeployed daemon), this returns the raw
+// script unchanged rather than fabricating a substitute — a normalized
+// script must come from the daemon that actually compiled it, never a
+// heuristic mirror of its injection rule.
+function normalizeProofScript(daemonText, rawScript) {
+  const m = String(daemonText == null ? "" : daemonText).match(
+    /\[\[LEAK_NORMALIZED_SCRIPT_B64:([A-Za-z0-9+/=]+)\]\]/,
+  )
+  if (m) {
+    try {
+      const decoded = Buffer.from(m[1], "base64").toString("utf8")
+      if (decoded.trim()) return decoded
+    } catch {
+      /* fall through — treat as no marker */
+    }
+  }
+  return String(rawScript == null ? "" : rawScript)
+}
+
+// ===========================================================================
+// RUN-SCOPED VERIFIED-LEMMA POOL
+// ---------------------------------------------------------------------------
+// Every `verify_full_script` that returns "✅ Compilation Successful" is, by
+// construction, a FULLY CLOSED Lean fact: Leak IV fails on any warning and
+// `sorry` is a warning, so a successful verify can never contain a hole. That
+// makes the compiler channel a free, already-paid-for stream of proven lemmas.
+//
+// Minions spend most of their tokens establishing small facts on the way to a
+// hole — a coset characterisation, a cardinality rewrite, which `exact?` closes
+// a goal — and then every one of them dies with the minion's context. Only the
+// hole's final FILL survives, so a hole that is cut off or fails banks nothing
+// at all, and a sibling working a related hole re-derives the same lemmas from
+// scratch minutes later.
+//
+// This pool keeps them for the run and hands the relevant ones to whoever is
+// dispatched next. It is the shared memory isolated minions otherwise cannot
+// have, and it costs NOTHING: no extra model call, no extra compile, no extra
+// token spent producing it — only re-use of work already done and verified.
+const LEMMA_POOL_MAX = Number(process.env.LEAK_LEMMA_POOL_MAX || 250)
+const LEMMA_CTX_N = Number(process.env.LEAK_LEMMA_CTX_N || 14)
+const LEMMA_STMT_CHARS = 400
+const LEMMA_PROOF_CHARS = 900
+
+function makeLemmaPool() {
+  return { facts: new Map() } // normalized statement -> {statement, proof, tokens, seq}
+}
+
+// Syntax words carry no evidence about WHICH goal a fact is about.
+const LEMMA_STOP = new Set(
+  "the and for with have show from this that using where obtain refine exact apply simp intro intros rintro constructor rfl sorry example theorem lemma open scoped Type Prop def instance".split(" "),
+)
+
+// Identifiers plus the notation that actually discriminates between goals (`⧸`
+// for a quotient, `•` for a coset action…). A dotted Mathlib name also yields
+// its last component, so `Subgroup.IsComplement` and a bare `IsComplement` in
+// the hole's statement count as the same evidence.
+function lemmaTokens(text) {
+  const out = new Set()
+  const s = String(text == null ? "" : text)
+  for (const m of s.matchAll(/[A-Za-z_][A-Za-z0-9_.']*/g)) {
+    const t = m[0]
+    if (t.length < 3 || LEMMA_STOP.has(t)) continue
+    out.add(t)
+    const dot = t.lastIndexOf(".")
+    if (dot > 0 && dot < t.length - 1) out.add(t.slice(dot + 1))
+  }
+  for (const m of s.matchAll(/[⧸•∈∉⊆≤≥∀∃↔∧∨¬≠∑∏⨆⨅⁻ᵒᵖ]/gu)) out.add(m[0])
+  return out
+}
+
+// Top-level declarations of a compiled script. `open … in` and `@[attr]` lines
+// PREFIX the declaration that follows rather than starting one of their own.
+function splitTopLevelDecls(script) {
+  const startRe = /^(open\b.*\bin\s*$|@\[|example\b|theorem\b|lemma\b|def\b|instance\b|abbrev\b|noncomputable\b|private\b|protected\b)/
+  const prefixRe = /^(open\b.*\bin\s*$|@\[)/
+  const blocks = []
+  let cur = null
+  for (const ln of String(script == null ? "" : script).split("\n")) {
+    if (/^import\b/.test(ln)) continue
+    if (startRe.test(ln)) {
+      if (cur && prefixRe.test(cur[cur.length - 1] || "")) {
+        cur.push(ln)
+        continue
+      }
+      cur = [ln]
+      blocks.push(cur)
+      continue
+    }
+    if (cur) cur.push(ln)
+  }
+  return blocks.map((b) => b.join("\n").trim()).filter(Boolean)
+}
+
+// The conclusion's colon is the FIRST one at bracket depth 0: every binder is
+// bracketed, so `example (h : A) [Inst] : B` and `example : ∀ x : Nat, P x`
+// both resolve correctly (taking the LAST depth-0 colon gets the second one
+// wrong, splitting inside the ∀ binder).
+function topLevelColon(stmt) {
+  let d = 0
+  for (let i = 0; i < stmt.length; i++) {
+    const c = stmt[i]
+    if ("([{⟨".includes(c)) d++
+    else if (")]}⟩".includes(c)) d--
+    else if (c === ":" && d === 0 && stmt[i + 1] !== "=") return i
+  }
+  return -1
+}
+
+// Definitional probes (`example … : Set G' := g • H`) elaborate a TERM, not a
+// proposition — they are not lemmas and would only dilute the context.
+const LEMMA_NOT_A_PROP =
+  /^(Set|Type|Prop|Sort|Nat|ℕ|ℤ|ℚ|ℝ|ℂ|Setoid|Subgroup|Submonoid|Finset|List|Multiset|True)\b[^↔=∈∉≤≥<>∀∃∧∨¬≠]*$/
+
+function parseLemmaDecl(block) {
+  const s = String(block == null ? "" : block)
+  if (!/^(?:(?:open|@\[)[^\n]*\n)*\s*(?:example|theorem|lemma)\b/.test(s)) return null
+  const i = s.indexOf(":=")
+  if (i < 0) return null
+  const statement = s.slice(0, i).replace(/\s+/g, " ").trim()
+  const proof = s.slice(i + 2).trim()
+  // THE soundness filter, not a backstop. Since the harvest trigger accepts
+  // any error-free compile (a skeleton compile carries sorry warnings by
+  // construction — see the capture site), this line is what separates the
+  // declarations that are genuinely CLOSED from the one that still has holes
+  // in it. The master theorem's `have … := by sorry --⟪hN⟫` lines are indented
+  // inside its own block, so it is rejected whole and only the sorry-free
+  // helper lemmas beside it reach the pool.
+  if (!statement || !proof || /\b(?:sorry|admit)\b/.test(proof)) return null
+  const colon = topLevelColon(statement)
+  if (colon < 0) return null
+  const concl = statement.slice(colon + 1).trim()
+  if (!concl || LEMMA_NOT_A_PROP.test(concl)) return null
+  return { statement: statement.slice(0, LEMMA_STMT_CHARS), proof: proof.slice(0, LEMMA_PROOF_CHARS) }
+}
+
+function harvestVerifiedLemmas(pool, script) {
+  if (!pool || !script) return 0
+  let added = 0
+  for (const block of splitTopLevelDecls(script)) {
+    const d = parseLemmaDecl(block)
+    if (!d || pool.facts.has(d.statement)) continue
+    pool.facts.set(d.statement, { ...d, tokens: lemmaTokens(d.statement), seq: pool.facts.size })
+    added++
+    // Oldest-first eviction: a run's later lemmas are the ones aimed at the
+    // holes still open.
+    if (pool.facts.size > LEMMA_POOL_MAX) pool.facts.delete(pool.facts.keys().next().value)
+  }
+  return added
+}
+
+// Rank the pool against the text of whatever is about to be worked (a hole's
+// proposition, or the whole skeleton for the refiner) and render the top slice.
+function lemmaPoolBlock(pool, focusText, limit = LEMMA_CTX_N) {
+  if (!pool || !pool.facts.size) return ""
+  const facts = [...pool.facts.values()]
+  const focus = lemmaTokens(focusText)
+  let picked
+  if (focus.size) {
+    // IDF, because `Group`/`Subgroup` appear in EVERY fact of a group-theory
+    // run: without it the shared boilerplate outranks the one distinctive name
+    // that the hole and the fact genuinely have in common, and the ranking
+    // degenerates to "most verbose fact wins".
+    const df = new Map()
+    for (const f of facts) for (const t of f.tokens) df.set(t, (df.get(t) || 0) + 1)
+    const n = facts.length
+    const score = (f) => {
+      let s = 0
+      for (const t of f.tokens) if (focus.has(t)) s += Math.log(1 + n / (df.get(t) || 1))
+      return s
+    }
+    picked = facts
+      .map((f) => ({ f, s: score(f) }))
+      .filter((x) => x.s > 0)
+      .sort((a, b) => b.s - a.s || b.f.seq - a.f.seq)
+      .slice(0, limit)
+      .map((x) => x.f)
+    // Nothing shares a token: hand over the most recent few rather than
+    // nothing — they are the ones aimed at the part of the proof still open.
+    if (!picked.length) picked = facts.slice(-Math.min(limit, 4))
+  } else {
+    picked = facts.slice(-limit)
+  }
+  const body = picked.map((f) => `${f.statement} :=\n  ${f.proof.replace(/\n/g, "\n  ")}`).join("\n\n")
+  const more = pool.facts.size - picked.length
+  return `ALREADY-PROVED FACTS from earlier work on THIS problem — each one COMPILED on Leak IV with zero errors and zero warnings, so each is a closed, correct Lean proof, not a suggestion. They were established by other agents whose contexts are gone; this block is the only way they reach you. Reuse them directly (paste one in as a local \`have\`, or lift its tactic), and do NOT spend a verify re-deriving anything listed here${more > 0 ? ` (${more} further proved fact(s) are on file but less related to your goal)` : ""}:
+
+\`\`\`lean
+${body}
+\`\`\``
 }
 
 // Identify the master declaration in a scaffold BY NAME (robust to the agent
@@ -1208,7 +1743,25 @@ function callRemoteMcpTool(sseUrl, toolMatch, args, { timeoutMs = 180000 } = {})
             ? tools.find((t) => t.name === toolMatch) || tools.find((t) => String(t.name).endsWith(toolMatch))
             : tools.find((t) => toolMatch.test(t.name))
         if (!tool) throw new Error(`tool not found on server: ${toolMatch}`)
-        const r = await rpc("tools/call", { name: tool.name, arguments: args || {} })
+        // Adapt the argument KEY to THIS server's schema. The same logical tool
+        // is exposed with different parameter names across daemons (Leak IV's
+        // verify_full_script takes `script`, another takes `code`), so a
+        // hardcoded key passes on one server and fails pydantic validation on
+        // the rest — which then looks like a broken Lean statement rather than
+        // a wiring bug. Only remaps when the supplied keys do NOT fit and both
+        // sides have exactly one field, so a real multi-arg call is never
+        // silently rewritten.
+        let callArgs = args || {}
+        const props = tool?.inputSchema?.properties
+        if (props && typeof props === "object") {
+          const schemaKeys = Object.keys(props)
+          const givenKeys = Object.keys(callArgs)
+          const unknown = givenKeys.filter((k) => !schemaKeys.includes(k))
+          if (unknown.length && givenKeys.length === 1 && schemaKeys.length === 1) {
+            callArgs = { [schemaKeys[0]]: callArgs[givenKeys[0]] }
+          }
+        }
+        const r = await rpc("tools/call", { name: tool.name, arguments: callArgs })
         if (r?.error) throw new Error(`mcp RPC error: ${JSON.stringify(r.error)}`)
         const c = r?.result?.content
         const text = Array.isArray(c)
@@ -1311,7 +1864,9 @@ const SEARCH_USAGE_NOTE = `FINDING & USING LEMMAS — do this instead of guessin
 - To get the exact name of a lemma that closes a goal, let unification find it: \`example : <goal> := by exact?\` (or \`apply?\`, \`rw?\`, \`simp?\`). THAT is the name search, and it costs no search budget.
 - loogle takes a TYPE PATTERN or a list of constants, never a lemma name: e.g. \`loogle "(fwdDiff _)^[_] _ _ = _"\` or \`loogle Nat.choose, Finset.sum, (_ ^ _)\`. A bare name like \`loogle "fwdDiff_iter_eq_shift"\` always errors.
 - The MOMENT you have a plausible lemma — from search, from \`exact?\`, or from memory — USE it in a real script: \`simpa using <lemma> …\`, \`rw [<lemma>]\`, \`exact <lemma> …\`. If the name is slightly off, the compiler's "unknown identifier — did you mean …?" corrects it in one step. Never collect lemmas you don't apply.
-- Stay in ONE workspace: drive the proof through verify_full_script. Use init_proof/apply_tactic only to LOOK at a stuck goal, ONE tactic per call (no \`;\`-chains, no \`rename'\` — Pantograph rejects them).`
+- Stay in ONE workspace: drive the proof through verify_full_script. Use init_proof/apply_tactic only to LOOK at a stuck goal, ONE tactic per call (no \`;\`-chains, no \`rename'\` — Pantograph rejects them).
+
+SEARCH BUDGET — it is a RENEWABLE allowance, not a one-time ration. You start with ${GOV_INITIAL} searches. Every time a REAL proof attempt (a script containing theorem/lemma/have/show/suffices or \`:= by\`) is compiled and the compiler reports an unknown identifier / unknown constant / unknown tactic, you are automatically granted ${GOV_GRANT} MORE searches. Probe scripts that are nothing but \`#check\`/\`#print\`/\`#eval\` earn nothing. So if you hit 0, that is TEMPORARY and self-inflicted-by-idleness only: go compile a real attempt, and the moment it names something Mathlib does not have, your allowance comes back. Search is never switched off for the run — you just have to keep proving to keep paying for it.`
 
 // The goal is to let Claude use the tools logically on its own — but a bare
 // "prove this" makes it fall into an endless moogle/loogle syntax-search spiral
@@ -1617,17 +2172,246 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "have",
   },
+  // Leak Control I/II: the flat baselines. One continuous agent, one-shots
+  // the WHOLE theorem, no decompose escape hatch — see proveControl. Exist to
+  // give blueprint-refinement strategies something to beat besides each
+  // other. I is Leak IV only; II adds Leak I search (loogle/moogle) — see the
+  // CONTROL header comment above proveControl for the full split.
+  "control-oneshot": {
+    label: "Leak Control I — one continuous agent, one-shot, Leak IV only (no decomposition)",
+    node: (t, m, x) => controlPrompt(t, m),
+    decompose: (t, m, x) => controlPrompt(t, m), // unused; keeps the registry shape
+    search: 0,
+    style: "control",
+  },
+  "control-oneshot-2": {
+    label: "Leak Control II — one continuous agent, one-shot, Leak IV + Leak I search (no decomposition)",
+    node: (t, m, x) => controlPrompt(t, m, 1, null, true),
+    decompose: (t, m, x) => controlPrompt(t, m, 1, null, true), // unused; keeps the registry shape
+    search: GOV_INITIAL,
+    style: "control2",
+  },
+  // Leak Control III: the BLIND arm. Two roles — a toolless prover asked
+  // only for a Lean 4 proof (no verify tool, no compiler, no error feedback),
+  // and a separate Leak IV gate that checks each attempt and returns only
+  // pass/fail. On failure the prover is told only that it was wrong, never why.
+  // Since the continuous-session change, all attempts share ONE resumed CLI
+  // conversation (auto-compacted when it outgrows the window), so the prover
+  // remembers its own past attempts — memory WITHOUT error feedback. Sits
+  // between blind resampling and Control II (memory + real compiler errors).
+  // See proveControlBlind.
+  "control-oneshot-3": {
+    label: "Leak Control III — blind prover, ONE continuous session (no tools / no error feedback) + separate Leak IV gate (no decomposition)",
+    node: (t, m, x) => blindControlPrompt(t),
+    decompose: (t, m, x) => blindControlPrompt(t), // unused; keeps the registry shape
+    search: 0,
+    style: "control3",
+  },
+  // Leak Control IV: Control II's exact surface (Leak IV verify + Leak I
+  // search, one continuous flat agent, no decomposition) PLUS Leak II — the
+  // interactive Pantograph tactic-stepper (init_proof/apply_tactic). Isolates
+  // one variable over Control II: does interactive goal-state stepping help a
+  // flat agent. See proveControl tier IV.
+  "control-oneshot-4": {
+    label: "Leak Control IV — one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph (no decomposition)",
+    node: (t, m, x) => controlPrompt(t, m, 1, null, true, true),
+    decompose: (t, m, x) => controlPrompt(t, m, 1, null, true, true), // unused; keeps the registry shape
+    search: GOV_INITIAL,
+    style: "control4",
+  },
   // Phase-1 linear context: planner writes a `have`-skeleton, isolated minions
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
   // agent; falls back to `have` on any failure. See proveHaveTree.
   "have-tree": {
-    label: "Have-tree — planner + isolated per-hole minions (linear context)",
+    // Named "Leak Stronghold Dark" in the research tables; the VALUE stays
+    // `have-tree` so saved checkpoints, queued items and existing rows keep
+    // resolving. See STRONGHOLD_LABELS on the client for the display name.
+    label: "Leak Stronghold Dark — planner + isolated per-hole minions (linear context)",
     node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
     decompose: (t, m, x) => haveHoleFillPrompt("<the verified skeleton>", "hN", m, x),
     search: GOV_INITIAL,
     style: "have-tree",
   },
+  // Stronghold Surround: Dark's exact planner/minion/assembler shape, but the
+  // minion phase runs as PARALLEL WAVES over the ghost-army Leak II (persistent
+  // per-state ledger, id-scoped cleanup, snapshot_state / branch_tactics).
+  // Dark above stays byte-identical as the sequential control. See
+  // proveHaveSurround.
+  "have-surround": {
+    label: "Leak Stronghold Surround — parallel minion waves over the ghost-army Leak II",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => surroundHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "have-surround",
+  },
+  // Leak Finality I: Surround's parallel work-queue + Ultra's refinement loop.
+  // A bridge timer summons a refiner 10 min after the last refinement
+  // completed; in-flight minions are cut off, their Pantograph states handed
+  // to the refiner (assign-or-decimate), and a run-scoped proven-lemma bank
+  // refills kept haves in the revised skeleton for free. See proveFinality.
+  "finality-1": {
+    label: "Leak Finality I — Surround + timed skeleton refinement (lemma bank, state hand-off)",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => finalityRefinerPrompt(t, "<the current skeleton>", [], {}, {}, [], m, x),
+    search: GOV_INITIAL,
+    style: "finality",
+  },
+  // Leak Stronghold Force: the recursion moved OUT of the minions and into a
+  // dedicated splitter stage, because the minion-owned version never fired
+  // once in production. Small root → timed recursive expansion (verified on
+  // Leak IV at every cut) → bounded minion campaign → failed campaign goes
+  // BACK to the decomposer, never to a finisher. See proveForce.
+  "stronghold-force": {
+    label: "Leak Stronghold Force — dedicated recursive decomposer + bounded minion campaigns",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x ? `${FORCE_PLAN_NOTE}\n${x}` : FORCE_PLAN_NOTE),
+    decompose: (t, m, x) => forceSplitPrompt("<the current skeleton>", "hN", "", null, m, x),
+    search: GOV_INITIAL,
+    style: "force",
+  },
+  // Leak Stronghold Forte: Force's exact skeleton/expand/campaign shape, plus
+  // three additions audited from a real unsolved Force run — locally-tracked
+  // handoff scripts (a cut-off minion's progress no longer depends on a live
+  // Pantograph re-query succeeding right after a mass recall), a cross-hole
+  // opening pool (siblings stop re-deriving the same opening moves from
+  // scratch), and a near-duplicate cut guard (a splitter's cut is rejected if
+  // its own child restates the parent almost verbatim). See proveForte.
+  "stronghold-forte": {
+    label: "Leak Stronghold Forte — Force + reliable handoff scripts, cross-hole opening pool, duplicate-cut guard",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x ? `${FORCE_PLAN_NOTE}\n${x}` : FORCE_PLAN_NOTE),
+    decompose: (t, m, x) => forceSplitPrompt("<the current skeleton>", "hN", "", null, m, x),
+    search: GOV_INITIAL,
+    style: "forte",
+  },
+  // Leak Stronghold Keep: Surround's planner/queue/assembler unchanged, but the
+  // clock is split three ways — a FLAT attack on the whole theorem first, then a
+  // bounded decomposition siege with a progress gate that rejects a cut whose
+  // child restates its parent or an ancestor, then a FLAT finisher that is
+  // guaranteed the remaining time. Built on Surround (3/4) rather than on
+  // Force/Forte (0/3), which deleted the finisher. See proveStrongholdKeep.
+  "stronghold-keep": {
+    label: "Leak Stronghold Keep — flat first, bounded gated siege, guaranteed flat finisher",
+    node: (t, m, x) => haveProvePrompt(t, m, x),
+    decompose: (t, m, x) => surroundHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "keep",
+  },
+  // Leak Stronghold Impenetrable: Surround, but the planner is briefed by a
+  // breadth-first machine reconnaissance sweep first — `apply?` names the
+  // Mathlib theorems that unify with each goal, the ghost army measures which
+  // tactics actually move it, and the planner gets evidence instead of a cold
+  // reading. Fail-soft: no Pantograph / unreadable proposition / un-patched
+  // Leak IV each degrade it back toward plain Surround. See
+  // proveStrongholdImpenetrable.
+  "stronghold-impenetrable": {
+    label: "Leak Stronghold Impenetrable — apply?-driven recon sweep, then Surround",
+    node: (t, m, x) => haveTreePlannerPrompt(t, m, x),
+    decompose: (t, m, x) => surroundHoleFillPrompt("<the verified skeleton>", "hN", m, x),
+    search: GOV_INITIAL,
+    style: "impenetrable",
+  },
+  // ---- Leak River family -----------------------------------------------------
+  // Goedel-Architect (arXiv 2606.06468): blueprint generation -> parallel
+  // isolated node provers -> global blueprint refinement, on the real
+  // LeanArchitect toolchain via Leak XI/XII/XIV. Driven by Grok (xAI API),
+  // not the Claude CLI — see proveArchitect.
+  //
+  // Four variants. stone→gate→delta is an ablation ladder (each adds exactly
+  // one change to the one before); vintage branches off STONE so its numbers
+  // isolate exactly one change too — the oversight watchers — with no ledger
+  // or NL seed mixed in:
+  //   river-stone    CONTROL — the paper as written, nothing added.
+  //   river-gate     + shared dead-end ledger across node provers.
+  //   river-delta    + a one-shot local Sonnet 5 natural-language proof seed.
+  //   river-vintage  Stone + the oversight watchers (per-node interceptor,
+  //                  run-wide mechanic). Own research table.
+  "river-stone": {
+    label: "Leak River Stone — CONTROL: bare Goedel blueprint pipeline, isolated nodes",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false },
+  },
+  "river-gate": {
+    label: "Leak River Gate — Stone + shared dead-end ledger (no node rediscovers another's wall)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: true, nlSeedLocal: false },
+  },
+  "river-delta": {
+    label: "Leak River Delta — Gate + one-shot local Sonnet 5 natural-language proof seed",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: true, nlSeedLocal: true },
+  },
+  "river-vintage": {
+    label: "Leak River Vintage — Stone + oversight watchers (interceptor per node, mechanic run-wide)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false, watchers: true },
+  },
+  // ---- Leak Ultra family -------------------------------------------------------
+  // The same Goedel blueprint pipeline as Leak River Stone — identical prompts,
+  // identical tool contract, identical Leak XI/XII/XIV gates — but driven by the
+  // LOCAL Claude CLI instead of the xAI API, on whatever model the operator picks
+  // in the dropdown. A separate branch, not a River ablation: the driver changes,
+  // so its numbers belong in their own table.
+  //
+  // The driver swap is real work, not a model string: the CLI calls MCP tools
+  // itself, so the bridge serves `lean_compile` + the two search tools from a
+  // LOCAL MCP server (the governor) whose handlers are the very same `exec`
+  // closures the Grok loop uses. That keeps the compile gate and the blueprint
+  // capture on the bridge, where they have to be — the CLI is never trusted to
+  // self-report that a blueprint compiled.
+  "ultra-fleeting": {
+    label: "Leak Ultra Fleeting — Stone's pipeline, local Claude CLI driver (model from the dropdown)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false, driver: "claude" },
+  },
+  // Back-compat: runs saved/queued under the old name behave as the control.
+  architect: {
+    label: "Architect — alias for Leak River Stone (control)",
+    node: (t, m, x) => architectProverSystem(),
+    decompose: (t, m, x) => architectRefineSystem(),
+    search: 0,
+    style: "architect",
+    architect: { shareDeadEnds: false, nlSeedLocal: false },
+  },
 }
+// Per-variant architect knobs (see the Leak River family above). Unknown or
+// non-architect strategies get the control's settings.
+const architectConfigFor = (name) =>
+  pickStrategy(name).architect || { shareDeadEnds: false, nlSeedLocal: false }
+// Which LLM drives the architect pipeline: "grok" (xAI API, the River family) or
+// "claude" (the local CLI, Leak Ultra). Anything unset is Grok, so the River
+// variants and the legacy alias are untouched.
+const architectDriverFor = (name) => (architectConfigFor(name).driver === "claude" ? "claude" : "grok")
+
+// ── Lean toolchain provenance ────────────────────────────────────────────────
+// The two verifier groups DO NOT run the same Lean. A certificate that names the
+// wrong one is a false claim about how the proof was checked, so the toolchain is
+// carried per run (from whichever group actually certified the proof) instead of
+// being assumed. Sources: Leak II/IV lean-toolchain + lake-manifest (mathlib tag
+// v4.29.1, rev 5e932f9…); Leak XII/XIV gateway/lean-toolchain + lakefile.toml
+// (mathlib tag v4.32.0). Update these together with those pins.
+const TOOLCHAINS = {
+  // Leak I / II / IV — the original group, gate = verify_full_script.
+  legacy: { lean: "leanprover/lean4:v4.29.1", mathlib: "v4.29.1", group: "Leak I/II/IV" },
+  // Leak XI / XII / XIV — the LeanArchitect group, gate = Leak XIV.
+  architect: { lean: "leanprover/lean4:v4.32.0", mathlib: "v4.32.0", group: "Leak XI/XII/XIV" },
+}
+// Which pins applied to THIS run, keyed off the orchestrator style: the architect
+// styles are certified by Leak XIV, everything else by the Leak II/IV daemon.
+const toolchainForStyle = (style) => (style === "architect" ? TOOLCHAINS.architect : TOOLCHAINS.legacy)
 // Decomposition STYLE selects the orchestrator: "lemma" = the top-level-lemma
 // prove-or-split tree (proveNode); "have" = a single agent decomposing in-context
 // with local `have`s (proveHaveFlat). Defaults to "lemma" for existing modes.
@@ -1652,6 +2436,8 @@ const searchBudgetFor = (name) => {
 // cost only on its final frame. $/1M in/out from the model table; cache read =
 // 0.1× input, 5-min write = 1.25×, 1-hour write = 2×.
 const MODEL_PRICE = [
+  [/grok-4\.3|grok-4-3/i, { i: 1.25, o: 2.5 }],
+  [/grok/i, { i: 0.2, o: 0.5 }],
   [/opus/i, { i: 5, o: 25 }],
   [/sonnet/i, { i: 3, o: 15 }],
   [/haiku/i, { i: 1, o: 5 }],
@@ -1730,11 +2516,14 @@ function runProve(theorem, mcpServers, opts = {}) {
         ? 0
         : Math.min(Math.max(Number(opts.timeoutMs) || 1800000, 30000), 21600000)
     let timedOut = false
+    // SIGINT (via stopChild) not SIGKILL, so the CLI flushes its final `result`
+    // frame carrying total_cost_usd before it exits — otherwise a timed-out run
+    // records $0. stopChild is defined below; the timer fires long after.
     const timer =
       timeoutMs > 0
         ? setTimeout(() => {
             timedOut = true
-            child.kill("SIGKILL")
+            stopChild("SIGINT")
           }, timeoutMs)
         : null
 
@@ -1812,6 +2601,11 @@ function runProve(theorem, mcpServers, opts = {}) {
     child.on("close", (code) => {
       clearTimeout(timer)
       const verifiedScript = gate.verifiedScript
+      // If it was killed before flushing a `result` frame (rare now that timeout
+      // uses SIGINT), fall back to the per-turn estimate so spend is still
+      // recorded rather than lost as $0.
+      const costEstimated = costUsd <= 0 && runningCostUsd > 0
+      const finalCostUsd = costEstimated ? Math.round(runningCostUsd * 1e6) / 1e6 : costUsd
       resolve({
         // ok = the process ran cleanly; verified = the daemon-gated proof exists.
         ok: (code === 0 || !!verifiedScript) && !timedOut,
@@ -1822,7 +2616,8 @@ function runProve(theorem, mcpServers, opts = {}) {
         durationMs: Date.now() - start,
         timedOut,
         budgetExceeded,
-        costUsd, // authoritative total_cost_usd for billing
+        costUsd: finalCostUsd, // authoritative total_cost_usd, or per-turn estimate on a hard kill
+        costEstimated,
         stderr: budgetExceeded
           ? "aborted: run cost would exceed remaining balance"
           : stderr,
@@ -1894,7 +2689,17 @@ function proveStreamRun(res, theorem, mcpServers, opts = {}) {
   })
 
   const start = Date.now()
-  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+  // Single-agent path: always gated by verify_full_script on the Leak II/IV
+  // daemon, so the legacy pins are the honest ones to report.
+  const metrics = {
+    tools_invoked: 0,
+    llm_invocations: 0,
+    time_elapsed: 0,
+    bridge_build: BRIDGE_BUILD,
+    lean_toolchain: TOOLCHAINS.legacy.lean,
+    mathlib_version: TOOLCHAINS.legacy.mathlib,
+    verifier_group: TOOLCHAINS.legacy.group,
+  }
   const stripName = (n) => String(n || "").replace(/^mcp__[a-z0-9-]+__/i, "")
 
   // System gate: the ONE enforced restriction. We only accept a proof that the
@@ -2119,18 +2924,59 @@ const clampNum = (v, lo, hi, dflt) => {
 // killers read the deadline LIVE (not a fixed timer), so the UI's "+5 min" button
 // (POST /extend) rescues even the stage that's currently running. No budget (0)
 // means uncapped — deadline Infinity — preserving the old "let it run" behavior.
-const ACTIVE_RUNS = new Map() // runId -> { deadlineMs, budgetMs }
-function registerRun(budgetMs) {
+// `maxIters` is the Leak River refinement budget, mutable for the same reason:
+// the UI's "+1 iter" button must be able to rescue a run that is already on its
+// final iteration, not just configure the next run.
+const ACTIVE_RUNS = new Map() // runId -> { deadlineMs, budgetMs, maxIters }
+function registerRun(budgetMs, maxIters = 0) {
   const runId = randomUUID()
   const st = {
     deadlineMs: budgetMs > 0 ? Date.now() + budgetMs : Infinity,
     budgetMs: budgetMs > 0 ? budgetMs : 0,
+    maxIters: maxIters > 0 ? maxIters : 0,
   }
   ACTIVE_RUNS.set(runId, st)
   return { runId, st }
 }
 // True once a governed run's wall-clock budget is spent (used to stop retrying).
+// ---- ACCOUNT QUOTA -------------------------------------------------------
+// When the Claude CLI is out of quota it does not fail — it returns, instantly,
+// with "You've hit your session limit · resets 6:30pm". Every loop in this file
+// reads that as "the stage produced no usable output" and tries again, and
+// because a refused call costs no wall-clock the retry budget (which assumes an
+// attempt takes minutes) is spent in seconds. One observed run burned 8
+// refinements, 8 minion waves and 74 finisher retries in ~3 minutes, all of
+// them no-ops, and then reported "unverified" — as if the mathematics had been
+// attempted and failed.
+//
+// The block is per ACCOUNT, not per run, so it is module-level: once one stage
+// is refused, every other stage in flight is refused too, and spawning more
+// processes cannot help. Cleared when a new run starts (`clearUsageBlock`), so
+// a later run after the reset time proceeds normally.
+const USAGE_LIMIT_RE = /hit your (?:session|usage|weekly|5-hour|five-hour) limit/i
+let usageBlock = null // { at:number, message:string }
+function noteUsageBlock(text) {
+  if (usageBlock) return true
+  const s = String(text == null ? "" : text)
+  if (!USAGE_LIMIT_RE.test(s)) return false
+  const m = s.match(/You've hit your[^\n"]*/i)
+  usageBlock = { at: Date.now(), message: (m ? m[0] : "usage limit reached").trim() }
+  return true
+}
+function usageBlocked() {
+  return !!usageBlock
+}
+function clearUsageBlock() {
+  usageBlock = null
+}
+
+// True when the run must stop. Deliberately ALSO covers the quota block: every
+// loop already gates on this (19 call sites), so folding the check in here stops
+// the whole pipeline at once instead of scattering a second condition through
+// each one — and a refused account is exactly as unable to continue as an
+// expired clock.
 function deadlinePassed(ctx) {
+  if (usageBlocked()) return true
   if (typeof ctx?.getDeadline !== "function") return false
   const dl = ctx.getDeadline()
   return Number.isFinite(dl) && Date.now() >= dl
@@ -2193,13 +3039,17 @@ function mapObjectToEvents(o, emit, stage, metrics) {
 // `onObject` (which returns true to stop the run early — e.g. goal closed), and
 // mirror activity into the console via `emit`. Shared by the node-prover and the
 // decomposer. Resolves when the process exits.
-function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget }, { onObject, emit }) {
+function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, getDeadline, stage, metrics, signal, searchBudget, bridgeHandlers, systemAppend, disallowedTools, effort, lemmaPool, omitLeanNote, resumeSessionId }, { onObject, emit }) {
   return new Promise((resolve) => {
     // Each subagent run gets its OWN search governor (budget resets per node /
     // per decomposition — a fresh sub-goal earns a fresh allowance). The initial
     // budget is strategy-dependent (e.g. librarian gets a large one). Search tools
     // are routed through the bridge; verify + Pantograph stay direct.
     const governor = createGovernor({ initial: searchBudget })
+    // Bridge-served tools (the architect stages' own executors) ride the same
+    // local MCP server as the governed search, so the CLI reaches them without
+    // ever talking to Leak XII/XIV directly.
+    if (bridgeHandlers) for (const [n, h] of bridgeHandlers) governor.handlers.set(n, h)
     let cfgPath
     try {
       const dir = mkdtempSync(join(tmpdir(), "claude-tree-"))
@@ -2223,10 +3073,30 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       // it's an unsolved conjecture, and stop — burning the run on research instead
       // of the compiler. Cut them. (Leak I loogle/moogle stay for LEAN lemma search,
       // and Bash stays — numeric witness-finding is real proof work.)
-      "--disallowedTools", ...PROVER_DISALLOWED_TOOLS,
+      "--disallowedTools", ...(Array.isArray(disallowedTools) ? disallowedTools : PROVER_DISALLOWED_TOOLS),
+      // Applies to EVERY strategy, not just the controls: a local Lean is a
+      // different Mathlib from the gate, so its answers are misleading for all
+      // of them. Unlike removing Bash, this takes away nothing legitimate.
+      "--settings", NO_LOCAL_LEAN_SETTINGS,
     ]
     if (model) args.push("--model", model)
+    // Continue an existing CLI conversation instead of opening a fresh one
+    // (Control III's continuous-session mode). The CLI may fork the resumed
+    // conversation under a NEW session id — callers must always chase the
+    // sessionId returned by THIS call, never cache the first one.
+    if (typeof resumeSessionId === "string" && resumeSessionId.trim()) args.push("--resume", resumeSessionId.trim())
+    if (typeof effort === "string" && effort.trim()) args.push("--effort", effort.trim())
     if (Number.isFinite(maxTurns) && maxTurns > 0) args.push("--max-turns", String(Math.floor(maxTurns)))
+    // The architect stage contract (blueprint rules / prover rules / refinement
+    // rules) rides as a system prompt so it outranks the conversation, matching
+    // how the Grok driver sends it as role:"system".
+    // Every prover agent is told about the local-Lean block, on the same system
+    // channel as any stage contract the caller supplies (concatenated, not
+    // replaced, so neither silently drops the other).
+    const sysAppend = [typeof systemAppend === "string" ? systemAppend.trim() : "", omitLeanNote ? "" : NO_LOCAL_LEAN_NOTE]
+      .filter(Boolean)
+      .join("\n\n")
+    args.push("--append-system-prompt", sysAppend)
 
     let child
     try {
@@ -2248,6 +3118,19 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         /* gone */
       }
     }
+    // Deadline / cap expiry uses SIGINT (not a hard kill) so the CLI flushes its
+    // final `result` frame — the SOLE carrier of total_cost_usd. Without this a
+    // timed-out attempt records $0 (the LC-II / every-timed-strategy cost gap:
+    // budget-killed unsolved rows had no cost). Hard SIGKILL only as a grace
+    // fallback if the CLI doesn't exit promptly after flushing.
+    const softKill = () => {
+      try {
+        child.kill("SIGINT")
+        setTimeout(kill, PROOF_STOP_GRACE_MS).unref?.()
+      } catch {
+        /* gone */
+      }
+    }
     // Two ways to bound a stage. A live `getDeadline()` (extendable wall-clock
     // budget) is POLLED so the UI's "+5 min" push takes effect on the RUNNING
     // subprocess; a plain `cap` is the legacy fixed one-shot timer. Deadline wins
@@ -2259,18 +3142,19 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         const dl = getDeadline()
         if (Number.isFinite(dl) && Date.now() >= dl) {
           timedOut = true
-          kill()
+          softKill()
         }
       }, 3000)
     } else if (cap > 0) {
       timer = setTimeout(() => {
         timedOut = true
-        kill()
+        softKill()
       }, cap)
     }
     const clearTimers = () => {
       if (timer) clearTimeout(timer)
       if (deadlineTimer) clearInterval(deadlineTimer)
+      clearInterval(idleTimer)
     }
     const onAbort = () => {
       stopped = true
@@ -2281,9 +3165,68 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
       else signal.addEventListener("abort", onAbort, { once: true })
     }
 
+    // ---- Liveness ----------------------------------------------------------
+    // The CLI owns its own tool loop, so between two of its JSON objects the
+    // bridge emits NOTHING. A stalled CLI and a thinking CLI look identical in
+    // the transcript, and with timeoutMs=0 on the architect stages the only
+    // bound is the run deadline — so "nothing for ten minutes" is unreadable:
+    // it could be a long think, a wedged subprocess, or a hung MCP call, and
+    // there is no way to tell them apart from outside. Say so on a timer.
+    // Observability only: it never stops or changes anything.
+    // Measured against the last thing that reached the TRANSCRIPT, not the last
+    // raw CLI object. The first cut used raw objects and never fired once: the
+    // CLI streams continuously while it thinks, so `idleS` sat at 1 second
+    // forever even as the user watched a blank screen for ten minutes. The
+    // silence being diagnosed is the user's, not the subprocess's.
+    //
+    // Reporting both is what makes the notice worth having: a live object count
+    // with an empty transcript means the CLI is thinking, while a frozen object
+    // count means it is wedged, and those want opposite responses.
+    let lastObjectAt = Date.now()
+    let lastVisibleAt = Date.now()
+    let objectCount = 0
+    const say = (o) => {
+      lastVisibleAt = Date.now()
+      emit?.(o)
+    }
+    const idleTimer = setInterval(() => {
+      const quietS = Math.round((Date.now() - lastVisibleAt) / 1000)
+      if (quietS < ARCHITECT_IDLE_NOTICE_S) return
+      const objAgoS = Math.round((Date.now() - lastObjectAt) / 1000)
+      const alive =
+        objAgoS <= ARCHITECT_IDLE_NOTICE_S
+          ? `the CLI is alive and streaming (${objectCount} objects, last ${objAgoS}s ago) — it is thinking, not stuck`
+          : `the CLI has produced NOTHING for ${objAgoS}s (${objectCount} objects total) — it may be wedged`
+      lastVisibleAt = Date.now()
+      emit?.({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `⏳${stage ? ` ${stage}` : ""} ${quietS}s with nothing to show: ${alive}. Nothing is capped here; the run deadline is the only bound.`,
+      })
+    }, ARCHITECT_IDLE_NOTICE_S * 1000)
+    idleTimer.unref?.()
+
     let buf = ""
     let stderr = ""
     let finalText = ""
+    // This call's OWN cost, isolated from the shared `metrics` object below —
+    // needed because ARCHITECT_NODE_CONCURRENCY runs several spawnProverStream
+    // calls at once against the SAME ctx.metrics, so a caller that diffs
+    // metrics.cost_usd before/after its own call double-counts every sibling
+    // call that lands in between (see claudeArchitectLoop).
+    let costUsd = 0
+    // The CLI conversation's identity, read off every frame that carries one
+    // (init + result both do). Returned to the caller so a follow-up call can
+    // --resume this conversation; updated continuously because a resume can
+    // fork to a fresh id.
+    let sessionId = ""
+    // Per-turn cost estimate from `assistant` usage frames — the fallback when a
+    // sub-run is hard-killed before it can flush its authoritative `result`
+    // frame (operator abort, usage block, a crash). Priced from the same
+    // MODEL_PRICE table the mid-run spend guard uses. Only consulted at close if
+    // no authoritative total_cost_usd was seen (costUsd === 0), so it never
+    // double-counts a run that DID flush.
+    let runningCostUsd = 0
     child.stdout.on("data", (chunk) => {
       buf += chunk.toString("utf8")
       let nl
@@ -2291,12 +3234,28 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
         const line = buf.slice(0, nl)
         buf = buf.slice(nl + 1)
         if (!line.trim()) continue
+        // Checked on the RAW line: the refusal can arrive as assistant text or
+        // as the result frame, and testing here catches it whatever shape it
+        // takes. First sighting kills this stage; deadlinePassed() then stops
+        // every other loop, so we never spawn another doomed process.
+        if (!usageBlocked() && noteUsageBlock(line)) {
+          say({
+            type: "message-annotation",
+            subtype: "error",
+            thought: `🛑 ${usageBlock.message} — stopping the run. No further stage can succeed until the quota resets, so nothing more is spawned. This is NOT a proof failure: the problem was not attempted.`,
+          })
+          stopped = true
+          kill()
+        }
         let o
         try {
           o = JSON.parse(line)
         } catch {
           continue
         }
+        lastObjectAt = Date.now()
+        objectCount++
+        if (typeof o.session_id === "string" && o.session_id) sessionId = o.session_id
         let stop = false
         try {
           stop = onObject ? onObject(o) : false
@@ -2318,15 +3277,45 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
                 const t = Array.isArray(c.content)
                   ? c.content.map((x) => x.text || "").join("\n")
                   : String(c.content ?? "")
+                // Bank every CLOSED Lean fact this compile establishes. The
+                // compile is already paid for; keeping the result costs nothing
+                // and is the only way an agent's side lemmas outlive its
+                // context.
+                //
+                // The trigger used to be "Compilation Successful", which sounds
+                // right and is in fact unreachable for every decomposition
+                // strategy: a minion validates its work by compiling the WHOLE
+                // skeleton, which still holds the other holes' `sorry`, and the
+                // daemon fails on any warning. Two logged 30-minute Finality
+                // runs: 41 verify calls after the planner, 0 "Successful", 0
+                // lemmas banked. The pool only ever held planner scraps.
+                //
+                // So accept any compile with NO errors, and let parseLemmaDecl
+                // do the filtering per declaration — it drops anything whose
+                // proof still contains `sorry`/`admit`, which throws away the
+                // master theorem (the holes live inside it) and keeps exactly
+                // the sorry-free helper lemmas beside it. Those helpers are real
+                // closed proofs: they compiled, in this script, with no errors.
+                //
+                // `success || sorryWarnings.length` is the guard against
+                // unparseable daemon output: a failure whose diagnostics don't
+                // match the Line-N grammar would otherwise read as error-free.
+                // Requiring positive evidence — a clean success, or a sorry
+                // warning we actually parsed — means garbage banks nothing.
+                if (lemmaPool) {
+                  const pv = parseVerifyOutput(t)
+                  if (!pv.serverError && !pv.errors.length && (pv.success || pv.sorryWarnings.length))
+                    harvestVerifiedLemmas(lemmaPool, normalizeProofScript(t, verifyCalls.get(c.tool_use_id)))
+                }
                 // Refill ONLY when a genuine proof attempt hit an unknown name —
                 // never for a `#check @guess` probe (that would reward guessing).
                 if (verifyTextIsSyntaxError(t) && isRealProofScript(verifyCalls.get(c.tool_use_id))) {
                   grantSearch(governor, "verify syntax error")
                   if (emit)
-                    emit({
+                    say({
                       type: "message-annotation",
                       subtype: "status",
-                      thought: `${stage ? stage + " " : ""}🔎 Compiler flagged an unknown name — search budget +${GOV_GRANT} (now ${governor.budget}).`,
+                      thought: `${stage ? stage + " " : ""}🔎 Compiler flagged an unknown name — search budget +${GOV_GRANT} (now ${governor.budget})${governor.wasBlocked ? "; the agent was refused earlier and will be told on its next search" : ""}.`,
                     })
                 }
               }
@@ -2336,11 +3325,17 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
           /* budget accounting must never crash the run */
         }
         if (emit) mapObjectToEvents(o, emit, stage, metrics)
+        if (o.type === "assistant" && o.message?.usage) {
+          runningCostUsd += priceUsageUsd(o.message.usage, o.message.model || model)
+        }
         if (o.type === "result") {
           finalText = o.result || finalText
           // Sum this sub-run's cost into the shared tree metrics (ctx.metrics),
           // so the tree's final `done` reports the whole item's actual cost.
-          if (metrics && typeof o.total_cost_usd === "number") metrics.cost_usd = (metrics.cost_usd || 0) + o.total_cost_usd
+          if (typeof o.total_cost_usd === "number") {
+            costUsd += o.total_cost_usd
+            if (metrics) metrics.cost_usd = (metrics.cost_usd || 0) + o.total_cost_usd
+          }
           if (metrics && o.usage) metrics.tokens = (metrics.tokens || 0) + usageTokens(o.usage)
         }
         if (stop && !stopped) {
@@ -2365,20 +3360,37 @@ function spawnProverStream({ prompt, mcpServers, model, maxTurns, timeoutMs, get
     child.on("error", (e) => {
       clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
+      if (costUsd <= 0 && runningCostUsd > 0) {
+        costUsd = Math.round(runningCostUsd * 1e6) / 1e6
+        if (metrics) {
+          metrics.cost_usd = (metrics.cost_usd || 0) + costUsd
+          metrics.cost_estimated = true
+        }
+      }
       destroyGovernor(governor)
-      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message })
+      resolve({ ok: false, finalText, exitCode: null, timedOut, stopped, stderr: e.message, costUsd, sessionId })
     })
     child.on("close", (code) => {
       clearTimers()
       if (signal) signal.removeEventListener?.("abort", onAbort)
+      // Hard-killed before it could flush its `result` frame → no authoritative
+      // total_cost_usd landed. Record the per-turn estimate so the spend is
+      // captured instead of lost as $0 (the timed-out-attempt cost gap).
+      if (costUsd <= 0 && runningCostUsd > 0) {
+        costUsd = Math.round(runningCostUsd * 1e6) / 1e6
+        if (metrics) {
+          metrics.cost_usd = (metrics.cost_usd || 0) + costUsd
+          metrics.cost_estimated = true
+        }
+      }
       if (governor.searchCount)
-        emit?.({
+        say({
           type: "message-annotation",
           subtype: "status",
           thought: `${stage ? stage + " " : ""}🔎 Search used ${governor.searchCount}× (${governor.blockedCount} blocked, ${governor.grantCount} refills).`,
         })
       destroyGovernor(governor)
-      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr })
+      resolve({ ok: code === 0 && !timedOut, finalText, exitCode: code, timedOut, stopped, stderr, costUsd, sessionId })
     })
   })
 }
@@ -2738,7 +3750,12 @@ async function proveNode(node, ctx) {
 // tree: the agent's self-reported success is RE-VERIFIED independently on the
 // daemon before acceptance. Bounded outer retries feed the last compile failure
 // back in (like #2) so a stuck run gets a fresh, informed attempt.
-async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
+// `carry`, when supplied, is an out-parameter: the flat prover writes its LAST
+// compiled script and the error that script produced into it before returning
+// unproven. Stronghold Keep uses it to hand a failed direct attack's real
+// artefacts to the decomposition that follows, instead of restarting cold.
+// Undefined for every existing caller, so their behaviour is unchanged.
+async function proveHaveFlat(theorem, ctx, { seed, hints, carry } = {}) {
   const maxRetry = Number.isFinite(ctx.maxRedecompose) ? ctx.maxRedecompose : 1
   // When the have-tree banked some holes, it hands us the partially-filled
   // skeleton here so that proven work is never thrown away — the agent only has
@@ -2764,6 +3781,12 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
           })
           .join("\n") + "\n"
       : ""
+  // Verified side lemmas banked by every agent on this run (only set by
+  // strategies that keep a pool — absent everywhere else, so the flat path is
+  // unchanged for them). Ranked against the seed when there is one, since the
+  // seed is exactly what still needs closing.
+  const lemmaBlock = lemmaPoolBlock(ctx.lemmaPool, seed || theorem)
+  const lemmaNote = lemmaBlock ? `\n${lemmaBlock}\n` : ""
   let extra = ""
   for (let attempt = 0; ; attempt++) {
     if (ctx.signal?.aborted) return { verified: false, proof: "" }
@@ -2779,27 +3802,34 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
             : `🧩 Proving in one context via local \`have\` decomposition (${remainingLabel(ctx)}).`,
     })
     const gate = makeProofGate(theorem)
-    const verifyIds = new Set()
+    // id -> the script that call compiled. Was a Set; it holds the script now
+    // only so `carry` can hand the last real attempt forward (see above). The
+    // membership test below is identical either way.
+    const verifyIds = new Map()
     let lastVerifyError = ""
+    let lastVerifyScript = ""
     const onObject = (o) => {
       const ev = gate.observe(o)
       if (ev?.verified) return true
       if (o.type === "assistant" && o.message?.content) {
         for (const c of o.message.content) {
-          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyIds.add(c.id)
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyIds.set(c.id, c.input?.script ?? "")
         }
       } else if (o.type === "user" && o.message?.content) {
         for (const c of o.message.content) {
           if (c.type !== "tool_result" || !verifyIds.has(c.tool_use_id)) continue
           const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
-          if (t && !/Compilation Successful|100% verified/i.test(t) && /error|Error|Line \d+|sorry/.test(t)) lastVerifyError = t
+          if (t && !/Compilation Successful|100% verified/i.test(t) && /error|Error|Line \d+|sorry/.test(t)) {
+            lastVerifyError = t
+            lastVerifyScript = verifyIds.get(c.tool_use_id) || lastVerifyScript
+          }
         }
       }
       return false
     }
     await spawnProverStream(
       {
-        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${extra}`),
+        prompt: haveProvePrompt(theorem, ctx.mcpServers, `${seedNote}${hintNote}${lemmaNote}${extra}`),
         mcpServers: ctx.mcpServers,
         model: ctx.model,
         // NO turn cap. The finisher runs until it proves the goal or the SHARED
@@ -2812,6 +3842,8 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
         metrics: ctx.metrics,
         signal: ctx.signal,
         searchBudget: ctx.searchBudget,
+        // Undefined for strategies that keep no pool — capture is a no-op then.
+        lemmaPool: ctx.lemmaPool,
       },
       { onObject, emit: ctx.emit },
     )
@@ -2830,7 +3862,13 @@ async function proveHaveFlat(theorem, ctx, { seed, hints } = {}) {
     // budget ⇒ Infinite deadline) keep the finite maxRetry so they can't loop
     // forever. Every retry re-verifies independently, so soundness is unchanged.
     const outOfAttempts = ctx.computeGoverned ? false : attempt >= maxRetry
-    if (outOfAttempts || ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
+    if (outOfAttempts || ctx.signal?.aborted || deadlinePassed(ctx)) {
+      if (carry) {
+        carry.lastError = lastVerifyError || carry.lastError || ""
+        carry.lastScript = lastVerifyScript || carry.lastScript || ""
+      }
+      return { verified: false, proof: "" }
+    }
     extra = lastVerifyError
       ? `YOUR PREVIOUS ATTEMPT FAILED. The last verify_full_script reported:\n${lastVerifyError.slice(0, 1400)}\n\nFix the SPECIFIC error above — adjust the failing \`have\` or the final assembly, and keep the parts that already compiled.`
       : "YOUR PREVIOUS ATTEMPT did not produce a verified proof. Start from the skeleton-first approach: lay out the `have`s, compile the skeleton, then fill them."
@@ -2921,28 +3959,54 @@ function freshenTags(body, existing) {
     }
     return `⟪${map.get(t)}⟫`
   })
-  return { body: out, tags: [...map.values()] }
+  // `rename` is the ORIGINAL tag -> fresh tag mapping. Callers that also parse
+  // tag-addressed side-channels out of the same agent message (Force's ASSIGN
+  // and BRIEF lines, which name s1/s2/s3) need it: without it they compare the
+  // agent's own tags against the renamed ones and silently never match.
+  return { body: out, tags: [...map.values()], rename: map }
 }
 
 // Replace hole `id`'s `:= by sorry --⟪id⟫` with the minion's tactics, re-indented
-// under the `have`. Returns the skeleton unchanged if the hole's shape is
-// unexpected (the final assembly verify then catches the leftover sorry).
+// under the `have`. TWO shapes are accepted:
+//   1. the one-liner the planner emits — `have h : P := by sorry --⟪id⟫`;
+//   2. the WRAPPED form a refiner produces when a long proposition spills over
+//      several lines and `sorry --⟪id⟫` ends up on its own line under `:= by`.
+// Shape 2 used to fail here SILENTLY (returning the skeleton unchanged while the
+// caller still counted the hole as banked), so genuinely proven lemmas were
+// dropped and their holes re-dispatched forever. Anything else still returns the
+// skeleton unchanged — the final assembly verify then catches the leftover sorry.
 function spliceHole(skeleton, id, tactics) {
   const lines = String(skeleton || "").split("\n")
   const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
   const idx = lines.findIndex((l) => markRe.test(l))
   if (idx < 0) return skeleton
   const line = lines[idx]
+  const indentOf = (s) => (s.match(/^\s*/) || [""])[0].length
+  const reindent = (width) => {
+    const pad = " ".repeat(width)
+    return String(tactics)
+      .split("\n")
+      .map((t) => (t.trim() === "" ? "" : pad + t))
+      .join("\n")
+  }
   const bodyRe = new RegExp(":=\\s*by\\s+sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫\\s*$")
-  if (!bodyRe.test(line)) return skeleton
-  const ind = (line.match(/^\s*/) || [""])[0].length
-  const pad = " ".repeat(ind + 2)
-  const body = String(tactics)
-    .split("\n")
-    .map((t) => (t.trim() === "" ? "" : pad + t))
-    .join("\n")
-  lines[idx] = line.replace(bodyRe, ":= by\n" + body)
-  return lines.join("\n")
+  if (bodyRe.test(line)) {
+    lines[idx] = line.replace(bodyRe, ":= by\n" + reindent(indentOf(line) + 2))
+    return lines.join("\n")
+  }
+  // Wrapped: the marker line holds NOTHING but `sorry --⟪id⟫`, and the nearest
+  // preceding non-blank line ends with `:= by`. Replace just that line, at its
+  // own indentation — already the body indent Lean expects under the `by`.
+  const soloRe = new RegExp("^\\s*sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫\\s*$")
+  if (soloRe.test(line)) {
+    let prev = idx - 1
+    while (prev >= 0 && !lines[prev].trim()) prev--
+    if (prev >= 0 && /:=\s*by\s*$/.test(lines[prev])) {
+      lines[idx] = reindent(indentOf(line))
+      return lines.join("\n")
+    }
+  }
+  return skeleton
 }
 
 function haveTreePlannerPrompt(theorem, mcpServers = [], extra = "") {
@@ -2968,6 +4032,7 @@ RULES:
 - Every hole tag must be unique and match \`--⟪hN⟫\` EXACTLY (double angle brackets). Hole bodies are a single \`:= by sorry --⟪hN⟫\`.
 - No top-level \`theorem\`/\`lemma\` other than the master; all structure is \`have\`s.
 - A skeleton whose assembly still has a bare \`sorry\`, or whose holes aren't tagged, is INVALID — fix it before stopping.
+- NEVER call \`cleanup_memory\` with no arguments — the Pantograph service is SHARED and a bare call wipes every state on it, including ones that are not yours. Free each state you created individually: \`cleanup_memory(state_id)\`.
 
 ${SEARCH_USAGE_NOTE}
 ${extra ? `\n${extra}\n` : ""}
@@ -3204,7 +4269,7 @@ async function proveHaveTree(theorem, ctx) {
     const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
     if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
       ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Have-tree assembled a verified proof from ${filled} banked hole(s) (recursive decomposition).` })
-      return { verified: true, proof: partial }
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
     }
     ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
   } else if (!ctx.signal?.aborted) {
@@ -3216,6 +4281,7662 @@ async function proveHaveTree(theorem, ctx) {
   // full, independently-verified proof of the master, so soundness is unchanged.
   if (ctx.signal?.aborted) return { verified: false, proof: "" }
   return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ---------------------------------------------------------------------------
+// STRONGHOLD SURROUND — Dark's shape with PARALLEL minion waves.
+// Requires the ghost-army Leak II (per-state ledger, id-scoped cleanup_memory,
+// snapshot_state, branch_tactics): concurrent minions each own their proof
+// states inside ONE resident daemon, so nothing here ever clears state
+// globally. proveHaveTree above is deliberately untouched as the sequential
+// control; every difference from it is commented.
+// ---------------------------------------------------------------------------
+const SURROUND_MINIONS = Number(process.env.LEAK_SURROUND_MINIONS || 4)
+
+function surroundHoleFillPrompt(skeleton, id, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  return `You are a MINION working ONE hole in a Lean 4 proof skeleton. Do NOT touch any other hole.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE SKELETON (already compiles with every \`have\` stubbed as \`sorry\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`. Its declared type is your GOAL; the hypotheses in scope are the theorem's binders plus the EARLIER \`have\`s (they're available by name). To see the EXACT goal state, \`init_proof\` your hole's proposition (closed: ∀-quantify any free variable) and step it with \`apply_tactic\` — lead with strong automation (\`decide\`, \`native_decide\`, \`omega\`, \`simp_all\`, \`nlinarith\`, \`induction\`).
+
+You have TWO ways to make progress — you must ALWAYS produce one of them, never nothing:
+
+CLOSE — if you can finish the hole, work out the tactics and CHECK them: take the skeleton, replace ONLY \`sorry --⟪${id}⟫\` with your tactics (leave every other \`sorry --⟪…⟫\` untouched), verify_full_script until it compiles with only the OTHER holes' \`sorry\` warnings and NO errors. Then output:
+FILL ⟪${id}⟫
+\`\`\`lean
+<only the tactics that replace \`sorry\`, one per line, from the LEFT margin — no \`have\`, no leading \`by\`, no theorem>
+\`\`\`
+
+DECOMPOSE — if the hole resists a direct close, do NOT give up: break its goal into SMALLER sub-steps that another minion will fill. Write local \`have\`s (they inherit this hole's context automatically — do NOT re-quantify), each a NEW tagged hole, then close THIS hole's goal from them. CHECK it by splicing in place of \`sorry --⟪${id}⟫\` and verify_full_script — it MUST compile with only \`sorry\` warnings (the new ones plus the untouched others), NO errors. Then output:
+DECOMPOSE ⟪${id}⟫
+\`\`\`lean
+have s1 : <smaller subgoal> := by sorry --⟪s1⟫
+have s2 : <smaller subgoal> := by sorry --⟪s2⟫
+<tactics that close THIS hole's goal from s1, s2, …>
+\`\`\`
+Each sub-step must be a GENUINELY smaller/easier goal. Use fresh tags (s1, s2, …); the system renames them to stay unique. Prefer CLOSE; DECOMPOSE only when you can't close directly — but ALWAYS pick one, never report that it's impossible.
+
+PARALLEL ETIQUETTE — you are ONE OF SEVERAL minions working DIFFERENT holes at the same time against the same Pantograph service:
+- Any state you \`init_proof\` is yours alone; siblings cannot touch it and you must not touch theirs.
+- NEVER call \`cleanup_memory\` with no arguments — that wipes EVERY minion's states, not just yours. When you are finished with a state, free exactly it: \`cleanup_memory(state_id)\`. Free your states before you emit your final answer.
+- \`snapshot_state(state_id)\` instantly forks a state — snapshot before a risky tactic line so a dead end never costs you your position.
+- \`branch_tactics(state_id, [t1, t2, …])\` races several candidate tactics against ONE state in a single call (e.g. ["omega","simp_all","nlinarith","positivity","decide"]) — use it early to triage which automation bites; every survivor is a new state you can continue from (free the ones you abandon).
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// Identical to fillHole but with the parallel-etiquette minion prompt and a
+// wave-aware status line. Kept separate so Dark's path stays untouched.
+//
+// `extra` and `ctx.lemmaPool` are both OPTIONAL and both default to nothing,
+// so Surround — which passes neither and never sets a pool — behaves exactly
+// as before and stays the clean control. Force uses them to hand a minion the
+// run's proved facts and whatever the last campaign learned about this hole.
+async function fillHoleSurround(skeleton, id, ctx, extra = "") {
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Surround minion working hole ⟪${id}⟫ (parallel wave)…` })
+  const applied = []
+  const res = await spawnProverStream(
+    {
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, extra),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    {
+      onObject: (o) => {
+        if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+          for (const c of o.message.content) {
+            if (c?.type === "tool_use" && String(c.name || "").endsWith("apply_tactic") && c.input?.tactic)
+              applied.push(String(c.input.tactic))
+          }
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
+  )
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
+}
+
+// Stronghold Surround orchestrator. Planner and finisher are Dark's verbatim;
+// the minion phase dispatches each round's open holes as a PARALLEL wave of up
+// to SURROUND_MINIONS isolated minions. Result APPLICATION is serialised
+// through one async lock so splices and decompose-verifications never race on
+// `partial`; minion RUNS overlap freely. No global Pantograph cleanup ever
+// happens — minions free their own states (ghost-army id-scoped cleanup).
+// `opts` is how Stronghold Keep reuses this body without forking it (so Keep's
+// numbers isolate exactly the changes Keep makes, and Surround's arm stays the
+// untouched control). All three default off ⇒ Surround behaves exactly as before:
+//   planNote   — extra text appended to the planner prompt.
+//   cutGate    — reject a proposed split whose child restates its parent or an
+//                ancestor (see cutIsVacuous).
+//   deferFinish— return { partial, hints } instead of calling proveHaveFlat, so
+//                the caller owns the endgame and its clock.
+async function proveHaveSurround(theorem, ctx, opts = {}) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  const { planNote = "", cutGate = false, deferFinish = false, holeRecon: useHoleRecon = false } = opts
+  ctx.stage = "🛰️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Stronghold Surround: planning a decomposition skeleton (parallel minion waves ×${SURROUND_MINIONS}).` })
+
+  // ---- 1) PLANNER (verbatim from Dark) --------------------------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+            skeleton = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  // With the gate on, a skeleton that merely RESTATES the theorem is refused
+  // and the planner gets one more go with the reason. Worth exactly one retry:
+  // the second plan is cheap next to a whole run spent on a hole that is the
+  // original problem wearing a hat, and two refusals means the gate and the
+  // planner disagree, at which point the planner wins and we proceed.
+  let planFeedback = ""
+  for (let planAttempt = 0; planAttempt < (cutGate ? 2 : 1); planAttempt++) {
+    skeleton = null
+    await spawnProverStream(
+      {
+        prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, planFeedback ? `${planNote}\n\n${planFeedback}` : planNote),
+        mcpServers: ctx.mcpServers,
+        model: ctx.model,
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "🛰️",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      { onObject: onPlan, emit: ctx.emit },
+    )
+    if (gate.verifiedScript || !skeleton || !cutGate) break
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+    const bad = skeletonIsVacuous(theorem, skeleton)
+    if (!bad) break
+    if (planAttempt + 1 >= 2) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Skeleton still restates the theorem after a re-plan — proceeding with it anyway rather than spending more clock.` })
+      break
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Skeleton REFUSED — ${bad}. Re-planning once.` })
+    planFeedback = `YOUR PREVIOUS SKELETON WAS REFUSED. ${bad}.
+
+It type-checked, but type-checking is not the test: \`have h : <the whole problem> := by sorry\` followed by using \`h\` always compiles. The test is whether the HARDEST hole is meaningfully easier than the theorem you started with.
+
+Do it differently this time:
+- Split the argument into at least TWO holes that a reader would recognise as separate mathematical facts, and write the assembly between them yourself.
+- If one step really does carry everything, then that step is the proof — find the actual sub-facts INSIDE it (the construction, the injectivity, the counting, the surjectivity) and make each of those a hole.
+- Anything the machinery can already discharge belongs in the assembly, not in a hole.`
+  }
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  // With deferFinish the caller owns the endgame, so "no usable skeleton" must
+  // hand control back rather than spend the caller's finisher clock here.
+  const noSkeleton = () =>
+    deferFinish ? { verified: false, proof: "", partial: null, hints: {} } : proveHaveFlat(theorem, ctx)
+  if (!skeleton) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
+    return noSkeleton()
+  }
+  const holeIds = parseHoleIds(skeleton)
+  if (!holeIds.length) return noSkeleton()
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Skeleton verified — ${holeIds.length} hole(s): ${holeIds.map((h) => `⟪${h}⟫`).join(" ")}. Dispatching parallel minion waves (×${Math.min(SURROUND_MINIONS, holeIds.length)}).` })
+  ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: holeIds.length })
+
+  // ---- 2) CONTINUOUS WORK QUEUE over ONE evolving skeleton ------------------
+  // No rounds, no barrier: every open hole is a queue item {id, depth}, and up
+  // to SURROUND_MINIONS workers pull from the queue CONCURRENTLY. When a
+  // decompose is accepted its sub-holes enter the queue IMMEDIATELY, so an
+  // idle worker starts them while slower siblings are still grinding — a
+  // round barrier here would idle workers behind the slowest minion of each
+  // round exactly when the tree deepens (observed live on fatex_001: three
+  // fresh sub-holes plus three free workers all waiting on one long minion).
+  // The per-hole depth bound replaces the old per-round bound — identical
+  // recursion limit, no synchronisation.
+  //   Each minion sees the skeleton as of its claim — safe, because a fill
+  // only depends on the have SIGNATURES (immutable), never on sibling proof
+  // bodies, and the final assembly re-verifies hole-free on the daemon anyway.
+  // All mutations of `partial` (fill splices, decompose trial+verify+accept)
+  // run under `applyLock` so they serialise; a decompose trial therefore
+  // always verifies against the up-to-date partial, fills included.
+  let partial = skeleton
+  const rejectedNotes = {}
+  const stuck = new Set()
+  let banked = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  // `anc` carries the alpha-keys of every goal ABOVE this hole in the tree, so
+  // the cut gate can reject a child that restates a grandparent, not just its
+  // immediate parent. Empty and inert unless cutGate is on.
+  const queue = parseHoleIds(skeleton).map((id) => ({ id, depth: 0, anc: [] }))
+  let vacuousCuts = 0
+  let inFlight = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(SURROUND_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const item = queue.shift()
+      if (!item) {
+        if (inFlight === 0) return // drained and nobody can add more
+        await new Promise((r) => setTimeout(r, 500)) // a sibling may still split
+        continue
+      }
+      inFlight++
+      try {
+        const { id, depth, anc = [] } = item
+        // Recon the hole BEFORE its minion launches, so a sub-hole created by
+        // a mid-run split is briefed exactly like a root hole was. Costs
+        // nothing when useHoleRecon is off, or once the run's recon cap is hit.
+        const holeBrief = useHoleRecon ? await holeRecon(partial, id, ctx) : ""
+        const r = await fillHoleSurround(partial, id, ctx, holeBrief)
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted) return
+          if (r.fill != null) {
+            partial = spliceHole(partial, id, r.fill)
+            banked++
+            ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (parallel wave).` })
+          } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
+            // PROGRESS GATE. A split that reproduces its own parent (or an
+            // ancestor) compiles perfectly — `have h : P := by sorry` followed
+            // by `exact h` is valid Lean — so the structural check below waves
+            // it through, and the run then spends its remaining minutes
+            // re-proving the goal it started with under a new tag. Observed
+            // live: a child alpha-identical to its parent burned 20 minutes.
+            // The gate is deliberately fail-OPEN: it only fires when it can
+            // positively read both propositions and they match.
+            const parentProp = cutGate ? holePropOf(partial, id) : null
+            const vacuous = cutGate ? cutIsVacuous(parentProp, decomposeChildProps(r.decompose), anc) : null
+            if (vacuous) {
+              vacuousCuts++
+              stuck.add(id)
+              rejectedNotes[id] = { text: `Split REJECTED by the progress gate: ${vacuous}. ${r.notes?.text || ""}`.trim(), tactics: r.notes?.tactics || [] }
+              ctx.emit({ type: "message-annotation", subtype: "error", thought: `⛔ Rejected the split of ⟪${id}⟫ — ${vacuous}. Not a decomposition; leaving the hole for the finisher.` })
+              const openNow0 = parseHoleIds(partial)
+              ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow0.length })
+              return
+            }
+            const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
+            const trial = spliceHole(partial, id, freshBody)
+            const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+            if (v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig)) {
+              partial = trial
+              const childAnc = cutGate && parentProp ? [...anc, alphaKey(parentProp)].filter(Boolean) : anc
+              for (const t of tags) queue.push({ id: t, depth: depth + 1, anc: childAnc }) // live hand-off — idle workers start these NOW
+              ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Split hole ⟪${id}⟫ into ${tags.length} smaller hole(s): ${tags.map((t) => `⟪${t}⟫`).join(" ")} — queued for the next free minion.` })
+            } else {
+              stuck.add(id)
+              if (r.notes) rejectedNotes[id] = r.notes
+              ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ split didn't type-check — leaving it for the finisher.` })
+            }
+          } else {
+            stuck.add(id)
+            if (r.notes) rejectedNotes[id] = r.notes
+          }
+          const openNow = parseHoleIds(partial)
+          ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow.length })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+
+  // ---- 3) + 4) verbatim from Dark: assemble, else finish from the seed ------
+  const remaining = parseHoleIds(partial)
+  const filled = banked
+
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Stronghold Surround assembled a verified proof from ${filled} banked hole(s) (parallel waves).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛰️ Banked ${filled}/${filled + remaining.length} hole(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
+  }
+  if (cutGate && vacuousCuts) ctx.emit({ type: "message-annotation", subtype: "status", thought: `⛔ Progress gate rejected ${vacuousCuts} non-decreasing split(s) this siege.` })
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "", partial, hints: rejectedNotes }
+  // deferFinish: hand the partially-filled skeleton back so the CALLER runs the
+  // finisher on a clock it controls. Surround itself (deferFinish off) finishes
+  // here exactly as before, on whatever time the minions left it.
+  if (deferFinish) return { verified: false, proof: "", partial, hints: rejectedNotes }
+  return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ---------------------------------------------------------------------------
+// PROGRESS GATE helpers (used only when opts.cutGate is on — Stronghold Keep).
+// ---------------------------------------------------------------------------
+
+// The PROPOSITION of the `have` that carries hole `id`, i.e. the P in
+// `have h : P := by sorry -- ⟪id⟫`. Returns null when it cannot be read
+// confidently — every caller treats null as "no opinion", never as "bad".
+function holePropOf(skeleton, id) {
+  const lines = String(skeleton || "").split("\n")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return null
+  // A long statement may wrap across lines, so walk back to the `have` that
+  // opens it and re-join. Bounded to 12 lines: beyond that we'd risk swallowing
+  // a PRECEDING have and comparing the wrong proposition.
+  let start = idx
+  while (start >= 0 && idx - start < 12 && !/\bhave\b/.test(lines[start])) start--
+  if (start < 0 || !/\bhave\b/.test(lines[start] || "")) return null
+  const chunk = lines.slice(start, idx + 1).join(" ")
+  const m = chunk.match(/\bhave\b[^:]*:([\s\S]*?):=\s*by\s+sorry/)
+  const prop = m ? m[1].trim() : ""
+  return prop || null
+}
+
+// Every child proposition a DECOMPOSE body proposes.
+function decomposeChildProps(body) {
+  const out = []
+  for (const id of parseHoleIds(body)) {
+    const p = holePropOf(body, id)
+    if (p) out.push(p)
+  }
+  return out
+}
+
+// A cheap alpha-invariant fingerprint of a proposition: two statements that
+// differ ONLY in the names of bound variables produce the same key.
+//
+// Locals are approximated as undotted, lowercase-initial identifiers of at most
+// three characters (`n`, `hx`, `ih`, `abc`) that are not preceded by a dot —
+// the dot guard is what keeps `Finset.sum` and `Nat.add` intact, so genuinely
+// different lemma names never collide. The approximation can over-collapse
+// (a 3-letter GLOBAL like `gcd` also folds), which at worst rejects a good cut
+// and costs one hole its split; a missed vacuous cut costs the rest of the run,
+// so the asymmetry is deliberate.
+function alphaKey(prop) {
+  return String(prop || "")
+    .replace(/--[^\n]*/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/(^|[^.\w])([a-z][A-Za-z0-9_']{0,2})(?![\w.'])/g, "$1·")
+    .trim()
+}
+
+// Returns a human reason when the proposed cut makes no progress, else null.
+// Null on ANY uncertainty (unreadable parent, empty keys) — see holePropOf.
+// A cut can also fail by RESTATEMENT rather than repetition: one hole that says
+// the same thing in different words. Observed live — a "decomposition" of the
+// common-transversal theorem into the single hole "∃ φ bijective with common
+// representatives", which is the entire problem reworded, and which alpha-
+// equality cannot see. Only applied when there is exactly ONE hole, because
+// that is the only case where the hole must carry everything; a genuine
+// multi-way split may legitimately have one large child alongside smaller ones.
+const REFORM_SIZE = Number(process.env.LEAK_REFORM_SIZE || 0.8)
+
+function cutIsVacuous(parentProp, childProps, ancestorKeys = []) {
+  if (!parentProp || !childProps.length) return null
+  const pk = alphaKey(parentProp)
+  if (!pk) return null
+  const anc = new Set(ancestorKeys.filter(Boolean))
+  for (const cp of childProps) {
+    const ck = alphaKey(cp)
+    if (!ck) continue
+    if (ck === pk) return "a child restates the hole's own goal (identical up to bound-variable names)"
+    if (anc.has(ck)) return "a child restates an ANCESTOR goal already open higher in the tree"
+  }
+  return null
+}
+
+// The single-hole rule, applied ONLY to the planner's whole-theorem skeleton.
+//
+// Detecting a semantic reformulation syntactically does not work, and I tried:
+// the restatement observed live shares almost NO vocabulary with the theorem it
+// restates (`∃ S, IsComplement S H ∧ IsComplement H S` became `∃ φ bijective
+// with common representatives`), so token overlap scores ~0 on exactly the case
+// it was meant to catch. What IS decidable is structural: if the planner
+// emitted ONE hole and that hole is no smaller than the theorem's own goal,
+// nothing was decomposed — every bit of difficulty sits in one place, whether
+// by restating, reformulating or generalising.
+//
+// Scoped to the skeleton deliberately. A minion's cut may legitimately have one
+// large child (an induction step is often longer than what it proves), and this
+// rule would misjudge it; at the top level, "the whole theorem got exactly one
+// hole" is a much safer call. It also only ever costs one re-plan — see the
+// planner loop, which proceeds with the skeleton if the planner insists.
+function singleHoleCarriesEverything(goal, props) {
+  if (props.length !== 1) return null
+  const pk = alphaKey(goal)
+  const ck = alphaKey(props[0])
+  if (!pk || !ck) return null
+  if (ck.length < pk.length * REFORM_SIZE) return null
+  return `the skeleton has exactly ONE hole and it is ${Math.round((ck.length / pk.length) * 100)}% the size of the theorem's own goal — all of the difficulty is still in one place, so nothing has been decomposed`
+}
+
+// The PLANNER's skeleton was never gated at all: the only check was that it
+// type-checks, and a one-hole restatement type-checks perfectly. Parent = the
+// theorem's own goal; children = the props of the holes it emitted.
+function skeletonIsVacuous(theorem, skeleton) {
+  const m = String(theorem || "").match(/\b(?:theorem|lemma)\s+[^\s({[:]+([\s\S]*?)(?=:=)/)
+  if (!m) return null
+  const rest = m[1]
+  let depth = 0
+  let cut = -1
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === "(" || c === "{" || c === "[" || c === "⦃") depth++
+    else if (c === ")" || c === "}" || c === "]" || c === "⦄") depth--
+    else if (c === ":" && depth === 0) {
+      cut = i
+      break
+    }
+  }
+  if (cut < 0) return null
+  const goal = rest.slice(cut + 1).trim()
+  const ids = parseHoleIds(skeleton)
+  const props = ids.map((h) => holePropOf(skeleton, h)).filter(Boolean)
+  if (!goal || props.length !== ids.length) return null
+  return cutIsVacuous(goal, props, []) || singleHoleCarriesEverything(goal, props)
+}
+
+// ===========================================================================
+// LEAK FINALITY I — Surround's continuous parallel work-queue crossed with
+// Ultra's system-summoned refinement loop, on the ancestral Leak I/II/IV
+// stack (Lean 4.29.1, legacy certificate key group).
+// ---------------------------------------------------------------------------
+// Identical to Stronghold Surround (planner → parallel minion work-queue →
+// assembler → flat-finisher fallback) EXCEPT:
+//   • A bridge-side timer fires FINALITY_REFINE_MS (default 10 min — matched
+//     to Ultra's own refinement pacing, up from the original 5 min once a
+//     real hard-benchmark run showed 5 min cutting minions off before they
+//     got real traction) after the LAST refinement completed (the planner
+//     counts as refinement #0). When it
+//     fires, in-flight minions are CUT OFF immediately (epoch abort — no
+//     waiting for the slowest), and a REFINER conversation is summoned.
+//   • A run-scoped PROVEN-LEMMA BANK keyed by have-PROPOSITION (not tag)
+//     records every closed hole. The refiner sees it; any have it keeps
+//     verbatim in the new skeleton is re-filled automatically for free. The
+//     bank is a function local — disposed with the run, never persisted.
+//   • Minions' live Pantograph proof-state ids are ledgered per hole (ghost-
+//     army Leak II). The refiner receives them all — inspectable via
+//     get_current_proof_state — and must TRIAGE each: ASSIGN it to a hole
+//     whose have it kept exactly (the next minion resumes from that state),
+//     or DECIMATE it with cleanup_memory(state_id). The orchestrator frees
+//     anything left unassigned anyway, so the ledger can never leak.
+//   • Refinements are bounded by FINALITY_MAX_REFINES (default 8 — Ultra's
+//     refinement-iteration budget), NOT by any new wall clock: time
+//     governance stays exactly the shared ctx.getDeadline the parents use.
+// Surround above stays byte-identical as the no-refinement control.
+// ===========================================================================
+const FINALITY_REFINE_MS = Number(process.env.LEAK_FINALITY_REFINE_MS || 600000)
+const FINALITY_MAX_REFINES = Number(process.env.LEAK_FINALITY_MAX_REFINES || 8)
+// Reasoning effort for the REFINER only. Refinement is a barrier — minions are
+// cut off and nothing else runs — so its deliberation is paid for in dead wall
+// clock. Observed live on fatex_001: ~8 min of refinement against 5 min of
+// proving, of which roughly 6 min was pure thinking behind only 4 tool calls.
+// This is the same lever (and the same symptom) as the architect blueprint
+// stage, where dropping effort was measured to work and prompt tweaks were
+// measured NOT to — see ARCHITECT_BLUEPRINT_EFFORT. Minions keep the default on
+// purpose, for the same reason node proving does: that stage is real proof
+// search and the deliberation earns its keep.
+const FINALITY_REFINE_EFFORT = process.env.LEAK_FINALITY_REFINE_EFFORT || "medium"
+const UUID_ANY_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi
+
+// The have-line carrying hole `id`: its bound name and proposition. The bank
+// keys on the WHITESPACE-NORMALIZED proposition so a refiner keeping the same
+// have under a different tag (tags are re-freshened every refinement) still
+// gets the banked proof restored.
+function holeHaveInfo(skeleton, id) {
+  const lines = String(skeleton || "").split("\n")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const idx = lines.findIndex((l) => markRe.test(l))
+  if (idx < 0) return null
+  const mk = (m) =>
+    m && m[2].trim()
+      ? { name: m[1], prop: m[2].trim(), key: m[2].replace(/\s+/g, " ").trim() }
+      : null
+  const one = mk(lines[idx].match(/have\s+([^\s:(]+)\s*:\s*([\s\S]*?):=\s*by\s+sorry\s*--/))
+  if (one) return one
+  // Wrapped hole (see spliceHole): walk back to THIS hole's `have` and read the
+  // joined block. Bounded, and abandoned the moment another hole's marker shows
+  // up, so a malformed hole can never borrow its neighbour's proposition. The
+  // key normalizes whitespace, so a re-wrapped proposition still matches the
+  // bank entry it was proved under.
+  for (let i = idx - 1; i >= 0 && idx - i <= 12; i--) {
+    if (/--\s*⟪/.test(lines[i])) break
+    if (!/^\s*have\s/.test(lines[i])) continue
+    return mk(
+      lines
+        .slice(i, idx + 1)
+        .join("\n")
+        .match(
+          new RegExp(
+            "have\\s+([^\\s:(]+)\\s*:\\s*([\\s\\S]*?):=\\s*by\\s*sorry\\s*--\\s*⟪\\s*" + id + "\\s*⟫",
+          ),
+        ),
+    )
+  }
+  return null
+}
+
+// ASSIGN lines in the refiner's final message: `ASSIGN <state-uuid> ⟪tag⟫`.
+function parseAssignLines(text) {
+  const out = []
+  const re = /ASSIGN\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s*⟪\s*(\w+)\s*⟫/gi
+  let m
+  while ((m = re.exec(String(text || ""))) !== null) out.push({ stateId: m[1].toLowerCase(), tag: m[2] })
+  return out
+}
+
+// `BRIEF ⟪tag⟫` + free-form body, the refiner's channel for handing what was
+// learned before a redesign to the minion that works that hole next. A block
+// runs to the next BRIEF/ASSIGN line or the end of the message, so the refiner
+// can write real prose instead of cramming it onto one line.
+// Pull the assembled tactic sequence out of a `get_current_proof_state` reply.
+// Pantograph answers with "=== LEAN 4 SCRIPT SO FAR ===" + a ```lean4 fence,
+// then "=== CURRENT OPEN GOALS ===" — we keep only the script, because the
+// goals are already rendered on their own line from the ledger and repeating
+// them doubles the block for nothing. Tolerates the raw text or the
+// {"result": …} JSON envelope the MCP layer sometimes wraps it in.
+const STATE_SCRIPT_CHARS = 1400
+function proofScriptOfState(text) {
+  let s = String(text == null ? "" : text)
+  if (!s.trim()) return ""
+  try {
+    const j = JSON.parse(s)
+    if (j && typeof j.result === "string") s = j.result
+  } catch {
+    /* not an envelope — use as-is */
+  }
+  const m = s.match(/SCRIPT SO FAR ===\s*```(?:lean4?|)\n([\s\S]*?)```/)
+  const body = (m ? m[1] : "").trim()
+  if (!body) return ""
+  // An UNTOUCHED state still prints a script: the theorem line, then
+  // Pantograph's "-- no tactics applied yet" placeholder. Showing that as
+  // partial progress is worse than showing nothing — it is precisely the
+  // scratch probe the refiner mistook for real work last run. Judge by the
+  // tactic block (everything after the header's `:= by`), not the first line.
+  const tail = body.slice(body.indexOf(":= by") + 5)
+  if (!tail.split("\n").some((l) => l.trim() && !l.trim().startsWith("--"))) return ""
+  return body.length > STATE_SCRIPT_CHARS ? body.slice(0, STATE_SCRIPT_CHARS) + "\n-- …truncated" : body
+}
+
+function parseBriefBlocks(text) {
+  const lines = String(text || "").split("\n")
+  const out = {}
+  let tag = null
+  let buf = []
+  const flush = () => {
+    if (tag) {
+      const body = buf.join("\n").trim()
+      if (body) out[tag] = body
+    }
+    tag = null
+    buf = []
+  }
+  for (const line of lines) {
+    const m = line.match(/^\s*BRIEF\s*⟪\s*(\w+)\s*⟫\s*$/i)
+    if (m) {
+      flush()
+      tag = m[1]
+      continue
+    }
+    if (tag) {
+      if (/^\s*(BRIEF|ASSIGN)\b/i.test(line)) flush()
+      else buf.push(line)
+    }
+  }
+  flush()
+  return out
+}
+
+function finalityRefinerPrompt(theorem, skeleton, bankList, stuckNotes, cutoffNotes, inflight, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  const bankBlock = bankList.length
+    ? bankList.map((b) => `- ${b.name} : ${b.prop}   [PROVED — kept verbatim ⇒ refilled for free]`).join("\n")
+    : "(none proved yet)"
+  const noteLine = ([id, n]) =>
+    `- ⟪${id}⟫: ${oneLine(String(n?.text || "no notes")).slice(0, 500)}${n?.tactics?.length ? `\n    tactics tried: ${n.tactics.slice(-10).join(" ; ").slice(0, 400)}` : ""}`
+  const stuckBlock = Object.keys(stuckNotes).length ? Object.entries(stuckNotes).map(noteLine).join("\n") : "(none)"
+  // Kept SEPARATE from the stuck notes on purpose: a stuck minion tried and
+  // failed, an interrupted one merely ran out of clock. Merging them would
+  // report a live approach as a dead one, which is how a refiner talks itself
+  // out of the direction that was about to work.
+  const cutoffBlock = Object.keys(cutoffNotes || {}).length ? Object.entries(cutoffNotes).map(noteLine).join("\n") : "(none)"
+  const inflightBlock = inflight.length
+    ? inflight
+        .map(
+          (f) =>
+            `- hole ⟪${f.tag}⟫ — state id(s): ${[...f.ids].join(", ")}${f.lastGoal ? `\n    last goals: ${oneLine(f.lastGoal).slice(0, 400)}` : ""}${f.tactics?.length ? `\n    tactics applied: ${f.tactics.slice(-10).join(" ; ").slice(0, 300)}` : ""}${(f.scripts || [])
+              .map((s) => `\n    proof script in state ${s.id}:\n\`\`\`lean\n${s.script}\n\`\`\``)
+              .join("")}`,
+        )
+        .join("\n")
+    : "(none)"
+  return `You are the REFINER in the Leak Finality I pipeline for a Lean 4 + Mathlib proof. A planner wrote a \`have\`-skeleton; parallel minions have been filling its holes. You are summoned on a timer to REDESIGN the skeleton in light of everything learned so far. Your output becomes the new skeleton the minions work next.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE TARGET THEOREM (its signature is IMMUTABLE):
+${theorem}
+
+CURRENT SKELETON (proven steps have their tactic bodies spliced in; open holes are \`:= by sorry --⟪tag⟫\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+PROVEN-LEMMA BANK — steps already closed this run. If your new skeleton contains a \`have\` with EXACTLY one of these propositions (whitespace aside; the tag may differ), its proof is restored automatically for free. Changing a proposition even slightly forfeits the free proof:
+${bankBlock}
+
+STUCK HOLES — minions tried and failed; their notes:
+${stuckBlock}
+
+INTERRUPTED WORK — these minions were CUT OFF by the refinement timer, not defeated. Their approach was still in flight and may well have been the right one; do NOT read this as evidence that it fails:
+${cutoffBlock}
+
+LIVE PARTIAL PROGRESS — Pantograph proof states from minions that were cut off mid-work. The tactic sequence each state has ALREADY accepted is printed below, so read it here rather than spending a call on get_current_proof_state; call that only if you need a goal state the listing does not show. A state whose script is long is a real, part-built proof — reshaping its hole throws that away, so prefer keeping the proposition and ASSIGNing the state:
+${inflightBlock}
+
+YOUR JOB:
+1. Decide the best skeleton NOW. Keep proven \`have\`s verbatim (free). Restructure what is stuck: a different split, different intermediate propositions, more or fewer steps — informed by the failure notes and partial progress above.
+2. VERIFY the new skeleton exactly like the planner: reproduce the master theorem VERBATIM (same name + signature), open with \`by\`, every open step a ONE-LINE hole \`have hN : <prop> := by sorry --⟪hN⟫\` with a DISTINCT tag, assembly closed from the \`have\`s and sorry-FREE, then verify_full_script it — it MUST compile with the ONLY diagnostics being \`sorry\` warnings (no errors). Iterate until it passes; an unverified skeleton is useless.
+3. TRIAGE every live partial state listed above — each must end either assigned or freed:
+   - If your new skeleton keeps that hole's \`have\` with the SAME proposition, you may hand its progress to the next minion: output an ASSIGN line (format below).
+   - Otherwise DECIMATE it: call cleanup_memory(state_id) for exactly that state. Never call cleanup_memory with no arguments — that wipes every state on the server. Freeing a state DESTROYS its proof script permanently — the listing above is the last copy — so before you free one, lift any tactic lines that still apply under your new shape into that hole's BRIEF.
+4. BRIEF THE NEXT WAVE — for every hole still open in your new skeleton, hand the next minion everything worth knowing so it does not restart from zero. Put in it: which approaches were already tried and how far each got; which lemma names turned out NOT to exist; which ones did work; and — if you reshaped the hole — WHY, and what the new shape is meant to make easier. If you FREED a state whose proof script above had real work in it, transcribe the tactic lines that still apply into the brief, verbatim: that script dies with the state, and a minion that has to rediscover a sequence you were just shown is the most expensive kind of waste there is. A minion sees only the skeleton and its own hole: this brief is the ONLY channel by which anything learned before the refinement reaches it. Write nothing you would not want acted on — the minion treats it as established fact and will not re-verify it.
+5. OUTPUT: the verified skeleton in ONE \`\`\`lean block, then one line per state you kept, then one briefing per hole you want to brief:
+ASSIGN <state_id> ⟪tag⟫
+BRIEF ⟪tag⟫
+<briefing text, one or more lines; it ends at the next line beginning with BRIEF or ASSIGN, or at the end of your message>
+
+RULES: master signature immutable; every hole tagged \`--⟪hN⟫\` and unique; do NOT fill holes yourself (banked proofs are restored by the system); prefer keeping proven propositions word-for-word.
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// Surround's minion with two Finality additions: (a) every Pantograph state id
+// the minion creates is ledgered into `reg` (init_proof / snapshot_state /
+// branch_tactics results; ids it frees itself are removed), along with the
+// last goal state seen, so a cut-off minion's progress is visible to the
+// refiner; (b) an optional resume hint points it at a state a refiner carried
+// over from a predecessor.
+async function fillHoleFinality(skeleton, id, ctx, reg) {
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧩 Finality minion working hole ⟪${id}⟫…` })
+  const resumeBlock = reg?.resume
+    ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. That state is LIVE and already holds the tactics below — CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over. Free it with cleanup_memory(state_id) if you abandon it.${
+        reg.script ? `\nTactics this state has already accepted:\n\`\`\`lean\n${reg.script}\n\`\`\`` : ""
+      }`
+    : ""
+  // Written by the refiner that redesigned this skeleton. Without it a
+  // post-refinement minion starts cold on a hole earlier minions already
+  // explored for minutes — the redesign silently erases what they learned.
+  const briefBlock = reg?.brief
+    ? `CARRIED-OVER BRIEFING — the refiner that just redesigned this skeleton wrote this from what earlier minions learned on this problem BEFORE the redesign. Treat it as established: do not re-derive what it says is known, and do not re-try what it says already failed.\n${String(reg.brief).slice(0, 2000)}`
+    : ""
+  // Everything any agent on this run has already PROVED, ranked against this
+  // hole's own proposition. Siblings work different holes of the same theorem,
+  // so their side lemmas are usually the ones this hole needs — and without
+  // this they are unreachable, because a minion's context dies with it.
+  const lemmaBlock = lemmaPoolBlock(ctx.lemmaPool, holeHaveInfo(skeleton, id)?.prop || skeleton)
+  const resumeExtra = [lemmaBlock, briefBlock, resumeBlock].filter(Boolean).join("\n\n")
+  if (lemmaBlock)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🧠 ⟪${id}⟫ starts with the most relevant of ${ctx.lemmaPool.facts.size} lemma(s) already proved on this run.`,
+    })
+  const applied = []
+  const toolNames = new Map() // tool_use id -> short tool name
+  const res = await spawnProverStream(
+    {
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, resumeExtra),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    {
+      onObject: (o) => {
+        try {
+          if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_use") continue
+              const name = String(c.name || "")
+              if (c.id) toolNames.set(c.id, name.replace(/^.*__/, ""))
+              if (name.endsWith("apply_tactic") && c.input?.tactic) applied.push(String(c.input.tactic))
+              // A state the minion frees itself leaves the ledger immediately.
+              if (name.endsWith("cleanup_memory") && typeof c.input?.state_id === "string" && reg)
+                reg.ids.delete(c.input.state_id.toLowerCase())
+            }
+          } else if (o?.type === "user" && Array.isArray(o.message?.content) && reg) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_result" || !c.tool_use_id) continue
+              const tool = toolNames.get(c.tool_use_id)
+              if (!tool) continue
+              const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+              if (/init_proof|snapshot_state|branch_tactics/.test(tool)) {
+                UUID_ANY_RE.lastIndex = 0
+                let m
+                while ((m = UUID_ANY_RE.exec(t)) !== null) reg.ids.add(m[0].toLowerCase())
+              }
+              if (/init_proof|apply_tactic|branch_tactics|get_current_proof_state/.test(tool) && /⊢|Goal/i.test(t))
+                reg.lastGoal = t.slice(-700)
+            }
+          }
+        } catch {
+          /* ledgering must never crash a minion */
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
+  )
+  if (reg) reg.tactics.push(...applied)
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
+}
+
+// Leak Finality I orchestrator.
+async function proveFinality(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "♾️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Leak Finality I: Surround's parallel waves + a ${Math.round(FINALITY_REFINE_MS / 60000)}-min refinement cadence (lemma bank + state hand-off).` })
+
+  // Shared memory for the whole run: every lemma any agent gets past Leak IV,
+  // from the planner's first probe onward, ranked back out to whoever works
+  // next. Hung on `ctx` so the epoch spread (`{...ctx, signal}`) and the
+  // finisher hand-off both carry the same pool by reference. Only Finality
+  // sets it, so Surround/Dark stay byte-identical controls.
+  ctx.lemmaPool = makeLemmaPool()
+
+  // ---- 1) PLANNER — verbatim Surround/Dark planner phase --------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          const parsed = parseVerifyOutput(t)
+          if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+            skeleton = script
+          }
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "♾️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it directly (under the split ceiling)." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ No valid tagged skeleton — falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+  if (!parseHoleIds(skeleton).length) return proveHaveFlat(theorem, ctx)
+
+  // ---- 2) EPOCHS: Surround work-queue, cut off by the refinement timer ------
+  // Run-scoped, disposed with the run (plain locals — nothing persists):
+  const bank = new Map() // normalized have-proposition -> { name, prop, fill }
+  const stateReg = new Map() // open hole tag -> { ids:Set<uuid>, lastGoal, tactics:[], resume }
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  const freeStates = async (ids) => {
+    if (!pantoUrl) return
+    for (const id of ids)
+      await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, { state_id: id }, { timeoutMs: 15000 }).catch(() => {})
+  }
+  const allLedgeredIds = () => {
+    const out = new Set()
+    for (const r of stateReg.values()) for (const i of r.ids) out.add(i)
+    return out
+  }
+  // The refiner could already read these itself — but that costs it a tool call
+  // per state and a guess about which one matters, and last run it guessed
+  // wrong and inspected a `True` scratch probe. Fetching them here puts the
+  // actual tactic sequences in front of it before it decides anything. Bounded:
+  // one call per ledgered state, only at refinement time, failures ignored.
+  const stateScripts = async (ids) => {
+    const out = new Map()
+    if (!pantoUrl || !ids.length) return out
+    await Promise.all(
+      ids.slice(0, MAX_STATE_SCRIPTS).map(async (id) => {
+        const r = await callRemoteMcpTool(
+          pantoUrl,
+          /get.*current.*proof.*state|get_current_proof_state/i,
+          { state_id: id },
+          { timeoutMs: 15000 },
+        ).catch(() => null)
+        const s = proofScriptOfState(r?.text)
+        if (s) out.set(id, s)
+      }),
+    )
+    return out
+  }
+
+  let partial = skeleton
+  let rejectedNotes = {}
+  // Notes from minions the refinement timer cut off mid-work. Separate from
+  // `rejectedNotes` because these holes are NOT stuck — they get re-queued —
+  // and because the refiner must be told the difference.
+  let cutoffNotes = {}
+  let stuck = new Set()
+  let banked = 0
+  let refines = 0
+  let lastRefineDoneAt = Date.now() // the planner counts as refinement #0
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Skeleton verified — ${parseHoleIds(skeleton).length} hole(s). Waves of ×${SURROUND_MINIONS} minions; refinement summoned ${Math.round(FINALITY_REFINE_MS / 60000)} min after the last one completed.` })
+  ctx.emit({ type: "checkpoint", skeleton, filled: 0, total: parseHoleIds(skeleton).length })
+
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    const open = parseHoleIds(partial).filter((h) => !stuck.has(h))
+
+    if (open.length) {
+      // ---- one epoch: Surround's continuous queue under an epoch abort ------
+      const epochAC = new AbortController()
+      const onParentAbort = () => epochAC.abort()
+      ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+      let refineDue = false
+      const msLeft = lastRefineDoneAt + FINALITY_REFINE_MS - Date.now()
+      const timer = setTimeout(() => {
+        refineDue = true
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏰ Refinement cadence hit (${Math.round(FINALITY_REFINE_MS / 60000)} min since the last refinement) — cutting off in-flight minions and summoning the refiner.` })
+        epochAC.abort()
+      }, Math.max(1000, msLeft))
+      const ectx = { ...ctx, signal: epochAC.signal }
+
+      let applyLock = Promise.resolve()
+      const withApplyLock = (fn) => {
+        const p = applyLock.then(fn)
+        applyLock = p.then(() => {}, () => {})
+        return p
+      }
+      const queue = open.map((id) => ({ id, depth: 0 }))
+      let inFlight = 0
+      const workers = Array.from({ length: Math.max(1, Math.min(SURROUND_MINIONS, queue.length)) }, async () => {
+        while (true) {
+          if (epochAC.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+          const item = queue.shift()
+          if (!item) {
+            if (inFlight === 0) return
+            await new Promise((r) => setTimeout(r, 500))
+            continue
+          }
+          inFlight++
+          try {
+            const { id, depth } = item
+            let reg = stateReg.get(id)
+            if (!reg) {
+              reg = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+              stateReg.set(id, reg)
+            }
+            const r = await fillHoleFinality(partial, id, ectx, reg)
+            await withApplyLock(async () => {
+              if (ctx.signal?.aborted) return
+              if (r.fill != null) {
+                const info = holeHaveInfo(partial, id)
+                const next = spliceHole(partial, id, r.fill)
+                if (next === partial) {
+                  // Proved, but the hole's shape defeated the splicer, so the
+                  // skeleton did NOT change. Counting this as banked is how a
+                  // run silently loops forever re-proving the same hole — say
+                  // it out loud and hand the hole to the refiner instead.
+                  stuck.add(id)
+                  if (r.notes) rejectedNotes[id] = r.notes
+                  ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ was proved but its skeleton shape could not be spliced — flagged for the refiner.` })
+                } else {
+                  partial = next
+                  banked++
+                  if (info) bank.set(info.key, { name: info.name, prop: info.prop, fill: r.fill })
+                  // The hole is closed — its ledgered states are dead weight now.
+                  const dead = [...reg.ids]
+                  stateReg.delete(id)
+                  freeStates(dead)
+                  ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Banked hole ⟪${id}⟫ (Finality wave).` })
+                }
+              } else if (epochAC.signal.aborted && !ctx.signal?.aborted) {
+                // Cut off by the refinement timer mid-work: NOT stuck — its
+                // partial states stay ledgered for the refiner to triage, and
+                // its scratch notes go to the refiner too. Dropping them (as
+                // this branch used to) is how ten minutes of real exploration
+                // reached the refiner as "STUCK HOLES: (none)".
+                if (r.notes) cutoffNotes[id] = r.notes
+                queue.length = 0
+              } else if (r.decompose && depth + 1 < MAX_DECOMP_DEPTH) {
+                const { body: freshBody, tags } = freshenTags(r.decompose, parseHoleIds(partial))
+                const trial = spliceHole(partial, id, freshBody)
+                const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+                if (v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig)) {
+                  partial = trial
+                  stateReg.delete(id)
+                  for (const t of tags) queue.push({ id: t, depth: depth + 1 })
+                  ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Split hole ⟪${id}⟫ into ${tags.length} smaller hole(s): ${tags.map((t) => `⟪${t}⟫`).join(" ")}.` })
+                } else {
+                  stuck.add(id)
+                  if (r.notes) rejectedNotes[id] = r.notes
+                  ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Hole ⟪${id}⟫ split didn't type-check — flagged for the refiner.` })
+                }
+              } else {
+                stuck.add(id)
+                if (r.notes) rejectedNotes[id] = r.notes
+              }
+              const openNow = parseHoleIds(partial)
+              ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openNow.length })
+            })
+          } finally {
+            inFlight--
+          }
+        }
+      })
+      await Promise.all(workers)
+      clearTimeout(timer)
+      ctx.signal?.removeEventListener?.("abort", onParentAbort)
+
+      if (!refineDue && parseHoleIds(partial).length === 0) break // all closed — assemble below
+      if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+      // Fall through to refinement: either the timer fired, or every open hole
+      // is stuck (waiting idle for the timer would waste pure wall-clock).
+    }
+
+    // ---- 3) REFINEMENT — system-summoned redesign of the skeleton -----------
+    if (refines >= FINALITY_MAX_REFINES) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Refinement budget spent (${FINALITY_MAX_REFINES}) — handing the banked partial to the finisher.` })
+      break
+    }
+    refines++
+    // Count what the refiner will ACTUALLY be shown (a ledger entry with no
+    // state ids renders as "(none)"), not how many holes happen to have an
+    // entry — reporting stateReg.size claimed live progress the prompt didn't
+    // contain, which is exactly the kind of thing that hides a real gap.
+    const scriptById = await stateScripts([...allLedgeredIds()])
+    const inflight = [...stateReg.entries()]
+      .filter(([, r]) => r.ids.size)
+      .map(([tag, r]) => ({
+        tag,
+        ids: r.ids,
+        lastGoal: r.lastGoal,
+        tactics: r.tactics,
+        scripts: [...r.ids].map((id) => ({ id, script: scriptById.get(id) })).filter((s) => s.script),
+      }))
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines}: refiner receives the skeleton, ${bank.size} banked hole(s), ${ctx.lemmaPool.facts.size} verified lemma(s) from the run pool, ${inflight.length} live partial state-set(s).` })
+    const refGate = makeProofGate(theorem)
+    const refScripts = new Map()
+    let refined = null
+    const onRefine = (o) => {
+      const ev = refGate.observe(o)
+      if (ev?.verified) return true // refiner closed the whole theorem outright
+      try {
+        if (o.type === "assistant" && o.message?.content) {
+          for (const c of o.message.content) {
+            if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) refScripts.set(c.id, c.input?.script ?? "")
+          }
+        } else if (o.type === "user" && o.message?.content) {
+          for (const c of o.message.content) {
+            if (c.type !== "tool_result" || !refScripts.has(c.tool_use_id)) continue
+            const script = refScripts.get(c.tool_use_id)
+            const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+            const parsed = parseVerifyOutput(t)
+            if (isStructurallyValidDecomposition(parsed) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) {
+              refined = script
+            }
+          }
+        }
+      } catch {
+        /* observation must never crash the run */
+      }
+      return false
+    }
+    const refRes = await spawnProverStream(
+      {
+        // Ranked against the WHOLE skeleton, not one hole: the refiner is
+        // choosing the next decomposition, so what it most needs is the set of
+        // facts already closed anywhere on this problem — a split it would
+        // otherwise call risky may already be half-proved in the pool.
+        prompt: finalityRefinerPrompt(theorem, partial, [...bank.values()], rejectedNotes, cutoffNotes, inflight, ctx.mcpServers, lemmaPoolBlock(ctx.lemmaPool, partial)),
+        mcpServers: ctx.mcpServers,
+        model: ctx.model,
+        effort: FINALITY_REFINE_EFFORT,
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "📐",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+        lemmaPool: ctx.lemmaPool,
+      },
+      { onObject: onRefine, emit: ctx.emit },
+    )
+
+    if (refGate.verifiedScript) {
+      const v = await verifyViaDaemon(refGate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+      if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(refGate.verifiedScript, sig)) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Refiner closed the theorem outright." })
+        await freeStates(allLedgeredIds())
+        return { verified: true, proof: refGate.verifiedScript }
+      }
+    }
+
+    if (refined) {
+      // Restore banked proofs into every kept have (keyed by proposition), then
+      // carry ASSIGNed partial states over to their new tags.
+      let restored = 0
+      let next = refined
+      for (const id of parseHoleIds(refined)) {
+        const info = holeHaveInfo(next, id)
+        const hit = info && bank.get(info.key)
+        if (hit) {
+          next = spliceHole(next, id, hit.fill)
+          restored++
+        }
+      }
+      const assigns = parseAssignLines(refRes.finalText)
+      const before = allLedgeredIds()
+      const keptIds = new Set()
+      const nextReg = new Map()
+      const openNext = new Set(parseHoleIds(next))
+      for (const { stateId, tag } of assigns) {
+        if (!openNext.has(tag) || !before.has(stateId)) continue
+        let r = nextReg.get(tag)
+        if (!r) {
+          r = { ids: new Set(), lastGoal: "", tactics: [], resume: stateId }
+          nextReg.set(tag, r)
+        }
+        r.ids.add(stateId)
+        keptIds.add(stateId)
+        // The script was already fetched for the refiner a moment ago, so hand
+        // the SAME text to the minion rather than making it spend a
+        // get_current_proof_state call to see what it inherited — and rather
+        // than trusting it to make that call at all.
+        r.script = r.script || scriptById.get(stateId)
+        // Carry the goal/tactic trail from whichever old hole ledgered it.
+        for (const [, old] of stateReg) {
+          if (old.ids.has(stateId)) {
+            r.lastGoal = r.lastGoal || old.lastGoal
+            r.tactics.push(...old.tactics)
+          }
+        }
+      }
+      // Briefings attach to a hole whether or not a Pantograph state came with
+      // it, so a hole the refiner RESHAPED — which by definition cannot carry
+      // its old state — still reaches its next minion with what was learned.
+      const briefs = parseBriefBlocks(refRes.finalText)
+      let briefed = 0
+      for (const [tag, text] of Object.entries(briefs)) {
+        if (!openNext.has(tag)) continue
+        let r = nextReg.get(tag)
+        if (!r) {
+          r = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+          nextReg.set(tag, r)
+        }
+        r.brief = text
+        briefed++
+      }
+      // Decimate everything the refiner did not carry over (it was told to
+      // cleanup_memory these itself — this is the guarantee).
+      await freeStates([...before].filter((i) => !keptIds.has(i)))
+      stateReg.clear()
+      for (const [k, v2] of nextReg) stateReg.set(k, v2)
+      partial = next
+      stuck = new Set()
+      rejectedNotes = {}
+      cutoffNotes = {}
+      const openCount = parseHoleIds(partial).length
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Refinement #${refines} accepted: ${restored} banked proof(s) restored, ${keptIds.size} partial state(s) handed over, ${briefed} hole(s) briefed, ${openCount} hole(s) open.` })
+      ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + openCount })
+      if (openCount === 0) break // bank restoration alone closed everything
+    } else {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Refinement #${refines} produced no verified skeleton — keeping the current one.` })
+      // Free cut-off states anyway (nothing will resume them under this
+      // skeleton) and clear `stuck` so the surviving holes get another wave.
+      await freeStates(allLedgeredIds())
+      stateReg.clear()
+      if (!parseHoleIds(partial).filter((h) => !stuck.has(h)).length) stuck = new Set()
+    }
+    lastRefineDoneAt = Date.now()
+  }
+
+  // ---- 4) + 5) verbatim from Surround: assemble, else finish from the seed --
+  const remaining = parseHoleIds(partial)
+  await freeStates(allLedgeredIds()) // dispose the ghost ledger with the run
+
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Finality I assembled a verified proof: ${banked} banked hole(s), ${refines} refinement(s).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}) — finishing from the filled skeleton in one context.` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `♾️ Banked ${banked} hole(s) across ${refines} refinement(s); finishing ${remaining.map((h) => `⟪${h}⟫`).join(" ")} in one context.` })
+  }
+
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  return proveHaveFlat(theorem, ctx, { seed: partial, hints: rejectedNotes })
+}
+
+// ===========================================================================
+// LEAK STRONGHOLD FORCE — recursion FIRST, minions second, no finisher
+// ---------------------------------------------------------------------------
+// Dark, Surround and Finality are all described as recursive decomposers, and
+// none of them has ever recursed. The reason is structural, not incidental:
+// recursion is offered to the MINION as the consolation prize for failing to
+// close its hole (`Prefer CLOSE; DECOMPOSE only when you can't`), the minion
+// has a 15-minute node budget, and before it may hand a split back it must
+// compile that split itself. So it grinds at CLOSE until the clock kills it
+// and returns nothing at all. Two logged 30-minute runs: 24 and 30
+// verify_full_script calls, 0 DECOMPOSE blocks, 0 splits. The hole count in a
+// Stronghold run has only ever gone DOWN from whatever the planner opened
+// with.
+//
+// Force fixes that by taking the recursion away from the minions entirely and
+// giving it to a stage whose ONLY job is cutting:
+//
+//   1. PLAN     — a deliberately SMALL skeleton (3–5 holes), verified on Leak
+//                 IV. This is the saved root; every later skeleton descends
+//                 from it.
+//   2. EXPAND   — dedicated splitter agents, ≤FORCE_MINIONS at a time, each
+//                 cutting ONE hole into ~FORCE_SPLIT_N sub-holes, recursively
+//                 to FORCE_DEPTH levels. Every split is re-verified on Leak IV
+//                 by the BRIDGE before it is applied, so `partial` is a
+//                 verified skeleton at every instant and its hole count only
+//                 ever rises — which is what makes "hand back the current
+//                 highest-hole-count skeleton" a one-liner at cutoff time.
+//                 Bounded by FORCE_EXPAND_MS for the phase and
+//                 FORCE_SPLIT_CALL_MS for any single agent.
+//   3. CAMPAIGN — ≤FORCE_MINIONS minions for ≤FORCE_CAMPAIGN_MS, DEEPEST holes
+//                 first (deepest = smallest goal = likeliest to fall).
+//   4. A campaign that leaves holes open has FAILED, and a failed campaign
+//      goes back to EXPAND — never to a finisher. The splitters are told what
+//      each minion tried and why it failed, and cut those holes again from
+//      depth 0. That loop is the entire strategy: keep cutting until the
+//      pieces are minion-sized.
+const FORCE_MINIONS = Number(process.env.LEAK_FORCE_MINIONS || 5)
+const FORCE_SPLIT_N = Number(process.env.LEAK_FORCE_SPLIT_N || 3)
+const FORCE_DEPTH = Number(process.env.LEAK_FORCE_DEPTH || 3)
+// The whole recursive expansion phase. Cutting is cheap relative to proving,
+// but it is not free, and an unbounded expansion would spend the entire run
+// building a tree nobody ever works.
+const FORCE_EXPAND_MS = Number(process.env.LEAK_FORCE_EXPAND_MS || 7 * 60_000)
+// Hard ceiling on ONE splitter agent. A splitter that has not produced a
+// verified cut in five minutes is not going to; killing it frees a worker slot
+// for a hole that will.
+const FORCE_SPLIT_CALL_MS = Number(process.env.LEAK_FORCE_SPLIT_CALL_MS || 5 * 60_000)
+const FORCE_CAMPAIGN_MS = Number(process.env.LEAK_FORCE_CAMPAIGN_MS || 10 * 60_000)
+// Two cycles that neither cut anything new nor closed anything mean the loop
+// has converged on a shape it cannot move. Spinning it again just re-buys the
+// same result — stop and report honestly instead.
+const FORCE_MAX_DRY_CYCLES = 2
+// Same reasoning as FINALITY_REFINE_EFFORT: a splitter is doing STRUCTURE, not
+// proof search, and the deliberation it would otherwise spend is the deliberation
+// that produced 0 verified cuts in a 7-minute window on the first live run.
+const FORCE_SPLIT_EFFORT = process.env.LEAK_FORCE_SPLIT_EFFORT || "medium"
+
+// Ghost-army housekeeping, shared by the campaign and the expansion. Force is
+// one of several agents on a SHARED Pantograph, so every state a cut-off minion
+// leaves behind is a leak until someone frees it by id — which is exactly what
+// the first Force run did to states 3e690f3e, b66413e9 and 6bdd697c.
+async function freeForceStates(ctx, ids) {
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  if (!pantoUrl) return
+  for (const id of ids)
+    await callRemoteMcpTool(pantoUrl, /cleanup.*memory|cleanup_memory/i, { state_id: id }, { timeoutMs: 15000 }).catch(() => {})
+}
+const forceLedgeredIds = (stateReg) => {
+  const out = new Set()
+  for (const r of stateReg.values()) for (const i of r.ids) out.add(i)
+  return out
+}
+// The tactic sequence each ledgered state has ALREADY accepted, fetched once
+// before the splitter runs. Without this the splitter has to guess which state
+// matters and spend a call to look — last run it guessed wrong and inspected a
+// `True` scratch probe. Bounded and failure-tolerant.
+async function forceStateScripts(ctx, ids) {
+  const out = new Map()
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  if (!pantoUrl || !ids.length) return out
+  await Promise.all(
+    ids.slice(0, MAX_STATE_SCRIPTS).map(async (id) => {
+      const r = await callRemoteMcpTool(pantoUrl, /get.*current.*proof.*state|get_current_proof_state/i, { state_id: id }, { timeoutMs: 15000 }).catch(() => null)
+      const s = proofScriptOfState(r?.text)
+      if (s) out.set(id, s)
+    }),
+  )
+  return out
+}
+
+// Aim the shared planner at a SMALL root. The planner's own instinct is to lay
+// out the whole argument, which produces the 5–9 hole skeletons Surround runs
+// on; here the expansion stage is what grows the tree, so a big root only
+// means less time cutting.
+const FORCE_PLAN_MIN = 3
+const FORCE_PLAN_MAX = 5
+const FORCE_PLAN_NOTE = `FORCE MODE — KEEP THE SKELETON SMALL: aim for ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX} holes, no more. A LATER stage recursively cuts every hole you write into smaller ones, so your job is only the top-level shape of the argument: the few big moves the proof turns on. Do NOT try to reach minion-sized steps yourself — a coarse ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole skeleton that type-checks is a BETTER input to this pipeline than a fine-grained one.`
+
+// One splitter's brief. It is not asked to prove anything and is told so twice:
+// the failure mode this whole strategy exists to fix is an agent that treats
+// "split it" as "close it, and split only if you give up".
+// `hist` is everything earlier agents learned about THIS hole:
+//   { failed, cutoff, scripts:[{id,script}], lastGoal, tactics:[], priorCuts:[] }
+// Every field is optional; an empty hist renders nothing.
+function forceSplitPrompt(skeleton, id, prop, hist, mcpServers = [], extra = "") {
+  const toolSection = mcpToolSection(mcpServers)
+  const h = hist || {}
+  const noteBlock = (label, n, guidance) =>
+    !n ? "" : `\n${label}\n${oneLine(String(n.text || "no notes")).slice(0, 700)}${
+      n.tactics?.length ? `\n  tactics it applied: ${n.tactics.slice(-16).join(" ; ").slice(0, 500)}` : ""
+    }\n${guidance}\n`
+  const failedBlock = noteBlock(
+    "A MINION ALREADY TRIED THIS HOLE AND WAS DEFEATED. What it reported:",
+    h.failed,
+    "That is evidence about the SHAPE of this hole, not just about that minion. Cut it somewhere else than where it got stuck — a split that reproduces the same wall is worth nothing.",
+  )
+  const cutoffBlock = noteBlock(
+    "A MINION WAS WORKING THIS HOLE AND RAN OUT OF CLOCK — it was NOT defeated:",
+    h.cutoff,
+    "Its approach was still live and may well have been the right one. Do NOT read this as evidence that it fails. Prefer a cut that lets the next minion CONTINUE it.",
+  )
+  const scriptBlock = (h.scripts || []).length
+    ? `\nLIVE PARTIAL PROGRESS — proof states a minion built on this hole and did not finish. The tactic sequence each has ALREADY accepted is printed here, so read it rather than spending a call on get_current_proof_state. A long script is real, part-built work: shape your cut so it still applies.${h.lastGoal ? `\n  last goal seen: ${oneLine(h.lastGoal).slice(0, 400)}` : ""}\n${h.scripts
+        .map((s) => `  state ${s.id}:\n\`\`\`lean\n${s.script}\n\`\`\``)
+        .join("\n")}\n`
+    : ""
+  const priorBlock = (h.priorCuts || []).length
+    ? `\nCUTS ALREADY ATTEMPTED ON THIS HOLE BY EARLIER SPLITTERS — all of them were REJECTED or never produced a verified block. Do not re-walk these:\n${h.priorCuts
+        .map((c) => `  - ${oneLine(String(c)).slice(0, 300)}`)
+        .join("\n")}\n`
+    : ""
+  return `You are a SPLITTER in the Leak Stronghold Force pipeline. You do NOT prove this hole. You CUT it into smaller holes that other agents will prove. Producing a correct CUT is a complete success; producing a proof is not what you were called for.
+
+${toolSection}
+
+${RESEARCH_MODE_NOTE}
+
+THE CURRENT SKELETON (compiles; every open step is \`:= by sorry --⟪tag⟫\`):
+\`\`\`lean
+${skeleton}
+\`\`\`
+
+YOUR HOLE: the \`have\` tagged \`--⟪${id}⟫\`${prop ? `\nIts goal: ${prop}` : ""}
+The hypotheses in scope are the theorem's binders plus every EARLIER \`have\` — available by name, and your sub-steps inherit them too.
+${failedBlock}${cutoffBlock}${scriptBlock}${priorBlock}
+YOUR JOB — cut ⟪${id}⟫ into about ${FORCE_SPLIT_N} genuinely smaller steps:
+1. Decide the ${FORCE_SPLIT_N} intermediate facts that, taken together, make this hole's goal easy. Each must be a REAL step down in difficulty — a restatement, a triviality, or a sub-goal as hard as the original is a wasted cut.
+2. Write them as local \`have\`s with fresh tags, then close THIS hole's goal from them:
+\`\`\`lean
+have s1 : <smaller fact> := by sorry --⟪s1⟫
+have s2 : <smaller fact> := by sorry --⟪s2⟫
+have s3 : <smaller fact> := by sorry --⟪s3⟫
+<the tactics that close ⟪${id}⟫'s goal from s1, s2, s3>
+\`\`\`
+   Do NOT re-quantify the ambient variables — the \`have\`s are inside this hole's context already.
+3. CHECK IT. Splice your block in place of \`sorry --⟪${id}⟫\` in the skeleton above, leave every OTHER \`sorry --⟪…⟫\` exactly as it is, and verify_full_script. It MUST compile with the ONLY diagnostics being \`sorry\` warnings (your new ones plus the untouched others) and NO errors. Iterate until it does. An unverified cut is thrown away by the system.
+4. OUTPUT exactly:
+DECOMPOSE ⟪${id}⟫
+\`\`\`lean
+<your block, from the left margin>
+\`\`\`${
+    (h.scripts || []).length
+      ? `\n5. THEN, for every live state listed above whose part-built work still applies under ONE of your new sub-holes, add a line:
+ASSIGN <state_id> ⟪s1⟫
+   The next minion on that sub-hole resumes from that exact state instead of starting cold. Any state you do NOT assign is FREED — its tactic script is destroyed permanently and the listing above was the last copy, so if the work still matters, either assign it or shape a sub-hole it fits.`
+      : ""
+  }
+${(h.scripts || []).length ? "6" : "5"}. FINALLY, brief the minions who will work your new sub-holes. They see ONLY the skeleton and their own hole — this is the ONLY channel by which anything you just learned reaches them. One block per sub-hole you want to brief:
+BRIEF ⟪s1⟫
+<what you found out that bears on this sub-step: which lemma names turned out NOT to exist, which ones did, what an earlier minion already tried and how far it got, and WHY you cut here — what this shape is meant to make easier>
+   Write nothing you would not want acted on: the minion treats it as established fact and will not re-verify it. Omit the block entirely for a sub-hole where you have nothing real to say.
+
+THE ONE ESCAPE HATCH: if this goal is already so small that cutting it would produce sub-steps no easier than the goal itself (a single \`rw\`, one library lemma, a pure computation), do not force a pointless split — output the single line:
+ATOMIC ⟪${id}⟫
+Use it honestly and sparingly. It sends the hole straight to a minion; if that minion then fails, you will be asked to cut it after all${h.failed ? ", and you are being asked now precisely because that already happened — so ATOMIC is almost certainly the wrong answer this time" : ""}.
+
+RULES:
+- The master theorem's signature is IMMUTABLE. Do not touch any other hole.
+- Every new hole needs a DISTINCT tag matching \`--⟪…⟫\` exactly; the system renames them to stay globally unique.
+- The closing tactics must be \`sorry\`-FREE — the only holes you introduce are the tagged \`have … := by sorry --⟪…⟫\` lines.
+- NEVER call \`cleanup_memory\` with no arguments — the Pantograph service is SHARED and a bare call wipes every agent's states. Free each state you made individually: \`cleanup_memory(state_id)\`.
+
+${SEARCH_USAGE_NOTE}
+${extra ? `\n${extra}\n` : ""}`
+}
+
+// A splitter run. Returns { body, atomic } — `body` is the unverified block
+// (the bridge re-verifies before applying), `atomic` means the splitter
+// declined to cut and the hole should go straight to a minion.
+async function splitHoleForce(skeleton, id, ctx, hist) {
+  if (ctx.signal?.aborted) return { body: null, atomic: false }
+  const info = holeHaveInfo(skeleton, id)
+  const carried = [
+    hist?.failed && "a defeated minion's notes",
+    hist?.cutoff && "a cut-off minion's notes",
+    hist?.scripts?.length && `${hist.scripts.length} live proof state(s)`,
+    hist?.priorCuts?.length && `${hist.priorCuts.length} rejected cut(s)`,
+  ].filter(Boolean)
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `⚒️ Splitter cutting ⟪${id}⟫${info ? ` — ${oneLine(info.prop).slice(0, 140)}` : ""}${carried.length ? ` [carrying ${carried.join(", ")}]` : ""}`,
+  })
+  const res = await spawnProverStream(
+    {
+      prompt: forceSplitPrompt(skeleton, id, info?.prop || "", hist, ctx.mcpServers, lemmaPoolBlock(ctx.lemmaPool, info?.prop || skeleton)),
+      effort: FORCE_SPLIT_EFFORT,
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      // The system-enforced 5-minute ceiling the strategy promises. Distinct
+      // from ctx.nodeTimeoutMs (15 min) on purpose: a minion's clock buys
+      // proof search, and a splitter is not doing proof search.
+      timeoutMs: FORCE_SPLIT_CALL_MS,
+      getDeadline: ctx.getDeadline,
+      stage: `⚒️⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: () => false, emit: ctx.emit },
+  )
+  const t = res.finalText || ""
+  if (new RegExp("ATOMIC\\s*⟪\\s*" + id + "\\s*⟫").test(t)) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ declared ATOMIC — going straight to a minion.` })
+    return { body: null, atomic: true, summary: null, assigns: [] }
+  }
+  return {
+    body: parseDecomposeBlock(t, id),
+    atomic: false,
+    // The tail of what it said, kept ONLY so a failed splitter's direction can
+    // be shown to the next one. Cheap, and the alternative is re-buying the
+    // same dead end every cycle.
+    summary: t ? t.slice(-600) : null,
+    assigns: parseAssignLines(t),
+    briefs: parseBriefBlocks(t),
+  }
+}
+
+// EXPAND. Grows `skeleton` by recursive verified cuts until the phase clock
+// runs out or the frontier is exhausted. Returns the grown skeleton (always a
+// Leak IV-verified one) plus the depth map the campaign orders its queue by.
+// `hist` is a Map: hole tag -> { failed, cutoff, scripts, lastGoal, tactics,
+// priorCuts }. It ACCUMULATES across cycles (proveForce owns it), so a splitter
+// that fails on a hole leaves its dead end behind for its successor rather than
+// letting cycle N+1 re-walk the identical search — which is what produced the
+// repeated `loogle "doubleCoset, Nat.card"` seventeen minutes apart on the
+// first live run. `stateReg` is the campaign's Pantograph ledger: states a cut
+// destroys are freed here, and states a kept hole still owns are carried.
+async function forceExpand(skeleton, ctx, sig, hist, stateReg) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  let cutoff = false
+  const timer = setTimeout(() => {
+    cutoff = true
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Expansion window (${Math.round(FORCE_EXPAND_MS / 60000)} min) spent — freezing the skeleton at ${parseHoleIds(partial).length} hole(s) and dispatching minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_EXPAND_MS))
+
+  const roots = parseHoleIds(partial)
+  const depth = new Map(roots.map((id) => [id, 0]))
+  const queue = roots.map((id) => ({ id, d: 0 }))
+  let splits = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const item = queue.shift()
+      if (!item) {
+        if (inFlight === 0) return // frontier exhausted and nobody can extend it
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        const { id, d } = item
+        const r = await splitHoleForce(partial, id, ectx, hist?.get(id))
+        if (!r.body) {
+          // ATOMIC, cut off, or no usable block. Record the miss so the NEXT
+          // splitter on this hole does not repeat the same dead end.
+          if (!r.atomic && r.summary) {
+            const e = hist?.get(id)
+            if (e) (e.priorCuts ||= []).push(r.summary)
+          }
+          continue
+        }
+        await withApplyLock(async () => {
+          // The run clock and an explicit abort still win; the PHASE clock does
+          // not discard a cut that already came back, because the verify is
+          // seconds and throwing away a finished split to save them is the
+          // opposite of the trade this phase is making.
+          if (ctx.signal?.aborted || deadlinePassed(ctx)) return
+          if (!parseHoleIds(partial).includes(id)) return
+          const { body: freshBody, tags, rename } = freshenTags(r.body, parseHoleIds(partial))
+          // The splitter addresses its sub-holes by ITS OWN names (s1/s2/s3);
+          // freshenTags renamed them to be globally unique. Translate before
+          // matching, or ASSIGN and BRIEF silently never apply.
+          const fresh = (t) => rename.get(t) || t
+          const trial = spliceHole(partial, id, freshBody)
+          if (trial === partial) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut could not be spliced into the skeleton — hole left intact.` })
+            return
+          }
+          const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+          if (!(v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig))) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut rejected by Leak IV — hole left intact.` })
+            return
+          }
+          partial = trial
+          splits++
+          // The parent hole is gone. Its Pantograph states either move to a
+          // sub-hole the splitter ASSIGNed them to, or they are freed — never
+          // left dangling on the shared service, and never silently discarded
+          // while still holding a real part-built proof.
+          const reg = stateReg?.get(id)
+          if (reg) {
+            const kept = new Set()
+            for (const { stateId, tag: raw } of r.assigns || []) {
+              const tag = fresh(raw)
+              if (!tags.includes(tag) || !reg.ids.has(stateId)) continue
+              let nr = stateReg.get(tag)
+              if (!nr) {
+                nr = { ids: new Set(), lastGoal: reg.lastGoal, tactics: [...reg.tactics], resume: stateId }
+                stateReg.set(tag, nr)
+              }
+              nr.ids.add(stateId)
+              nr.resume = nr.resume || stateId
+              nr.script = nr.script || hist?.get(id)?.scripts?.find((s) => s.id === stateId)?.script
+              kept.add(stateId)
+            }
+            const dropped = [...reg.ids].filter((i) => !kept.has(i))
+            stateReg.delete(id)
+            if (dropped.length) freeForceStates(ctx, dropped)
+            if (kept.size)
+              ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ handed ${kept.size} live proof state(s) down to its sub-hole(s); freed ${dropped.length}.` })
+          }
+          // Whatever the splitter learned while cutting reaches the sub-hole's
+          // minion — the only channel there is, since a minion sees just the
+          // skeleton and its own hole. Attaches whether or not a state came
+          // with it, so a reshaped sub-step is still briefed.
+          let briefed = 0
+          for (const [raw, text] of Object.entries(r.briefs || {})) {
+            const tag = fresh(raw)
+            if (!tags.includes(tag)) continue
+            let nr = stateReg?.get(tag)
+            if (!nr && stateReg) {
+              nr = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+              stateReg.set(tag, nr)
+            }
+            if (nr) {
+              nr.brief = text
+              briefed++
+            }
+          }
+          hist?.delete(id)
+          for (const t of tags) {
+            depth.set(t, d + 1)
+            if (d + 1 < FORCE_DEPTH) queue.push({ id: t, d: d + 1 })
+          }
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ ⟪${id}⟫ → ${tags.length} hole(s) at depth ${d + 1}/${FORCE_DEPTH}${d + 1 < FORCE_DEPTH ? "" : " (leaf)"} — skeleton now ${parseHoleIds(partial).length} hole(s)${briefed ? `, ${briefed} briefed` : ""}.` })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  if (!cutoff && !ctx.signal?.aborted)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Expansion exhausted the frontier (depth ${FORCE_DEPTH}) with time to spare — ${parseHoleIds(partial).length} hole(s).` })
+  return { skeleton: partial, splits, depth }
+}
+
+// CAMPAIGN. Up to FORCE_MINIONS minions for at most FORCE_CAMPAIGN_MS, deepest
+// holes first. Holes it fails on come back as notes for the next expansion —
+// there is no finisher to hand them to.
+//
+// Uses fillHoleFinality, NOT fillHoleSurround. The first cut of Force used
+// Surround's minion because its signature was shorter, and that single
+// substitution silently deleted the entire Pantograph hand-off layer: state
+// ids were never ledgered, so a cut-off minion's live proof state was neither
+// shown to the splitter nor freed on the SHARED service, and its tactic trail
+// died with it. `reg` is what carries all of that.
+async function forceCampaign(skeleton, ctx, depth, banked, stateReg) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  const timer = setTimeout(() => {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Campaign window (${Math.round(FORCE_CAMPAIGN_MS / 60000)} min) spent — recalling the minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_CAMPAIGN_MS))
+
+  // Deepest first: a depth-3 hole is the smallest goal in the tree and the one
+  // most likely to fall inside a campaign window. Filling it also shrinks its
+  // parent's remaining work, so the tree collapses from the leaves up.
+  const queue = parseHoleIds(partial).sort((a, b) => (depth.get(b) ?? 0) - (depth.get(a) ?? 0))
+  // Two SEPARATE note maps, exactly as Finality keeps them. A minion the
+  // campaign clock killed is not a minion that was defeated, and telling a
+  // splitter "this already failed" about an approach that was still in flight
+  // is how it talks itself off the direction that was about to work. The first
+  // Force run did precisely that to hole ⟪d1⟫.
+  const notes = {} // genuinely tried and failed
+  const cutoff = {} // still working when the window closed
+  let closed = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const id = queue.shift()
+      if (id === undefined) {
+        if (inFlight === 0) return
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        if (!parseHoleIds(partial).includes(id)) continue
+        // Ledger this hole's Pantograph states so the splitter can read (or
+        // inherit) whatever the minion built, and so nothing leaks on the
+        // shared service if the clock kills it mid-tactic.
+        let reg = stateReg.get(id)
+        if (!reg) {
+          reg = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+          stateReg.set(id, reg)
+        }
+        const r = await fillHoleFinality(partial, id, ectx, reg)
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted) return
+          if (r.fill == null) {
+            // Includes the DECOMPOSE case: a Force minion that wants to split
+            // does not get to, because splitting is the expansion stage's job
+            // and its notes route there anyway.
+            if (ac.signal.aborted && !ctx.signal?.aborted) cutoff[id] = r.notes || { text: "(cut off before it reported)" }
+            else if (r.notes) notes[id] = r.notes
+            return
+          }
+          const next = spliceHole(partial, id, r.fill)
+          if (next === partial) {
+            if (r.notes) notes[id] = r.notes
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ was proved but could not be spliced — back to the decomposer.` })
+            return
+          }
+          partial = next
+          closed++
+          // Closed: its ledgered states are dead weight — free them now rather
+          // than carrying them to the end of the run.
+          const dead = [...reg.ids]
+          stateReg.delete(id)
+          freeForceStates(ctx, dead)
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Closed hole ⟪${id}⟫ (Force campaign).` })
+          const openNow = parseHoleIds(partial)
+          ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked + closed, total: banked + closed + openNow.length })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  return { skeleton: partial, closed, notes, cutoff }
+}
+
+async function proveForce(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "⚒️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Leak Stronghold Force: a ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root, then ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion (×${FORCE_SPLIT_N}, depth ${FORCE_DEPTH}) and ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions. A failed campaign goes back to the decomposer, never to a finisher.` })
+
+  // Shared across every splitter and minion for the whole run — the same
+  // run-scoped pool Finality uses. Cheap: it is harvested from compiles that
+  // were already paid for.
+  ctx.lemmaPool = makeLemmaPool()
+
+  // ---- 1) PLANNER — the shared planner, aimed at a SMALL root ---------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          if (isStructurallyValidDecomposition(parseVerifyOutput(t)) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) skeleton = script
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, FORCE_PLAN_NOTE),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "⚒️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it outright — no decomposition needed." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  // The ONE finisher-shaped path left in Force, and it is not the campaign
+  // escape hatch the strategy forbids: with no skeleton there is nothing to
+  // cut and nothing to dispatch, so the alternative is returning nothing at
+  // all.
+  if (!skeleton || !parseHoleIds(skeleton).length) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ Planner produced no tagged skeleton — nothing to decompose; falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+
+  let partial = skeleton
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Root skeleton verified — ${parseHoleIds(partial).length} hole(s): ${parseHoleIds(partial).map((h) => `⟪${h}⟫`).join(" ")}. Saved; expansion starts now.` })
+  ctx.emit({ type: "checkpoint", skeleton: partial, filled: 0, total: parseHoleIds(partial).length })
+
+  // ---- 2) EXPAND → CAMPAIGN → (failed? EXPAND again) ------------------------
+  // Run-scoped and disposed with the run. `hist` accumulates per hole ACROSS
+  // cycles — it is never reassigned — so nothing a minion or a splitter learned
+  // is lost at a stage boundary. `stateReg` is the Pantograph ledger.
+  const hist = new Map() // hole tag -> { failed, cutoff, scripts, lastGoal, tactics, priorCuts }
+  const stateReg = new Map() // hole tag -> { ids:Set, lastGoal, tactics, resume, script }
+  const histFor = (id) => {
+    let e = hist.get(id)
+    if (!e) {
+      e = { failed: null, cutoff: null, scripts: [], lastGoal: "", tactics: [], priorCuts: [] }
+      hist.set(id, e)
+    }
+    return e
+  }
+  let banked = 0
+  let cycle = 0
+  let dry = 0
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    cycle++
+    const before = parseHoleIds(partial).length
+    // Read every ledgered state's actual tactic script BEFORE the splitters
+    // run, so each one sees the part-built proof rather than guessing which
+    // state matters and burning a call to look.
+    const scriptById = await forceStateScripts(ctx, [...forceLedgeredIds(stateReg)])
+    for (const [tag, reg] of stateReg) {
+      const e = histFor(tag)
+      e.scripts = [...reg.ids].map((sid) => ({ id: sid, script: scriptById.get(sid) })).filter((s) => s.script)
+      e.lastGoal = reg.lastGoal || e.lastGoal
+      if (reg.tactics?.length) e.tactics = reg.tactics
+    }
+    const liveStates = [...stateReg.values()].reduce((n, r) => n + r.ids.size, 0)
+    if (liveStates)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle}: ${liveStates} live proof state(s) from cut-off minions handed to the decomposer (${scriptById.size} with a readable script).` })
+    const ex = await forceExpand(partial, ctx, sig, hist, stateReg)
+    partial = ex.skeleton
+    const after = parseHoleIds(partial).length
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle} expansion: ${ex.splits} verified cut(s), ${before} → ${after} hole(s). Dispatching ×${Math.min(FORCE_MINIONS, after)} minions for ${Math.round(FORCE_CAMPAIGN_MS / 60000)} min.` })
+    ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + after })
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+
+    const camp = await forceCampaign(partial, ctx, ex.depth, banked, stateReg)
+    partial = camp.skeleton
+    banked += camp.closed
+    // MERGE, never replace. Overwriting is how cycle N+1 forgets what cycle N
+    // paid for; and a hole the clock cut off must NOT be reported to the next
+    // splitter as one that was defeated.
+    for (const [id, n] of Object.entries(camp.notes)) histFor(id).failed = n
+    for (const [id, n] of Object.entries(camp.cutoff)) histFor(id).cutoff = n
+    const left = parseHoleIds(partial)
+    if (!left.length) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚒️ Cycle ${cycle} campaign closed every remaining hole (${banked} total).` })
+      break
+    }
+    dry = ex.splits === 0 && camp.closed === 0 ? dry + 1 : 0
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `↩︎ Cycle ${cycle} campaign closed ${camp.closed}/${after} hole(s); ${left.length} still open — returning them to the decomposer (no finisher).`,
+    })
+    if (dry >= FORCE_MAX_DRY_CYCLES) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `🛑 ${FORCE_MAX_DRY_CYCLES} consecutive cycles cut nothing and closed nothing — the loop has converged on a shape it cannot move. Stopping rather than re-buying the same result.` })
+      break
+    }
+  }
+
+  // ---- 3) ASSEMBLE ----------------------------------------------------------
+  const remaining = parseHoleIds(partial)
+  // Dispose the ghost ledger with the run — Pantograph is SHARED, and a state
+  // this run created is nobody else's to collect.
+  await freeForceStates(ctx, [...forceLedgeredIds(stateReg)])
+  stateReg.clear()
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Stronghold Force assembled a verified proof: ${banked} hole(s) closed across ${cycle} cycle(s).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚒️ Out of clock with ${remaining.length} hole(s) still open after ${cycle} cycle(s) (${banked} closed). Force has no finisher by design — the partial skeleton is checkpointed for a resume.` })
+  }
+  return { verified: false, proof: "" }
+}
+
+// ===========================================================================
+// CONTROL — the flat baselines. One continuous CLI agent, one-shotting the
+// WHOLE theorem, no planner, no splitter, no minions, no top-level helper
+// lemmas, and — unlike every decomposition strategy above — no DECOMPOSE
+// escape hatch and no "too hard" stopping state. Exists so blueprint-
+// refinement strategies (Leak River/Ultra) have something to be compared
+// against besides each other: does structuring the search actually beat just
+// retrying against the compiler's own error output?
+//
+// Three tiers, one shared implementation (proveControl's `tier` param):
+//   I  — Leak IV only. Leak I search and Leak II interactive are both
+//        filtered out of the tool inventory even if connected.
+//   II — Leak IV + Leak I search (loogle/moogle). Still no Leak II — no
+//        interactive tactic-stepping.
+//   IV — Control II's surface PLUS Leak II (Pantograph init_proof/apply_tactic).
+//        The one control that gets interactive tactic-stepping.
+// No tier decomposes; the ONLY thing that changes between tiers is the tool
+// surface.
+// ===========================================================================
+
+// Leak Control's entire prompt: the loop, the rules, the theorem, and — tier
+// II only — the SAME search-usage guidance every other search-capable
+// strategy renders (SEARCH_USAGE_NOTE), not a bespoke variant, so loogle/
+// moogle usage reads identically across strategies. No RESEARCH_MODE_NOTE at
+// either tier — that note's own "BREAK IT SMALLER and hand the pieces on"
+// language is exactly the decomposition instinct Control is built to NOT
+// have.
+// `lastAttempt`, when present, is { script, result } from the LAST
+// verify_full_script call of the IMMEDIATELY PRECEDING session — not an
+// accumulated history across every attempt so far. That distinction is
+// deliberate: a human "just keep trying" doesn't forget their last attempt,
+// so a totally amnesiac retry-from-scratch loop is a strawman, not a fair
+// baseline. But accumulating EVERY past attempt (or a proven-lemma bank, or a
+// dead-end ledger) would make this a refinement strategy by another name and
+// defeat the point of a flat one-shot control — so exactly one step of
+// memory, no more.
+function controlPrompt(theorem, mcpServers, attempt = 1, lastAttempt = null, allowSearch = false, allowPantograph = false) {
+  const toolSection = mcpToolSection(mcpServers)
+  const lastBlock = lastAttempt
+    ? `\nYOUR MOST RECENT ATTEMPT (a previous session — different context, so this block is the ONLY thing carried forward; treat it as established fact about what was already tried, not something to re-derive):\n\`\`\`lean\n${String(lastAttempt.script || "").slice(0, 4000)}\n\`\`\`\nLeak IV's response to it:\n${String(lastAttempt.result || "").slice(0, 2500)}\n\nDo not just resubmit this unchanged. Either fix precisely what that error points at, or — if this exact spot has already failed before — switch to a genuinely different proof approach for the goal.\n`
+    : ""
+  const toolsLine = allowSearch
+    ? `Your tools are Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message) — and Leak I's loogle_search/moogle_search for library lookups. verify_full_script is still the ONLY thing that counts as progress; search only ever supports a submission, it does not replace one.${allowPantograph ? " You ALSO have Leak II's interactive proof assistant (init_proof / apply_tactic) — step a goal ONE tactic at a time to watch the live goal state evolve, then fold the tactics that worked into your verify_full_script submission. Pantograph never certifies a proof; only verify_full_script does." : ""}`
+    : `Your only tool is Leak IV's verify_full_script — it IS the compiler: every call returns either "✅ Compilation Successful! The proof is 100% verified." or the exact Lean diagnostic text (line number, error/warning message). That text is your entire feedback loop.`
+  return `You are proving ONE Lean 4 + Mathlib theorem, one shot, in a single continuous session. There is no decomposition here — you do not write top-level helper lemmas, you do not split this into holes for another agent to fill, and there is no "too hard, hand it off" outcome. ${toolsLine}
+
+${toolSection}
+
+THE LOOP:
+1. Write your best complete attempt at a full proof of the theorem below.
+2. Call verify_full_script with it.
+3. If it fails, read the compiler's error CAREFULLY — the line and message tell you exactly what broke. Fix precisely that if you can localize it; otherwise try a genuinely different approach to the same goal. Resubmit.
+4. It only counts as done when verify_full_script reports success with ZERO 'sorry' anywhere in the script. A compile that still contains 'sorry' is not a stopping point — go back to step 1 on whatever is still sorried.
+${allowSearch ? `\n${SEARCH_USAGE_NOTE}\n` : ""}${allowPantograph ? `\nINTERACTIVE (Leak II): when an error is opaque or a subgoal is fiddly, init_proof the goal and apply_tactic ONE tactic at a time to read the real goal state, then fold the working tactics back into the full script and verify_full_script it. Never put 'sorry' in an apply_tactic — a goal you cannot close means try a different tactic, not stop.\n` : ""}
+RULES:
+- No top-level 'theorem'/'lemma' other than the target itself. Any intermediate fact you need is a local 'have' INSIDE the one proof of the target.
+- Never conclude a goal is "too hard", "open", "beyond reach", or ask to decompose/split it — there is no one to hand it to here. A repeatedly-failing approach means try a DIFFERENT proof strategy for the same goal, not a smaller piece of it.
+- Never stop before verify_full_script has reported success with zero 'sorry'. An unfinished attempt is not a report-worthy result — keep going.
+- This is attempt ${attempt} of an unbounded series the system keeps making until either you succeed or the run's own wall clock — not you — ends it. If you get stuck, that's expected; just keep iterating on what the compiler actually told you.
+${lastBlock}
+Theorem (its signature is immutable):
+${theorem}`
+}
+
+const CONTROL_LABELS = { 1: "Leak Control I", 2: "Leak Control II", 4: "Leak Control IV" }
+
+// Loop-until-deadline across FRESH attempts (same shape as the architect
+// stages' own attempt loop): a single spawnProverStream call is one
+// continuous agent session, but if that session ends — the model stops
+// calling tools, or gives up despite the prompt — without a verified proof
+// AND clock remains, a brand-new session starts rather than the strategy
+// just quitting. Only a verified proof or deadlinePassed()/abort ends it.
+// The one thing that crosses the session boundary is lastAttempt — see
+// controlPrompt's header comment for why it's exactly one step, not more.
+async function proveControl(theorem, ctx, tier = 1) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🎯"
+  const sig = theoremSignature(theorem)
+  const label = CONTROL_LABELS[tier] || CONTROL_LABELS[1]
+  const allowSearch = tier === 2 || tier === 4
+  const allowPantograph = tier === 4
+  // Tier I: keep only whichever connected server resolveVerifyUrl picked
+  // (Leak IV). Tier II: everything EXCEPT the Pantograph server (Leak II) —
+  // i.e. Leak IV + Leak I search. Tier IV: Control II's surface PLUS Leak II —
+  // the ONE control where the interactive tactic-stepper reaches the agent.
+  const pantographUrl = resolvePantographUrl(ctx.mcpServers)
+  const allowedServers =
+    tier === 1
+      ? (ctx.mcpServers || []).filter((s) => s?.url === ctx.verifyUrl)
+      : allowPantograph
+        ? (ctx.mcpServers || []).filter((s) => s?.url)
+        : (ctx.mcpServers || []).filter((s) => s?.url && s.url !== pantographUrl)
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🎯 ${label}: one continuous agent one-shots the whole theorem against Leak IV${allowSearch ? " + Leak I search" : " only"}${allowPantograph ? " + Leak II (Pantograph)" : ""} — no decomposition, no give-up state. It keeps resubmitting against the compiler's own error output until it verifies or the clock runs out.`,
+  })
+  let attempt = 0
+  let lastAttempt = null // { script, result } from the previous session's LAST verify_full_script call
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    attempt++
+    if (attempt > 1)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt} — fresh context, same theorem, same gate(s)${lastAttempt ? ", carrying forward the last attempt's final script + compiler response" : ""}.` })
+    const gate = makeProofGate(theorem)
+    // Passively track the LAST verify_full_script call this session made,
+    // overwriting each time — only the most recent one survives to seed the
+    // next attempt's prompt. Mirrors fillHoleForte's tool_use/tool_result
+    // pairing so a failed or unfinished call is never mistaken for success.
+    const pendingVerify = new Map()
+    await spawnProverStream(
+      {
+        prompt: controlPrompt(theorem, allowedServers, attempt, lastAttempt, allowSearch, allowPantograph),
+        mcpServers: allowedServers,
+        model: ctx.model,
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "🎯",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      {
+        onObject: (o) => {
+          const ev = gate.observe(o)
+          try {
+            if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+              for (const c of o.message.content) {
+                if (c?.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script") && c.input && typeof c.input.script === "string")
+                  pendingVerify.set(c.id, c.input.script)
+              }
+            } else if (o?.type === "user" && Array.isArray(o.message?.content)) {
+              for (const c of o.message.content) {
+                if (c?.type !== "tool_result" || !c.tool_use_id || !pendingVerify.has(c.tool_use_id)) continue
+                const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+                lastAttempt = { script: pendingVerify.get(c.tool_use_id), result: t }
+              }
+            }
+          } catch {
+            /* tracking must never break the run */
+          }
+          return !!ev?.verified
+        },
+        emit: ctx.emit,
+      },
+    )
+    if (gate.verifiedScript) {
+      const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+      if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ ${label} closed it on attempt ${attempt} — verified sorry-free against Leak IV.` })
+        return { verified: true, proof: gate.verifiedScript }
+      }
+    }
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 ${label} ran out of clock after ${attempt} attempt(s) without a verified proof.` })
+  return { verified: false, proof: "" }
+}
+
+// Pull the Lean script a BLIND prover emitted: the LAST ```lean (or bare ```)
+// fenced block in its output, else the whole text if it wrote no fence. The
+// blind control has no verify tool, so this text is the proof's only path to
+// the gate.
+function extractLeanScript(text) {
+  const s = String(text || "")
+  const fences = [...s.matchAll(/```(?:lean4?|lean)?\s*\n([\s\S]*?)```/gi)]
+  if (fences.length) return fences[fences.length - 1][1].trim()
+  return s.trim()
+}
+
+// Environment note for Leak Control III, in place of the tool-oriented
+// NO_LOCAL_LEAN_NOTE (which names verify_full_script — a tool this blind control
+// does NOT have). Same local-Lean block + no-internet as every other run, but
+// states plainly there is no verifier and no error feedback. Shell/scratch stay
+// enabled (parity with Control II); only internet + local Lean are off.
+const BLIND_CONTROL_ENV_NOTE = `You are working BLIND. There is NO verifier and NO compiler available to you here: you cannot check whether a proof is correct, and a failed attempt comes back only as "incorrect" — never with an error message, a line number, or any diagnostic. Local Lean/Mathlib on this machine is NOT available and is blocked (\`lean\`, \`lake\`, \`elan\`, \`leanc\` will not run) — do not use or hunt for them; any local checkout is a DIFFERENT Mathlib and its answers can simply be wrong here. You have no internet. You DO have a normal shell and scratch files for your OWN working notes and numeric experiments — use them freely, but nothing on this machine can compile or check Lean for you. Your only deliverable is the proof text itself.`
+
+// Leak Control III — the BLIND arm. The prover is given ONLY the theorem
+// and asked for a complete Lean 4 proof. It has NO verifier, NO compiler, and NO
+// error feedback (see BLIND_CONTROL_ENV_NOTE); local shell/scratch tools stay
+// enabled (matching Control II), but there is no Lean for it to run.
+// This prompt OPENS the run's single continuous conversation (attempt 1);
+// retries normally ride blindControlFollowup on a --resume of that same
+// conversation. The attempt>1 branch here survives only as the fallback for a
+// LOST session (the CLI died before reporting a session id), where the old
+// one-step "you failed N times" memory is all that can be reconstructed.
+function blindControlPrompt(theorem, attempt = 1) {
+  const retry =
+    attempt > 1
+      ? `\nYour previous ${attempt - 1} attempt(s) were checked and were INCORRECT. You are not told why — no error message, no diagnostic, no line number. Produce a fresh, genuinely different complete proof.\n`
+      : ""
+  return `You are proving ONE Lean 4 + Mathlib theorem. Provide a COMPLETE, self-contained Lean 4 script that proves the theorem below: include any imports you need, and a full proof with NO 'sorry' and NO 'admit'. There is no verifier or compiler here and you will get no error feedback — produce your best complete proof from reasoning alone.
+
+Your submitted script is handed VERBATIM to a Lean 4 verification service (real Lean 4 + Mathlib — it is the compiler). So it must be valid Lean 4 that compiles exactly as written: real tactics and lemma names, correct syntax, no natural-language steps, no pseudocode, no placeholders, nothing but Lean.
+
+Output ONLY the script, as a single \`\`\`lean fenced code block. No explanation before or after.
+${retry}
+Theorem (its signature is immutable — prove exactly this):
+${theorem}`
+}
+
+// Follow-up turn for the RESUMED blind conversation (attempt ≥ 2). Unlike the
+// session-lost restart, the prover keeps its whole history — every past proof,
+// every scratch note — but still learns nothing about WHY an attempt failed.
+// Memory across attempts is the ONE variable this arm isolates: Control II
+// gets memory + real compiler errors; blind resampling gets neither. The CLI
+// auto-compacts the conversation when it outgrows the context window, so long
+// runs summarize their history instead of dying.
+function blindControlFollowup(hadScript = true) {
+  const verdict = hadScript
+    ? "That attempt was checked and is INCORRECT. As always, you are not told why — no error message, no diagnostic, no line number."
+    : "Your last reply contained no parseable Lean script, so nothing could be checked."
+  return `${verdict} You have your full history above — reason about what is most likely wrong with your previous attempt(s) and produce a corrected COMPLETE Lean 4 script (imports included, NO 'sorry', NO 'admit').
+
+Output ONLY the script, as a single \`\`\`lean fenced code block. No explanation before or after.`
+}
+
+// Leak Control III driver: a two-role control. Role 1 (prover) is deliberately
+// TOOLLESS — no MCP servers (so no verify_full_script, no Leak IV, no search)
+// and every built-in execution tool disallowed, so it has zero channel to the
+// compiler; its proof reaches the gate only as text. Role 2 (gate) is the SAME
+// authoritative Leak IV daemon check every other run gates on. On a failed gate
+// the prover is told only that it was wrong — never why. Cost/metrics accrue on
+// ctx.metrics exactly like the other controls; the gate itself is a free daemon
+// compile. Parallel-worker behaviour is inherited (one problem per worker).
+//
+// Continuous-session mode: every attempt after the first --resumes the SAME
+// CLI conversation (each attempt is still its own process, so the per-attempt
+// clock, SIGINT cost-flush and metrics all work unchanged). The resumed id is
+// re-read from every call's result because a resume can fork to a fresh id.
+// Only if a call dies without reporting any session id does the loop fall back
+// to a cold blindControlPrompt restart.
+async function proveControlBlind(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🎯"
+  const sig = theoremSignature(theorem)
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought:
+      "🎯 Leak Control III: ONE BLIND agent in ONE continuous conversation is asked for a complete Lean 4 proof — no tools, no compiler, no error feedback. A separate Leak IV gate checks each attempt; on failure the same conversation resumes, told only that it was wrong, never why — it remembers all its past attempts and repeats until it verifies or the clock runs out.",
+  })
+  // Only the internet is off (WebSearch/WebFetch) — same policy as Control II.
+  // Bash/Read/Write/etc. stay ENABLED for scratch + numeric work; local Lean is
+  // still blocked at the settings level, and no MCP servers means no verifier.
+  const BLIND_DISALLOWED = ["WebSearch", "WebFetch"]
+  let attempt = 0
+  let sessionId = "" // the single continuous conversation; "" until attempt 1 opens it (or after a lost session)
+  let lastHadScript = true // shapes the follow-up: "incorrect" vs "no parseable script"
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    attempt++
+    if (attempt > 1)
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought: sessionId
+          ? `🎯 Attempt ${attempt} — resuming the SAME conversation: the prover sees all its past attempts, but is still never told why they failed.`
+          : `🎯 Attempt ${attempt} — previous session was lost; opening a fresh conversation (only the failure count carries over).`,
+      })
+    // Role 1: the blind prover. No MCP servers (so no verify_full_script / no
+    // Leak IV / no compiler feedback) and no internet, but a normal shell for
+    // scratch; unbounded turns per attempt (bounded by the node/run clock).
+    const r = await spawnProverStream(
+      {
+        prompt: sessionId ? blindControlFollowup(lastHadScript) : blindControlPrompt(theorem, attempt),
+        resumeSessionId: sessionId || undefined,
+        mcpServers: [],
+        model: ctx.model,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "🎯",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: 0,
+        disallowedTools: BLIND_DISALLOWED,
+        systemAppend: BLIND_CONTROL_ENV_NOTE,
+        omitLeanNote: true,
+      },
+      { onObject: () => false, emit: ctx.emit },
+    )
+    if (r.sessionId) sessionId = r.sessionId
+    const proof = extractLeanScript(r.finalText)
+    if (!proof) {
+      lastHadScript = false
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: the prover produced no parseable Lean script — retrying.` })
+      continue
+    }
+    lastHadScript = true
+    // Role 2: the Leak IV gate — same authoritative daemon check (hole-free
+    // compile + proves the exact target) as every other run. No text fed back.
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: submitting the blind proof to the Leak IV gate…` })
+    const v = await verifyViaDaemon(proof, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(proof, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Control III closed it on attempt ${attempt} — verified sorry-free against Leak IV.` })
+      return { verified: true, proof }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Attempt ${attempt}: the Leak IV gate rejected it. The prover is told only "incorrect, try again" — retrying.` })
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 Leak Control III ran out of clock after ${attempt} attempt(s) without a verified proof.` })
+  return { verified: false, proof: "" }
+}
+
+// ===========================================================================
+// FORTE — Force plus three additions, audited from a real unsolved Force run
+// on FATE-X (fatex_003 / exists_leftCoset_rightCoset_representative,
+// stronghold-force, 2026-07-31: 19 holes closed but 3 stuck when the hour ran
+// out). The transcript (~/.leak-runs/2026-07-31T08-34-55…jsonl) showed the
+// actual bottleneck wasn't dead search — it was wasted cycles:
+//
+//   - Cycle 3 handed the decomposer 4 live proof states from cut-off minions
+//     with ZERO readable scripts ("0 with a readable script"), because the
+//     only source for "what did this minion already accept" was a live
+//     get_current_proof_state round-trip fired at the shared Leak II daemon
+//     right after a mass recall — precisely when it is busiest and a 15s
+//     timeout is most likely. The decomposer then had almost nothing to work
+//     with and that whole cycle produced 1 hole from nothing.
+//   - Several DIFFERENT, independently-dispatched holes re-derived the exact
+//     same opening moves from scratch (`intro G _ H ι _ r c σ hrd hru hrg hc`
+//     appears verbatim against two unrelated state ids) — there is no channel
+//     for a hole to benefit from a SIBLING hole's progress, only its own
+//     lineage (hist is per-hole).
+//
+// Neither is the vacuous/circular-cut bug that motivated Force's own
+// priorCuts tracking, but a THIRD, related failure mode — an LLM-authored cut
+// whose child is a near-restatement of its own parent — is a documented risk
+// on this family of strategies (one real run lost 20 minutes to an
+// alpha-renamed parent==child hole before priorCuts existed) and had no
+// dedicated gate, so it is closed here too. Fixes, in order of the evidence
+// behind them:
+//
+//   1. LOCAL SCRIPT TRACKING (fillHoleForte) — the accepted-tactic prefix is
+//      built from the minion's OWN tool-call stream as it happens (pairing
+//      every apply_tactic with its own tool_result via applyTacticSucceeded,
+//      keeping only ACCEPTED tactics), so a cut-off minion's progress is
+//      never lost to a failed post-hoc daemon query. forceStateScripts is
+//      kept only as a fallback for states Forte itself never touched (e.g.
+//      inherited via ASSIGN from a splitter).
+//   2. RUN-WIDE OPENING POOL (openingPool) — a cross-hole cache of accepted
+//      opening sequences, ranked against a NEW hole's own goal text with the
+//      same lemmaTokens overlap the lemma pool already uses, surfaced as a
+//      hint (never asserted as fact) so a sibling hole with a similarly-shaped
+//      goal does not re-derive an opening from zero.
+//   3. NEAR-DUPLICATE CUT GUARD (forteExpand) — a cheap, local token-overlap
+//      check (no embedding call) between a proposed sub-hole and its own
+//      parent. A cut whose child restates the parent almost verbatim is
+//      rejected before it is ever spliced in, and the rejection is recorded
+//      as a priorCut so the next splitter attempt does not repeat it.
+//
+// Everything else — the planner, the expand/campaign cycle shape, the
+// dry-cycle breaker, ASSIGN/BRIEF, state ledgering, deepest-first campaign
+// ordering — is Force's, byte-for-byte reused. Force, Surround and Finality
+// are untouched; Forte is a new strategy, not an edit to theirs.
+// ===========================================================================
+
+// Ground truth for whether a Leak II apply_tactic call was accepted: the
+// daemon always answers "Tactic succeeded…" on acceptance and "Tactic
+// failed: …" (or an unknown-state error) otherwise — see Leak-II/server.py's
+// apply_tactic. fillHoleFinality (Force/Finality/Surround's shared minion)
+// pushes every ATTEMPTED tactic unconditionally; a rejected tactic could
+// therefore poison the "already accepted" script a later splitter is told to
+// build on top of. Forte's minion checks this before keeping one.
+function applyTacticSucceeded(resultText) {
+  return /^\s*Tactic succeeded/i.test(String(resultText || ""))
+}
+
+// Cheap, local stand-in for lean-collab's embedding-similarity duplicate/
+// ancestor check: containment rather than pure Jaccard, so a short
+// restatement wholly contained in a longer goal (the common shape of an
+// alpha-renamed vacuous cut) still scores high even when the two texts differ
+// in length. Reuses lemmaTokens — already tuned to drop bound-variable-like
+// short identifiers and syntax words, which is exactly what alpha-renaming
+// changes and what this check needs to see past.
+function tokenOverlapRatio(ta, tb) {
+  if (!ta.size || !tb.size) return 0
+  let inter = 0
+  for (const t of ta) if (tb.has(t)) inter++
+  return inter / Math.min(ta.size, tb.size)
+}
+const FORTE_DUP_REJECT = Number(process.env.LEAK_FORTE_DUP_REJECT || 0.92)
+const FORTE_OPENING_MIN_TACTICS = 3 // an opening worth sharing has at least this many accepted tactics
+const FORTE_OPENING_POOL_MAX = 40
+const FORTE_OPENING_MIN_SCORE = 0.5 // relevance floor for a HINT, looser than the duplicate-cut reject bar
+const FORTE_OPENING_CTX_N = 1 // one best match only — a hint, not a lemma dump
+
+function makeOpeningPool() {
+  return { entries: [] } // { prop, tokens, script, holeId, seq }
+}
+
+// Called from fillHoleForte whenever a hole's minion accepted enough tactics
+// to be worth sharing — CLOSED or cut off, either way the prefix is real,
+// paid-for work.
+function openingPoolAdd(pool, prop, tactics, holeId) {
+  if (!pool || !prop || !tactics || tactics.length < FORTE_OPENING_MIN_TACTICS) return
+  pool.entries.push({ prop, tokens: lemmaTokens(prop), script: tactics.join("\n"), holeId, seq: pool.entries.length })
+  if (pool.entries.length > FORTE_OPENING_POOL_MAX) pool.entries.shift() // oldest-first eviction, same policy as the lemma pool
+}
+
+// Best-matching opening(s) for a NEW hole's own goal, excluding its own
+// lineage — a hole should never be "reminded" of its own prior attempt here,
+// that channel is hist.scripts/priorCuts already.
+function openingPoolBest(pool, focusText, excludeHoleId, limit = FORTE_OPENING_CTX_N) {
+  if (!pool || !pool.entries.length) return []
+  const focus = lemmaTokens(focusText)
+  if (!focus.size) return []
+  return pool.entries
+    .filter((e) => e.holeId !== excludeHoleId)
+    .map((e) => ({ e, score: tokenOverlapRatio(focus, e.tokens) }))
+    .filter((x) => x.score >= FORTE_OPENING_MIN_SCORE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map((x) => x.e)
+}
+
+function openingPoolBlock(pool, focusText, excludeHoleId) {
+  const best = openingPoolBest(pool, focusText, excludeHoleId)
+  if (!best.length) return ""
+  return `\nA DIFFERENT hole elsewhere in this run had a similarly-shaped goal and reached this far before its minion moved on to something else (NOT your hole, NOT guaranteed to still apply here — a hint worth trying, not a fact to build on):\n${best
+    .map((e) => `  from ⟪${e.holeId}⟫:\n\`\`\`lean\n${e.script}\n\`\`\``)
+    .join("\n")}\n`
+}
+
+// Forte's minion. Identical to fillHoleFinality (surroundHoleFillPrompt, the
+// same resume/brief/lemma-pool channels, the same ledgering of init_proof/
+// snapshot_state/branch_tactics ids and lastGoal) except: (a) apply_tactic is
+// only counted toward the accepted script once ITS OWN tool_result confirms
+// it, and (b) a run-wide opening-pool hint is added alongside the lemma pool.
+async function fillHoleForte(skeleton, id, ctx, reg) {
+  if (ctx.signal?.aborted) return { fill: null, decompose: null, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Forte minion working hole ⟪${id}⟫…` })
+  const holeProp = holeHaveInfo(skeleton, id)?.prop || ""
+  const resumeBlock = reg?.resume
+    ? `PREVIOUS PARTIAL PROGRESS: a predecessor minion advanced this very hole to Pantograph state id ${reg.resume}${reg.lastGoal ? ` (last goals: ${oneLine(reg.lastGoal).slice(0, 300)})` : ""}. That state is LIVE and already holds the tactics below — CONTINUE from it (apply_tactic / snapshot_state / branch_tactics on that state id) instead of starting over. Free it with cleanup_memory(state_id) if you abandon it.${
+        reg.script ? `\nTactics this state has already accepted:\n\`\`\`lean\n${reg.script}\n\`\`\`` : ""
+      }`
+    : ""
+  const briefBlock = reg?.brief
+    ? `CARRIED-OVER BRIEFING — the splitter that shaped this hole wrote this from what earlier agents learned BEFORE this hole existed. Treat it as established: do not re-derive what it says is known, and do not re-try what it says already failed.\n${String(reg.brief).slice(0, 2000)}`
+    : ""
+  const lemmaBlock = lemmaPoolBlock(ctx.lemmaPool, holeProp || skeleton)
+  const openingBlock = openingPoolBlock(ctx.openingPool, holeProp || skeleton, id)
+  const resumeExtra = [lemmaBlock, openingBlock, briefBlock, resumeBlock].filter(Boolean).join("\n\n")
+  if (lemmaBlock)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧠 ⟪${id}⟫ starts with the most relevant of ${ctx.lemmaPool.facts.size} lemma(s) already proved on this run.` })
+  if (openingBlock)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧭 ⟪${id}⟫ starts with a related hole's opening moves from elsewhere in this run.` })
+
+  const pendingApply = new Map() // tool_use id -> tactic text, resolved on the matching tool_result
+  const applied = [] // ACCEPTED tactics only
+  const toolNames = new Map()
+  const res = await spawnProverStream(
+    {
+      prompt: surroundHoleFillPrompt(skeleton, id, ctx.mcpServers, resumeExtra),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: `⟪${id}⟫`,
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    {
+      onObject: (o) => {
+        try {
+          if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_use") continue
+              const name = String(c.name || "")
+              if (c.id) toolNames.set(c.id, name.replace(/^.*__/, ""))
+              if (name.endsWith("apply_tactic") && c.input?.tactic && c.id) pendingApply.set(c.id, String(c.input.tactic))
+              if (name.endsWith("cleanup_memory") && typeof c.input?.state_id === "string" && reg)
+                reg.ids.delete(c.input.state_id.toLowerCase())
+            }
+          } else if (o?.type === "user" && Array.isArray(o.message?.content) && reg) {
+            for (const c of o.message.content) {
+              if (c?.type !== "tool_result" || !c.tool_use_id) continue
+              const tool = toolNames.get(c.tool_use_id)
+              if (!tool) continue
+              const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+              if (tool === "apply_tactic" && pendingApply.has(c.tool_use_id)) {
+                const tac = pendingApply.get(c.tool_use_id)
+                pendingApply.delete(c.tool_use_id)
+                if (applyTacticSucceeded(t)) applied.push(tac)
+              }
+              if (/init_proof|snapshot_state|branch_tactics/.test(tool)) {
+                UUID_ANY_RE.lastIndex = 0
+                let m
+                while ((m = UUID_ANY_RE.exec(t)) !== null) reg.ids.add(m[0].toLowerCase())
+              }
+              if (/init_proof|apply_tactic|branch_tactics|get_current_proof_state/.test(tool) && /⊢|Goal/i.test(t))
+                reg.lastGoal = t.slice(-700)
+            }
+          }
+        } catch {
+          /* ledgering must never crash a minion */
+        }
+        return false
+      },
+      emit: ctx.emit,
+    },
+  )
+  if (reg) {
+    reg.tactics.push(...applied)
+    // The primary source proveForte's cycle loop reads from — built locally
+    // as the stream happened, so it survives regardless of whether a live
+    // get_current_proof_state round-trip succeeds afterward. See the FORTE
+    // header comment (#1) for why this exists.
+    if (applied.length) reg.script = (reg.script ? reg.script + "\n" : "") + applied.join("\n")
+  }
+  openingPoolAdd(ctx.openingPool, holeProp, reg?.tactics, id)
+  const fill = parseFillBlock(res.finalText, id)
+  if (fill) return { fill, decompose: null, notes: null }
+  const decompose = parseDecomposeBlock(res.finalText, id)
+  if (decompose) return { fill: null, decompose, notes: null }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Hole ⟪${id}⟫ minion returned no usable FILL/DECOMPOSE block.` })
+  return { fill: null, decompose: null, notes: { text: (res.finalText || "").slice(-800), tactics: applied.slice(-24) } }
+}
+
+// EXPAND, Forte edition. Identical to forceExpand — same splitter
+// (splitHoleForce is reused unchanged), same freshenTags/ASSIGN/BRIEF
+// handling, same state hand-down on a successful cut — plus the near-
+// duplicate cut guard (#3) between the verify check and committing the cut.
+async function forteExpand(skeleton, ctx, sig, hist, stateReg) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  let cutoff = false
+  const timer = setTimeout(() => {
+    cutoff = true
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Expansion window (${Math.round(FORCE_EXPAND_MS / 60000)} min) spent — freezing the skeleton at ${parseHoleIds(partial).length} hole(s) and dispatching minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_EXPAND_MS))
+
+  const roots = parseHoleIds(partial)
+  const depth = new Map(roots.map((id) => [id, 0]))
+  const queue = roots.map((id) => ({ id, d: 0 }))
+  let splits = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const item = queue.shift()
+      if (!item) {
+        if (inFlight === 0) return
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        const { id, d } = item
+        const r = await splitHoleForce(partial, id, ectx, hist?.get(id))
+        if (!r.body) {
+          if (!r.atomic && r.summary) {
+            const e = hist?.get(id)
+            if (e) (e.priorCuts ||= []).push(r.summary)
+          }
+          continue
+        }
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted || deadlinePassed(ctx)) return
+          if (!parseHoleIds(partial).includes(id)) return
+          const parentProp = holeHaveInfo(partial, id)?.prop || ""
+          const { body: freshBody, tags, rename } = freshenTags(r.body, parseHoleIds(partial))
+          const fresh = (t) => rename.get(t) || t
+          const trial = spliceHole(partial, id, freshBody)
+          if (trial === partial) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut could not be spliced into the skeleton — hole left intact.` })
+            return
+          }
+          const v = await verifyViaDaemon(trial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+          if (!(v.ok && isStructurallyValidDecomposition(parseVerifyOutput(v.text)) && scriptProvesTarget(trial, sig))) {
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut rejected by Leak IV — hole left intact.` })
+            return
+          }
+          // NEAR-DUPLICATE CUT GUARD (#3) — cheap local stand-in for lean-
+          // collab's embedding-similarity ancestor check. If a cut's own
+          // child restates the PARENT goal it was supposed to shrink (the
+          // alpha-renamed shape a vacuous cut takes), reject it here rather
+          // than paying a minion's clock to discover the same wall the
+          // parent already stood at.
+          if (parentProp) {
+            const parentTokens = lemmaTokens(parentProp)
+            for (const t of tags) {
+              const childProp = holeHaveInfo(trial, fresh(t))?.prop || holeHaveInfo(trial, t)?.prop || ""
+              if (!childProp) continue
+              const overlap = tokenOverlapRatio(parentTokens, lemmaTokens(childProp))
+              if (overlap >= FORTE_DUP_REJECT) {
+                ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ cut rejected — sub-hole ⟪${t}⟫ restates the parent goal almost verbatim (${Math.round(overlap * 100)}% token overlap), not a real step down. Hole left intact.` })
+                const e = hist?.get(id)
+                if (e) (e.priorCuts ||= []).push(`a cut whose sub-hole restated the parent goal almost verbatim (${Math.round(overlap * 100)}% overlap) — vacuous, not a real simplification`)
+                return
+              }
+            }
+          }
+          partial = trial
+          splits++
+          const reg = stateReg?.get(id)
+          if (reg) {
+            const kept = new Set()
+            for (const { stateId, tag: raw } of r.assigns || []) {
+              const tag = fresh(raw)
+              if (!tags.includes(tag) || !reg.ids.has(stateId)) continue
+              let nr = stateReg.get(tag)
+              if (!nr) {
+                nr = { ids: new Set(), lastGoal: reg.lastGoal, tactics: [...reg.tactics], resume: stateId }
+                stateReg.set(tag, nr)
+              }
+              nr.ids.add(stateId)
+              nr.resume = nr.resume || stateId
+              nr.script = nr.script || hist?.get(id)?.scripts?.find((s) => s.id === stateId)?.script
+              kept.add(stateId)
+            }
+            const dropped = [...reg.ids].filter((i) => !kept.has(i))
+            stateReg.delete(id)
+            if (dropped.length) freeForceStates(ctx, dropped)
+            if (kept.size)
+              ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ ⟪${id}⟫ handed ${kept.size} live proof state(s) down to its sub-hole(s); freed ${dropped.length}.` })
+          }
+          let briefed = 0
+          for (const [raw, text] of Object.entries(r.briefs || {})) {
+            const tag = fresh(raw)
+            if (!tags.includes(tag)) continue
+            let nr = stateReg?.get(tag)
+            if (!nr && stateReg) {
+              nr = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+              stateReg.set(tag, nr)
+            }
+            if (nr) {
+              nr.brief = text
+              briefed++
+            }
+          }
+          hist?.delete(id)
+          for (const t of tags) {
+            depth.set(t, d + 1)
+            if (d + 1 < FORCE_DEPTH) queue.push({ id: t, d: d + 1 })
+          }
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ ⟪${id}⟫ → ${tags.length} hole(s) at depth ${d + 1}/${FORCE_DEPTH}${d + 1 < FORCE_DEPTH ? "" : " (leaf)"} — skeleton now ${parseHoleIds(partial).length} hole(s)${briefed ? `, ${briefed} briefed` : ""}.` })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  if (!cutoff && !ctx.signal?.aborted)
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Expansion exhausted the frontier (depth ${FORCE_DEPTH}) with time to spare — ${parseHoleIds(partial).length} hole(s).` })
+  return { skeleton: partial, splits, depth }
+}
+
+// CAMPAIGN, Forte edition. Identical to forceCampaign except it dispatches
+// fillHoleForte instead of fillHoleFinality.
+async function forteCampaign(skeleton, ctx, depth, banked, stateReg) {
+  let partial = skeleton
+  const ac = new AbortController()
+  const onParentAbort = () => ac.abort()
+  ctx.signal?.addEventListener?.("abort", onParentAbort, { once: true })
+  const timer = setTimeout(() => {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⏱️ Campaign window (${Math.round(FORCE_CAMPAIGN_MS / 60000)} min) spent — recalling the minions.` })
+    ac.abort()
+  }, Math.max(1000, FORCE_CAMPAIGN_MS))
+
+  const queue = parseHoleIds(partial).sort((a, b) => (depth.get(b) ?? 0) - (depth.get(a) ?? 0))
+  const notes = {}
+  const cutoff = {}
+  let closed = 0
+  let inFlight = 0
+  let applyLock = Promise.resolve()
+  const withApplyLock = (fn) => {
+    const p = applyLock.then(fn)
+    applyLock = p.then(() => {}, () => {})
+    return p
+  }
+  const ectx = { ...ctx, signal: ac.signal }
+  const workers = Array.from({ length: Math.max(1, Math.min(FORCE_MINIONS, queue.length)) }, async () => {
+    while (true) {
+      if (ac.signal.aborted || ctx.signal?.aborted || deadlinePassed(ctx)) return
+      const id = queue.shift()
+      if (id === undefined) {
+        if (inFlight === 0) return
+        await new Promise((r) => setTimeout(r, 400))
+        continue
+      }
+      inFlight++
+      try {
+        if (!parseHoleIds(partial).includes(id)) continue
+        let reg = stateReg.get(id)
+        if (!reg) {
+          reg = { ids: new Set(), lastGoal: "", tactics: [], resume: null }
+          stateReg.set(id, reg)
+        }
+        const r = await fillHoleForte(partial, id, ectx, reg)
+        await withApplyLock(async () => {
+          if (ctx.signal?.aborted) return
+          if (r.fill == null) {
+            if (ac.signal.aborted && !ctx.signal?.aborted) cutoff[id] = r.notes || { text: "(cut off before it reported)" }
+            else if (r.notes) notes[id] = r.notes
+            return
+          }
+          const next = spliceHole(partial, id, r.fill)
+          if (next === partial) {
+            if (r.notes) notes[id] = r.notes
+            ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ ⟪${id}⟫ was proved but could not be spliced — back to the decomposer.` })
+            return
+          }
+          partial = next
+          closed++
+          const dead = [...reg.ids]
+          stateReg.delete(id)
+          freeForceStates(ctx, dead)
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Closed hole ⟪${id}⟫ (Forte campaign).` })
+          const openNow = parseHoleIds(partial)
+          ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked + closed, total: banked + closed + openNow.length })
+        })
+      } finally {
+        inFlight--
+      }
+    }
+  })
+  await Promise.all(workers)
+  clearTimeout(timer)
+  ctx.signal?.removeEventListener?.("abort", onParentAbort)
+  return { skeleton: partial, closed, notes, cutoff }
+}
+
+async function proveForte(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const sig = theoremSignature(theorem)
+  ctx.stage = "⚔️"
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Leak Stronghold Forte: Force's ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root, ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion (×${FORCE_SPLIT_N}, depth ${FORCE_DEPTH}) and ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions — plus locally-tracked handoff scripts, a cross-hole opening pool, and a near-duplicate cut guard. A failed campaign goes back to the decomposer, never to a finisher.` })
+
+  ctx.lemmaPool = makeLemmaPool()
+  ctx.openingPool = makeOpeningPool()
+
+  // ---- 1) PLANNER — identical to Force ---------------------------------
+  const gate = makeProofGate(theorem)
+  const verifyScripts = new Map()
+  let skeleton = null
+  const onPlan = (o) => {
+    const ev = gate.observe(o)
+    if (ev?.verified) return true
+    try {
+      if (o.type === "assistant" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script")) verifyScripts.set(c.id, c.input?.script ?? "")
+        }
+      } else if (o.type === "user" && o.message?.content) {
+        for (const c of o.message.content) {
+          if (c.type !== "tool_result" || !verifyScripts.has(c.tool_use_id)) continue
+          const script = verifyScripts.get(c.tool_use_id)
+          const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+          if (isStructurallyValidDecomposition(parseVerifyOutput(t)) && scriptProvesTarget(script, sig) && HAS_HOLE_TAG.test(script)) skeleton = script
+        }
+      }
+    } catch {
+      /* observation must never crash the run */
+    }
+    return false
+  }
+  await spawnProverStream(
+    {
+      prompt: haveTreePlannerPrompt(theorem, ctx.mcpServers, FORCE_PLAN_NOTE),
+      mcpServers: ctx.mcpServers,
+      model: ctx.model,
+      maxTurns: 0,
+      timeoutMs: ctx.nodeTimeoutMs,
+      getDeadline: ctx.getDeadline,
+      stage: "⚔️",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: ctx.searchBudget,
+      lemmaPool: ctx.lemmaPool,
+    },
+    { onObject: onPlan, emit: ctx.emit },
+  )
+
+  if (gate.verifiedScript) {
+    const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Planner closed it outright — no decomposition needed." })
+      return { verified: true, proof: gate.verifiedScript }
+    }
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  if (!skeleton || !parseHoleIds(skeleton).length) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "↩︎ Planner produced no tagged skeleton — nothing to decompose; falling back to single-context have mode." })
+    return proveHaveFlat(theorem, ctx)
+  }
+
+  let partial = skeleton
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Root skeleton verified — ${parseHoleIds(partial).length} hole(s): ${parseHoleIds(partial).map((h) => `⟪${h}⟫`).join(" ")}. Saved; expansion starts now.` })
+  ctx.emit({ type: "checkpoint", skeleton: partial, filled: 0, total: parseHoleIds(partial).length })
+
+  // ---- 2) EXPAND → CAMPAIGN → (failed? EXPAND again) ------------------------
+  const hist = new Map()
+  const stateReg = new Map()
+  const histFor = (id) => {
+    let e = hist.get(id)
+    if (!e) {
+      e = { failed: null, cutoff: null, scripts: [], lastGoal: "", tactics: [], priorCuts: [] }
+      hist.set(id, e)
+    }
+    return e
+  }
+  let banked = 0
+  let cycle = 0
+  let dry = 0
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    cycle++
+    const before = parseHoleIds(partial).length
+    // PRIMARY source: the locally-tracked accepted script fillHoleForte built
+    // as it went (#1) — survives regardless of whether a live re-query
+    // succeeds. Only ids Forte never itself built a local script for (e.g.
+    // inherited via ASSIGN from a splitter, never touched by a Forte minion)
+    // fall back to forceStateScripts' live daemon query.
+    const needsLiveQuery = [...stateReg.entries()].filter(([, reg]) => !reg.script).flatMap(([, reg]) => [...reg.ids])
+    const scriptById = needsLiveQuery.length ? await forceStateScripts(ctx, needsLiveQuery) : new Map()
+    let readableLocal = 0
+    let readableLive = 0
+    for (const [tag, reg] of stateReg) {
+      const e = histFor(tag)
+      if (reg.script) {
+        e.scripts = [{ id: reg.resume || tag, script: reg.script }]
+        readableLocal++
+      } else {
+        e.scripts = [...reg.ids].map((sid) => ({ id: sid, script: scriptById.get(sid) })).filter((s) => s.script)
+        if (e.scripts.length) readableLive++
+      }
+      e.lastGoal = reg.lastGoal || e.lastGoal
+      if (reg.tactics?.length) e.tactics = reg.tactics
+    }
+    const liveStates = [...stateReg.values()].reduce((n, r) => n + r.ids.size, 0)
+    if (liveStates)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Cycle ${cycle}: ${liveStates} live proof state(s) from cut-off minions handed to the decomposer (${readableLocal} readable locally, ${readableLive} more via live query).` })
+    const ex = await forteExpand(partial, ctx, sig, hist, stateReg)
+    partial = ex.skeleton
+    const after = parseHoleIds(partial).length
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Cycle ${cycle} expansion: ${ex.splits} verified cut(s), ${before} → ${after} hole(s). Dispatching ×${Math.min(FORCE_MINIONS, after)} minions for ${Math.round(FORCE_CAMPAIGN_MS / 60000)} min.` })
+    ctx.emit({ type: "checkpoint", skeleton: partial, filled: banked, total: banked + after })
+    if (ctx.signal?.aborted || deadlinePassed(ctx)) break
+
+    const camp = await forteCampaign(partial, ctx, ex.depth, banked, stateReg)
+    partial = camp.skeleton
+    banked += camp.closed
+    for (const [id, n] of Object.entries(camp.notes)) histFor(id).failed = n
+    for (const [id, n] of Object.entries(camp.cutoff)) histFor(id).cutoff = n
+    const left = parseHoleIds(partial)
+    if (!left.length) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `⚔️ Cycle ${cycle} campaign closed every remaining hole (${banked} total).` })
+      break
+    }
+    dry = ex.splits === 0 && camp.closed === 0 ? dry + 1 : 0
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `↩︎ Cycle ${cycle} campaign closed ${camp.closed}/${after} hole(s); ${left.length} still open — returning them to the decomposer (no finisher).`,
+    })
+    if (dry >= FORCE_MAX_DRY_CYCLES) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `🛑 ${FORCE_MAX_DRY_CYCLES} consecutive cycles cut nothing and closed nothing — the loop has converged on a shape it cannot move. Stopping rather than re-buying the same result.` })
+      break
+    }
+  }
+
+  // ---- 3) ASSEMBLE ----------------------------------------------------------
+  const remaining = parseHoleIds(partial)
+  await freeForceStates(ctx, [...forceLedgeredIds(stateReg)])
+  stateReg.clear()
+  if (remaining.length === 0 && !ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "🛡️ All holes filled — assembling and re-verifying the whole proof on the daemon…" })
+    const v = await verifyViaDaemon(partial, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(partial, sig)) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ Leak Stronghold Forte assembled a verified proof: ${banked} hole(s) closed across ${cycle} cycle(s).` })
+      return { verified: true, proof: normalizeProofScript(v.text, partial) }
+    }
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `↩︎ Stitched proof didn't verify (${oneLine(v.text || v.error || "unknown")}).` })
+  } else if (!ctx.signal?.aborted) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚔️ Out of clock with ${remaining.length} hole(s) still open after ${cycle} cycle(s) (${banked} closed). Forte has no finisher by design — the partial skeleton is checkpointed for a resume.` })
+  }
+  return { verified: false, proof: "" }
+}
+
+// ===========================================================================
+// LEAK STRONGHOLD KEEP — Surround, with the endgame protected.
+// ---------------------------------------------------------------------------
+// WHY THIS ARM EXISTS. Head-to-head on the problems both families attempted,
+// Stronghold's ORIGINAL arm is not the weak one: Surround proved fatex_001,
+// _002 and _004 (3/4). What lost ground was everything built on top of it —
+// Finality I 1/7, Force 0/2, Forte 0/1 — and on fatex_003 every Stronghold arm
+// failed while a FLAT agent (Control I and II) closed it in ~25 min. Force ran
+// nearly an hour on that same problem and did not.
+//
+// Two structural causes, both about where the clock goes rather than how the
+// cut is chosen:
+//
+//   1. THE ENDGAME IS STARVED. Surround's minions run against the run-level
+//      deadline, so on a hard problem they consume all of it and the flat
+//      finisher that follows inherits a clock of roughly zero. Force and Forte
+//      went further and deleted the finisher outright ("no finisher by
+//      design"), which is why they can never recover a fragmented run. Some
+//      theorems — fatex_003's normal-core quotient restructuring, reached via
+//      Hall's marriage theorem — need ONE agent holding the WHOLE goal. A
+//      decomposition run must be able to return to that, with real time left.
+//   2. VACUOUS CUTS COMPILE. `have h : P := by sorry` followed by `exact h` is
+//      valid Lean, so a split that merely restates its parent passes the
+//      structural gate and is counted as progress. Observed live: a child
+//      alpha-identical to its parent absorbed 20 minutes.
+//
+// So Keep is Surround plus a clock discipline and a progress gate — three
+// phases over ONE shared deadline, no new agents, no new machinery:
+//
+//   1. VANGUARD (~35%) — the flat prover attacks the WHOLE theorem first, with
+//      the full tool surface. This is deliberately Control's shape: if a
+//      problem yields to a single unfragmented context, Keep takes it there and
+//      never fragments at all. Decomposition becomes a FALLBACK, which is also
+//      the ordering Goedel's Poetry (arXiv 2512.14252 §3.4) arrived at.
+//   2. SIEGE (~40%) — Surround's exact planner + parallel work queue, seeded
+//      with what the vanguard actually compiled, and with the progress gate on
+//      (cutIsVacuous). Bounded, so it cannot eat phase 3.
+//   3. KEEP (the remainder, ≥25%, plus any "+5 min" the operator adds) — the
+//      flat prover again, holding the whole theorem, handed the partially
+//      filled skeleton and every minion's scratch notes. The banked holes are
+//      kept; the residual hard goal finally gets a real budget in one context.
+//
+// The guarantee worth stating plainly: decomposition can no longer consume the
+// endgame, and a run can no longer end with its remaining time spent inside a
+// fragment. Phases PARTITION the operator's existing budget — none of them caps
+// the run, the run still ends only at the shared deadline, and an extension
+// lands wholly in phase 3.
+//
+// Deliberately NOT included: re-decomposition/backtracking, extra watchers,
+// campaign schedulers. Every arm that added machinery to Surround scored below
+// it; the two changes here are the two the run data actually implicates.
+// ===========================================================================
+
+// Fractions of the clock REMAINING when Keep starts. The rest is phase 3.
+const KEEP_VANGUARD_FRAC = Number(process.env.LEAK_KEEP_VANGUARD_FRAC || 0.35)
+const KEEP_SIEGE_FRAC = Number(process.env.LEAK_KEEP_SIEGE_FRAC || 0.4)
+// Used only on an UNCAPPED run (no compute budget ⇒ infinite deadline), where
+// a fraction is meaningless. These bound the phase, never the run: phase 3 then
+// inherits the same infinite clock and runs until proof or Terminate.
+const KEEP_VANGUARD_MS = Number(process.env.LEAK_KEEP_VANGUARD_MS || 15 * 60000)
+const KEEP_SIEGE_MS = Number(process.env.LEAK_KEEP_SIEGE_MS || 20 * 60000)
+
+// A ctx whose deadline is the EARLIER of the run's deadline and this phase's
+// end. Read live, so Terminate still cuts through instantly; `endAt` is fixed
+// at phase start, so a "+5 min" extension flows past the bounded phases and
+// lands entirely in the unbounded finisher — which is the point.
+function phaseCtx(ctx, endAt) {
+  const base = typeof ctx.getDeadline === "function" ? ctx.getDeadline : null
+  return { ...ctx, getDeadline: () => Math.min(base ? base() : Infinity, endAt) }
+}
+
+async function proveStrongholdKeep(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  const t0 = Date.now()
+  const dl = typeof ctx.getDeadline === "function" ? ctx.getDeadline() : Infinity
+  const total = Number.isFinite(dl) ? Math.max(0, dl - t0) : Infinity
+  const capped = Number.isFinite(total)
+  const vanguardMs = capped ? total * KEEP_VANGUARD_FRAC : KEEP_VANGUARD_MS
+  const siegeMs = capped ? total * KEEP_SIEGE_FRAC : KEEP_SIEGE_MS
+  const vanguardEnd = t0 + vanguardMs
+  const siegeEnd = vanguardEnd + siegeMs
+  const mins = (ms) => Math.max(1, Math.round(ms / 60000))
+
+  // ---- 1) VANGUARD — flat, whole theorem, no decomposition ------------------
+  ctx.stage = "🏇"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🏇 Stronghold Keep — phase 1/3 VANGUARD: one agent attacks the WHOLE theorem for ~${mins(vanguardMs)} min before anything is decomposed.`,
+  })
+  const carry = {}
+  const van = await proveHaveFlat(theorem, phaseCtx(ctx, vanguardEnd), { carry })
+  if (van.verified) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Stronghold Keep closed it in the VANGUARD — the theorem never needed decomposing." })
+    return van
+  }
+  if (ctx.signal?.aborted || deadlinePassed(ctx)) return { verified: false, proof: "" }
+
+  // ---- 2) SIEGE — Surround's queue, gated, bounded --------------------------
+  // The vanguard's last compiled script and its error are handed to the planner
+  // so the decomposition is cut around what actually resisted, not around a
+  // fresh reading of the statement.
+  const planNote = [
+    `A DIRECT ATTACK ON THIS EXACT THEOREM ALREADY RAN FOR ~${mins(vanguardMs)} MIN IN ONE CONTEXT AND FAILED. Do not simply retry it — decompose around the step that resisted.`,
+    carry.lastScript ? "Its LAST compiled attempt was:\n```lean\n" + String(carry.lastScript).slice(0, 2600) + "\n```" : "",
+    carry.lastError ? "The compiler's verdict on that attempt was:\n```\n" + String(carry.lastError).slice(0, 1400) + "\n```" : "",
+    "Put your holes where THAT failure is. A hole that restates the theorem is not a decomposition and will be rejected.",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🛰️ Stronghold Keep — phase 2/3 SIEGE: decomposing for ~${mins(siegeMs)} min (progress gate on), holding ~${capped ? mins(Math.max(0, dl - siegeEnd)) + " min" : "the rest of the clock"} in reserve for the finisher.`,
+  })
+  const siege = await proveHaveSurround(theorem, phaseCtx(ctx, siegeEnd), { planNote, cutGate: true, deferFinish: true })
+  if (siege.verified) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Stronghold Keep assembled a verified proof in the SIEGE." })
+    return siege
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+
+  // ---- 3) KEEP — flat again, whole theorem, FULL remaining clock ------------
+  // This phase is why the arm exists: whatever the siege banked comes with it,
+  // but the agent holds the entire goal again and has real time to spend on it.
+  const open = siege.partial ? parseHoleIds(siege.partial).length : 0
+  ctx.stage = "🏰"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🏰 Stronghold Keep — phase 3/3 KEEP: falling back to ONE context on the whole theorem${
+      siege.partial ? ` with ${open} hole(s) still open and the banked steps kept` : ""
+    } (${remainingLabel(ctx)}).`,
+  })
+  return proveHaveFlat(theorem, ctx, { seed: siege.partial || undefined, hints: siege.hints || {} })
+}
+
+// ===========================================================================
+// LEAK STRONGHOLD IMPENETRABLE — Surround, planned from machine reconnaissance.
+// ---------------------------------------------------------------------------
+// The premise: Stronghold's planner is asked to invent a decomposition from a
+// cold reading of the statement, which is the one thing an LLM is WORST at, and
+// it gets exactly one sample. Meanwhile the ghost army can try a tactic on a
+// snapshotted state for a few hundred milliseconds — elaboration, not search, is
+// >99% of the cost (Shen & Shi, arXiv 2605.25556) — and `apply?` will name the
+// Mathlib theorems whose CONCLUSION unifies with the goal. So before the planner
+// says a word, the bridge runs a breadth-first reconnaissance sweep:
+//
+//   root = init_proof(theorem)
+//   repeat, breadth-first, until a depth/node/time cap:
+//     for every state on the frontier:
+//       ask `apply?` (via Leak IV) which Mathlib theorems close this goal
+//       branch_tactics(state, [those suggestions] ++ [a fixed portfolio])
+//       every tactic that advanced becomes a child state on the next frontier
+//
+// This is expansion, not descent: every frontier state is expanded at each
+// level, so the sweep maps the neighbourhood instead of tunnelling down one
+// line. What comes back is empirical rather than imagined — which tactics
+// actually move this goal, which sub-goals a real Mathlib theorem reduces it
+// to, and (occasionally) a closed proof found by nothing but the portfolio.
+//
+// Two properties worth stating:
+//   • `apply?`-derived cuts COMPOSE BY CONSTRUCTION. Unification found a
+//     theorem whose conclusion is the goal, so its hypotheses are a valid
+//     decomposition and the closing step is the application itself. There is no
+//     vacuous-cut failure mode available to it.
+//   • The sweep is a difficulty probe. A hole that four tactics close in 200ms
+//     is not where the proof is hard; a frontier state nothing moves is. That
+//     is the signal the planner has never had.
+//
+// FAIL-SOFT BY CONSTRUCTION. Every stage degrades instead of breaking: no
+// Pantograph ⇒ no sweep; a proposition that will not elaborate ⇒ no sweep; a
+// Leak IV that predates the suggestion patch ⇒ no `apply?` names, portfolio
+// only. In the worst case Impenetrable is exactly Surround with the progress
+// gate on, which is the floor it is designed to have.
+//
+// NOTE: harvesting `apply?` requires the Leak IV change that surfaces
+// severity-3 ("Try this: …") diagnostics behind a [[LEAK_SUGGESTIONS]] marker.
+// Until that Space is redeployed the sweep still runs — it just plans from the
+// fixed portfolio alone.
+// ===========================================================================
+
+const IMPEN_RECON_MS = Number(process.env.LEAK_IMPEN_RECON_MS || 4 * 60000)
+const IMPEN_RECON_DEPTH = Number(process.env.LEAK_IMPEN_RECON_DEPTH || 3)
+const IMPEN_RECON_NODES = Number(process.env.LEAK_IMPEN_RECON_NODES || 24)
+const IMPEN_RECON_BREADTH = Number(process.env.LEAK_IMPEN_RECON_BREADTH || 5)
+const IMPEN_RECON_SUGGEST = Number(process.env.LEAK_IMPEN_RECON_SUGGEST || 4)
+// Per-hole sweeps are much smaller than the root's: one expansion round is
+// where nearly all the value is (does `apply?` name a theorem, does the
+// portfolio close it), and Leak II runs a branch serially, so breadth here is
+// paid once per hole. IMPEN_RECON_CAP_FRAC bounds ALL recon for the run as a
+// fraction of the clock, so recursion can never starve the provers.
+const IMPEN_HOLE_DEPTH = Number(process.env.LEAK_IMPEN_HOLE_DEPTH || 1)
+const IMPEN_HOLE_NODES = Number(process.env.LEAK_IMPEN_HOLE_NODES || 2)
+const IMPEN_HOLE_MS = Number(process.env.LEAK_IMPEN_HOLE_MS || 90000)
+// How many binders the sweep will strip before measuring. Two caps, because one
+// global counter starved deep nodes: peeling five binders at depth 0 left a
+// depth-2 node unable to strip its own, through no fault of its own. PER_NODE is
+// the real allowance — every state gets its own, sized to any realistic binder
+// prefix. TOTAL is only a runaway backstop for the whole sweep.
+const IMPEN_PEEL_PER_NODE = Number(process.env.LEAK_IMPEN_PEEL_PER_NODE || 8)
+const IMPEN_PEEL_TOTAL = Number(process.env.LEAK_IMPEN_PEEL_TOTAL || 40)
+
+// Is this goal still wrapped in binders? Only `∀` (and a leading instance
+// binder, which prints the same way) counts. A top-level `→` is deliberately
+// NOT peeled: telling it apart from the `→` inside `∃ x, P x → Q x` needs a
+// real parse, and guessing wrong strips a binder the goal never had.
+function goalIsQuantified(goalText) {
+  const line = String(goalText || "").split("\n").map((l) => l.trim()).find((l) => l.startsWith("⊢"))
+  if (!line) return false
+  return /^⊢\s*(∀|Π)\s/.test(line)
+}
+const IMPEN_RECON_CAP_FRAC = Number(process.env.LEAK_IMPEN_RECON_CAP_FRAC || 0.25)
+
+// Cheap, high-yield, and safe under Pantograph (single tactic, no `;`-chains,
+// which it rejects). Ordered so the fast decisive ones run first — the sweep is
+// serial inside one Leak II worker, so ordering is the cost control.
+const IMPEN_BASE_TACTICS = [
+  "exact?",
+  "simp_all",
+  "omega",
+  "norm_num",
+  "positivity",
+  "ring",
+  "field_simp",
+  "linarith",
+  "aesop",
+  "constructor",
+  "ext",
+]
+
+// `theorem f (a : α) (h : P a) : Q a := by …`  ⟶  `∀ (a : α) (h : P a), Q a`,
+// i.e. the CLOSED proposition init_proof wants. Returns null when the shape is
+// not confidently readable — the sweep is skipped rather than run on a guess.
+function theoremProposition(src) {
+  const m = String(src || "").match(/\b(?:theorem|lemma)\s+[^\s({[:]+([\s\S]*?)(?=:=)/)
+  if (!m) return null
+  const rest = m[1]
+  let depth = 0
+  let cut = -1
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === "(" || c === "{" || c === "[" || c === "⦃") depth++
+    else if (c === ")" || c === "}" || c === "]" || c === "⦄") depth--
+    else if (c === ":" && depth === 0) {
+      cut = i
+      break
+    }
+  }
+  if (cut < 0) return null
+  const binders = rest.slice(0, cut).trim()
+  const goal = rest.slice(cut + 1).trim()
+  if (!goal) return null
+  return binders ? `∀ ${binders}, ${goal}` : goal
+}
+
+// A Pantograph goal block —
+//   n : ℕ
+//   h : P n
+//   ⊢ Q n
+// — rendered as a standalone `example` we can ask `apply?` about on Leak IV.
+// Returns null on anything we cannot rebuild faithfully: inaccessible names
+// (`n✝`) cannot be written as binders, and a goal we cannot restate is one we
+// must not fabricate.
+// An INACCESSIBLE name, i.e. one Lean will not let you write: `G✝`, `inst✝¹`.
+// Every tactic that introduces binders produces them, so the previous version
+// of this function — which bailed on any block containing `✝` — could only ever
+// query the UN-INTRODUCED root goal, where `apply?` has nothing to suggest but
+// introducing the binders. That is why a live sweep harvested four "theorems"
+// that were all `refine fun G [Group G] H [...] => ?_`. Renaming them instead
+// is what lets the sweep ask about states that carry real content.
+const INACCESSIBLE_RE = /[A-Za-z_][A-Za-z0-9_']*✝[⁰¹²³⁴⁵⁶⁷⁸⁹]*/g
+
+function goalToExample(goalText, tacticSuffix) {
+  const raw = String(goalText || "").split(/\n\s*\n/)[0] || ""
+  if (!raw.includes("⊢")) return null
+
+  // Consistent rename across hypothesis names, their types AND the goal — a
+  // per-line rename would silently change what we are asking about.
+  const rename = new Map()
+  // Longest first: `inst✝` is a PREFIX of `inst✝³`, so substituting the short
+  // one first would rewrite the long one into `ia5³` and change the goal.
+  for (const m of [...new Set(raw.match(INACCESSIBLE_RE) || [])].sort((a, b) => b.length - a.length)) {
+    rename.set(m, `ia${rename.size}`)
+  }
+  // A collision would make us probe a different proposition, so refuse instead.
+  for (const fresh of rename.values()) if (raw.includes(fresh)) return null
+  let block = raw
+  for (const [orig, fresh] of rename) block = block.split(orig).join(fresh)
+  if (block.includes("✝")) return null // an inaccessible shape we did not model
+
+  const lines = block.split("\n").map((l) => l.trim()).filter(Boolean)
+  const binders = []
+  let goal = ""
+  for (const l of lines) {
+    if (l.startsWith("⊢")) {
+      goal = l.replace(/^⊢\s*/, "").trim()
+      continue
+    }
+    const h = l.match(/^([^:]+):(.+)$/)
+    if (!h) return null
+    const names = h[1].trim()
+    if (!/^[A-Za-z_][A-Za-z0-9_'ₙ₀-₉]*(\s+[A-Za-z_][A-Za-z0-9_'ₙ₀-₉]*)*$/.test(names)) return null
+    const type = h[2].trim()
+    // A renamed `inst✝` MUST come back as an instance binder: as an explicit
+    // `(ia0 : Group G)` it is in scope but invisible to instance resolution, so
+    // `G ⧸ H` and every other class-driven notation stops elaborating.
+    const isInstance = names.split(/\s+/).every((n) => /^ia\d+$/.test(n)) && [...rename].some(([o, f]) => /^inst✝/.test(o) && names.split(/\s+/).includes(f))
+    binders.push(isInstance ? `[${type}]` : `(${names} : ${type})`)
+  }
+  if (!goal) return null
+  return `example ${binders.join(" ")} : ${goal} := by ${tacticSuffix}`
+}
+
+// `apply?` answers a goal with whatever unifies, which on a bare `∃ x, P x`
+// means generic existential plumbing — a live sweep came back with
+// `Filter.frequently_principal`, `MeasureTheory.Measure.exists_mem_of_...`,
+// `IsEmpty.exists_iff`. Presenting those under "MATHLIB THEOREMS WHOSE
+// CONCLUSION UNIFIES WITH A GOAL" is worse than presenting nothing, because the
+// briefing tells the planner to weight them above tactics. Three filters, all
+// of them about PROGRESS rather than taste:
+const SUGGESTION_PLUMBING_RE =
+  /\b(Filter|MeasureTheory|Classical\.not_forall|Decidable\.not_forall|IsEmpty|Unique\.exists|Subtype\.exists|Exists\.of_psigma|bex_def|exists_and_iff|exists_congr|existsUnique_iff|ExistsUnique\.exists|nonempty_subtype|not_forall_not|Set\.inter_nonempty|Set\.not_disjoint|Equiv\.exists|eq_of_beq_eq_true)/
+// Pure binder introduction: `refine fun x [Inst x] => ?_`. Not a theorem.
+const SUGGESTION_INTRO_RE = /^\s*(?:\[apply\]\s*)?refine\s+fun\b[\s\S]*=>\s*\?_\s*$/
+
+function usefulSuggestion(tactic, remaining, goalKey) {
+  const body = String(tactic || "").replace(/^\s*\[apply\]\s*/, "").trim()
+  if (!body) return false
+  if (SUGGESTION_INTRO_RE.test(body)) return false
+  if (SUGGESTION_PLUMBING_RE.test(body)) return false
+  if (!goalKey) return true
+  // No progress: it hands back the same goal, or every subgoal it leaves is at
+  // least as big as what we asked about.
+  const keys = remaining.map((r) => alphaKey(r)).filter(Boolean)
+  if (!keys.length) return true
+  if (keys.some((k) => k === goalKey)) return false
+  if (keys.every((k) => k.length >= goalKey.length)) return false
+  return true
+}
+
+// Ask Leak IV which Mathlib theorems unify with this goal. Returns the tactics
+// it suggested (`Try this: exact foo bar` ⟶ `exact foo bar`). Empty on any
+// failure, including a Leak IV that does not yet emit [[LEAK_SUGGESTIONS]].
+// Returns { tactics, introOnly }. `introOnly` is the signal the peel loop runs
+// on: apply? had things to say, but every one of them was "introduce the
+// binders" — i.e. we asked about a goal still wrapped in ∀/→ and there is a
+// real question one `intro` further in.
+async function harvestApplySuggestions(goalText, ctx) {
+  const script = goalToExample(goalText, "apply?")
+  const none = { tactics: [], introOnly: false }
+  if (!script || !ctx.verifyUrl) return none
+  let text = ""
+  try {
+    const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: Math.min(ctx.verifyTimeoutMs || 120000, 90000) })
+    text = v.ok ? v.text : ""
+  } catch {
+    return none
+  }
+  const block = String(text || "").split("[[LEAK_SUGGESTIONS]]")[1]
+  if (!block) return none
+  // Leak IV whitespace-collapses each diagnostic, so one suggestion arrives as
+  // a single line: "Try this: [apply] <tactic> -- Remaining subgoals: -- ⊢ A -- ⊢ B".
+  const goalLine = (String(goalText || "").split("\n").find((l) => l.trim().startsWith("⊢")) || "").replace(/^\s*⊢\s*/, "")
+  const goalKey = alphaKey(goalLine)
+  const out = []
+  const seen = new Set()
+  let dropped = 0
+  let introSeen = 0
+  let considered = 0
+  for (const line of block.split("\n")) {
+    const m = line.match(/Try this:\s*(.+?)\s*$/i)
+    if (!m) continue
+    const whole = m[1].trim()
+    const [tacPart, subgoalPart = ""] = whole.split(/--\s*Remaining subgoals:/)
+    const tac = tacPart.trim()
+    const remaining = subgoalPart
+      .split(/--\s*⊢/)
+      .slice(1)
+      .map((s) => s.replace(/\s*--\s*$/, "").trim())
+      .filter(Boolean)
+    if (!tac || tac.length > 300 || seen.has(tac)) continue
+    seen.add(tac)
+    considered++
+    if (SUGGESTION_INTRO_RE.test(tac.replace(/^\s*\[apply\]\s*/, "").trim())) introSeen++
+    if (!usefulSuggestion(tac, remaining, goalKey)) {
+      dropped++
+      continue
+    }
+    out.push(tac)
+    if (out.length >= IMPEN_RECON_SUGGEST) break
+  }
+  if (dropped) console.log(`[recon] dropped ${dropped} non-progress apply? suggestion(s)`)
+  return { tactics: out, introOnly: out.length === 0 && considered > 0 && introSeen > 0 }
+}
+
+// Parse one branch_tactics reply into per-candidate outcomes.
+function parseBranchResults(text) {
+  const out = []
+  const src = String(text || "")
+  const re = /^\[(\d+)\]\s*(✅|❌)\s*([\s\S]*?)\s*→\s*([\s\S]*?)$/gm
+  let m
+  while ((m = re.exec(src)) !== null) {
+    const ok = m[2] === "✅"
+    const tactic = m[3].trim()
+    const tail = m[4]
+    const done = /PROOF COMPLETE/i.test(tail)
+    const id = (tail.match(/New State ID:\s*(\S+)/) || [])[1] || null
+    // The goals for this candidate run from just after its header to the next
+    // `[n]` header (or the trailing summary line).
+    const after = src.slice(re.lastIndex)
+    const goalsRaw = (after.match(/^\s*Goals:\s*\n([\s\S]*?)(?=\n\[\d+\]|\n\d+\/\d+ candidates|$)/) || [])[1] || ""
+    out.push({ ok, tactic, done, id, goals: goalsRaw.trim() })
+  }
+  return out
+}
+
+// The breadth-first sweep itself. `opts` lets a per-hole sweep run the same
+// machinery on a different proposition and a much smaller budget.
+async function reconSweep(theorem, ctx, opts = {}) {
+  const {
+    proposition = null,
+    depthCap = IMPEN_RECON_DEPTH,
+    nodeCap = IMPEN_RECON_NODES,
+    budgetMs = IMPEN_RECON_MS,
+  } = opts
+  const pantoUrl = resolvePantographUrl(ctx.mcpServers)
+  const empty = { ran: false, closed: null, levels: [], suggestions: [], expanded: 0, dead: [] }
+  if (!pantoUrl) return empty
+  const prop = proposition || theoremProposition(theorem)
+  if (!prop) return empty
+  // A run-wide ceiling so per-hole sweeps can never eat the proving clock.
+  const rb = ctx.reconBudget
+  if (rb && rb.spentMs >= rb.capMs) return empty
+
+  const t0 = Date.now()
+  const overBudget = () =>
+    Date.now() - t0 > budgetMs ||
+    (rb && rb.spentMs + (Date.now() - t0) >= rb.capMs) ||
+    ctx.signal?.aborted ||
+    deadlinePassed(ctx)
+
+  let root
+  try {
+    root = await callRemoteMcpTool(pantoUrl, "init_proof", { proposition: prop }, { timeoutMs: 120000 })
+  } catch {
+    return empty
+  }
+  const rootId = root?.ok ? (String(root.text || "").match(/State ID:\s*(\S+)/) || [])[1] : null
+  if (!rootId) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: "🔭 Recon skipped — the theorem's proposition did not open as a live state." })
+    return empty
+  }
+  const rootGoals = String(root.text || "").split(/Current Goal\(s\):/)[1]?.trim() || ""
+
+  const levels = []
+  const allSuggestions = []
+  const deadTactics = new Map() // tactic -> failures
+  let expanded = 0
+  let peeled = 0
+  let frontier = [{ id: rootId, goals: rootGoals, path: [] }]
+
+  for (let depth = 0; depth < depthCap && frontier.length && !overBudget(); depth++) {
+    const next = []
+    const levelRows = []
+    for (let node of frontier) {
+      if (overBudget() || expanded >= nodeCap) break
+      // PEEL. A `∀`/`→`-wrapped goal is the only thing `apply?` can answer with
+      // "introduce the binders", so every level the sweep spent on a wrapped
+      // goal was thrown away — observed live, three whole levels of
+      // `advanced by: norm_num, aesop, intro` and zero theorems harvested.
+      // Peeling is charged to its OWN counter, never to nodeCap: introducing a
+      // binder is bookkeeping, not exploration, and it should not cost the
+      // sweep a level. apply? itself is the stopping rule — we peel exactly
+      // while every suggestion it offers is another intro.
+      let cur = node
+      let nodePeeled = 0
+      const peelBudget = () => nodePeeled < IMPEN_PEEL_PER_NODE && peeled < IMPEN_PEEL_TOTAL
+      const peelOnce = async () => {
+        let r
+        try {
+          r = await callRemoteMcpTool(pantoUrl, "apply_tactic", { state_id: cur.id, tactic: "intro" }, { timeoutMs: 60000 })
+        } catch {
+          return false
+        }
+        const t = String(r?.ok ? r.text : "")
+        if (!/Tactic succeeded/i.test(t)) return false
+        const goals = t.split(/New Goals:/)[1]?.trim() || ""
+        if (!goals || goals === cur.goals) return false // nothing actually moved
+        peeled++
+        nodePeeled++
+        cur = { id: cur.id, goals, path: [...cur.path, "intro"] }
+        return true
+      }
+      // Strip binders SYNTACTICALLY first — cheap, certain, and no `apply?`
+      // round-trip per binder. Relying on apply? to say "intro" turned out to
+      // be too fragile: on a goal still reading `∀ [inst : Group G] (H : …), …`
+      // it stopped volunteering the intro and the peel stalled one binder in.
+      while (peelBudget() && goalIsQuantified(cur.goals) && !overBudget()) {
+        if (!(await peelOnce())) break
+      }
+      let sug = await harvestApplySuggestions(cur.goals, ctx)
+      // …then let apply? have the last word, for the shapes the syntactic test
+      // does not model (a leading instance binder, an arrow chain).
+      for (let extra = 0; extra < 3 && sug.introOnly && peelBudget() && !overBudget(); extra++) {
+        if (!(await peelOnce())) break
+        sug = await harvestApplySuggestions(cur.goals, ctx)
+      }
+      const suggestions = sug.tactics
+      if (suggestions.length) allSuggestions.push(...suggestions)
+      const candidates = [...suggestions, ...IMPEN_BASE_TACTICS]
+      let res
+      try {
+        res = await callRemoteMcpTool(pantoUrl, "branch_tactics", { state_id: cur.id, tactics: candidates }, { timeoutMs: 300000 })
+      } catch {
+        continue
+      }
+      node = cur
+      expanded++
+      const parsed = parseBranchResults(res?.ok ? res.text : "")
+      for (const p of parsed) if (!p.ok) deadTactics.set(p.tactic, (deadTactics.get(p.tactic) || 0) + 1)
+
+      const finished = parsed.find((p) => p.ok && p.done)
+      if (finished) {
+        // The portfolio closed this state outright. If it is the ROOT, that is
+        // a whole proof; the caller re-verifies it on Leak IV before believing.
+        const path = [...node.path, finished.tactic]
+        levelRows.push({ ...node, hits: parsed.filter((p) => p.ok), closedBy: path })
+        levels.push({ depth, rows: levelRows })
+        if (rb) rb.spentMs += Date.now() - t0
+        return { ran: true, closed: { path, atDepth: depth, isRoot: depth === 0 && node.id === rootId }, levels, suggestions: allSuggestions, expanded, peeled, dead: [...deadTactics.entries()] , prop }
+      }
+
+      // A tactic that left the goal byte-identical did not advance it —
+      // `norm_num` and `aesop` were being counted as progress on goals they
+      // never touched, filling the briefing with fake breadth and eating
+      // frontier slots. Same test the peel loop uses.
+      const norm = (g) => String(g || "").replace(/\s+/g, " ").trim()
+      const hits = parsed.filter((p) => p.ok && p.id && p.goals && norm(p.goals) !== norm(node.goals))
+      levelRows.push({ ...node, hits })
+      // Keep the most INFORMATIVE children: distinct goal states, widest first.
+      const seenGoal = new Set()
+      for (const h of hits) {
+        const key = h.goals.replace(/\s+/g, " ").slice(0, 400)
+        if (seenGoal.has(key)) continue
+        seenGoal.add(key)
+        next.push({ id: h.id, goals: h.goals, path: [...node.path, h.tactic] })
+      }
+    }
+    if (levelRows.length) levels.push({ depth, rows: levelRows })
+    frontier = next.slice(0, IMPEN_RECON_BREADTH)
+  }
+  if (rb) rb.spentMs += Date.now() - t0
+  return { ran: true, closed: null, levels, suggestions: allSuggestions, expanded, peeled, dead: [...deadTactics.entries()], prop }
+}
+
+// ---- PER-HOLE RECON --------------------------------------------------------
+// The root sweep only ever briefed the PLANNER, so every hole a minion picked
+// up — and, worse, every sub-hole a mid-run split created — was worked with
+// none of the evidence the planner got, and Impenetrable's advantage decayed
+// with depth. Fixing that needs the hole's goal as a CLOSED proposition, which
+// is exactly the have-to-lemma lifting problem: a `have`'s statement means
+// nothing outside its enclosing binders and the earlier `have`s it may cite.
+//
+// So we lift: ∀ over (the theorem's own binders) ++ (every earlier `have`,
+// as a hypothesis), with the hole's stated proposition as the body. That
+// over-abstracts — the hole probably does not need every earlier step — but
+// over-abstraction only makes the probe's goal harder than the real one, so a
+// tactic that closes it here would certainly close it there. Under-abstracting
+// would silently probe a DIFFERENT proposition, which is the failure that
+// actually matters.
+function theoremBinderText(src) {
+  const m = String(src || "").match(/\b(?:theorem|lemma)\s+[^\s({[:]+([\s\S]*?)(?=:=)/)
+  if (!m) return ""
+  const rest = m[1]
+  let depth = 0
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if (c === "(" || c === "{" || c === "[" || c === "⦃") depth++
+    else if (c === ")" || c === "}" || c === "]" || c === "⦄") depth--
+    else if (c === ":" && depth === 0) return rest.slice(0, i).trim()
+  }
+  return ""
+}
+
+// Every `have` STATED before hole `id`, rendered as binders. Anonymous haves
+// become `(_ : P)` so their fact is still in scope without inventing a name a
+// later step might collide with.
+function haveBindersBefore(skeleton, id) {
+  const src = String(skeleton || "")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const lines = src.split("\n")
+  const stop = lines.findIndex((l) => markRe.test(l))
+  if (stop < 0) return null
+  const out = []
+  for (const line of lines.slice(0, stop)) {
+    const m = line.match(/\bhave\b\s*([^:\s]*)\s*:([\s\S]*?):=/)
+    if (!m) continue
+    const prop = m[2].trim()
+    if (!prop) continue
+    const name = m[1].trim()
+    out.push(`(${name && /^[A-Za-z_][A-Za-z0-9_'!?]*$/.test(name) ? name : "_"} : ${prop})`)
+  }
+  return out
+}
+
+// A real skeleton opens with tactic-level context the `have`s depend on but
+// that no binder records — observed live on a group-theory skeleton whose holes
+// referenced `Lt`/`Rt` from `set`, and needed `Fintype` instances from `letI`
+// and decidability from `classical`. Lifting without these produces a
+// proposition mentioning undefined names, which does not elaborate, which
+// silently disables the whole per-hole sweep. So:
+//   `set X := e`            ⟶ textually substitute X back to (e)
+//   `letI/haveI : T := _`   ⟶ an instance binder [T]
+//   `letI/haveI n : T := _` ⟶ a named binder (n : T)
+//   `classical`             ⟶ [∀ p, Decidable p], so Finset.filter elaborates
+function tacticContextBefore(skeleton, id) {
+  const src = String(skeleton || "")
+  const markRe = new RegExp("--\\s*⟪\\s*" + id + "\\s*⟫")
+  const lines = src.split("\n")
+  const stop = lines.findIndex((l) => markRe.test(l))
+  if (stop < 0) return null
+  const subs = []
+  const binders = []
+  let classical = false
+  for (const line of lines.slice(0, stop)) {
+    const t = line.trim()
+    if (/^classical\b/.test(t)) classical = true
+    const s = t.match(/^set\s+([A-Za-z_][A-Za-z0-9_']*)\s*(?::[^:=]*)?:=\s*(.+?)(?:\s+with\s+\S+)?$/)
+    if (s) {
+      subs.push([s[1], `(${s[2].trim()})`])
+      continue
+    }
+    const li = t.match(/^(?:letI|haveI|let|have)\s+([A-Za-z_][A-Za-z0-9_']*)?\s*:\s*([\s\S]*?)\s*:=/)
+    if (li && /^(letI|haveI)\b/.test(t)) {
+      const name = li[1]
+      binders.push(name ? `(${name} : ${li[2]})` : `[${li[2]}]`)
+    }
+  }
+  return { subs, binders, classical }
+}
+
+const applySubs = (text, subs) =>
+  subs.reduce(
+    (acc, [name, val]) => acc.replace(new RegExp(`(^|[^.\\w'])${name}(?![\\w'])`, "g"), `$1${val}`),
+    String(text || ""),
+  )
+
+function closedHoleProposition(skeleton, id) {
+  const body = holePropOf(skeleton, id)
+  if (!body) return null
+  const ctxt = tacticContextBefore(skeleton, id)
+  if (!ctxt) return null
+  const binders = theoremBinderText(skeleton)
+  const haves = haveBindersBefore(skeleton, id)
+  if (haves === null) return null
+  const all = [
+    binders,
+    ...ctxt.binders,
+    ctxt.classical ? "[∀ (p : Prop), Decidable p]" : "",
+    ...haves.map((h) => applySubs(h, ctxt.subs)),
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .trim()
+  const goal = applySubs(body, ctxt.subs)
+  return all ? `∀ ${all}, ${goal}` : goal
+}
+
+// A small sweep on ONE hole, cached across the run by the hole's alpha-key so
+// two holes with the same shape are probed once. Returns "" when it has nothing
+// worth saying — the minion prompt is then exactly Surround's.
+// Every exit reports itself. A silent per-hole sweep is the same blindness the
+// root sweep had before its briefing was emitted: from a run log you could not
+// tell a hole that was briefed from one that was skipped, from one that was
+// briefed and ignored — and that is the only question worth asking of this arm.
+// The skip reasons are distinct on purpose; each points at a different fix.
+async function holeRecon(skeleton, id, ctx) {
+  const say = (thought, subtype = "status") => ctx.emit({ type: "message-annotation", subtype, thought })
+  const rb = ctx.reconBudget
+  if (rb && rb.spentMs >= rb.capMs) {
+    say(`🔭 ⟪${id}⟫ no hole sweep — the run's recon budget is spent (${Math.round(rb.spentMs / 1000)}s of ${Math.round(rb.capMs / 1000)}s). Minion proceeds as plain Surround.`)
+    return ""
+  }
+  const prop = closedHoleProposition(skeleton, id)
+  if (!prop) {
+    say(`🔭 ⟪${id}⟫ no hole sweep — could not lift this hole to a closed proposition (unreadable \`have\`, or tactic context this lifter does not model).`, "error")
+    return ""
+  }
+  const key = alphaKey(prop)
+  if (ctx.reconCache?.has(key)) {
+    const cached = ctx.reconCache.get(key)
+    say(`🔭 ⟪${id}⟫ reusing a cached sweep — an earlier hole had the same goal shape${cached ? "" : " (and it found nothing)"}.`)
+    return cached
+  }
+  let brief = ""
+  let stats = null
+  try {
+    const r = await reconSweep(null, ctx, {
+      proposition: prop,
+      depthCap: IMPEN_HOLE_DEPTH,
+      nodeCap: IMPEN_HOLE_NODES,
+      budgetMs: IMPEN_HOLE_MS,
+    })
+    if (r?.ran) {
+      stats = { expanded: r.expanded, suggestions: [...new Set(r.suggestions || [])].length, closed: !!r.closed }
+      const closedNote = r.closed
+        ? `\n\nTHIS HOLE'S GOAL WAS CLOSED OUTRIGHT by [${r.closed.path.join(" ; ")}] on an over-abstracted version of it (every earlier step was assumed, so your real goal is no harder). Try that first, inline, and do not decompose this hole.`
+        : ""
+      brief = reconBriefing(r) + closedNote
+    } else {
+      say(`🔭 ⟪${id}⟫ hole sweep did not run — the lifted proposition did not open as a live state. Lifted was: ${oneLine(prop)}`, "error")
+    }
+  } catch (e) {
+    say(`🔭 ⟪${id}⟫ hole sweep errored (${oneLine(e?.message || e)}) — minion proceeds without it.`, "error")
+    brief = ""
+  }
+  const note = brief
+    ? `${brief}\n\nThis is EVIDENCE about your hole, not instructions. It was measured on your goal with every earlier step assumed, so anything that closed it will close yours. If it shows nothing useful, ignore it and prove the hole your own way — and if the portfolio already closes it, just close it rather than splitting it further.`
+    : ""
+  if (stats)
+    say(
+      `🔭 ⟪${id}⟫ HOLE BRIEFING (${note.length} chars — ${stats.expanded} state(s), ${stats.suggestions} apply? theorem(s)${stats.closed ? ", GOAL CLOSED OUTRIGHT" : ""}):\n${note || "(nothing worth reporting — minion gets the plain Surround prompt)"}`,
+    )
+  ctx.reconCache?.set(key, note)
+  return note
+}
+
+// Render the sweep as a BRIEFING. Written to inform without anchoring: it
+// reports what the machine measured and explicitly refuses to recommend a plan,
+// because a planner handed a plan stops planning.
+function reconBriefing(recon) {
+  if (!recon?.ran) return ""
+  const parts = []
+  parts.push(
+    "MACHINE RECONNAISSANCE (already done — it cost you nothing, and it is EVIDENCE, not a proposal).",
+    `A breadth-first sweep expanded ${recon.expanded} live goal state(s) on the interactive prover, trying \`apply?\`-suggested Mathlib theorems and a standard tactic portfolio against each, and recording what actually moved.${
+      recon.peeled ? ` Binders were introduced ${recon.peeled}× first, so every measurement below is of the goal UNDER its quantifiers, not of the quantifiers.` : ""
+    }`,
+  )
+  const uniqSug = [...new Set(recon.suggestions)]
+  if (uniqSug.length) {
+    parts.push(
+      "MATHLIB THEOREMS WHOSE CONCLUSION UNIFIES WITH A GOAL IN THIS PROOF (from `apply?` — these are real, they type-check against the goal, and their own hypotheses are a ready-made decomposition):\n" +
+        uniqSug.map((s) => `  • ${s}`).join("\n"),
+    )
+  }
+  for (const lvl of recon.levels) {
+    const rows = []
+    for (const r of lvl.rows) {
+      const moved = (r.hits || []).map((h) => h.tactic)
+      const goal = String(r.goals || "").split("\n").filter((l) => l.trim().startsWith("⊢"))[0] || String(r.goals || "").split("\n")[0] || ""
+      rows.push(
+        `  state${r.path?.length ? ` after [${r.path.join(" ; ")}]` : " (the theorem itself)"}: ${oneLine(goal)}\n` +
+          `    advanced by: ${moved.length ? moved.map((t) => `\`${t}\``).join(", ") : "NOTHING in the portfolio"}`,
+      )
+    }
+    if (rows.length) parts.push(`DEPTH ${lvl.depth}:\n${rows.join("\n")}`)
+  }
+  const stubborn = recon.levels.flatMap((l) => l.rows.filter((r) => !(r.hits || []).length))
+  if (stubborn.length)
+    parts.push(
+      `${stubborn.length} state(s) resisted EVERY tactic tried. Those are where this proof is actually hard — a decomposition that does not address them has not decomposed anything.`,
+    )
+  return parts.join("\n\n")
+}
+
+// The plan note. Two jobs beyond delivering the briefing: keep the planner from
+// anchoring on the sweep, and keep it from deliberating. Both are stated as
+// where Impenetrable's advantage comes from, because a planner told WHY a
+// constraint exists honours it better than one merely told to obey.
+function impenetrablePlanNote(recon) {
+  const briefing = reconBriefing(recon)
+  if (!briefing) return ""
+  return `${briefing}
+
+HOW TO USE THE ABOVE — read it once, then think for yourself:
+- It is a map of the neighbourhood, NOT a proposal and NOT a ranking. It shows what cheap machinery can and cannot do; it says nothing about what the RIGHT argument is. Do not build your skeleton by stitching these tactics together.
+- The parts it closed instantly are, by definition, NOT where the difficulty is. Do not spend holes on them — close them inline.
+- The states nothing moved are the real content of this theorem. Your holes belong there.
+- A theorem \`apply?\` found is worth more than a tactic it found: applying it turns its hypotheses into your holes, and the closing step is the application itself, so that cut is guaranteed to compose.
+- If the sweep suggests nothing useful, ignore it entirely. It is a probe, not an authority, and it is blind to any argument requiring an idea.
+
+PACE — this is where Impenetrable wins or loses. The mechanical exploration has ALREADY been done for you; that is the entire point of the sweep. So your scarce resource is not exploration, it is JUDGEMENT — the one call the machine cannot make: where does this argument actually break? Make that call deliberately, then commit. Spending around TEN minutes here is well spent if it buys a skeleton whose holes are the real mathematical content; spending thirty is not, because every minute beyond that is taken from the minions who have to fill your holes and the finisher who has to close whatever they leave. What that budget is FOR is the mathematics — reading the sweep, choosing the argument, checking the assembly compiles. It is not for filler: do not run no-op shell commands, do not re-derive what the briefing already told you, and do not polish a skeleton that already type-checks. Decide, compile the skeleton, hand it over.`
+}
+
+async function proveStrongholdImpenetrable(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🔭"
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🔭 Stronghold Impenetrable — reconnaissance: breadth-first \`apply?\`-driven sweep over the ghost army (≤${IMPEN_RECON_DEPTH} levels, ≤${IMPEN_RECON_NODES} states, ≤${Math.round(IMPEN_RECON_MS / 60000)} min) before the planner sees anything.`,
+  })
+
+  // One shared recon budget for the WHOLE run (root sweep + every per-hole
+  // sweep). Recon is only worth paying for if it leaves the provers their time.
+  const dl = typeof ctx.getDeadline === "function" ? ctx.getDeadline() : Infinity
+  const capMs = Number.isFinite(dl)
+    ? Math.max(IMPEN_RECON_MS, (dl - Date.now()) * IMPEN_RECON_CAP_FRAC)
+    : IMPEN_RECON_MS * 4
+  ctx.reconBudget = { capMs, spentMs: 0 }
+  ctx.reconCache = new Map()
+
+  let recon = { ran: false }
+  try {
+    recon = await reconSweep(theorem, ctx)
+  } catch (e) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `🔭 Recon aborted (${oneLine(e?.message || e)}) — planning without it.` })
+  }
+
+  // The sweep occasionally just closes the theorem. Never trust it on its own
+  // word: rebuild the script and put it through the same independent Leak IV
+  // gate every other proof goes through.
+  if (recon?.closed?.isRoot && recon.prop) {
+    const script = `theorem ${declName(theoremSignature(theorem)) || "recon_proof"}_recon : ${recon.prop} := by\n  ${recon.closed.path.join("\n  ")}`
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔭 The sweep CLOSED the goal with [${recon.closed.path.join(" ; ")}] — re-verifying independently.` })
+    const v = await verifyViaDaemon(script, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+    if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text))) {
+      // It proves the PROPOSITION, not necessarily the target's exact signature,
+      // so hand it to the planner as a gift rather than claiming the run.
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "✅ Recon's closing tactic sequence verified — handing it to the planner as a proven opening." })
+      recon.verifiedOpening = script
+    }
+  }
+
+  if (recon?.ran)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🔭 Recon done — ${recon.expanded} state(s) expanded, ${[...new Set(recon.suggestions || [])].length} \`apply?\` theorem(s) harvested. Planning from evidence.`,
+    })
+
+  const note = [
+    impenetrablePlanNote(recon),
+    recon?.verifiedOpening ? "AN ALREADY-VERIFIED OPENING (compiles today, use it if it helps):\n```lean\n" + recon.verifiedOpening + "\n```" : "",
+  ]
+    .filter(Boolean)
+    .join("\n\n")
+
+  // Emit the ACTUAL briefing. The run's "full agent context" frame is built
+  // before the sweep runs, so it can only ever show a placeholder — without
+  // this, an operator cannot tell whether the planner was briefed at all, or
+  // whether it ignored a briefing it did receive. That distinction is the
+  // whole evaluation of this arm.
+  if (note)
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🔭 BRIEFING HANDED TO THE PLANNER (verbatim, ${note.length} chars):\n${note}`,
+    })
+
+  // Everything downstream is Surround, unchanged, with the progress gate on.
+  return proveHaveSurround(theorem, ctx, { planNote: note, cutGate: true, holeRecon: true })
+}
+
+// ===========================================================================
+// ARCHITECT — Goedel-Architect pipeline (arXiv 2606.06468), style: "architect"
+// ---------------------------------------------------------------------------
+// Faithful replication of the paper's three-stage loop on the Leak stack:
+//
+//   1. BLUEPRINT GENERATION — one model conversation emits a dependency graph
+//      of `@[blueprint]` declarations (LeanArchitect syntax, bodies
+//      `:= by sorry_using [deps]`), iterating against Leak XII's lean_compile
+//      gate (structural safeguards → Lean compile → graph validation) until
+//      "Compilation SUCCESSFUL. Validation SUCCESSFUL."
+//   2. THEOREM PROVING — every unsolved node is dispatched to a FRESH, ISOLATED
+//      prover conversation in parallel. A node prover sees ONLY its lemma and
+//      its declared parents' signatures (the paper's context discipline — no
+//      global transcript, no sibling proofs). Outcomes: solved, formally
+//      negated (compiler-corroborated disproof), or a structured forfeit
+//      (## Diagnosis / ## Analysis / ## Suggested Fix).
+//   3. BLUEPRINT REFINEMENT — a fresh conversation reads the annotated graph
+//      (decls + `-- PROVED`/`-- UNPROVED` markers + per-failure Diagnosis
+//      blocks — compact signals, never transcripts) and emits a revised
+//      blueprint. Proved nodes carry their proofs forward as long as their
+//      signature is byte-identical (modulo whitespace). Loop ≤ 8 iterations.
+//
+// The driver is xAI's Grok (default grok-4.1 fast tier — the closest open
+// analogue to the paper's DeepSeek-V4-Flash backbone), spoken to directly
+// over the OpenAI-compatible chat/completions API with function calling.
+// No Claude CLI is involved on this path.
+//
+// Budgets (paper Appendix A): blueprint 262,144 tokens/attempt, ≤8 attempts;
+// node 65,536 tokens/attempt, ≤4 attempts; refinement 262,144, ≤8 attempts
+// per step; ≤8 refinement iterations. The run-level wall clock (ctx.getDeadline)
+// still governs everything, so Terminate / +5 min behave as usual.
+//
+// Context management: fresh conversation per stage attempt and per node
+// (bounded, cache-aligned: the static behavioral prompt is the stable prefix
+// xAI's implicit caching keys on); within a conversation, stale tool outputs
+// are digested down once they stop being the latest compiler signal, so a
+// long compile-fix loop can't quadratically flood its own window. The exit
+// is compiler-gated end-to-end: only Leak XIV's certificate of the assembled
+// proof counts as success.
+// ===========================================================================
+
+const ARCHITECT_MODEL_LADDER = [
+  // Verified live against api.x.ai on 2026-07-26: the SKU uses dashes.
+  "grok-4-1-fast-reasoning",
+  "grok-4-1-fast-non-reasoning",
+  "grok-4.1-fast-reasoning",
+  "grok-4.1",
+  "grok-3-mini",
+]
+// The wall clock (UI compute budget) and the refinement iteration budget
+// (maxIters) are the governors meant to bind on how LONG a run goes and how
+// many refinement passes it gets. How many FRESH ATTEMPTS a node/blueprint
+// stage gets was previously also artificially capped (6/8/8) — that ceiling
+// is lifted (effectively unbounded; the attempt loop already breaks on
+// deadlinePassed()/architectCapStop()), so an attempt only stops being
+// retried when time or the cost cap runs out.
+//
+// hardTurns and the per-attempt token budgets are NOT the same kind of cap:
+// they're what forces ONE attempt to give up and hand off to a FRESH attempt
+// (with a note about what failed, prompting a structurally different route).
+// Removing them (tried once, reverted) let a stuck model spin in the same
+// conversation for 35+ minutes cycling near-identical failed variants of one
+// proof, never getting the reset that helps it escape a rut. Kept at their
+// original sizes.
+const ARCHITECT_BLUEPRINT_TOKENS = 262144
+// Per-attempt caps that force ONE node-proving attempt to give up and hand off
+// -- to a fresh attempt, or (once the model actually produces a `## Diagnosis`)
+// to blueprint-level refinement. See the note above on why hardTurns/token
+// budgets exist at all: they're what turns a stuck attempt into a forfeit.
+//
+// River's grok turns are near-instant xAI API calls; Ultra's are full local
+// Claude CLI round-trips that can each take minutes. The SAME turn cap for
+// both therefore means Ultra waits far longer in real wall-clock time before
+// a stuck node ever hands off — observed live (ultra-fleeting,
+// sum_gcd_pow_two): three nodes still on submission #1-#2 of "attempt 1/9999"
+// after 45+ minutes, refinement never reached in that time. Keyed by driver so
+// each can be tuned to how expensive ITS OWN turns actually are, independently
+// and without a code change. Grok's defaults are exactly the prior shared
+// values (60 turns / 131072 tokens) -- River's behavior is unchanged unless
+// these are explicitly overridden.
+const ARCHITECT_NODE_HARD_TURNS = {
+  claude: Number(process.env.ARCHITECT_NODE_HARD_TURNS_CLAUDE || 20),
+  grok: Number(process.env.ARCHITECT_NODE_HARD_TURNS_GROK || 60),
+}
+const ARCHITECT_NODE_TOKENS_BY_DRIVER = {
+  claude: Number(process.env.ARCHITECT_NODE_TOKENS_CLAUDE || 131072),
+  grok: Number(process.env.ARCHITECT_NODE_TOKENS_GROK || 131072),
+}
+// MCP tools/call timeouts — match the Python services' own defaults
+// (BLUEPRINT_TIMEOUT_S/NODE_TIMEOUT_S/VERIFY_TIMEOUT_S).
+const BLUEPRINT_TIMEOUT_MS = 600000
+const NODE_TIMEOUT_MS = 300000
+const VERIFY_TIMEOUT_MS = 600000
+// How long the CLI may produce nothing before the bridge says so. Purely a
+// notice: it never stops anything.
+// Effort for Leak Ultra's BLUEPRINT stage only. Blueprint generation is a
+// structuring task -- read the target, maybe search, emit a `sorry_using`
+// skeleton -- and it proves nothing, so maximum deliberation is spent on
+// mathematics it has not been asked to do yet. Measured on insane_lamp_circle,
+// three concurrent arms on the same bridge:
+//
+//   baseline (CLI default effort)                375s, 0 tool calls
+//   + "explore-compile FIRST" added to C.1       375s, 0 tool calls
+//   + --effort low                               214s, 7 tool calls
+//
+// The prompt lever did nothing; this is the one that works. Node proving keeps
+// the default -- that stage is real proof search and the deliberation earns its
+// keep. Override with ARCHITECT_BLUEPRINT_EFFORT to try another level without a
+// code change.
+const ARCHITECT_BLUEPRINT_EFFORT = process.env.ARCHITECT_BLUEPRINT_EFFORT || "low"
+const ARCHITECT_IDLE_NOTICE_S = 45
+// Ceiling on get_current_proof_state fetches per refinement (see stateScripts).
+const MAX_STATE_SCRIPTS = Number(process.env.LEAK_MAX_STATE_SCRIPTS || 8)
+const ARCHITECT_BLUEPRINT_RETRIES = 9999
+const ARCHITECT_NODE_RETRIES = 9999
+const ARCHITECT_REFINE_RETRIES = 9999
+// Default refinement-iteration budget. The UI sends a per-run value (its own
+// default is 5, +1 per click) as opts.maxIters, so this is only the fallback
+// for callers that don't specify one.
+const ARCHITECT_MAX_ITERS = Number(process.env.ARCHITECT_MAX_ITERS || 5)
+// Model for the river-delta natural-language proof seed. Runs through the LOCAL
+// Claude CLI (one shot, no tools), so its cost is whatever the CLI reports as
+// total_cost_usd on its result frame — see architectNlSeed.
+const ARCHITECT_SEED_MODEL = process.env.ARCHITECT_SEED_MODEL || "claude-sonnet-5"
+// river-vintage only: divide the per-attempt budgets above by this before a
+// stuck blueprint/node attempt is forced to hand off. With watchers active to
+// correct attempts inline, a stuck attempt doesn't need the full rope stone
+// was tuned for — and without this, refinement (the architecture's "hindsight"
+// stage) could go unreached for 20+ minutes of wall-clock. Stone/gate/delta
+// are untouched (divisor 1) so their research numbers stay exactly as tuned.
+const ARCHITECT_VINTAGE_CUTOFF_DIVISOR = Number(process.env.ARCHITECT_VINTAGE_CUTOFF_DIVISOR || 3)
+
+// --- Cost accounting ---------------------------------------------------------
+// USD per MILLION tokens for the xAI models this pipeline drives. Keyed by
+// model-id prefix, longest match first, so a ladder fallback is still priced
+// correctly. Verified against xAI's published pricing for the grok-4.1-fast
+// SKUs; `c` is the cached-input (prompt-cache read) rate.
+//
+// The Sonnet seed is NOT priced here: the Claude CLI reports its own
+// authoritative `total_cost_usd`, which already accounts for cache reads and
+// writes, so using the reported figure is both more accurate and immune to
+// price changes (e.g. Sonnet 5's introductory rate ending 2026-08-31).
+const GROK_PRICES = [
+  ["grok-4.3", { i: 1.25, o: 2.5, c: 0.2 }],
+  ["grok-4-3", { i: 1.25, o: 2.5, c: 0.2 }],
+  ["grok-4.1-fast", { i: 0.2, o: 0.5, c: 0.05 }],
+  ["grok-4-1-fast", { i: 0.2, o: 0.5, c: 0.05 }],
+  ["grok-4.1", { i: 0.2, o: 0.5, c: 0.05 }],
+  ["grok-3-mini", { i: 0.3, o: 0.5, c: 0.075 }],
+]
+function grokPrice(model) {
+  const m = String(model || "").toLowerCase()
+  let best = null
+  for (const [prefix, price] of GROK_PRICES) {
+    if (m.startsWith(prefix) && (!best || prefix.length > best[0].length)) best = [prefix, price]
+  }
+  // Unknown SKU: fall back to the fast-tier rate rather than reporting $0, so a
+  // new model id can never make a run look free in the research tables.
+  return best ? best[1] : { i: 0.2, o: 0.5, c: 0.05 }
+}
+// Recompute the run's total cost from cumulative token counts + the seed's
+// CLI-reported cost. Called after every Grok reply so the live UI figure and the
+// cap guard always reflect the same number the research row records.
+function architectRecost(ctx, state) {
+  // Claude driver (Leak Ultra): the CLI reports authoritative total_cost_usd per
+  // stage, already accounting for cache reads/writes — no price table, and the
+  // accumulated figure is used as-is. Grok driver: priced from token counts.
+  let driver
+  if (state.driver === "claude") {
+    driver = Number(Number(state.driverCostUsd || 0).toFixed(6))
+  } else {
+    const p = grokPrice(state.model)
+    driver = Number(
+      (((state.usage.prompt - state.usage.cached) * p.i +
+        state.usage.cached * p.c +
+        state.usage.completion * p.o) /
+        1e6).toFixed(6),
+    )
+    state.driverCostUsd = driver
+  }
+  const seed = Number((state.seedCostUsd || 0).toFixed(6))
+  if (!ctx.metrics) return
+  ctx.metrics.cost_driver_usd = driver
+  ctx.metrics.cost_seed_usd = seed
+  ctx.metrics.cost_usd = Number((driver + seed).toFixed(6))
+  // Per-bucket token counts exist only for the Grok driver (the xAI response
+  // reports them per call). For the Claude driver the CLI reports a combined
+  // total, already accumulated into metrics.tokens — leave these unset rather
+  // than writing zeros, which would read as "this run used no tokens".
+  if (state.driver !== "claude") {
+    ctx.metrics.prompt_tokens = state.usage.prompt
+    ctx.metrics.completion_tokens = state.usage.completion
+    ctx.metrics.cached_tokens = state.usage.cached
+  }
+  ctx.metrics.models_used = Array.from(state.models)
+}
+// Higher than the other decomposition paths' defaults: with a short wall
+// clock, more parallel node attempts is what actually buys more coverage per
+// minute (deadlinePassed() still cuts every stage off the instant time is up).
+const ARCHITECT_NODE_CONCURRENCY = Number(process.env.ARCHITECT_NODE_CONCURRENCY || 4)
+// HARD dollar ceiling for one architect run — but ONLY for the Grok driver
+// (River). Grok is billed per-token against a real xAI API key, so an
+// unbounded bill is a genuine operator fear (the paper (Appendix A) governs
+// by token budgets, never wall clock, but that's not the risk that matters
+// here). Cost is computed live after every Grok call (ctx.metrics.cost_usd),
+// so this is enforceable exactly: once crossed, no further Grok call is
+// issued anywhere in the pipeline. 0 disables.
+//
+// Leak Ultra (Claude driver) runs on the operator's Claude Max subscription,
+// a flat-rate plan with NO per-token bill — total_cost_usd there is a
+// notional API-equivalent figure the CLI reports for visibility, not a real
+// charge. Gating Ultra on it was a bug: it silently repurposed a financial
+// guardrail as an arbitrary compute cap, cutting off perfectly good runs for
+// no real reason (worse before the cost-accounting fix, which made the
+// notional number wildly inflated; still wrong after the fix, since $5 of
+// notional cost still isn't $5 of real spend). Ultra's actual Max-plan
+// constraint (5-hour rolling window / weekly caps) is already handled by the
+// CLI's own usage-limit detection (detectSessionLimit/pauseForLimit on the
+// client) — that's the correct backstop, not a fake dollar cap. Time limit
+// and iteration budget remain Ultra's real governors, same as everything
+// else in this pipeline.
+const ARCHITECT_MAX_COST_USD = Number(process.env.ARCHITECT_MAX_COST_USD ?? 5)
+// Fallback driver model for Leak Ultra when the operator left the dropdown on
+// "bridge default". Normally the dropdown value wins — inheriting it is the point.
+const ARCHITECT_ULTRA_MODEL = process.env.ARCHITECT_ULTRA_MODEL || "claude-opus-5"
+function architectCostCapHit(ctx) {
+  if (ctx?.metrics?.driver === "claude") return false
+  return ARCHITECT_MAX_COST_USD > 0 && (ctx?.metrics?.cost_usd || 0) >= ARCHITECT_MAX_COST_USD
+}
+// Guard used at every stage boundary: true (and emits a one-time notice) when
+// the run must stop because the dollar cap is spent.
+function architectCapStop(ctx) {
+  if (!architectCostCapHit(ctx)) return false
+  if (ctx.metrics) ctx.metrics.cost_cap_hit = true
+  if (!ctx._costCapNoted) {
+    ctx._costCapNoted = true
+    ctx.emit?.({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `💸 Architect cost cap reached ($${ARCHITECT_MAX_COST_USD.toFixed(2)}, spend so far $${(ctx.metrics?.cost_usd || 0).toFixed(3)}) — stopping. Raise ARCHITECT_MAX_COST_USD on the bridge to allow deeper runs.`,
+    })
+  }
+  return true
+}
+
+// Resolve XI/XII/XIV the SAME way every other Leak server is discovered in
+// this app: by NAME, from the servers the operator registered in the
+// existing MCP Servers UI (ctx.mcpServers — populated via the app's normal
+// /api/mcp/servers -> fetchProverMcpServers path, not a separate mechanism).
+// Only the URL matters here; auth type on the registered row is irrelevant.
+// Matching is punctuation/case-insensitive so "Leak XI", "Leak-XI",
+// "leak_xi" all resolve.
+// LEAK_SERVICE_TOKEN deliberately stays a bridge-local env var rather than
+// living on the registered-server row: registered-server credentials in this
+// app never leave the server side (fetchProverMcpServers strips `credentials`
+// down to {name,url} before it ever reaches the browser or this bridge) --
+// the bridge needs the RAW bearer token itself to call these services
+// directly, so keeping it local matches the existing trust boundary instead
+// of poking a hole in it. Same pattern as XAI_API_KEY.
+const NORM_NAME = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "")
+function findRegisteredUrl(mcpServers, ...aliases) {
+  const wanted = aliases.map(NORM_NAME)
+  const hit = (mcpServers || []).find((s) => wanted.includes(NORM_NAME(s?.name)))
+  return hit?.url || ""
+}
+function architectUrls(opts = {}, mcpServers = []) {
+  const a = opts.architect || {}
+  return {
+    xi: a.xiUrl || findRegisteredUrl(mcpServers, "Leak XI", "Leak-XI") || process.env.LEAK_XI_URL || "",
+    xii: a.xiiUrl || findRegisteredUrl(mcpServers, "Leak XII", "Leak-XII") || process.env.LEAK_XII_URL || "",
+    xiv: a.xivUrl || findRegisteredUrl(mcpServers, "Leak XIV", "Leak-XIV") || process.env.LEAK_XIV_URL || "",
+  }
+}
+
+// --- Appendix C.1 — blueprint generation (behavioral prompt, cached) --------
+function architectBlueprintSystem() {
+  return `## Task
+You are a Lean 4 formalizer producing a dependency graph decomposition for a Lean theorem. The input is the targeted Lean theorem signature. Design a dependency graph of named Definitions, Lemmas, and exactly one Theorem (the main target), then translate the graph into one Lean 4 file in which every node is a \`@[blueprint]\`-annotated declaration. Lemma bodies are \`:= by sorry_using [...]\` -- proving them is the next stage's job. The ONE proof you do write here is the main Theorem's ASSEMBLY: its body is a real, sorry-free tactic proof deriving the target from your lemma nodes, which the compiler checks with those lemmas taken as given. This is deliberate: if your decomposition cannot even be CHAINED into the target (a helper stated over ℕ where the goal elaborates over ℤ, a cast that blocks every rewrite), the assembly fails to compile NOW, in your hands, instead of after a prover pool has burned its budget discovering it.
+
+## Decomposition guidelines
+Plan a graph that captures the structure of the proof. Use Definitions for any helper functions, sets, structures, or notation the proof needs. Use Lemmas for intermediate facts that require justification. Use the Theorem for the final claim -- its name MUST equal the targeted theorem identifier given in the user prompt.
+
+Each Lemma should be (nearly) trivial once its parent nodes are taken as given: it should require at most 1-2 new logical ideas beyond its declared dependencies and its own inlined premises. If a step needs more, split it into intermediate lemmas -- use as many components as the proof requires. Independent branches stay independent: if two parts of the proof do not share reasoning, their lemmas should not depend on each other.
+
+## Library-aware decomposition
+The node provers prove against Mathlib, and much of the "standard theory" a textbook proof leans on is already a named Mathlib lemma. Before designing the graph, search for the target's main objects and for each intermediate fact you are about to emit as a Lemma — \`moogle_search\` when you know the mathematics in English, \`loogle_search\` when you have a name or a type shape. What comes back shapes the graph:
+- If a planned lemma already exists in Mathlib (exactly, or up to trivial rephrasing), do NOT emit a node for it -- the node provers can invoke the library directly; cite the Mathlib name in the dependent node's \`proof\` sketch instead.
+- Emit nodes only for content Mathlib does not already have: the problem-specific reasoning, numeric side conditions, and the glue the target actually needs.
+- The smallest correct graph wins. If search shows the target itself is within direct reach of a library lemma plus routine side conditions, emit a MINIMAL blueprint -- the main Theorem plus only the helper nodes those side conditions genuinely need (a single-node blueprint is valid). A graph that is harder to formalize than the target it decomposes is a failed decomposition.
+
+## Statement ergonomics (write signatures the prover can actually close)
+- Prefer multiplicative/product forms over division or subtraction on ℕ/ℤ: state \`a * b = n\`, not \`n / b = a\` -- ℕ/ℤ division truncates and generates side conditions that stall proofs.
+- Type-ascribe ring-valued expressions whose elaboration is ambiguous (e.g. \`((X : Polynomial ℤ) ^ n - 1)\`), and state hypotheses in the form library lemmas consume (\`n ≠ 0\` rather than only \`n ≥ 1\`; carry both when helpful).
+- Match the phrasing of the nearest Mathlib lemmas found in search -- idiomatic signatures compile; bespoke rephrasings fight the elaborator.
+
+## Numeric facts are CHECKED, never recalled
+Every concrete number you write into a node — a p-adic valuation, a digit list, a factorial exponent, a plain arithmetic identity — is machine-checkable, and you must check it before you emit it. \`lean_compile\` returns the output of \`#eval\`/\`#check\`/\`#print\`, so submit the computation and read the value back:
+
+    #eval Nat.digits 3 2026
+    #eval (Nat.factorial 2026).factorization 2
+    #eval (4 * 9 : ℕ)
+
+Submit these WITHOUT an \`import\` line — the compile environment already has Mathlib, and an added import is a safeguard violation. \`decide\`, \`norm_num\` and \`native_decide\` are all available to node provers too, and \`set_option maxRecDepth\`/\`maxHeartbeats\` survive into their proofs, so a large closed computation is not out of reach.
+
+A guessed number is the most expensive mistake available to you: it sends every downstream node prover after a false lemma, and the whole refinement iteration that follows is spent undoing it. Two \`#eval\` calls now are cheaper than one wasted iteration.
+
+Be aware that a compiling blueprint is not an accepted one. Compiling proves your nodes are well-TYPED; it says nothing about whether they are TRUE, because \`sorry_using\` accepts any well-typed statement. After validation, every node of yours with no binders is put to the compiler as \`example : ¬ (conclusion) := by ...\`, and if Lean proves that negation the whole blueprint is rejected and you are asked again, with the counterexample. So check your closed statements yourself before you emit them.
+
+Every natural language \`statement\` field is a closed, typed, standalone proposition: every variable carries an explicit quantifier and domain; every hypothesis the proof uses appears as a premise. Do not reach into ambient context -- restate every theorem-level typing and hypothesis your lemma uses. Every natural language \`proof\` field is a complete sketch citing each declared dep by backticked name (e.g. "by \`lemma_a\`", "from \`def_b\`"); show every key equation, and do not write "by algebra", "obviously", or "one can check".
+
+## Mapping graph nodes to Lean declarations
+Emit each node of your decomposition directly as a \`@[blueprint ...]\`-annotated Lean declaration. Use \`snake_case\` identifiers derived from content ('k_expansion', 'p_at_101'), not position ('lemma_1'); names must be unique within the file.
+
+- For a Definition, emit:
+    @[blueprint (statement := /-- natural language description of what's being defined -/)]
+    def name (binders) : type := body
+  (or \`noncomputable def\`, \`abbrev\`, \`structure\`, \`instance\` as fits.) Definitions get a real Lean body, not \`sorry_using\`.
+- A SUPPORTING declaration — one the signatures need only in order to ELABORATE, such as an \`instance\` supplying a typeclass the target's own statement requires — is written WITHOUT an \`@[blueprint]\` attribute. It is then not a graph node: it needs no \`statement\` field, it is exempt from the reachability check, and it is still carried into every node prover's prefix and into the final assembled file. Use this when the target does not typecheck on its own; do NOT use it to smuggle in a lemma (a theorem or lemma always has to be a real node).
+- For a Lemma, emit:
+    @[blueprint
+      (statement := /-- closed, typed, standalone natural language proposition -/)
+      (proof := /-- complete natural language sketch citing parent declarations by backticked name -/)]
+    lemma name (binders) : conclusion := by sorry_using [p1, p2, ...]
+  where \`sorry_using [...]\` lists each parent declaration as a bare Lean identifier (or \`sorry_using []\` if it has no parents). A lemma whose derivation from its own parents is purely mechanical (an \`rw\`/\`simp\`/\`norm_num\`/\`exact\` chain) MAY instead carry that real sorry-free proof as its body — it is then verified right here at admission and never costs a prover; keep \`sorry_using\` for every step with real mathematical content.
+- For the main Theorem, emit the same \`@[blueprint (statement := ...) (proof := ...)]\` annotation, but its body is your real ASSEMBLY — a sorry-free tactic proof deriving the target from your lemma nodes, e.g.:
+    theorem target_name ... : conclusion := by
+      rw [Finset.sum_congr rfl (fun k _ ↦ (step_one k).symm), step_two]
+      norm_num
+  The lemma nodes it cites compile as available facts, so this proof is checked at admission. It may NOT contain \`sorry\` or \`sorry_using\` — every unproved step must be its own lemma node, so all uncertainty lives in the graph, never in the glue. If the assembly will not compile, your decomposition does not reach the target: restate the lemmas at the target's elaborated types (compare against "the target as Lean elaborates it" in the user prompt) rather than fighting the glue.
+- The main Theorem's \`name\` MUST equal the targeted theorem identifier given in the user prompt, and you must emit it with the original Lean signature (same binders, same conclusion). Do not retype the statement informally.
+- Declare nodes in topological order: Definitions first, then Lemmas in dependency order, then the main Theorem last.
+- The file starts with \`import Mathlib\` and \`import Architect\` (both required), then any \`open\`/\`set_option\` lines, then the declarations.
+
+## Tool use
+You also have \`loogle_search\` (exact: names and Lean type patterns; zero hits PROVES a name is absent) and \`moogle_search\` (semantic: English concepts; always returns its nearest guesses, so it can never prove absence). Use them DURING graph design as described above, not only after compile errors. A hit that states a planned node kills that node; a near-miss tells you the idiomatic signature to adopt.
+
+Use \`lean_compile\` to verify the skeleton. Before Lean is invoked, the tool runs structural pre-checks on the raw code; any failure is returned as a \`Safeguard rejected\` response, and the file is never sent to Lean (so do not assume the code compiles). The pre-checks reject: unbalanced \`/- ... -/\` block comments; a missing main theorem; the forbidden construct \`axiom\`; a \`set_option\` other than a resource limit (\`maxRecDepth\`, \`maxHeartbeats\`, \`synthInstance.*\`); missing \`import Mathlib\` or \`import Architect\`; a main theorem signature that does not match the targeted signature verbatim (modulo whitespace); a Lemma or Theorem without an \`@[blueprint]\` attribute; a main theorem whose body is \`sorry_using\` or contains \`sorry\` (the main body must be the real assembly); a Lemma body containing bare \`sorry\` (a lemma is either \`:= by sorry_using [...]\` or a complete sorry-free proof).
+
+If the pre-checks pass, the code is compiled by Lean — INCLUDING your assembly proof, against the sorried lemmas. A compile error inside the main theorem means the decomposition does not reach the target; fix the LEMMA STATEMENTS (usually their types), not just the tactic line. After Lean returns no errors, a post-compile graph-validity check runs against the parsed \`@[blueprint]\` decls: every node must have a non-empty \`(statement := /-- ... -/)\` field; every Lemma and the Theorem must have a non-empty \`(proof := /-- ... -/)\` field; every name in \`sorry_using [...]\` must resolve to a declared \`@[blueprint]\` node, with no self-loops; the dependency graph (\`sorry_using\` lists ∪ the node names each real proof references) must be acyclic; exactly one main Theorem must exist with the targeted name; and every node must be reachable, in reverse, from the main Theorem (no isolated/dead nodes).
+
+If any gate fails, fix the reported issue and call \`lean_compile\` again. Sorries from \`sorry_using\` are expected and do not count as errors. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\``
+}
+
+// --- Appendix C.2 — theorem proving (behavioral prompt, cached) -------------
+function architectProverSystem() {
+  return `## Task
+You are a Lean 4 theorem prover. Given a formal statement, produce a complete, correct Lean 4 proof with no \`sorry\`.
+
+## Tool use
+You have three tools: \`lean_compile\`, \`loogle_search\` and \`moogle_search\`. Commit to a concrete proof plan up front and execute it against the Lean compiler -- iterating on compiler feedback is how proofs get done, not silent reasoning or repeated searching. The compiler is a stronger signal source than search.
+
+Use \`lean_compile\` to compile Lean 4 code. Call it early, even with a partial proof: use \`sorry\` as a placeholder for sub-goals you cannot yet discharge, and iterate (compile -> read errors / open goals -> patch -> compile). The system handles two cases automatically based on what you submit:
+- If your code includes the MAIN theorem with the canonical statement followed by \`:= by ...\`, the system rebuilds it under the original theorem statement: only your \`:= by\` proof body is kept from your submission; the imports and \`open\` lines come from the canonical formal statement, and any other top-level declarations are dropped. Only this case can register a solve. Do not use \`axiom\`; use \`have\` for helper lemmas inside your proof, not top-level declarations; and do not add \`import\` or \`open\` lines that are not already in the canonical formal statement -- any extras will be flagged as a safeguard violation, not silently kept.
+- If your code does NOT include the main theorem (e.g. \`#check\`, \`example\`, \`#print\`, \`#eval\`, helper-lemma prototypes), the system compiles the snippet as-given and returns the raw feedback, INCLUDING the output of any \`#eval\`/\`#check\`/\`#print\`. This is exploration only -- it cannot register a solve, so resubmit with the main theorem once you have a full proof. Use this sparingly: every turn against the compiler costs budget, and the only way to finish is to submit the main theorem.
+
+## Computation is available -- use it instead of guessing
+\`decide\`, \`norm_num\` and \`native_decide\` are all permitted in a registered proof, and a \`set_option maxRecDepth N\` / \`maxHeartbeats N\` line you write is KEPT (resource limits survive the canonical rebuild; other \`set_option\`s do not). So when a goal is a closed computation that hits "maximum recursion depth has been reached", raise the limit and resubmit rather than abandoning the route:
+
+    set_option maxRecDepth 8000 in
+    ${"theorem"} <target> := by native_decide
+
+To check a number before you build a proof around it, submit a bare \`#eval\` (no \`import\` line — the environment already has Mathlib) and read the value back from the report. A number you verified beats a number you remembered.
+
+Use the search tools as lookup helpers for *specific* Mathlib lemmas you need while executing your plan, or to recover the correct name after an "Unknown constant" / "Unknown identifier" error. For named mathematical objects (cyclotomic polynomials, totients, binomial coefficients, ...) Mathlib frequently already contains the exact fact you are proving, or a lemma that closes it in one application: if a search hit states your goal or subsumes it, APPLY IT AND SUBMIT immediately -- one lookup is cheaper than re-deriving standard theory, and a library one-liner is a perfectly good registered solve. What search will NOT find is a bespoke bound or numeric identity invented for this problem, so do not query for the goal's exact numbers verbatim.
+
+## Never submit a name you have not confirmed exists
+An invented lemma name is the cheapest mistake to prevent and one of the most expensive to make: it burns a full compile turn, teaches you nothing about the goal, and \`lean_compile\` LOCKS after ${ARCHITECT_HALLUCINATION_LOCK} unknown-name errors in a row with no search between them.
+
+Three tools settle existence, and the difference between them is WHAT THEIR SILENCE MEANS:
+- \`loogle_search\` — "does this NAME or SHAPE exist?" Searches the elaborated environment with Lean syntax: a constant (\`Nat.mul_div_assoc\`), a quoted name substring (\`"div_eq_zero"\`), a type pattern (\`?n / ?d = 0\`), a conclusion (\`|- _ = _ * _\`). **Zero hits is a PROOF of absence, not a near-miss.** Anchor every query with a concrete constant or metavariable; unanchored patterns scan the library and time out.
+- \`moogle_search\` — "what is this CONCEPT called?" Plain English ('difference of squares', 'a number divided by something that divides it'). It always returns its nearest neighbours, so **a moogle result set is never evidence that anything is absent** — it is a source of candidate names, which you then confirm.
+- \`#check <name>\` — "does THIS exact name exist?" A bare \`#check Nat.div_eq_zero_of_dvd\` (no \`import\` line) is a definitive yes/no, and you can batch several in one exploration compile. When you are about to build a rewrite chain on three or four remembered names, \`#check\` all of them in a single call FIRST.
+
+A name that failed is usually a whole naming CONVENTION that failed, not one typo -- so after \`Nat.foo_of_bar\` comes back unknown, do not immediately try \`Nat.foo_of_baz\`. Search for the FACT instead: \`moogle_search\` the mathematics, then \`loogle_search\` or \`#check\` the candidate it gives you.
+
+SCOPE: \`loogle_search\` and \`moogle_search\` see ONLY the published Mathlib environment — NEVER declarations local to this problem (your target, its declared parent facts, blueprint \`def\`s such as helper sets). A zero-hit for a LOCAL name is expected and means NOTHING — it is not evidence the statement is ill-formed or false. Local names are settled with \`#check <name>\` via lean_compile, which DOES see them.
+
+## Other outcomes
+If you become convinced the statement is FALSE, prove its negation instead: the user prompt gives the exact negated signature to prove. Submit it via \`lean_compile\`; a compiler-corroborated disproof is a valid, registered outcome.`
+
+// The paper's actual Appendix C.2 prompt (verbatim, as published) stops here
+// -- it never mentions forfeiting. Telling the model a structured "give up"
+// format is available FROM TURN ONE makes it an easy, well-lit exit ramp: a
+// fast/cheap model takes it the moment a goal gets algebraically annoying,
+// often within a handful of turns and nowhere near its real token budget --
+// exactly what happened on this stack's own six_dvd_cubic smoke run. The
+// forfeit format is injected instead as a follow-up message, ONLY once a
+// node has genuinely exhausted its turn/token budget with no solve -- see
+// grokLoop's forced-forfeit turn below. This forces every attempt to spend
+// its real budget compiling and iterating before any exit is offered.
+}
+
+// --- Appendix C.3 — blueprint refinement (behavioral prompt, cached) --------
+function architectRefineSystem() {
+  return `## Task
+You are revising a Lean 4 dependency graph for a single mathematical problem. The input is a sequence of \`@[blueprint ...]\`-annotated declarations -- definitions, lemmas with body \`:= by sorry_using [deps]\`, and one main theorem whose body is its real ASSEMBLY (a sorry-free tactic proof deriving the target from the lemma nodes, checked by the compiler with those lemmas taken as given; nodes marked \`-- ASSEMBLY\` are in the same situation). Your job is to emit a revised dependency graph that, when handed back to the same Lean 4 theorem prover, is more likely to close the previously-unsolved nodes while still proving the same main theorem. Whenever your revision touches a node an assembly cites — renames it, restates it, rewires it — update that assembly body so it still compiles; a revision whose glue no longer compiles is rejected whole.
+
+## Input format
+Each lemma or theorem in the input carries a one-line marker recording the previous prover pass's verdict on that node, and -- when the prover failed -- a follow-up review block describing what went wrong.
+
+A \`-- PROVED\` marker means a verified proof is banked for that node's exact signature and parent set.
+
+A \`-- UNPROVED\` marker is followed by exactly one \`/- Diagnosis ... -/\` review block, whose first two lines are the ones that bind on you:
+
+- \`## Class\` is the harness's classification of the failure. It is not a suggestion.
+- \`## Harness directive\` states what you MAY and MAY NOT do to that node. Follow it. It exists because the single most expensive failure mode in this pipeline is applying the wrong repair to a node — adding helpers to a node that was never given its parents, or deleting a true lemma because a prover asserted it was false without proof.
+
+The remaining sections are evidence, in descending order of reliability:
+- \`## Machine-verified facts\` — computed by Lean during this pass. These are ground truth and OVERRIDE any number appearing in a natural-language sketch, including sketches you wrote yourself in an earlier iteration.
+- \`## Names that DO NOT EXIST\` — declarations checked against this Mathlib and absent. Never cite them.
+- \`## Proposals the harness REJECTED\` — helper lemmas that failed to typecheck or that the compiler outright refuted. Do not reinstate them in any form.
+- \`## Verified helper lemmas\` — proposals that typecheck here and were not refuted. These are safe to adopt as new nodes.
+- \`## Analysis\` — the diagnostician's prose account. Useful, but weaker evidence than anything above it.
+
+These markers and review blocks are input-only -- do NOT copy them into your revised dependency graph.
+
+## The classes
+\`DISPROVED\` — machine-checked false. Change the statement or drop it, and re-examine every node depending on it. This is the ONLY class that licenses deleting or restating a node on grounds of falsity.
+
+\`SUSPECT_STATEMENT\` — a prover claimed the node was false but produced no disproof, and the harness could not refute it either. The claim is unsupported. Do not act on it; treat the node as \`PROOF_TOO_HARD\`.
+
+\`PARENTS_MISSING\` — the node was dispatched with unproved parents, so its decomposition was never actually tested. Change nothing about it; put this revision's effort into the parents.
+
+\`HARNESS_LIMIT\` — an elaborator resource limit, not mathematics. Leave the node completely unchanged.
+
+\`PROOF_TOO_HARD\` — a genuine decomposition need. Add the verified helpers as fresh \`@[blueprint ...]\` nodes with bodies \`:= by sorry_using [...]\`, and wire the failing node's \`sorry_using\` to include them.
+
+## Guidance
+Refinement is library-aware: you have \`loogle_search\` (exact -- zero hits proves a name is absent) and \`moogle_search\` (semantic -- always guesses, never proves absence). Before adding a helper, check whether Mathlib already contains it (or the failing node itself), and use search hits to phrase revised signatures idiomatically. Prefer DELETING nodes over stacking helpers: when a node fails repeatedly on glue (coercions, Finset membership packaging, ℕ/ℤ division side conditions) rather than on mathematics, the cure is usually re-anchoring the graph on library lemmas and REMOVING re-derived intermediate theory, not a deeper helper stack. Across iterations the graph should shrink toward the library, not grow away from it. Apply the same statement ergonomics as generation: multiplicative forms instead of ℕ/ℤ division (\`a * b = n\`, not \`n / b = a\`), explicit type ascriptions on ring-valued expressions, hypotheses stated the way library lemmas consume them (\`n ≠ 0\` alongside \`1 ≤ n\`).
+
+A \`-- PROVED\` node carries a real, verified proof. It survives your revision only while BOTH its signature and its \`sorry_using\` parent set stay unchanged — touching either discards the proof and the node must be re-proved from scratch. So leave proved nodes alone, and when a revision would leave one unreachable from the main theorem (which the graph-validity gate forbids), RE-WIRE it into the new structure rather than deleting it. Deleting a proved node throws away work that was already paid for.
+
+Separately, the harness NEVER throws a proven lemma away: every lemma proved in ANY earlier iteration stays banked run-wide, even if a past revision dropped or renamed its node. When such dormant lemmas exist, the input carries a \`## Proven-lemma vault\` section listing them. Re-emitting one — same signature, same \`sorry_using\` parent set, any name — restores its verified proof automatically, at zero prover cost. Check the vault before writing any new lemma: if a banked statement (or a trivial rephrasing you could instead consume as-is) already does the job, re-wire the banked one.
+
+Numbers in your own natural-language sketches are not evidence. If a \`## Machine-verified facts\` line contradicts a constant you previously wrote, the machine is right. If a node hinges on a concrete number that has never been verified, you can check it yourself: \`lean_compile\` returns \`#eval\` output, so submit \`#eval <term>\` (no \`import\` line) and read the value back before you commit a constant to a signature.
+
+After every edit, call \`lean_compile\`. The tool reports pre-compile safeguard violations, real Lean compile errors (including an assembly that no longer derives the target from the revised lemmas — fix the lemma STATEMENTS, usually their types, not just the tactic line), the body invariant (lemmas are \`:= by sorry_using [...]\` or a complete sorry-free proof; the main theorem is always its sorry-free assembly), graph-validity issues (cycles, missing fields, dead nodes, etc.), and on a clean compile a per-declaration proof-reuse check. Iterate until \`lean_compile\` reports \`Compilation SUCCESSFUL. Validation SUCCESSFUL.\`
+
+## Output
+Emit a revised dependency graph. Every theorem and lemma is \`@[blueprint (statement := /-- ... -/) (proof := /-- ... -/)]\`-annotated; lemma bodies are \`:= by sorry_using [deps]\` (or a complete sorry-free glue proof for purely mechanical steps), and the main theorem's body is always its sorry-free assembly. Do NOT replace a \`sorry_using\` with an actual proof unless that proof is genuinely mechanical -- closing hard nodes is the prover's job, not yours. Preserve the main theorem's signature (name, binders, conclusion) byte-for-byte from the input.`
+}
+
+// --- Grok driver -------------------------------------------------------------
+// One OpenAI-compatible chat call against api.x.ai with function calling,
+// retries on 429/5xx, and a model fallback ladder on unknown-model errors.
+async function grokCall(state, messages, tools, ctx, callOpts = {}) {
+  const key = process.env.XAI_API_KEY
+  if (!key) throw new Error("XAI_API_KEY is not set on the bridge — the architect strategy drives Grok directly")
+  if (architectCostCapHit(ctx))
+    throw new Error(`architect cost cap reached ($${ARCHITECT_MAX_COST_USD.toFixed(2)}) — no further LLM calls this run`)
+  for (let attempt = 0; ; attempt++) {
+    if (ctx.signal?.aborted) throw new Error("aborted")
+    // callOpts.grace: the forced-forfeit turn is the ONE call allowed past the
+    // wall-clock deadline — it is what feeds the refinement stage (§4.4), and
+    // under a short operator clock most exhaustion IS deadline exhaustion.
+    // Bounded: a single no-tools call per attempt, still under the cost cap.
+    if (deadlinePassed(ctx) && !callOpts.grace) throw new Error("wall-clock budget exhausted")
+    const body = {
+      model: state.model,
+      messages,
+      max_tokens: 8192,
+    }
+    // xAI rejects tool_choice with an empty tools array outright ("A
+    // tool_choice was set on the request but no tools were specified") — this
+    // exact 400 was silently killing every forced-forfeit turn, starving the
+    // refinement stage of the diagnoses that are its entire input (§4.4 of
+    // the paper: forfeits ARE the decomposition proposals). Only attach the
+    // tool plumbing when there are tools.
+    if (Array.isArray(tools) && tools.length) {
+      body.tools = tools
+      body.tool_choice = "auto"
+    }
+    let resp
+    try {
+      resp = await fetch("https://api.x.ai/v1/chat/completions", {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${key}` },
+        body: JSON.stringify(body),
+        signal: ctx.signal,
+      })
+    } catch (e) {
+      if (attempt < 4) {
+        await new Promise((r) => setTimeout(r, 1500 * 2 ** attempt))
+        continue
+      }
+      throw e
+    }
+    if (resp.status === 429 || resp.status >= 500) {
+      if (attempt < 5) {
+        const ra = Number(resp.headers.get("retry-after")) || 2 ** attempt
+        ctx.emit?.({ type: "message-annotation", subtype: "status", thought: `⏳ xAI ${resp.status} — retrying in ${Math.min(ra, 30)}s (attempt ${attempt + 1}/5).` })
+        await new Promise((r) => setTimeout(r, Math.min(ra, 30) * 1000))
+        continue
+      }
+      throw new Error(`xAI API ${resp.status} after retries`)
+    }
+    const data = await resp.json().catch(() => null)
+    if (!resp.ok) {
+      const msg = String(data?.error?.message || data?.error || resp.status)
+      // Unknown model → walk the ladder once per rung.
+      if (/model/i.test(msg) && (resp.status === 400 || resp.status === 404)) {
+        const idx = ARCHITECT_MODEL_LADDER.indexOf(state.model)
+        const next = ARCHITECT_MODEL_LADDER[idx + 1]
+        if (next) {
+          ctx.emit?.({ type: "message-annotation", subtype: "status", thought: `↩︎ Model ${state.model} rejected (${msg}) — falling back to ${next}.` })
+          state.model = next
+          continue
+        }
+      }
+      throw new Error(`xAI API error: ${msg}`)
+    }
+    const usage = data.usage || {}
+    state.usage.prompt += Number(usage.prompt_tokens) || 0
+    state.usage.completion += Number(usage.completion_tokens) || 0
+    state.usage.cached += Number(usage.prompt_tokens_details?.cached_tokens) || 0
+    state.stageTokens += Number(usage.total_tokens) || 0
+    ctx.metrics.llm_invocations += 1
+    // Record the SKU that actually served this call (may differ from the one
+    // first requested if the ladder fell back) for the row's models_used.
+    state.models?.add(state.model)
+    // Recompute the whole run's cost — driver tokens priced per SKU, plus any
+    // NL-seed cost the CLI reported. Writes `cost_usd` (snake_case) because
+    // that's the only key run-prover-stream.ts reads, alongside the per-source
+    // split and token counts the research tables record. `state.usage` is
+    // cumulative, so this is an assignment, not an accumulation.
+    architectRecost(ctx, state)
+    // Attach THIS call's own usage to the returned message. state.usage is
+    // shared by concurrently-running node provers, so a caller diffing it
+    // across a turn would bill itself for whatever siblings did in between —
+    // the same trap the cost accounting hit (see claudeArchitectLoop). Read by
+    // the per-turn telemetry only; nothing branches on it.
+    const out = data.choices?.[0]?.message || { content: "" }
+    try {
+      out.__usage = {
+        prompt: Number(usage.prompt_tokens) || 0,
+        completion: Number(usage.completion_tokens) || 0,
+        cached: Number(usage.prompt_tokens_details?.cached_tokens) || 0,
+        total: Number(usage.total_tokens) || 0,
+      }
+    } catch {}
+    return out
+  }
+}
+
+// Digest stale tool outputs so a long compile-fix loop cannot quadratically
+// flood its own context: everything but the newest `keep` tool results is
+// collapsed to a one-line summary (the newest compiler signal is the only one
+// that matters — the paper's stages are Markov in the latest gate report).
+function architectCompact(messages, keep = 2) {
+  const toolIdxs = []
+  for (let i = 0; i < messages.length; i++) if (messages[i].role === "tool") toolIdxs.push(i)
+  const stale = toolIdxs.slice(0, Math.max(0, toolIdxs.length - keep))
+  for (const i of stale) {
+    const c = String(messages[i].content || "")
+    if (c.length > 400)
+      messages[i].content = c.slice(0, 300) + `\n... [stale tool output elided — ${c.length} chars; rely on the newest compile report]`
+  }
+}
+
+// --- Resource failures vs. reasoning failures --------------------------------
+// A compile can fail because the proof is wrong, or because the elaborator ran
+// out of room. These need opposite handling everywhere in this pipeline: a
+// wrong proof should be rewritten, a resource failure should be RETRIED with a
+// bigger ceiling. Leak XII reports `resourceLimit` when EVERY error in a
+// submission is of the resource family; the text match is the fallback for
+// backend errors and for services not yet redeployed with that field.
+const ARCHITECT_RESOURCE_RE =
+  /maximum recursion depth|deterministic\)? timeout|maximum number of heartbeats|maxHeartbeats|Compile backend error|timed out/i
+function architectIsResourceFailure(out, text) {
+  if (out && out.resourceLimit === true) return true
+  if (out && out.solve) return false
+  return ARCHITECT_RESOURCE_RE.test(String(text || ""))
+}
+
+// Generic tool loop for one stage attempt: fresh conversation, budgeted,
+// short-circuits the moment `exec` reports the stage goal reached.
+// Requested ONLY once a grokLoop call has genuinely exhausted its turn/token
+// budget with no solve -- matches the paper's actual Appendix C.2 prompt
+// (which never mentions forfeiting at all; "user prompts... are omitted").
+// Baking this into the turn-1 SYSTEM prompt instead (the original bug here)
+// hands a fast/cheap model a well-lit, socially-sanctioned exit ramp from
+// turn one -- confirmed live: a real node forfeited in ~150s, nowhere near
+// its 65,536-token budget, the moment its Lean goal got algebraically messy.
+const ARCHITECT_FORFEIT_REQUEST = `You are out of turns/budget on this goal without a verified proof. This is your FINAL turn -- do not call any tool. Write your forfeit now, in EXACTLY this format (three sections, these exact headers):
+## Diagnosis: STATEMENT_WRONG or PROOF_TOO_HARD
+## Analysis: a forensic account of what you tried, what compiled, what errors remained, and where the gap is.
+## Suggested Fix: for STATEMENT_WRONG, why the statement is false under its hypotheses and how to repair it; for PROOF_TOO_HARD, a helper-lemma decomposition -- named helper lemmas arranged so that each is easy given its parents and the original goal becomes routine given the helpers.`
+
+async function grokLoop(ctx, state, { system, user, tools, exec, tokenBudget, hardTurns = 60, forfeitPrompt, label = "", trace = null, consultContext = "", intercept = false }) {
+  const messages = [
+    { role: "system", content: system },
+    { role: "user", content: user },
+  ]
+  state.stageTokens = 0
+  let finalText = ""
+  const tag = label ? `[${label}] ` : ""
+  // Every emission from THIS conversation is also appended to the agent's own
+  // rolling log (trace.streamLog) — the raw material the consultant and the
+  // interceptor read. Forwarding is unchanged; this only observes.
+  const emitL = (o) => {
+    traceLogPush(trace, o)
+    ctx.emit(o)
+  }
+
+  // Full context this conversation opens with — every dialogue the operator
+  // watches gets its own expandable "system" row before any turns happen, so
+  // the exact SYSTEM + USER text handed to Grok is always inspectable live.
+  emitL({
+    type: "system",
+    detail: `${tag}Grok context opened (${state.model})\n\n--- SYSTEM ---\n${system}\n\n--- USER ---\n${user}`,
+  })
+
+  // Fires ONLY on genuine exhaustion (token budget / deadline / turn cap) —
+  // never on a voluntary early stop, and never available to the model until
+  // this exact moment. A no-tools call so the reply can only be prose.
+  const forceForfeit = async () => {
+    if (!forfeitPrompt) return finalText
+    messages.push({ role: "user", content: forfeitPrompt })
+    emitL({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Budget exhausted — requesting a structured forfeit.` })
+    try {
+      // grace: allowed past the wall-clock deadline (one small no-tools call)
+      // so refinement always gets its diagnosis, even on time exhaustion.
+      const msg = await grokCall(state, messages, [], ctx, { grace: true })
+      const text = String(msg.content || "") || finalText
+      if (text.trim()) emitL({ type: "message-annotation", subtype: "status", thought: `${tag}${text}` })
+      return text
+    } catch (e) {
+      emitL({ type: "message-annotation", subtype: "error", thought: `${tag}Forfeit request failed: ${String(e?.message || e)}` })
+      return finalText
+    }
+  }
+
+  // Duplicate-submission guard: hash of every tool call this attempt → its
+  // report. Observed live: the prover resubmitting BYTE-IDENTICAL code 8+
+  // times, eating the whole budget on a compile loop that can only return the
+  // same error. A repeat is answered from cache (no service round-trip) with
+  // an explicit "identical input, identical outcome" banner.
+  const seen = new Map()
+  let nudges = 0
+
+  for (let turn = 0; turn < hardTurns; turn++) {
+    if (state.stageTokens >= tokenBudget) return { finalText: await forceForfeit(), exhausted: true }
+    if (deadlinePassed(ctx)) return { finalText: await forceForfeit(), exhausted: true }
+    if (architectCostCapHit(ctx)) return { finalText, exhausted: true }
+    let msg
+    try {
+      msg = await grokCall(state, messages, tools, ctx)
+    } catch (e) {
+      emitL({ type: "message-annotation", subtype: "error", thought: `${tag}Grok call failed (turn ${turn + 1}): ${String(e?.message || e)}` })
+      throw e
+    }
+    const toolCalls = msg.tool_calls || []
+    messages.push({ role: "assistant", content: msg.content || "", tool_calls: toolCalls.length ? toolCalls : undefined })
+    // (3) Turn envelope. Token counts come off THIS call (grokCall attaches
+    // them to the message) — never from a before/after diff of state.usage,
+    // which several node provers share concurrently and which would attribute
+    // siblings' tokens to whichever turn happened to straddle them.
+    if (trace) {
+      trace.turn += 1
+      const u = msg.__usage || {}
+      const parts = [`${trace.agentId} · turn ${trace.turn}/${hardTurns} · ${state.model}`]
+      if (u.total) parts.push(`tokens ${u.prompt || 0}→${u.completion || 0} (total ${u.total}${u.cached ? `, ${u.cached} cached` : ""})`)
+      parts.push(`stage ${state.stageTokens}/${tokenBudget}`)
+      parts.push(toolCalls.length ? `${toolCalls.length} tool call(s)` : "no tool call")
+      emitL({ type: "message-annotation", subtype: "status", thought: `⏱️ ${parts.join(" · ")}` })
+    }
+    if (msg.content && msg.content.trim())
+      emitL({ type: "message-annotation", subtype: "status", thought: `${tag}${msg.content.trim()}` })
+    if (!toolCalls.length) {
+      finalText = String(msg.content || "")
+      // Every registered exit is tool-driven (a lean_compile solve / a
+      // validated blueprint) or a structured forfeit. A bare prose reply ends
+      // the attempt with NOTHING — observed live as whole blueprint attempts
+      // burned on the model pasting a ```lean block as chat instead of
+      // calling the tool. Steer it back to the compiler (twice max), per the
+      // paper's loop contract ("iterate until lean_compile reports ...").
+      if (!/##\s*Diagnosis/i.test(finalText) && nudges < 2) {
+        nudges++
+        emitL({ type: "message-annotation", subtype: "status", thought: `${tag}↩︎ Reply had no tool call — steering the prover back to lean_compile (nudge ${nudges}/2).` })
+        messages.push({
+          role: "user",
+          content: "Your reply was NOT submitted to the compiler — nothing is checked or registered unless you CALL the lean_compile tool. Never paste Lean code as chat text. Call lean_compile now with your full current candidate.",
+        })
+        continue
+      }
+      return { finalText, exhausted: false }
+    }
+    let pendingConsult = ""
+    for (const tc of toolCalls) {
+      let args = {}
+      try {
+        args = JSON.parse(tc.function?.arguments || "{}")
+      } catch {}
+      ctx.metrics.tools_invoked += 1
+      const toolName = tc.function?.name || "tool"
+      emitL({
+        type: "message-annotation",
+        subtype: "tool_intent",
+        thought: `${tag}Using ${toolName}`,
+        tool: toolName,
+        input: JSON.stringify(args, null, 2),
+      })
+      const sig = `${toolName} ${JSON.stringify(args)}`
+      // (4) How this submission differs from THIS agent's previous one, and
+      // what it has stopped changing. Emitted before dispatch so the diff sits
+      // directly above the result it produced.
+      const subLog = traceSubmission(trace, toolName, args)
+      if (subLog) emitL({ type: "message-annotation", subtype: "status", thought: subLog })
+      let out
+      if (seen.has(sig)) {
+        out = {
+          report:
+            `⚠️ IDENTICAL RESUBMISSION — you already made exactly this ${toolName} call this attempt; identical input can only produce the identical result (repeated below). Change the proof STRUCTURALLY before compiling again — do not rename variables or reorder the same failing tactics.\n\n${seen.get(sig)}`,
+        }
+      } else {
+        try {
+          out = await exec(toolName, args)
+        } catch (e) {
+          out = { report: `tool error: ${String(e?.message || e)}` }
+        }
+      }
+      const outText = String(out.report ?? JSON.stringify(out))
+      // Resource failures are NOT cached. The guard's premise — "identical
+      // input can only produce the identical result" — holds for a reasoning
+      // error and fails for a resource one: the same submission compiles once
+      // maxRecDepth is raised or the daemon is warm. Caching them turned a
+      // fixable limit into a dead end (observed on
+      // factorial_base12_trailing_zeros, where a node whose only error was
+      // "maximum recursion depth has been reached" spent its remaining turns
+      // being told it had already asked).
+      if (!seen.has(sig) && !architectIsResourceFailure(out, outText)) seen.set(sig, outText.slice(0, 4000))
+      emitL({ type: "message-annotation", subtype: "tool_result", thought: `${tag}Tool output`, output: outText.slice(0, 8000) })
+      // (4b) Has the compiler's FIRST complaint moved? If not, whatever the
+      // model just edited is not the thing blocking it.
+      const resLog = traceResult(trace, outText)
+      if (resLog) {
+        emitL({ type: "message-annotation", subtype: "status", thought: resLog })
+        // The streak has a consumer now: a consultant with a fresh context.
+        // Fired at the 3rd identical first-error, again 3 submissions later,
+        // capped per conversation — a teammate's nudge, not a chaperone.
+        if (
+          consultContext &&
+          trace.consults < ARCHITECT_CONSULT_MAX &&
+          trace.repeatedFirstError >= ARCHITECT_CONSULT_STREAK &&
+          (trace.repeatedFirstError - ARCHITECT_CONSULT_STREAK) % 3 === 0
+        )
+          pendingConsult = outText
+      }
+      // Interceptor: a SEMANTIC watcher over this agent's own trajectory,
+      // fired off-thread every few submissions. Unlike the consultant's
+      // literal-string streak gate it can catch circling-but-not-identical
+      // failure, and unlike the consultant the agent NEVER waits for it —
+      // its verdict (if any) is read at the next injection point below.
+      if (intercept) maybeIntercept(ctx, state, trace, consultContext)
+      messages.push({ role: "tool", tool_call_id: tc.id, content: outText.slice(0, 24000) })
+      if (out.__done) return { finalText: String(msg.content || ""), exhausted: false, done: out.__done }
+    }
+    // Injected AFTER every tool reply of this turn, so the assistant→tool
+    // message alternation the API requires stays intact.
+    if (pendingConsult) {
+      trace.consults += 1
+      if (ctx.metrics) ctx.metrics.consults = (ctx.metrics.consults || 0) + 1
+      emitL({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `🧑‍⚖️ ${trace.agentId} · first error unmoved for ${trace.repeatedFirstError + 1} submissions — asking a consultant (fresh context, no stake in the current approach) for an outside view (${trace.consults}/${ARCHITECT_CONSULT_MAX}).`,
+      })
+      try {
+        const note = await architectConsult(ctx, state, {
+          agentId: trace.agentId,
+          taskContext: consultContext,
+          history: trace.history,
+          errorText: pendingConsult,
+          streamLog: trace.streamLog,
+        })
+        if (note) {
+          emitL({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant's review:\n${note}` })
+          messages.push({
+            role: "user",
+            content: `## Outside review\nA second model was shown your recent submissions and the compiler error that has not moved, with no other context. Its review:\n\n${note}\n\nAddress this before your next submission. If it identifies a type or coercion mismatch with a declared fact, do NOT retry the same rewrite — restructure or forfeit with that diagnosis.`,
+          })
+        }
+      } catch (e) {
+        emitL({ type: "message-annotation", subtype: "status", thought: `🧑‍⚖️ ${trace.agentId} · consultant unavailable (${String(e?.message || e).slice(0, 120)}) — continuing without it.` })
+      }
+    }
+    // Watcher verdicts land HERE — after the turn's tool replies, so the
+    // assistant→tool alternation the API requires stays intact. The agent
+    // never waited on any of these; it only reads what has already arrived.
+    // Every injection is mirrored to the stream (no silent side channel).
+    const mechNotes = Array.isArray(trace?.mechanicNotes) ? trace.mechanicNotes.splice(0) : []
+    for (const mn of mechNotes) {
+      trace.lastInjectedSub = trace.submissions
+      emitL({ type: "message-annotation", subtype: "status", thought: `🔧 ${trace.agentId} · mechanic → this agent:\n${mn}`, watcher: "mechanic-inject" })
+      messages.push({
+        role: "user",
+        content: `## Note from the run mechanic\nA system-wide watcher reading the whole run's live stream (context you cannot see) flagged this for you:\n\n${mn}\n\nWeigh it before your next submission; if it is wrong for your specific goal, say why in one line and continue.`,
+      })
+    }
+    if (trace?.interceptVerdict) {
+      const iv = trace.interceptVerdict
+      trace.interceptVerdict = null
+      if (iv.action === "abort") {
+        if (ctx.metrics) ctx.metrics.interceptor_aborts = (ctx.metrics.interceptor_aborts || 0) + 1
+        emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor ABORT — continuing judged futile:\n${iv.note}` })
+        messages.push({
+          role: "user",
+          content: `## Interceptor decision: this attempt stops now\nA watcher reviewing your recent trajectory concluded that continuing is futile:\n\n${iv.note}\n\nFold this into your forfeit diagnosis.`,
+        })
+        return { finalText: await forceForfeit(), exhausted: true }
+      }
+      trace.lastInjectedSub = trace.submissions
+      if (ctx.metrics) ctx.metrics.interceptor_notes = (ctx.metrics.interceptor_notes || 0) + 1
+      emitL({ type: "message-annotation", subtype: "status", thought: `🕵️ ${trace.agentId} · interceptor note:\n${iv.note}` })
+      messages.push({
+        role: "user",
+        content: `## Interceptor note\nA watcher reviewing your recent trajectory (a rolling window, not your full context) observes:\n\n${iv.note}\n\nAddress it if it is right; if it is wrong, say why in one line and continue.`,
+      })
+    }
+    architectCompact(messages)
+  }
+  emitL({ type: "message-annotation", subtype: "status", thought: `${tag}⛔ Hard turn cap (${hardTurns}) reached.` })
+  return { finalText: await forceForfeit(), exhausted: true }
+}
+
+// ── Claude driver for the architect pipeline (Leak Ultra) ────────────────────
+// Same contract as grokLoop — {system, user, tools, exec} in, {finalText, done,
+// exhausted} out — so every stage works with either driver and the prompts, gates
+// and exit conditions stay identical across the two branches.
+//
+// The one structural difference: the CLI owns its own tool loop, so instead of us
+// dispatching tool calls we SERVE the tools to it from a local MCP server whose
+// handlers are these very `exec` closures. Two consequences that matter:
+//   * the compile gate and blueprint capture stay bridge-side — a stage can only
+//     succeed because `exec` saw lean_compile return ok, never because the model
+//     claimed success in prose (the failure mode that wasted whole Grok attempts);
+//   * cost is the CLI's own reported total_cost_usd, so Ultra needs no price
+//     table and cannot drift when published prices change.
+async function claudeArchitectLoop(ctx, state, { system, user, tools, exec, hardTurns = 60, forfeitPrompt, label = "", effort = "", trace = null }) {
+  const tag = label ? `[${label}] ` : ""
+  ctx.emit({
+    type: "system",
+    detail: `${tag}Claude context opened (${state.model})\n\n--- SYSTEM ---\n${system}\n\n--- USER ---\n${user}`,
+  })
+
+  let done = null
+  const handlers = new Map()
+  for (const t of tools || []) {
+    const fn = t.function || t
+    if (!fn?.name) continue
+    handlers.set(fn.name, {
+      description: fn.description,
+      inputSchema: fn.parameters || { type: "object", properties: {} },
+      run: async (args) => {
+        // Same submission telemetry as the Grok loop. This wrapper is the one
+        // place the Claude path funnels every tool call through, so the two
+        // drivers produce the same diagnostic stream from one hook each.
+        const subLog = traceSubmission(trace, fn.name, args || {})
+        if (subLog) ctx?.emit?.({ type: "message-annotation", subtype: "status", thought: subLog })
+        const out = await exec(fn.name, args || {})
+        if (out && out.__done) done = out.__done
+        const text = String(out?.report ?? JSON.stringify(out ?? ""))
+        const resLog = traceResult(trace, text)
+        if (resLog) ctx?.emit?.({ type: "message-annotation", subtype: "status", thought: resLog })
+        return text
+      },
+    })
+  }
+
+  // The CLI namespaces MCP tools (mcp__architect__lean_compile), while the shared
+  // stage contracts name them bare — say so once rather than forking the prompts,
+  // which would break the "same prompts as Stone" property this branch rests on.
+  const toolNote = `\n\n## Tool names in this session\nThe tools named in these instructions are served over MCP and appear namespaced: \`lean_compile\` is \`mcp__architect__lean_compile\`, \`loogle_search\` is \`mcp__architect__loogle_search\`, \`moogle_search\` is \`mcp__architect__moogle_search\`. They are the same tools with the same arguments. Nothing is registered or checked unless you actually CALL the tool — never paste Lean code as chat text.`
+
+  const r = await spawnProverStream(
+    {
+      prompt: user,
+      systemAppend: system + toolNote,
+      mcpServers: [],
+      bridgeHandlers: handlers,
+      model: state.model,
+      maxTurns: hardTurns,
+      timeoutMs: 0, // the shared wall-clock deadline governs (see getDeadline)
+      getDeadline: ctx.getDeadline,
+      stage: label ? `[${label}]` : "",
+      metrics: ctx.metrics,
+      signal: ctx.signal,
+      searchBudget: 0,
+      // Every real action here must go through lean_compile / the search tools
+      // (served above via bridgeHandlers) — Bash/filesystem/Task access buys
+      // nothing for this pipeline and has caused real derailments (shelling
+      // out to Python instead of writing a direct proof; mistaking `import
+      // Architect` for a real package and searching the local filesystem
+      // for it). See ARCHITECT_DISALLOWED_TOOLS.
+      disallowedTools: ARCHITECT_DISALLOWED_TOOLS,
+      effort,
+    },
+    {
+      // Stop the CLI the moment a stage's gate is satisfied; SIGINT (not kill) so
+      // the result frame carrying total_cost_usd still flushes.
+      onObject: (o) => {
+        if (o?.type === "system" && typeof o.model === "string") state.models?.add(o.model)
+        return !!done
+      },
+      emit: ctx.emit,
+    },
+  )
+  state.models?.add(state.model)
+  // r.costUsd is THIS call's own isolated cost (see spawnProverStream). Diffing
+  // the shared ctx.metrics.cost_usd instead double(+)-counts under concurrency:
+  // ARCHITECT_NODE_CONCURRENCY runs several of these calls at once against the
+  // same ctx.metrics, so a "before/after" snapshot here would also capture
+  // whatever concurrent sibling calls added in between — and each sibling would
+  // do the same, compounding. Observed live: a single Medium problem "cost"
+  // $37 across just 38 LLM calls before this fix.
+  state.driverCostUsd = Number(state.driverCostUsd || 0) + Number(r.costUsd || 0)
+  architectRecost(ctx, state)
+
+  if (done) return { finalText: r.finalText || "", exhausted: false, done }
+
+  // No gate satisfied. Ask once, with no tools, for the structured forfeit the
+  // refinement stage reads (the paper's §4.4 decomposition proposal) — otherwise
+  // an exhausted node teaches the next blueprint nothing.
+  if (forfeitPrompt) {
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}🏳️ Stage ended without a gate — requesting a structured forfeit.` })
+    const fr = await runClaude(
+      buildArgs(`${user}\n\n---\n\n${forfeitPrompt}`, {
+        model: state.model,
+        systemPrompt: system,
+        disallowedTools: "Bash Read Write Edit Glob Grep WebFetch WebSearch Task",
+        strictMcpConfig: true,
+        excludeDynamicSections: true,
+      }),
+      { cwd: process.cwd(), timeoutMs: 180000 },
+    )
+    if (typeof fr.costUsd === "number") {
+      state.driverCostUsd = Number(state.driverCostUsd || 0) + fr.costUsd
+      architectRecost(ctx, state)
+    }
+    if (fr.ok && fr.text.trim()) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `${tag}${fr.text.trim()}` })
+      return { finalText: fr.text, exhausted: true }
+    }
+  }
+  return { finalText: r.finalText || "", exhausted: true }
+}
+
+// Stage-level driver dispatch: the River family drives Grok over the xAI API,
+// Leak Ultra drives the local Claude CLI. Identical opts either way.
+//
+// This is also where a conversation gets its identity. Minting the agent id
+// here rather than in each driver means the id rides the EXISTING `label` ->
+// `tag` prefix that both drivers already stamp on every emission, so every tool
+// call, tool result, assistant message and forfeit becomes attributable without
+// touching the emission plumbing. `trace` rides alongside for the same reason.
+const architectLoop = (ctx, state, opts) => {
+  const agentId = nextAgentId(state)
+  const trace = makeAgentTrace(agentId)
+  const label = opts.label ? `${agentId} · ${opts.label}` : agentId
+  ctx?.emit?.({
+    type: "system",
+    detail: contextManifest(agentId, state.model, String(opts.system || ""), String(opts.user || ""), opts.promptBlocks),
+  })
+  const next = { ...opts, label, trace }
+  // Live-agent registry: how the mechanic addresses a note to a conversation
+  // that is still running. Registered for the whole call, removed on exit.
+  if (state.liveTraces) state.liveTraces.set(agentId, { trace, label })
+  const run = state.driver === "claude" ? claudeArchitectLoop(ctx, state, next) : grokLoop(ctx, state, next)
+  return state.liveTraces ? run.finally(() => state.liveTraces.delete(agentId)) : run
+}
+
+const ARCHITECT_COMPILE_TOOL = {
+  type: "function",
+  function: {
+    name: "lean_compile",
+    description: "Compile Lean 4 code against the gateway (Mathlib + Architect preloaded). Returns safeguard violations, compiler errors, open goals, and validation results.",
+    parameters: {
+      type: "object",
+      properties: { code: { type: "string", description: "The full Lean 4 code to compile." } },
+      required: ["code"],
+    },
+  },
+}
+// Retrieval is TWO tools, because they answer different questions and only one
+// of them can answer "no".
+//
+// loogle searches the elaborated environment: zero hits for a name is proof the
+// name is absent. moogle is a vector index that always returns its nearest
+// neighbours: an unhelpful result set is not evidence about anything. Merging
+// them — which is what the single `mathlib_search` tool did — hands the model
+// an answer whose evidential weight depends on which engine happened to serve
+// it, invisibly. That is precisely how a prover reads "no such lemma" as "close,
+// try a variant" and spends a run on names that never existed.
+//
+// The descriptions below are the contract. They are deliberately blunt about
+// which tool's silence means something.
+const ARCHITECT_LOOGLE_TOOL = {
+  type: "function",
+  function: {
+    name: "loogle_search",
+    description:
+      "EXACT search of the Mathlib environment by name or Lean type pattern. This tool can say NO: zero results for a name is definitive evidence that the name does not exist — treat it as fact, not as a hint to try a variant. Syntax is Lean, not English: a constant (`Nat.mul_div_assoc`), a quoted name substring (\"add_comm\"), a type pattern (`?n / ?d = 0`), a conclusion (`|- _ = _ * _`), or several comma-separated filters. Always anchor with a concrete constant or metavariable.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  },
+}
+
+const ARCHITECT_MOOGLE_TOOL = {
+  type: "function",
+  function: {
+    name: "moogle_search",
+    description:
+      "SEMANTIC search of Mathlib by natural-language concept, for when you know the mathematics in English but not the Lean name. This tool CANNOT say no — it always returns its nearest neighbours, so an unhelpful result set is not evidence that anything is absent. Use it to discover naming conventions, then confirm the candidate with loogle_search.",
+    parameters: {
+      type: "object",
+      properties: {
+        concept: { type: "string" },
+        k: { type: "number", description: "max results (default 10)" },
+      },
+      required: ["concept"],
+    },
+  },
+}
+
+// Both stages offer both tools; kept as one array so a stage can never be
+// handed a lopsided pair by accident.
+const ARCHITECT_SEARCH_TOOLS = [ARCHITECT_LOOGLE_TOOL, ARCHITECT_MOOGLE_TOOL]
+
+// ---------------------------------------------------------------------------
+// Minimal hand-rolled MCP client (SSE transport). XI/XII/XIV are real
+// FastMCP servers now (mcp.server.fastmcp, matching every other Leak
+// server's wrapper architecture) rather than a bespoke REST API, so the
+// app's own "Add Server" UI can register and live-handshake against them
+// like any other Leak server. No npm dependency added (the bridge stays a
+// zero-install script) -- this IS the whole client: open the SSE stream,
+// read the `endpoint` event for where to POST JSON-RPC, do the `initialize`
+// handshake, then match tools/call responses back to their request by id.
+// One client per server URL, reused for the whole bridge process lifetime
+// (concurrent node provers share one session; JSON-RPC ids disambiguate
+// concurrent in-flight calls on it).
+// ---------------------------------------------------------------------------
+class McpSseClient {
+  constructor(sseUrl) {
+    // Registered MCP servers (findRegisteredUrl, above) store the FULL SSE
+    // endpoint — exactly the URL callRemoteMcpTool fetches as-is with no
+    // appending, same convention Leak I/II/IV already use. This class used to
+    // treat its argument as a bare origin and append "/sse" itself, which
+    // turned an already-complete ".../sse" URL into ".../sse/sse" — a path
+    // that never existed, 404ing every single connect. `origin` is derived
+    // separately (like callRemoteMcpTool's `base`/`origin` split) purely to
+    // resolve the server's `endpoint` event, which is relative to the origin,
+    // not to the /sse path.
+    this.sseUrl = sseUrl.replace(/\/$/, "")
+    try {
+      const u = new URL(this.sseUrl)
+      this.origin = `${u.protocol}//${u.host}`
+    } catch {
+      this.origin = this.sseUrl
+    }
+    this.messageUrl = null
+    this.nextId = 1
+    this.pending = new Map() // id -> {resolve, reject}
+    this.readyPromise = null
+  }
+
+  async connect() {
+    if (!this.readyPromise) {
+      // A rejected promise is still truthy, so a failed _connect() (a cold
+      // Space, a proxy hiccup mid-boot, anything) would otherwise get cached
+      // and replayed FOREVER — every later callTool() would immediately
+      // re-throw this same stale error without ever retrying the handshake,
+      // even once the Space is confirmed back up. Clear it on rejection so
+      // the next call gets a genuinely fresh /sse attempt.
+      this.readyPromise = this._connect().catch((e) => {
+        this.readyPromise = null
+        throw e
+      })
+    }
+    return this.readyPromise
+  }
+
+  async _connect() {
+    const resp = await fetch(this.sseUrl, { headers: { accept: "text/event-stream" } })
+    if (!resp.ok || !resp.body) throw new Error(`MCP SSE connect to ${this.sseUrl} → HTTP ${resp.status}`)
+    const endpointReady = new Promise((resolve, reject) => {
+      this._resolveEndpoint = resolve
+      this._rejectEndpoint = reject
+    })
+    this._pump(resp.body) // fire-and-forget: feeds endpointReady + this.pending as frames arrive
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => rej(new Error(`MCP SSE handshake with ${this.sseUrl} timed out (Space asleep? first request can take 1-2min to wake it)`)), 120000),
+    )
+    this.messageUrl = await Promise.race([endpointReady, timeout])
+
+    const initId = this.nextId++
+    const initResp = await this._rpc({
+      jsonrpc: "2.0", id: initId, method: "initialize",
+      params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "leak-architect-bridge", version: "1.0" } },
+    }, initId, 30000)
+    if (initResp.error) throw new Error(`MCP initialize with ${this.sseUrl} failed: ${JSON.stringify(initResp.error)}`)
+    await this._notify({ jsonrpc: "2.0", method: "notifications/initialized" })
+  }
+
+  async _pump(body) {
+    const reader = body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ""
+    try {
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        // Servers vary between LF and CRLF frame delimiters (Leak-I's own
+        // FastMCP server uses \r\n\r\n) — normalize before splitting so
+        // frame detection isn't silently blind to CRLF-terminated streams.
+        buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n")
+        let idx
+        while ((idx = buf.indexOf("\n\n")) >= 0) {
+          const frame = buf.slice(0, idx)
+          buf = buf.slice(idx + 2)
+          this._handleFrame(frame)
+        }
+      }
+      throw new Error("MCP SSE stream closed by server")
+    } catch (e) {
+      if (this._rejectEndpoint) { this._rejectEndpoint(e); this._rejectEndpoint = null }
+      for (const { reject } of this.pending.values()) reject(e)
+      this.pending.clear()
+      this.readyPromise = null // allow a future connect() to retry
+    }
+  }
+
+  _handleFrame(frame) {
+    let event = "message"
+    let data = ""
+    for (const line of frame.split("\n")) {
+      if (line.startsWith("event:")) event = line.slice(6).trim()
+      else if (line.startsWith("data:")) data += (data ? "\n" : "") + line.slice(5).trim()
+    }
+    if (!data) return
+    if (event === "endpoint") {
+      // Relative to the ORIGIN (matching callRemoteMcpTool's proven pattern),
+      // never to this.sseUrl — the server's `endpoint` data is always
+      // origin-relative (e.g. "/messages/?session_id=...").
+      let url
+      try {
+        url = new URL(data, this.origin).toString()
+      } catch {
+        url = this.origin + data
+      }
+      if (this._resolveEndpoint) { this._resolveEndpoint(url); this._resolveEndpoint = null }
+      return
+    }
+    let obj
+    try { obj = JSON.parse(data) } catch { return }
+    if (obj.id != null && this.pending.has(obj.id)) {
+      const { resolve } = this.pending.get(obj.id)
+      this.pending.delete(obj.id)
+      resolve(obj)
+    }
+  }
+
+  async _notify(payload) {
+    const resp = await fetch(this.messageUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) throw new Error(`MCP notify POST → HTTP ${resp.status}`)
+  }
+
+  async _rpc(payload, id, timeoutMs) {
+    const waitPromise = new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }))
+    const resp = await fetch(this.messageUrl, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    })
+    if (!resp.ok) { this.pending.delete(id); throw new Error(`MCP RPC POST → HTTP ${resp.status}`) }
+    const timeout = new Promise((_, rej) =>
+      setTimeout(() => { this.pending.delete(id); rej(new Error(`MCP call timed out after ${timeoutMs}ms`)) }, timeoutMs),
+    )
+    return Promise.race([waitPromise, timeout])
+  }
+
+  async callTool(name, args, timeoutMs = 300000) {
+    await this.connect()
+    const id = this.nextId++
+    const rpcResp = await this._rpc(
+      { jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } },
+      id, timeoutMs,
+    )
+    if (rpcResp.error) throw new Error(`MCP tool '${name}' error: ${rpcResp.error.message || JSON.stringify(rpcResp.error)}`)
+    const content = rpcResp.result?.content || []
+    return content.filter((c) => c.type === "text").map((c) => c.text).join("\n")
+  }
+}
+
+const MCP_CLIENTS = new Map() // baseUrl -> McpSseClient, reused for the process lifetime
+function getMcpClient(baseUrl) {
+  if (!MCP_CLIENTS.has(baseUrl)) MCP_CLIENTS.set(baseUrl, new McpSseClient(baseUrl))
+  return MCP_CLIENTS.get(baseUrl)
+}
+
+// lean_compile / verify_full_script return a JSON string as their MCP text
+// content (mirroring the {ok, report, graph, ...} shape the old REST version
+// returned directly) -- parse it back into an object.
+async function architectMcpCall(url, toolName, args, timeoutMs) {
+  const text = await getMcpClient(url).callTool(toolName, args, timeoutMs)
+  try {
+    return JSON.parse(text)
+  } catch {
+    return { ok: false, report: text }
+  }
+}
+
+// Leak XI's search tools return fully-formatted, citeable text server-side --
+// no client-side JSON parsing/formatting needed, just pass it through.
+//
+// `args` is forwarded verbatim rather than normalised into a common shape: the
+// two tools take DIFFERENT parameters on purpose (loogle takes a Lean `query`,
+// moogle takes an English `concept`), and flattening that here would quietly
+// re-merge the distinction the split exists to preserve.
+async function architectSearchCall(url, toolName, args, timeoutMs) {
+  const text = await getMcpClient(url).callTool(toolName, args, timeoutMs)
+  return { report: text }
+}
+
+// Resource ceilings applied to EVERY architect compile (node proving, final
+// assembly) unless the blueprint already set them itself.
+//
+// Lean's stock maxRecDepth (512) and maxHeartbeats (200000) are sized for
+// ordinary elaboration, not for `decide`/`norm_num`/`native_decide` over
+// competition-sized numerals. On factorial_base12_trailing_zeros that ceiling
+// alone decided the run: goals as small as `4 ^ 1009 = 2 ^ 2018` and
+// `Nat.factorial_ne_zero 2026` failed with "maximum recursion depth has been
+// reached", the prover wrote `set_option maxRecDepth 2000 in` six times, the
+// canonical rebuild silently discarded it every time (only the `:= by` body
+// survives), and nodes were forfeited whose sole defect was the limit. Leak
+// XII now passes whitelisted resource options through that rebuild, and the
+// floor below means the model usually does not have to ask.
+//
+// Scoped to the architect stack (Leak River / Leak Ultra on XI/XII/XIV) — the
+// legacy Leak I/II/IV paths are untouched. These are resource knobs only: none
+// of them can make a false proof typecheck, and the per-node wall clock
+// (NODE_TIMEOUT_MS) still bounds what a runaway computation can cost.
+const ARCHITECT_MAX_REC_DEPTH = Number(process.env.ARCHITECT_MAX_REC_DEPTH || 8000)
+const ARCHITECT_MAX_HEARTBEATS = Number(process.env.ARCHITECT_MAX_HEARTBEATS || 1000000)
+
+// Prelude = open/set_option lines between the imports and the first decl,
+// plus the resource floor above.
+// `boost` multiplies the floor. Raised by the loop when a whole proving pass
+// failed on nothing but resource ceilings — see the resource-retry branch in
+// proveArchitect.
+function architectPrelude(code, boost = 1) {
+  const lines = []
+  for (const ln of String(code || "").split("\n")) {
+    const t = ln.trim()
+    if (/^import\s/.test(t) || t === "") continue
+    if (/^(open|set_option|noncomputable section|section)\b/.test(t)) {
+      lines.push(t)
+      continue
+    }
+    break
+  }
+  const b = Math.max(1, Number(boost) || 1)
+  // A boosted pass overrides the blueprint's own ceiling too: the point of the
+  // retry is that the previous ceiling — whoever set it — was too low.
+  const keep = b > 1 ? lines.filter((l) => !/^set_option\s+(maxRecDepth|maxHeartbeats)\b/.test(l)) : lines
+  const has = (opt) => keep.some((l) => new RegExp(`^set_option\\s+${opt}\\b`).test(l))
+  const floor = []
+  if (ARCHITECT_MAX_REC_DEPTH > 0 && !has("maxRecDepth")) floor.push(`set_option maxRecDepth ${ARCHITECT_MAX_REC_DEPTH * b}`)
+  if (ARCHITECT_MAX_HEARTBEATS > 0 && !has("maxHeartbeats")) floor.push(`set_option maxHeartbeats ${ARCHITECT_MAX_HEARTBEATS * b}`)
+  return [...floor, ...keep].join("\n")
+}
+
+// Compile context for one node: every earlier node in topological order —
+// defs with real bodies (attribute stripped), lemmas/theorems sorried. The
+// PROMPT context stays exactly the declared parents; this larger closure is
+// compiler-only and costs the model nothing.
+function architectNodePrefix(graph, nodeName) {
+  const idx = graph.findIndex((n) => n.name === nodeName)
+  const before = graph.slice(0, Math.max(0, idx))
+  return before
+    .map((n) =>
+      n.kind === "def" || n.kind === "abbrev" || n.kind === "structure" || n.kind === "instance" || n.kind === "inductive"
+        ? n.declTextNoAttr
+        : `${n.signature.trim()} := by sorry`,
+    )
+    .join("\n\n")
+}
+
+// Strip a declaration's proof body, leaving the signature.
+//
+// The target arrives WITH a placeholder proof (`... := by\n  norm_num`), and
+// four consumers need it gone: the blueprint precheck's verbatim signature
+// comparison, Leak XII's node rebuild (`target_signature := <submitted body>`
+// — a retained `:= by norm_num` would rebuild as `... := by norm_num := by
+// ...`), Leak XIV's drift check, and architectNegSignature.
+//
+// This used to be `theorem.replace(/:=\s*by[\s\S]*$/, "").replace(/:=\s*sorry
+// [\s\S]*$/, "")`, which had two holes, both of which produce an UNWINNABLE
+// safeguard loop rather than a visible error:
+//   * it cuts at the earliest `:= by`, so a statement containing one — e.g.
+//     `let f : ℕ → ℕ := by exact id` — loses everything after it. Same failure
+//     class as the `parse_decl` bug on the Leak XII side.
+//   * it only recognises `by` and `sorry` bodies. A term-mode proof (`:= rfl`,
+//     `:= fun h => h`, `:= trivial`) is not stripped at all, so the expected
+//     signature carries a proof the model cannot reproduce — it must emit
+//     `:= by sorry_using []` — and the gate rejects every attempt forever.
+//
+// Same rule as the Python splitter: find the top-level `:=` that starts the
+// body, skipping the one each `let`/`have` binder in the statement consumes.
+//
+// This is the ONE scanner. Everything that needs to cut a declaration in two
+// calls it: architectSignatureOf takes what is before the returned index, the
+// node-solve handler takes what is after. They used to be separate code (the
+// body side was a bare `indexOf(":=")`), and the result was that a target whose
+// statement opens with a `let` binder produced a body of `1\n let k2 := ...` —
+// every node registered a solve, the assembled file was nonsense, and Leak XIV
+// rejected it with "numerals are data in Lean, but the expected type is a
+// proposition" on EVERY iteration until the refinement budget ran out. Nothing
+// the refinement model could write to the graph would have fixed it.
+//
+// Returns the index of the body-starting `:=`, or -1 if the declaration has no
+// proof body.
+function architectBodyStart(text) {
+  const src = String(text || "")
+  const m = src.match(
+    /(?:^|\n)[ \t]*(?:private\s+|protected\s+|noncomputable\s+|public\s+)*(?:theorem|lemma)\s+[A-Za-z_][A-Za-z0-9_'.]*/,
+  )
+  if (!m) return -1
+  const isIdent = (c) => !!c && /[A-Za-z0-9_'.]/.test(c)
+  let depth = 0
+  let pending = 0
+  let i = m.index + m[0].length
+  while (i < src.length - 1) {
+    // Lean string literals can contain `--`, `/-` and `:=`; step over them
+    // intact rather than lexing their contents.
+    if (src[i] === '"') {
+      let j = i + 1
+      while (j < src.length) {
+        if (src[j] === "\\") { j += 2; continue }
+        if (src[j] === '"') break
+        j++
+      }
+      i = j + 1
+      continue
+    }
+    const two = src.slice(i, i + 2)
+    if (two === "--") {
+      const nl = src.indexOf("\n", i)
+      i = nl < 0 ? src.length : nl
+      continue
+    }
+    if (two === "/-") {
+      const end = src.indexOf("-/", i + 2)
+      i = end < 0 ? src.length : end + 2
+      continue
+    }
+    const c = src[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (depth === 0) {
+      if (two === ":=") {
+        if (pending) {
+          pending--
+          i += 2
+          continue
+        }
+        return i
+      }
+      for (const kw of ["let", "have"]) {
+        if (!src.startsWith(kw, i)) continue
+        if (!isIdent(src[i - 1]) && !isIdent(src[i + kw.length])) pending++
+        break
+      }
+    }
+    i++
+  }
+  return -1
+}
+
+// Strip the proof body, leaving the signature.
+function architectSignatureOf(text) {
+  const src = String(text || "")
+  const at = architectBodyStart(src)
+  return at < 0 ? src.trim() : src.slice(0, at).trim()
+}
+
+// Keep only the proof body.
+//
+// Leak XII builds the declaration it verified as `${target_signature} :=\n
+// ${body}` from the signature THIS bridge sent it, so when that signature is
+// still a literal prefix the cut needs no parsing at all — exact beats clever,
+// and a parse that has been wrong four times does not get a fifth chance at
+// the one path whose output goes straight into the certified file. The scanner
+// is the fallback for callers with no signature to match against.
+function architectProofBody(text, signature = "") {
+  const src = String(text || "")
+  const sig = String(signature || "").trim()
+  if (sig && src.startsWith(sig)) {
+    const rest = src.slice(sig.length).trimStart()
+    if (rest.startsWith(":=")) return rest.slice(2).trim()
+  }
+  const at = architectBodyStart(src)
+  return at < 0 ? "" : src.slice(at + 2).trim()
+}
+
+function architectNegSignature(signature) {
+  const m = signature.match(/^\s*(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/)
+  if (!m) return null
+  const rest = signature.slice(m[0].length)
+  let depth = 0
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (c === ":" && depth === 0 && rest.slice(i, i + 2) !== ":=") {
+      const binders = rest.slice(0, i).trim()
+      const concl = rest.slice(i + 1).trim()
+      const inner = binders ? `∀ ${binders}, ${concl}` : concl
+      return `theorem ${m[1]}_neg : ¬ (${inner})`
+    }
+  }
+  return null
+}
+
+// --- Dead-end ledger (river-gate / river-delta) ------------------------------
+// The paper isolates node provers deliberately: each gets a fresh context with
+// only its declared parents, so parallel attempts can't correlate. That is right
+// for proof STRATEGY, but it also means every node independently rediscovers the
+// same environment facts. Observed live on mirage_break: three sibling nodes each
+// burned turns learning that `partial_sum_mono` doesn't exist, and separately
+// that `1 / list.getD i 1` elaborates over ℕ without a `(1:ℚ)` ascription.
+//
+// The ledger shares ONLY environment facts — names that don't resolve, typeclass
+// instances that aren't available, elaboration/coercion traps. It never shares a
+// tactic that worked, a proof body, or any node's approach, so node independence
+// (and the paper's parallel-attempt semantics) is preserved.
+//
+// The ledger is TWO-SIDED: alongside dead ends it records the Mathlib lemma
+// NAMES that appeared in siblings' ACCEPTED proofs (ledgerHarvestProven). A bare
+// name that provably resolves is the same class of knowledge as a search result
+// — environment fact, not strategy — and it is exactly the half the ledger was
+// missing: observed live, one node discovered `Nat.Prime.primeFactors` by
+// search while a sibling was still burning turns on the recorded-dead
+// `Nat.primeFactors_prime` with no way to learn the correct name.
+//
+// Bounded by construction: deduped by key, capped at LEDGER_MAX entries, each
+// entry one short line. Run-scoped rather than iteration-scoped because "this
+// name is not in Mathlib" stays true across refinements.
+const LEDGER_MAX = 40
+const LEDGER_GOOD_MAX = 24
+function makeDeadEndLedger() {
+  return { entries: new Map(), good: new Map(), shared: 0 }
+}
+// Pull environment-level dead ends out of one compiler report.
+function ledgerHarvest(ledger, report, nodeName) {
+  if (!ledger || !report) return
+  const text = String(report)
+  const add = (key, note) => {
+    if (ledger.entries.size >= LEDGER_MAX || ledger.entries.has(key)) return
+    ledger.entries.set(key, { note, from: nodeName })
+  }
+  // (Names the environment does not contain used to be harvested here. They now
+  // live in the ALWAYS-ON nonexistent-name ledger below — every arm gets them,
+  // and without this ledger's `excludeNode` suppression, which is wrong for
+  // names. See deadNameHarvest.)
+  // Typeclass instances that aren't derivable for the types in play.
+  //
+  // Entries containing metavariables (`?m.109`, `?a`) are SKIPPED here too, and
+  // for a stronger reason than noise: `HSub ?m.109[X] ℕ ?m.129` is not a fact
+  // about the environment at all — it is one submission's incomplete
+  // elaboration (usually a missing type ascription), and each recurrence mints
+  // a "new" entry because the metavariable numbers differ. Observed live: one
+  // missing `(X : ℤ[X])` ascription minted EIGHT distinct \"avoid lemmas that
+  // require HSub ?m.NNN\" entries that steered every sibling away from the
+  // correct (ascribed) approach.
+  for (const m of text.matchAll(/failed to synthesize(?:\s+instance of type class)?\s*\n?\s*([A-Za-z_][\w'.]*(?:\s+[^\n]{0,60})?)/g)) {
+    const inst = m[1].trim()
+    if (/\?\w/.test(inst)) continue
+    add(`inst:${inst}`, `typeclass \`${inst}\` is not available here — avoid lemmas that require it.`)
+  }
+  // (Head identifier only — `Fact`, `Semiring` — so a metavariable-riddled
+  // instance argument can never leak into the note.)
+  for (const m of text.matchAll(/typeclass instance problem is stuck\s*\n?\s*([A-Za-z_][\w'.]*)/g))
+    add(`stuck:${m[1]}`, `typeclass \`${m[1]}\` gets stuck (needs its type pinned by an explicit ascription).`)
+  // Elaboration / coercion traps: record the mismatched pair compactly. This is
+  // the class of failure that cost the most turns in practice (e.g. `1 / xs.getD
+  // i 1` silently elaborating over ℕ instead of ℚ).
+  //
+  // Mismatches containing metavariables (`?m.57`, `?a`) are SKIPPED: they are
+  // artefacts of a unification that never completed, not stable facts about the
+  // environment, and they read as noise in a sibling's prompt. Verified against a
+  // real mirage_break run — 3 of 12 harvested mismatches were metavariable-only
+  // and carried no actionable information, while the named-identifier and
+  // typeclass facts were all genuinely load-bearing.
+  for (const m of text.matchAll(/has type\s*\n?\s*\(?([^\n]{1,90}?)\)?\s*\n?\s*but is expected to have type\s*\n?\s*\(?([^\n]{1,90}?)\)?\s*\n/g)) {
+    const got = m[1].trim()
+    const want = m[2].trim()
+    if (!got || !want || got === want) continue
+    if (/\?\w/.test(got) || /\?\w/.test(want)) continue
+    // Prop-shaped mismatches (`n ≥ 1` supplied where `n ≠ 0` was expected) are
+    // hypothesis-FORM gaps, not elaboration gaps — "ascribe the numeral" is
+    // wrong advice there (observed live: nodes kept re-ascribing while the fix
+    // was a one-call bridge like `by omega`). Route the note by shape.
+    const proppy = /[≥≤<>=∣¬∀∃→↔]/.test(got) || /[≥≤<>=∣¬∀∃→↔]/.test(want)
+    add(
+      `coe:${got}=>${want}`,
+      proppy
+        ? `hypothesis-form mismatch: a proof of \`${got}\` was supplied where \`${want}\` was expected — convert it explicitly (\`by omega\` closes most ℕ/ℤ order-form gaps; otherwise the matching \`.mp\`/\`.mpr\` or bridging lemma), do not just retype the tactic.`
+        : `type mismatch seen: \`${got}\` where \`${want}\` was expected — ascribe the numeral/type explicitly.`,
+    )
+  }
+}
+// The POSITIVE side of the ledger: harvest dotted Mathlib identifiers out of a
+// node's ACCEPTED proof body. Bare names only — never the proof, never tactics,
+// never which goal they closed — so sibling independence is preserved while
+// "this name exists and resolves in this environment" propagates. (A name from
+// an accepted proof cannot conflict with a `name:` dead end: dead ends failed
+// to compile, these compiled.)
+function ledgerHarvestProven(ledger, proofBody, nodeName) {
+  if (!ledger || !proofBody) return
+  for (const m of String(proofBody).matchAll(/\b[A-Z][A-Za-z0-9_']*(?:\.[A-Za-z0-9_'][A-Za-z0-9_']*)+/g)) {
+    if (ledger.good.size >= LEDGER_GOOD_MAX) return
+    if (!ledger.good.has(m[0])) ledger.good.set(m[0], { from: nodeName })
+  }
+}
+// Render the ledger for a node's prompt. `excludeNode` drops facts the node
+// found itself (its own context already has those errors verbatim).
+function ledgerRender(ledger, excludeNode) {
+  if (!ledger || (ledger.entries.size === 0 && (!ledger.good || ledger.good.size === 0))) return ""
+  const lines = []
+  for (const [, v] of ledger.entries) {
+    if (v.from && v.from === excludeNode) continue
+    lines.push(`- ${v.note}`)
+  }
+  const goodNames = []
+  for (const [name, v] of ledger.good || []) {
+    if (v.from && v.from === excludeNode) continue
+    goodNames.push(`\`${name}\``)
+  }
+  if (!lines.length && !goodNames.length) return ""
+  ledger.shared += lines.length
+  const dead = lines.length
+    ? `\n\n## Known dead ends (established by the compiler on sibling nodes of this same problem — treat as facts, not suggestions)\n${lines.join("\n")}`
+    : ""
+  const good = goodNames.length
+    ? `\n\n## Verified library names (each appeared in a sibling node's ACCEPTED proof on this same problem — they exist and resolve here; how you use them is up to you)\n${goodNames.join(", ")}`
+    : ""
+  return `${dead}${good}\n\nThese are environment facts only; no proof strategy is implied. Do not spend turns rediscovering them.`
+}
+
+// --- Nonexistent-name ledger (ALWAYS on, every arm) --------------------------
+//
+// Deliberately NOT gated by the variant, unlike the dead-end ledger above.
+// "This identifier is not in this Mathlib" is a fact the compiler established
+// about the ENVIRONMENT — the same class as a search result — and re-earning it
+// is pure waste, not an experimental condition. Keeping it universal also keeps
+// the control's node ISOLATION intact: nothing about any node's approach,
+// tactics or proof crosses over, only a list of strings Lean refused.
+//
+// The hallucination lock catches a streak INSIDE one conversation. But every
+// node prover is a fresh conversation, and every refinement re-dispatches its
+// nodes from zero, so the lock resets and the same invented name gets paid for
+// again. Observed live on floors_recover_whole: `Nat.div_eq_zero_of_dvd` does
+// not exist, and it was submitted at least a dozen times across FIVE separate
+// prover contexts (iterations 0, 1, 2, 3, 5) — most of a ten-minute run spent
+// re-proving one absence. The dead-end ledger already harvested this class, but
+// only for gate/delta, and it hid the fact from the very node that found it
+// (`excludeNode`) — right within one conversation, wrong across fresh attempts,
+// which is exactly this case.
+//
+// Bounded, deduped, and never guessed: an entry is minted only where the
+// compiler itself said the name is unknown.
+const DEAD_NAME_MAX = 60
+// An "unknown identifier" can also name a BLUEPRINT declaration — a node citing
+// a non-parent sibling, or a submission referring to something the daemon's
+// prefix did not carry. Recording those as "not in Mathlib" would be a lie that
+// steers every later node away from a name that does exist, so callers pass the
+// names that are theirs.
+// "Unknown identifier" fires for LOCAL BINDERS that are simply out of scope, not
+// only for library names that don't exist — a submission referring to `k` outside
+// the lambda that bound it produces the same diagnostic as one inventing
+// `Nat.foo_of_bar`. Recording the first kind tells every later prover that a
+// perfectly ordinary variable "does not exist in this Mathlib", which is both
+// false and confusing. Observed live: `k` landed in the ledger and was served to
+// three downstream node provers.
+//
+// The shape test: a declaration reference carries a namespace dot or an
+// underscore, or is long enough not to be a binder. Binders are short and bare
+// (`k`, `n`, `hx`, `ih`); Mathlib names are `Nat.mul_div_assoc`, `sq_sub_sq`,
+// `congrArg`. The asymmetry is deliberate — failing to record a real absence
+// costs one repeated compile, while recording a false one misdirects every node
+// for the rest of the run, so this errs toward recording nothing.
+const looksLikeDeclName = (n) => /[._]/.test(n) || n.length >= 5
+
+function deadNameAdd(state, names, exclude) {
+  if (!state) return
+  if (!state.deadNames) state.deadNames = new Map()
+  const skip = exclude instanceof Set ? exclude : new Set(exclude || [])
+  for (const name of names) {
+    if (state.deadNames.size >= DEAD_NAME_MAX) return
+    if (!name || skip.has(name) || state.deadNames.has(name)) continue
+    if (!looksLikeDeclName(name)) continue
+    state.deadNames.set(name, true)
+  }
+}
+function deadNameHarvest(state, report, exclude) {
+  if (!report) return
+  deadNameAdd(
+    state,
+    [...String(report).matchAll(/Unknown (?:identifier|constant)\s+[`'"]?([A-Za-z_][A-Za-z0-9_'.]*)[`'"]?/gi)].map(
+      (m) => m[1],
+    ),
+    exclude,
+  )
+}
+// Declarations introduced by a submission itself — the exclusion set for a
+// whole-file (blueprint/refinement) compile, where there is no graph yet.
+function declaredNamesIn(code) {
+  const out = new Set()
+  for (const m of String(code || "").matchAll(
+    /^\s*(?:@\[[^\]]*\]\s*)?(?:noncomputable\s+|private\s+|protected\s+)*(?:theorem|lemma|def|abbrev|structure|instance|inductive)\s+([A-Za-z_][A-Za-z0-9_'.]*)/gm,
+  ))
+    out.add(m[1])
+  return out
+}
+function deadNameRender(state) {
+  const names = state?.deadNames
+  if (!names || names.size === 0) return ""
+  return (
+    `\n\n## Names already proved absent in this Mathlib (this run, this problem)\n` +
+    `The compiler has already rejected each of these as an unknown constant/identifier: ${[...names.keys()]
+      .map((n) => `\`${n}\``)
+      .join(", ")}.\n` +
+    `These are settled facts, not warnings. Do not submit them, and do not submit a near-variant of one — a name that failed is usually a whole naming CONVENTION that failed, not one typo. ` +
+    `When you need a name you are not certain of, settle it before you build on it: \`loogle_search\` or a bare \`#check <name>\` exploration compile for a definitive yes/no on a specific name (several \`#check\`s fit in one call), or \`moogle_search\` for the FACT you want when you do not have a candidate name yet.`
+  )
+}
+
+// ── Agent telemetry ──────────────────────────────────────────────────────────
+//
+// Diagnostic only. Nothing here decides anything: no emission from this section
+// reaches a model, changes a gate, or alters control flow. It exists because a
+// real run was undiagnosable from its own log.
+//
+// What that run looked like: three node provers ran CONCURRENTLY, every one of
+// them labelled "attempt 1/9999", and their lean_compile/search calls
+// interleaved into one flat stream with nothing saying which agent made which
+// call. Underneath that, one prover submitted NINE proofs whose first half was
+// byte-identical every time — the half carrying the error the compiler reported
+// first — while it rewrote the other half. The log could not show either fact.
+//
+// So: give every conversation a stable id (1), record the exact bytes it opened
+// with (2), envelope each turn (3), diff each submission against that agent's
+// own previous one and surface what never changes (4), and record the file the
+// daemon actually compiled next to the one the model wrote (5).
+const shortHash = (s) => createHash("sha1").update(String(s ?? "")).digest("hex").slice(0, 8)
+
+// (1) Stable per-conversation id. Minted at the single dispatch point so both
+// drivers inherit it through the existing `label` -> `tag` prefix, which is
+// already stamped on every emission either driver makes. Sequential within the
+// run and short enough to scan: A1, A2, … Concurrency is why the counter lives
+// on `state` (run-scoped) rather than in a module global — two runs in the same
+// bridge process must not share a numbering.
+function nextAgentId(state) {
+  if (!state) return "A?"
+  state.agentSeq = (Number(state.agentSeq) || 0) + 1
+  return `A${state.agentSeq}`
+}
+
+// (4) Per-agent submission history.
+//
+// `frozen` is the interesting one: the set of source lines present in EVERY
+// submission this agent has made. When a node stalls, that set is the part of
+// the proof the prover has stopped thinking about — and in the run that
+// motivated this, it contained the exact line the compiler kept rejecting.
+function makeAgentTrace(agentId) {
+  return {
+    agentId,
+    turn: 0,
+    submissions: 0,
+    lastCode: "",
+    frozen: null, // Set<string> | null (null = no submission yet)
+    lastFirstError: "",
+    repeatedFirstError: 0,
+    // Ring of the most recent submitted code blocks — the consultant's raw
+    // material for "what has this agent actually been changing".
+    history: [],
+    consults: 0,
+    // This agent's own rolling activity log (rendered stream frames) — what the
+    // consultant reads in full and the interceptor reads a tail of.
+    streamLog: [],
+    // Interceptor bookkeeping: at most one judgement in flight, verdicts parked
+    // here until the loop's injection point reads them. The agent never waits.
+    lastInterceptAt: 0,
+    interceptBusy: false,
+    interceptVerdict: null,
+    // Mechanic notes addressed to THIS agent, parked until the injection point.
+    mechanicNotes: [],
+  }
+}
+
+const normaliseLean = (s) =>
+  String(s ?? "")
+    .replace(/[ \t]+/g, " ")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .trim()
+
+// Line-level comparison. Deliberately NOT a minimal-edit diff: when the model
+// edits a proof in place the line counts match and an index-wise compare is
+// exact; when they don't, a truthful summary beats a pretty-but-approximate
+// alignment. Bounded output either way.
+function diffLines(prev, next, maxShown = 12) {
+  const a = String(prev ?? "").split("\n")
+  const b = String(next ?? "").split("\n")
+  if (a.length !== b.length) {
+    return { sameShape: false, changed: Math.abs(a.length - b.length), lines: [`(${a.length} lines → ${b.length} lines)`] }
+  }
+  const lines = []
+  let changed = 0
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] === b[i]) continue
+    changed++
+    if (lines.length < maxShown * 2) {
+      lines.push(`  L${i + 1} - ${a[i].trim().slice(0, 140)}`)
+      lines.push(`  L${i + 1} + ${b[i].trim().slice(0, 140)}`)
+    }
+  }
+  return { sameShape: true, changed, lines }
+}
+
+// Called with the raw tool arguments BEFORE dispatch. Returns a rendered block
+// or "" (never throws — a telemetry bug must not cost a compile).
+function traceSubmission(trace, toolName, args) {
+  try {
+    if (!trace) return ""
+    const code = typeof args?.code === "string" ? args.code : ""
+    if (!code) return ""
+    trace.submissions += 1
+    if (Array.isArray(trace.history)) {
+      trace.history.push(code)
+      if (trace.history.length > 4) trace.history.shift()
+    }
+    const n = trace.submissions
+    const lines = code.split("\n").map((l) => l.trim()).filter(Boolean)
+    trace.frozen = trace.frozen === null ? new Set(lines) : new Set([...trace.frozen].filter((l) => lines.includes(l)))
+
+    const head = `${trace.agentId} · submission #${n} · ${code.split("\n").length} lines · sha ${shortHash(code)}`
+    if (n === 1) {
+      trace.lastCode = code
+      return `🧾 ${head} (first submission)`
+    }
+
+    const exact = code === trace.lastCode
+    const norm = normaliseLean(code) === normaliseLean(trace.lastCode)
+    const d = diffLines(trace.lastCode, code)
+    trace.lastCode = code
+
+    const verdict = exact
+      ? "IDENTICAL to the previous submission"
+      : norm
+        ? "WHITESPACE-ONLY change from the previous submission"
+        : d.sameShape
+          ? `${d.changed} line(s) changed`
+          : `reshaped (${d.lines[0]})`
+    // The signal the stalled run needed: most of the proof is untouched and the
+    // model is perturbing the rest. Two changed lines after several submissions
+    // is not iteration, it is a loop dodging the duplicate guard.
+    const churn = !exact && d.sameShape && d.changed > 0 && d.changed <= 2 && n >= 3 ? " ⚠️ minimal perturbation" : ""
+    const frozenNote =
+      trace.frozen && trace.frozen.size && n >= 3
+        ? `\n   ${trace.frozen.size} line(s) unchanged across all ${n} submissions — the prover has stopped editing them.`
+        : ""
+    return `🧾 ${head}\n   ${verdict}${churn}${frozenNote}${d.lines.length ? `\n${d.lines.join("\n")}` : ""}`
+  } catch {
+    return ""
+  }
+}
+
+// --- Stream rendering + rolling logs (shared by consultant/interceptor/mechanic)
+// One renderer produces the compact textual form of every SSE frame — the same
+// content the admin prover viewer shows the operator — so the run-scoped ring
+// (the mechanic's window) and each agent's own log (consultant/interceptor
+// material) are built from identical ground truth.
+function renderStreamFrame(obj) {
+  try {
+    if (!obj || typeof obj !== "object") return ""
+    const clip = (s, n) => {
+      s = String(s ?? "")
+      return s.length > n ? `${s.slice(0, n)} …[+${s.length - n} chars]` : s
+    }
+    if (obj.type === "message-annotation") {
+      if (obj.subtype === "tool_intent") return `TOOL_CALL → ${obj.tool || "tool"}\n${clip(obj.input, 700)}`
+      if (obj.subtype === "tool_result") return `TOOL_RESULT\n${clip(obj.output, 1000)}`
+      if (obj.subtype === "error") return `ERROR — ${clip(obj.thought, 700)}`
+      return `TEXT — ${clip(obj.thought, 1500)}`
+    }
+    // Context manifests + full prompts repeat identically per agent; the
+    // mechanic's brief already carries the stage contracts, so clip hard here.
+    if (obj.type === "system") return `SYSTEM — ${clip(obj.detail, 500)}`
+    if (obj.type === "error") return `ERROR — ${clip(obj.message, 500)}`
+    if (obj.type === "text-delta") return `TEXT — ${clip(obj.content, 400)}`
+    if (obj.type === "prompt") return "RECEIVED — run prompt captured (full stage contracts live in the run header)"
+    if (obj.type === "run") return "SYSTEM — run registered (budgets set)"
+    if (obj.type === "done") return `DONE — verified=${!!obj.verified}`
+    return ""
+  } catch {
+    return ""
+  }
+}
+
+// Append a rendered frame to one agent's own rolling log. Bounded; never throws
+// (telemetry must not cost a compile).
+function traceLogPush(trace, obj) {
+  try {
+    if (!trace || !Array.isArray(trace.streamLog)) return
+    const text = renderStreamFrame(obj)
+    if (!text) return
+    trace.streamLog.push(text)
+    if (trace.streamLog.length > 400) trace.streamLog.shift()
+  } catch {}
+}
+
+// A watcher (interceptor/mechanic) calls Grok through the SAME shared state so
+// cost/usage accounting stays correct — but with its OWN stageTokens, so a
+// watcher's tokens never eat the budget of the stage it is watching.
+// Object.create: reads fall through to the real state (shared usage object,
+// model, driver), the += on stageTokens lands on the proxy.
+function watcherStateOf(state) {
+  const w = Object.create(state)
+  w.stageTokens = 0
+  return w
+}
+
+// --- Local-name scope caveat (deterministic, no LLM) -------------------------
+// Observed twice in one run: a node prover loogle-searched a name declared in
+// its OWN blueprint file (`good_residues`), read the truthful "does not exist
+// in Mathlib" reply as proof the lemma statement was ill-formed, and forfeited
+// a TRUE node as STATEMENT_WRONG. loogle/moogle index the published Mathlib
+// environment only — they structurally cannot see local declarations, and
+// their zero-hit wording does not distinguish "absent from Mathlib" from
+// "not something I can even look at". The harness knows every locally-declared
+// name, so it settles this mechanically at the exact moment of confusion.
+function architectLocalScopeCaveat(queryText, localNames) {
+  try {
+    if (!localNames || !localNames.size) return ""
+    const toks = new Set(String(queryText || "").match(/[A-Za-z_][A-Za-z0-9_']*/g) || [])
+    const hits = [...localNames].filter((n) => toks.has(n))
+    if (!hits.length) return ""
+    const one = hits.length === 1
+    return (
+      `\n\n⚠️ SCOPE NOTE from the harness: ${hits.map((h) => `\`${h}\``).join(", ")} ${one ? "is" : "are"} declared locally in THIS run's blueprint file — ${one ? "it is not, and will never be, a Mathlib name" : "they are not, and will never be, Mathlib names"}. ` +
+      `loogle_search/moogle_search search ONLY the published Mathlib environment and can NEVER see local declarations, so this result says NOTHING about ${one ? "that name" : "those names"} — in particular it is NOT evidence that a statement using ${one ? "it" : "them"} is ill-formed or false. ` +
+      `To inspect a local name, use a bare \`#check ${hits[0]}\` exploration compile via lean_compile (no import line) — that DOES see local declarations.`
+    )
+  } catch {
+    return ""
+  }
+}
+
+// --- Shared syntax reference for the watchers (NOT the main engine prompts) --
+// The main C.1/C.2/C.3 prompts stay problem-agnostic and free of one-off
+// patches — that's deliberate, they must generalize. This is the opposite
+// kind of fix: durable, general Lean/Mathlib syntax facts that keep tripping
+// agents up across DIFFERENT problems, given to the watchers so a caught
+// syntax loop gets the literal corrected line instead of a vague "fix the
+// syntax" note that a stuck agent has already failed to act on repeatedly.
+// Observed live (milestone_pairwise_distance): a blueprint generator burned
+// its ENTIRE token budget (~30 submissions) toggling between five wrong
+// doc-comment delimiter variants because neither watcher could name the
+// correct one; a node prover independently lost several more submissions to
+// the second trap below, from a completely fresh context. Extend this list
+// only from things actually observed live — it earns its keep by staying
+// short and correct, not by trying to be exhaustive.
+const ARCHITECT_SYNTAX_HINTS = `## Known Lean/Mathlib syntax traps — when you spot one, quote the EXACT fix
+A vague note ("fix the delimiters", "use proper syntax") has already failed to break these loops live — the agent needs the literal corrected line to copy, not another description of the symptom.
+
+1. **@[blueprint] doc-comment delimiters.** The ONLY correct form opens with THREE characters \`/--\` and closes with TWO characters \`-/\`:
+   \`(statement := /-- exactly this shape -/)\`
+   WRONG (all seen live, all rejected with "unbalanced '/- ... -/' block comments"): \`/- text -/\`, \`/-- text /-\`, \`/-- text /--)\`, \`/-- text --/\`, plain string literals \`"text"\`. If you see that error, tell the agent to replace EVERY statement/proof field with the exact \`/-- ... -/\` shape — nothing else compiles.
+
+2. **Big-operator binder notation.** This Mathlib pins \`∑ x ∈ s, f x\` / \`∏ x ∈ s, f x\` (using \`∈\`). The older \`∑ x in s, f x\` (using \`in\`) is REJECTED here with "unexpected token 'in'; expected ','". If an agent hits that error, tell it either to switch every \`in\` to \`∈\` in sum/product binders, OR — the form that sidesteps the notation question entirely — rewrite as \`Finset.sum s (fun x => f x)\` / \`s.sum (fun x => f x)\`.
+
+When you flag either of these (or another syntax convention you recognize with confidence), reproduce the corrected snippet verbatim in your note, not just a description of what's wrong.`
+
+// --- The interceptor: a per-agent semantic watcher ---------------------------
+// The consultant fires on a LITERAL streak (same first error, string-identical,
+// 3 times) and the agent waits for its reply. The interceptor is the other
+// half of the coverage: fired off-thread every few submissions, it judges the
+// agent's recent trajectory SEMANTICALLY — circling-but-not-identical failure,
+// a misread tool contract, building on an unverified claim — none of which a
+// string-match gate can see. The agent never waits for it; a verdict (if any)
+// is injected at the next turn boundary, and every injection is mirrored to
+// the stream. Scope is ONE agent's own window — never a sibling's (isolated
+// lasers stay isolated; see the mechanic for the run-wide view).
+const ARCHITECT_INTERCEPT_EVERY = Number(process.env.ARCHITECT_INTERCEPT_EVERY || 3)
+
+function maybeIntercept(ctx, state, trace, taskContext) {
+  try {
+    if (!trace || trace.interceptBusy) return
+    if (trace.submissions < ARCHITECT_INTERCEPT_EVERY) return
+    // Cooldown anchor is the LAST INJECTION of any watcher note, not just the
+    // last interceptor fire — observed live (count_div24): one node absorbed
+    // five same-topic notes in ~35s because interceptor and mechanic each
+    // re-flagged before the agent had even one submission to act on the first.
+    const anchor = Math.max(trace.lastInterceptAt || 0, trace.lastInjectedSub || 0)
+    if (trace.submissions - anchor < ARCHITECT_INTERCEPT_EVERY) return
+    trace.lastInterceptAt = trace.submissions
+    trace.interceptBusy = true
+    architectIntercept(ctx, state, trace, taskContext)
+      .then((v) => {
+        if (v && (v.action === "note" || v.action === "abort") && v.note) trace.interceptVerdict = v
+      })
+      .catch(() => {})
+      .finally(() => {
+        trace.interceptBusy = false
+      })
+  } catch {}
+}
+
+async function architectIntercept(ctx, state, trace, taskContext) {
+  const system = `You are the INTERCEPTOR for one agent in a multi-agent Lean 4 proving pipeline. You watch a rolling window of ONE prover's live activity (its turns, submissions with diffs, tool calls and compiler replies) and decide whether to interrupt. You are not the prover and you write no tactics.
+
+What is HEALTHY (do not interrupt):
+- Compiler errors that CHANGE between submissions — the agent is exploring; unique errors are progress.
+- Search calls followed by use of what was found.
+- Partial proofs with sorry placeholders being narrowed turn over turn.
+
+What needs a NOTE (action "note"):
+- Circling: submissions vary superficially (renamed hypotheses, reordered rewrites, permuted lemma variants) while failing in the same REGION for the same underlying reason, even when the literal error text differs each time.
+- A misread tool contract. Especially: loogle_search/moogle_search see ONLY the published Mathlib environment — never declarations local to this problem (the target, its parents, blueprint \`def\`s). A zero-hit on a LOCAL name is meaningless; treating it as evidence the statement is ill-formed is a critical misread. Local names are checked with \`#check\` via lean_compile.
+- Building multiple submissions on an unverified numeric or naming assumption a single #eval/#check would settle.
+- Ignoring an explicit hint already present in a tool reply (e.g. a search result that directly states the needed lemma).
+
+${ARCHITECT_SYNTAX_HINTS}
+
+When to ABORT (action "abort" — rare, high confidence only):
+- The agent is committed to disproving a statement on grounds you can see are false (e.g. the local-name misread above) and is spending its remaining budget on it.
+- Pure mechanical looping with the duplicate-guard already firing and no structural change across many submissions.
+- The window shows the same advice already injected (by you or the mechanic) two or more times and the submissions since then show NO structural change — a third note teaches nothing; hand the attempt to refinement instead.
+Never abort an agent that is still producing NEW errors — agents often self-correct; a premature abort kills a proof that was one submission away.
+
+Reply with STRICT JSON only, no prose, no fence:
+{"action": "silent" | "note" | "abort", "note": "<=120 words; empty when silent. Concrete: name the exact misread or the exact circling pattern and the ONE thing to do differently.>"}
+Prefer "silent" — a needless interruption is a real cost.`
+  const windowText = (trace.streamLog || []).slice(-30).join("\n\n").slice(-16000)
+  const user = `## The task this agent was given
+${String(taskContext || "").slice(0, 2500)}
+
+## The agent's recent activity window (oldest first)
+${windowText || "(no activity captured yet)"}`
+  const msg = await grokCall(
+    watcherStateOf(state),
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    [],
+    ctx,
+  )
+  const raw = String(msg?.content || "")
+  const m = raw.match(/\{[\s\S]*\}/)
+  if (!m) return { action: "silent", note: "" }
+  try {
+    const v = JSON.parse(m[0])
+    const action = ["silent", "note", "abort"].includes(v.action) ? v.action : "silent"
+    return { action, note: String(v.note || "").trim().slice(0, 1200) }
+  } catch {
+    return { action: "silent", note: "" }
+  }
+}
+
+// --- The mechanic: a run-wide watcher over the operator's own stream ---------
+// Every role above works from a NARROW context by design (isolated node
+// provers, a per-agent interceptor, a per-node diagnostician). The mechanic is
+// the one watcher with the OPERATOR's view: the full rolling window of the
+// admin prover viewer's stream, refreshed continuously, running in parallel
+// with the main loop and never gating it. It cannot compile, cannot edit the
+// blueprint, cannot change code — it only emits judgements, each routed to a
+// live agent, to the refinement stage's evidence, or to the log, and every
+// one of them is mirrored into the stream. Its own frames are tagged and
+// stripped from its next window, so it can never feed on its own output.
+//
+// Division of labour it must respect: the harness already DETERMINISTICALLY
+// catches identical resubmissions, literal error streaks (→ consultant),
+// unknown-name streaks (→ compile lock) and rebuild line offsets. The
+// mechanic's value is what needs judgement across agents and stages:
+// the same categorical mistake recurring in independent conversations, tool
+// misuse the per-agent watchers missed, blueprint-level trouble, harness
+// anomalies, and budget being visibly wasted.
+const ARCHITECT_MECHANIC_MIN_FRAMES = Number(process.env.ARCHITECT_MECHANIC_MIN_FRAMES || 15)
+const ARCHITECT_MECHANIC_INTERVAL_MS = Number(process.env.ARCHITECT_MECHANIC_INTERVAL_MS || 25000)
+const ARCHITECT_MECHANIC_WINDOW = Number(process.env.ARCHITECT_MECHANIC_WINDOW || 250)
+
+function architectMechanicBrief() {
+  return `## Role
+You are the MECHANIC of a multi-agent Lean 4 theorem-proving pipeline (the Goedel-Architect "Leak River" system). You watch the SAME live stream the human operator watches — a rolling window of every agent's turns, submissions, tool calls, compiler replies and harness telemetry — and you run in parallel with the main loop.
+
+You are NOT a prover and you are NOT a fixer. Your one job is keeping the machine lubricated: notice when the cogs stop turning correctly — the same mistake recurring, a stage stalled, budget draining — work out WHY (almost always: a piece of context an agent needed never reached it), and deliver THAT MISSING CONTEXT to the right recipient. The mathematics, the tactics, the graph design and every actual fix belong to the provers, the diagnostician and refinement — never to you.
+
+A mechanic's note contains exactly two things:
+1. The observed pattern: what keeps happening, where (cite #seq entries), and the misread or missing information that explains it.
+2. The missing context itself, quoted from ground truth: a tool contract from this brief, a syntax fact from the reference below, or a harness/tool reply already in the stream (cite its #seq).
+It NEVER contains: a proof strategy, a tactic or lemma to try, a closed form or numeric value, a restatement of a node, a graph change, or a format/spec rule you cannot quote from this brief or from a harness reply in the window. If what you want to write is "do X instead", you are fixing, not lubricating — drop the note, or reduce it to the pattern plus the context that was missed.
+
+## The team you are watching
+- BLUEPRINT GENERATOR (C.1): one agent per iteration; decomposes the target theorem into a dependency graph of @[blueprint] declarations and must compile the main theorem's ASSEMBLY against sorried lemmas. Tools: lean_compile, loogle_search, moogle_search.
+- NODE PROVERS (C.2): one FRESH, ISOLATED agent per unproved node (ids A1, A2, ...). Each sees only its own node, its parents' proved facts, and a run-wide dead-names ledger. Isolation is DELIBERATE — many independent lasers cover more ground than a shared beam. Never suggest sharing strategies or lemmas between live sibling nodes.
+- CONSULTANT: fires inside any agent (node prover, blueprint generation, or refinement) when its literal first error is unchanged 3 submissions running; fresh context, reads the agent's full log, the agent WAITS for its reply.
+- INTERCEPTOR: per-agent async watcher over that agent's own recent window — covers node provers AND blueprint generation/refinement; can note or abort. The agent never waits for it.
+- DIAGNOSTICIAN: after a node fails, classifies the failure (DISPROVED / SUSPECT_STATEMENT / PARENTS_MISSING / HARNESS_LIMIT / PROOF_TOO_HARD); every factual claim it makes is machine-checked before refinement sees it.
+- DOWNGRADE GUARD (deterministic): a prover claiming its statement is false WITHOUT a compiled disproof is downgraded to SUSPECT_STATEMENT so refinement may not delete a true lemma on a hunch.
+- REFINEMENT (C.3): the one graph-aware stage; reads every verdict and rewrites the graph between iterations. Your notes targeted "refinement" land in its evidence for the next iteration.
+- HARNESS (deterministic, no LLM): duplicate-submission cache, identical-error streak counter, unknown-name compile lock, blueprint sanity refutation gate, rebuild line-offset reports. Do not re-report what these already caught and announced — escalate only when they misfire or when the pattern is beyond them.
+
+## Tool ground truth (for spotting misuse)
+- lean_compile: compiles against Mathlib + this run's blueprint prelude; #eval/#check output is returned; ONLY a lean_compile solve registers.
+- loogle_search: exact name/type search over the PUBLISHED Mathlib environment. Zero hits proves a MATHLIB name absent — it says NOTHING about names declared locally in this run's blueprint (loogle cannot see those; \`#check\` can). An agent treating a local-name zero-hit as evidence its statement is ill-formed is making a critical misread — flag it immediately.
+- moogle_search: semantic search; always returns nearest neighbours; never evidence of absence.
+
+${ARCHITECT_SYNTAX_HINTS}
+
+## Epistemic limits (hard rules)
+- You cannot compute, and nothing you assert is machine-checked. NEVER state that a lemma or the TARGET is true or false from your own arithmetic or from inference over partial stream evidence — only the harness's refutation gates and Lean itself settle truth, and the target's non-refutability is already machine-tested at blueprint admission. Watchers before you have fabricated "eval shows X" claims that no eval in the stream actually showed, and have declared a CORRECT closed form "wrong" by misreading forfeit prose; a confident false note to refinement is worse than silence.
+- If you SUSPECT a statement is false, you may say so ONCE, as a suspicion ("worth a #eval of <exact term>"), severity at most "warn", citing the exact stream entry (its #seq) that grounds it. Never repeat a falsity suspicion in later windows, even reworded.
+- You do NOT know the pipeline's prompt or format specifications beyond what this brief states. Never assert a format rule (blueprint attribute shape, required fields, body forms) from memory — a watcher before you invented "no (proof := ...) fields" when the validator requires them, and the agent that trusted it walked straight into a validation failure. If a validator/harness reply in the window states the rule, quote THAT reply (with its #seq); otherwise say nothing about format.
+- Cite evidence by #seq for any factual claim; a claim you cannot anchor to a specific entry does not belong in a note.
+
+## What is GOOD (stay silent)
+- An agent whose compile errors CHANGE submission to submission — unique errors mean the model is trying things. This is the healthy baseline; do not interrupt it.
+- Search → confirm → apply chains; partial proofs narrowing; forfeits with honest structured diagnoses.
+
+## What needs ADDRESSING
+- The same underlying mistake, again and again — within one agent (if the consultant/interceptor visibly missed it or already fired and it persists) or ACROSS independent agents (a pattern no per-agent watcher can see; usually means a tool contract or piece of context is being missed by everyone at once). Name what recurs and supply the misread contract / missed context; route to the affected live agent, or to "refinement" when the NEXT iteration's agents will need that same context.
+- Context that visibly never reached an agent: a ledger fact, an earlier harness reply, a tool-result detail it is acting in ignorance of. Quote it to them (with its #seq).
+- System/harness issues: a tool systematically misread, line offsets that look wrong, a stage stalled with nothing in the stream, budget draining with no progress. Route to "log" — describe what you observe, not a remedy; the operator and refinement will see it.
+
+## Output — STRICT JSON only, no prose, no fence
+{"verdicts": [{"target": "<agent id like A7, or \\"refinement\\", or \\"log\\">", "severity": "info" | "warn" | "critical", "note": "<=120 words: the recurring pattern (with #seq) plus the missed context, quoted — never a fix>"}]}
+Empty verdicts ({"verdicts": []}) is the CORRECT output for a healthy window — prefer it. Never repeat a note you can see already addressed in the window; never target yourself; one note per distinct issue. An agent that was ALREADY given a note (by you or the interceptor) and has not yet had a few submissions to act on it must NOT be re-noted — the harness enforces a cooldown (re-injection only after ≥3 further submissions), so route follow-ups on an already-advised agent to "log" or "refinement" instead.`
+}
+
+async function architectMechanicTick(ctx, state, mech) {
+  const all = Array.isArray(ctx.streamLog) ? ctx.streamLog : []
+  const frames = all.filter((f) => !f.mech)
+  if (frames.length < 20) return
+  const newest = frames[frames.length - 1].seq
+  const freshCount = frames.filter((f) => f.seq > mech.lastSeq).length
+  if (!freshCount) return
+  if (freshCount < ARCHITECT_MECHANIC_MIN_FRAMES && Date.now() - mech.lastCallAt < ARCHITECT_MECHANIC_INTERVAL_MS) return
+  mech.lastSeq = newest
+  mech.lastCallAt = Date.now()
+  const window = frames.slice(-ARCHITECT_MECHANIC_WINDOW)
+  const live =
+    [...(state.liveTraces?.entries?.() || [])]
+      .map(([id, x]) => `- ${id} — ${String(x?.label || "agent").slice(0, 120)}`)
+      .join("\n") || "(none right now)"
+  const user = `## Live agents right now (address a note to one by its id)
+${live}
+
+## Rolling stream window — ${window.length} entries, oldest first (your own prior output removed)
+${window.map((f) => `[${f.t}s #${f.seq}] ${f.text}`).join("\n\n")}`
+  const msg = await grokCall(
+    mech.state,
+    [
+      { role: "system", content: architectMechanicBrief() },
+      { role: "user", content: user },
+    ],
+    [],
+    ctx,
+  )
+  const raw = String(msg?.content || "")
+  const m = raw.match(/\{[\s\S]*\}/)
+  if (!m) return
+  let verdicts = []
+  try {
+    const parsed = JSON.parse(m[0])
+    verdicts = Array.isArray(parsed?.verdicts) ? parsed.verdicts : []
+  } catch {
+    return
+  }
+  for (const v of verdicts.slice(0, 4)) {
+    const note = String(v?.note || "").trim().slice(0, 1200)
+    if (!note) continue
+    const sev = ["info", "warn", "critical"].includes(v?.severity) ? v.severity : "info"
+    // Dedup on content: the window rolls, so an unaddressed issue would
+    // otherwise be re-flagged every tick forever.
+    const key = shortHash(note.toLowerCase().replace(/\s+/g, " ").slice(0, 200))
+    if (mech.seen.has(key)) continue
+    mech.seen.add(key)
+    if (ctx.metrics) ctx.metrics.mechanic_notes = (ctx.metrics.mechanic_notes || 0) + 1
+    const target = String(v?.target || "log").trim()
+    if (target === "refinement") {
+      // Rate limit: refinement-routed notes proved the spam channel (a false
+      // "target is false" claim was re-sent 6× across ticks, reworded past the
+      // content dedup). One refinement note per window-and-a-half; overflow is
+      // logged, not queued as evidence.
+      if (Date.now() - (mech.lastRefAt || 0) < 90000) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic [${sev}] (re: refinement; note-rate cooldown — logged only):\n${note}`, watcher: "mechanic" })
+        continue
+      }
+      mech.lastRefAt = Date.now()
+      state.mechanicNotes.push(`[${sev}] ${note}`)
+      if (state.mechanicNotes.length > 12) state.mechanicNotes.shift()
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic → refinement [${sev}]:\n${note}`, watcher: "mechanic" })
+      continue
+    }
+    const liveEntry = target !== "log" ? state.liveTraces?.get?.(target) : null
+    if (liveEntry?.trace) {
+      const tr = liveEntry.trace
+      // Injection cooldown, shared with the interceptor: an agent that has an
+      // undelivered note pending, or fewer than 3 submissions since the last
+      // injected note, is NOT re-injected — the observation is logged instead.
+      // Advice needs runway to act before it is repeated at the agent.
+      if (tr.mechanicNotes.length || tr.submissions - (tr.lastInjectedSub || 0) < 3) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic [${sev}] (re: ${target}; injection cooldown — logged only):\n${note}`, watcher: "mechanic" })
+        continue
+      }
+      tr.mechanicNotes.push(note)
+      // The delivery itself is announced here; the injection point mirrors the
+      // full text when the agent actually reads it.
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic → ${target} [${sev}] (queued for its next turn):\n${note}`, watcher: "mechanic" })
+      continue
+    }
+    // "log" or a target that is no longer live — promote to the stream.
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔧 mechanic [${sev}]:\n${note}`, watcher: "mechanic" })
+  }
+}
+
+function architectMechanicStart(ctx, state) {
+  const mech = { stopped: false, lastSeq: 0, lastCallAt: 0, busy: false, seen: new Set(), state: watcherStateOf(state) }
+  ;(async () => {
+    while (!mech.stopped && !ctx.signal?.aborted) {
+      await new Promise((r) => setTimeout(r, 5000))
+      if (mech.stopped || ctx.signal?.aborted || mech.busy) continue
+      if (deadlinePassed(ctx) || architectCostCapHit(ctx)) continue
+      mech.busy = true
+      try {
+        await architectMechanicTick(ctx, state, mech)
+      } catch (e) {
+        // A watcher failure must never dent the run — note it once per message.
+        const t = `🔧 mechanic tick failed (${String(e?.message || e).slice(0, 140)}) — continuing.`
+        if (t !== mech.lastErr) ctx.emit({ type: "message-annotation", subtype: "status", thought: t, watcher: "mechanic" })
+        mech.lastErr = t
+      } finally {
+        mech.busy = false
+      }
+    }
+  })()
+  return { stop: () => (mech.stopped = true), mech }
+}
+
+// --- The consultant: a second model, called when the first is stuck ---------
+// A prover deep in a failing attempt reads its 20th pattern-mismatch error
+// with the same eyes that wrote the pattern. The telemetry already DETECTS
+// the loop ("first compiler error UNCHANGED for N submissions"); this gives
+// the detection a consumer that isn't the stuck agent itself: one fresh
+// context whose only job is to compare the attempts and the unmoved error
+// and say what actually has to change. Its note is injected into the stuck
+// conversation as machine-attributed advice — a teammate looking over the
+// shoulder, not a takeover.
+const ARCHITECT_CONSULT_STREAK = 2 // repeatedFirstError value → 3rd identical error
+const ARCHITECT_CONSULT_MAX = Number(process.env.ARCHITECT_CONSULT_MAX || 2)
+
+async function architectConsult(ctx, state, { agentId, taskContext, history, errorText, streamLog }) {
+  const system = `You are a Lean 4 expert reviewing a STUCK colleague's proof attempts cold. You did not write these attempts and you have no stake in their approach. You are given the task, the agent's FULL activity log for this attempt (every turn, submission diff, tool call and compiler reply, oldest first), its last few full submissions, and the one compiler error that has not moved. Answer in under 200 words, no code blocks longer than 3 lines:
+1. WHY the error is not moving — name the exact mismatch (compare the failing pattern and the goal character by character: a ↑ coercion in one and not the other, a differing binder or literal type, a wrong lemma orientation).
+2. What the submissions keep CHANGING that cannot matter, if anything — the full log shows every edit, so be specific.
+3. The ONE structural change to make next — a different fact to rewrite with, a cast transport (zify/push_cast/norm_cast) before the rewrite, a restated have, or the honest conclusion that the declared facts cannot reach this goal and the node should be forfeited with that diagnosis.
+Note on tools you may see in the log: loogle_search/moogle_search only see the published Mathlib environment — NEVER declarations local to this problem (the target, its parents, blueprint \`def\`s). A zero-hit on a local name is meaningless, not evidence the statement is ill-formed.`
+  const shown = (history || []).slice(-3)
+  // The full per-attempt log is bounded by the node's own token budget, so
+  // handing all of it over is safe — take the TAIL if it ever overflows.
+  const logText = Array.isArray(streamLog) && streamLog.length ? streamLog.join("\n\n").slice(-48000) : ""
+  const user = `## The task the stuck prover was given
+${String(taskContext || "").slice(0, 3000)}
+${logText ? `\n## The agent's full activity log for this attempt (oldest first; head may be truncated)\n${logText}\n` : ""}
+## Its last ${shown.length} full submission(s), oldest first
+${shown.map((c, i) => `### Submission ${i + 1}\n\`\`\`lean\n${String(c).slice(0, 1600)}\n\`\`\``).join("\n\n")}
+
+## The compiler error that has NOT moved across them
+${String(errorText || "").slice(0, 2000)}`
+  const msg = await grokCall(
+    state,
+    [
+      { role: "system", content: system },
+      { role: "user", content: user },
+    ],
+    [],
+    ctx,
+  )
+  return String(msg?.content || "").trim().slice(0, 2200)
+}
+
+// Called with the tool's report AFTER dispatch. Surfaces the case where the
+// compiler's FIRST complaint has not moved: whatever the model is editing, it
+// is not the thing blocking it.
+function traceResult(trace, outText) {
+  try {
+    if (!trace) return ""
+    const m = /line\s+(\d+),\s*col\s+\d+:\s*([^\n]{0,120})/i.exec(String(outText || ""))
+    if (!m) {
+      trace.lastFirstError = ""
+      trace.repeatedFirstError = 0
+      return ""
+    }
+    const sig = `${m[1]}|${m[2].trim()}`
+    if (sig === trace.lastFirstError) {
+      trace.repeatedFirstError += 1
+      if (trace.repeatedFirstError >= 2)
+        return `🔁 ${trace.agentId} · first compiler error UNCHANGED for ${trace.repeatedFirstError + 1} consecutive submissions — line ${m[1]}: ${m[2].trim()}`
+    } else {
+      trace.lastFirstError = sig
+      trace.repeatedFirstError = 0
+    }
+    return ""
+  } catch {
+    return ""
+  }
+}
+
+// (5) The daemon rebuilds a node submission under the canonical statement, so
+// the line numbers in its report are NOT the line numbers the model wrote. This
+// records both files and the measured offset.
+//
+// It only reports; it does not rewrite the diagnostics the model receives.
+// Remapping them is a real change to what the prover reads and belongs in its
+// own decision, not smuggled in behind a logging patch.
+function rebuildOffsetReport(submitted, rebuilt) {
+  try {
+    const a = String(submitted || "")
+    const b = String(rebuilt || "")
+    if (!a.trim() || !b.trim()) return ""
+    const aLines = a.split("\n")
+    const bLines = b.split("\n")
+    // Anchor on the first non-trivial submitted line that occurs exactly once
+    // in the rebuild — an unambiguous anchor or none at all.
+    let offset = null
+    // Bounded: an anchor is almost always found in the first handful of lines,
+    // and a diagnostic helper must not become the expensive part of a compile.
+    const scanLimit = Math.min(aLines.length, 60)
+    for (let i = 0; i < scanLimit; i++) {
+      const needle = aLines[i].trim()
+      if (needle.length < 8) continue
+      const hits = []
+      for (let j = 0; j < bLines.length; j++) if (bLines[j].trim() === needle) hits.push(j)
+      if (hits.length === 1) {
+        offset = hits[0] - i
+        break
+      }
+    }
+    const head = `📐 rebuild: submitted ${aLines.length} lines (sha ${shortHash(a)}) → compiled ${bLines.length} lines (sha ${shortHash(b)})`
+    if (offset === null) return `${head}\n   line offset: could not be measured (no unambiguous anchor line)`
+    if (offset === 0) return `${head}\n   line offset: 0 — reported line numbers match your submission`
+    return (
+      `${head}\n   line offset: ${offset > 0 ? "+" : ""}${offset} — a diagnostic reported at line N refers to submission line ${
+        offset > 0 ? `N-${offset}` : `N+${-offset}`
+      }`
+    )
+  } catch {
+    return ""
+  }
+}
+
+// (2) What the conversation actually opened with, hashed so two contexts can be
+// compared at a glance, plus which optional blocks were spliced in and how big
+// each was. A block that is silently absent is invisible in the prompt text but
+// obvious here.
+function contextManifest(agentId, model, system, user, blocks) {
+  const rows = Object.entries(blocks || {}).map(([name, text]) => {
+    const s = String(text || "")
+    return `   ${s ? "✓" : "·"} ${name}${s ? ` — ${s.length} chars` : " — absent"}`
+  })
+  return (
+    `${agentId} · context opened · model=${model}\n` +
+    `   system: ${system.length} chars, sha ${shortHash(system)}\n` +
+    `   user:   ${user.length} chars, sha ${shortHash(user)}\n` +
+    `   full:   sha ${shortHash(`${system} ${user}`)}\n` +
+    (rows.length ? `   blocks spliced into the user prompt:\n${rows.join("\n")}` : "")
+  )
+}
+
+function architectParseForfeit(text) {
+  const diag = /##\s*Diagnosis:?\s*(STATEMENT_WRONG|PROOF_TOO_HARD)/i.exec(text || "")
+  const analysis = /##\s*Analysis:?\s*([\s\S]*?)(?=##\s*Suggested Fix|$)/i.exec(text || "")
+  const fix = /##\s*Suggested Fix:?\s*([\s\S]*)$/i.exec(text || "")
+  return {
+    diagnosis: diag ? diag[1].toUpperCase() : "PROOF_TOO_HARD",
+    analysis: (analysis?.[1] || "The prover returned no structured analysis; it ran out of budget.").trim().slice(0, 2500),
+    fix: (fix?.[1] || "No suggested fix was produced.").trim().slice(0, 2500),
+  }
+}
+
+// ===========================================================================
+// FAILURE CLASSIFICATION + DIAGNOSTICIAN
+// ---------------------------------------------------------------------------
+// The paper gives refinement exactly one signal shape — the failing node's own
+// self-written forfeit — and exactly one response to it: adopt the suggested
+// helper decomposition. Two things go wrong with that in practice, both seen
+// on factorial_base12_trailing_zeros:
+//
+//   1. The forfeit is written by the agent that just failed, out of budget,
+//      with no way to check anything it says. It confabulates. That run
+//      produced a STATEMENT_WRONG verdict on a lemma that was TRUE (the
+//      prover reasoned 12^1009 = 4^1009·9^1009, which is false), and a
+//      proposed helper `12 = 4 * 9`. Refinement adopted both verbatim.
+//   2. Every failure gets the same response — "add helpers" — regardless of
+//      whether the node was refuted, never given its parents, or merely hit a
+//      recursion limit. The graph grew 3 → 17 nodes across 8 iterations while
+//      the actual proof needs about four.
+//
+// So: classify the failure first, route on the class, and let a SEPARATE
+// diagnostician model enrich only the classes where enrichment helps — with
+// every factual claim it makes checked against Lean before refinement is
+// allowed to see it. The diagnostician cannot assert a lemma is false, cannot
+// cite a Mathlib name, and cannot propose a helper without the harness
+// verifying it first; unsupported claims are stripped, not forwarded.
+// ===========================================================================
+
+const ARCHITECT_CLASSES = {
+  // Machine-checked negation, or a harness refutation of the node's own
+  // conclusion. The only class permitted to delete or restate a node.
+  DISPROVED: {
+    label: "DISPROVED",
+    directive:
+      "This statement is FALSE — machine-checked, not opinion. You MUST change it or drop it, and you MUST re-examine every node that lists it in `sorry_using` (their sketches may depend on the false claim). Do not re-emit this signature unchanged.",
+  },
+  // The prover BELIEVED the node false but produced no witness. Downgraded on
+  // purpose: acting on an unverified falsity claim is how a true lemma gets
+  // deleted and a whole branch re-planned around nothing.
+  SUSPECT_STATEMENT: {
+    label: "SUSPECT_STATEMENT",
+    directive:
+      "The prover asserted this statement is false but produced NO disproof, and the harness could not refute it either. Treat that assertion as UNSUPPORTED. Do NOT delete, weaken, or renumber this statement on the strength of it. Handle the node as PROOF_TOO_HARD instead; if you genuinely believe it is false, the node prover can be asked for a disproof next pass.",
+  },
+  // The node never had its inputs. Adding helpers here is pure waste — the
+  // decomposition it already has was never tested.
+  PARENTS_MISSING: {
+    label: "PARENTS_MISSING",
+    directive:
+      "This node was dispatched with unproved parents, so its own decomposition was never actually tested. Do NOT add helper lemmas to it and do NOT restate it. Leave it as-is and spend this revision on the unproved parents named below.",
+  },
+  // Not a mathematical failure at all.
+  HARNESS_LIMIT: {
+    label: "HARNESS_LIMIT",
+    directive:
+      "This failed on an elaborator resource limit (recursion depth / heartbeats / timeout), not on mathematics. The statement and the decomposition are not implicated. Leave this node COMPLETELY UNCHANGED — the harness raises the ceiling and retries it.",
+  },
+  // The paper's case: genuine decomposition need.
+  PROOF_TOO_HARD: {
+    label: "PROOF_TOO_HARD",
+    directive:
+      "The goal is believed provable but the prover could not chain its parents to it. Add the verified helper lemmas below as fresh nodes and wire this node's `sorry_using` to include them. Prefer a Mathlib lemma over a new node wherever one is offered. If the elaborated statements show a parent's literal types differ from this node's (a ↑cast or a `(1 : ℕ)` where the goal has `(1 : ℤ)`), the fix is to RESTATE that parent at this node's types — a helper repeating the mismatched shape can never apply, however true it is.",
+  },
+}
+
+// Which nodes are worth a diagnostician call. PARENTS_MISSING and
+// HARNESS_LIMIT already have a known, correct response — spending a model call
+// to restate it would be exactly the bloat this is meant to avoid.
+const ARCHITECT_DIAGNOSE_CLASSES = new Set(["DISPROVED", "SUSPECT_STATEMENT", "PROOF_TOO_HARD"])
+
+const ARCHITECT_DIAGNOSTIC_TOKENS = Number(process.env.ARCHITECT_DIAGNOSTIC_TOKENS || 24576)
+const ARCHITECT_MAX_HELPERS = 3
+const ARCHITECT_MAX_EVALS = 6
+const ARCHITECT_MAX_NAMES = 12
+
+// Split "theorem foo (a : ℕ) : concl" into its binder and conclusion parts.
+function architectSplitSig(signature) {
+  const m = String(signature || "").match(/^\s*(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/)
+  if (!m) return null
+  const rest = String(signature).slice(m[0].length)
+  let depth = 0
+  for (let i = 0; i < rest.length; i++) {
+    const c = rest[i]
+    if ("([{⟨".includes(c)) depth++
+    else if (")]}⟩".includes(c)) depth--
+    else if (c === ":" && depth === 0 && rest.slice(i, i + 2) !== ":=")
+      return { name: m[1], binders: rest.slice(0, i).trim(), concl: rest.slice(i + 1).trim() }
+  }
+  return null
+}
+
+// Try to REFUTE a closed proposition with the compiler. Returns true only on a
+// compiler-corroborated refutation; every other outcome (including "the tactic
+// gave up") returns false, so uncertainty never reads as falsity.
+async function architectRefute(concl, prefix, prelude, urls, ctx, timeoutMs = NODE_TIMEOUT_MS) {
+  if (!concl || !urls.xii) return false
+  try {
+    const r = await architectMcpCall(
+      urls.xii,
+      "lean_compile",
+      {
+        mode: "node",
+        code: `example : ¬ (${concl}) := by first | norm_num | decide | native_decide`,
+        target_name: "__architect_refute__",
+        target_signature: "",
+        prefix,
+        prelude,
+      },
+      Number(timeoutMs),
+    )
+    return !!r.ok && !(r.errors || []).length
+  } catch {
+    return false
+  }
+}
+
+// --- Elaborated statements: what Lean actually sees -------------------------
+// The sum_quartic_telescope class: target and helper both print as
+// `Finset.Icc 1 …` while elaborating over ℤ and ℕ respectively — parallel on
+// the page, unreachable in the elaborator, and invisible to every model in
+// the pipeline. lean_elaborate (Leak XII, warm REPL) returns each statement
+// with numeric-literal types explicit; attaching that to the graph makes the
+// mismatch literal text in every downstream prompt. Purely additive: on any
+// failure the graph keeps its source signatures and nothing else changes.
+async function architectAttachElaborated(bp, urls, ctx) {
+  if (!bp?.graph?.length || !urls.xii) return
+  try {
+    const names = bp.graph.filter((n) => ["lemma", "theorem"].includes(n.kind)).map((n) => n.name)
+    if (!names.length) return
+    const r = await architectMcpCall(urls.xii, "lean_elaborate", { code: bp.code, names: names.join(",") }, Number(NODE_TIMEOUT_MS))
+    const map = r && r.elaborated && typeof r.elaborated === "object" ? r.elaborated : {}
+    let attached = 0
+    for (const n of bp.graph)
+      if (map[n.name]) {
+        n.elaborated = String(map[n.name])
+        attached++
+      }
+    if (attached)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔬 Elaborated ${attached}/${names.length} node statement(s) — literal types made explicit for every downstream prompt.` })
+  } catch {}
+}
+
+// One-off variant for statements not yet in any graph (the target before C.1,
+// a proposed helper): returns the elaborated string or "".
+async function architectElaborateOne(urls, contextCode, signature, name) {
+  if (!urls.xii) return ""
+  try {
+    const code = `${contextCode ? contextCode + "\n\n" : ""}${signature.trim()} := by sorry`
+    const r = await architectMcpCall(urls.xii, "lean_elaborate", { code, names: name }, Number(NODE_TIMEOUT_MS))
+    return String(r?.elaborated?.[name] || "")
+  } catch {
+    return ""
+  }
+}
+
+// --- Blueprint admission: compiling is not the same as true -----------------
+// The paper's blueprint gate (§2.1) certifies that the file "parses, every node
+// is well-typed, and the graph is well-formed". None of that is a claim about
+// TRUTH. `sorry_using` is `sorry` carrying dependency metadata, so a well-typed
+// false lemma sails through, and so does a graph whose parents do not entail
+// their child. On factorial_base12_trailing_zeros the very first blueprint
+// asserted v₂(2026!) = 2023 and v₃(2026!) = 1011 — both wrong — and Leak XII
+// answered "Compilation SUCCESSFUL. Validation SUCCESSFUL." Three node provers
+// were then dispatched at false lemmas, and a whole refinement iteration went
+// on discovering what one `native_decide` settles in seconds.
+//
+// Entailment is undecidable in general (checking that the parents suffice IS
+// the proving problem, which is why the paper defers it to the node prover).
+// Falsity of a CLOSED statement is not: it is one compile. So sweep every
+// binder-free node before the blueprint is admitted. This is only affordable
+// now that `native_decide` is permitted and the resource floor is raised —
+// `decide` alone cannot touch anything factorial-sized.
+const ARCHITECT_SANITY_TIMEOUT_MS = Number(process.env.ARCHITECT_SANITY_TIMEOUT_MS || 90000)
+const ARCHITECT_SANITY_MAX_NODES = Number(process.env.ARCHITECT_SANITY_MAX_NODES || 14)
+const ARCHITECT_SANITY_ROUNDS = Number(process.env.ARCHITECT_SANITY_ROUNDS || 3)
+
+async function architectBlueprintSanity(bp, prelude, urls, ctx, targetName) {
+  const out = { refuted: [], targetRefuted: false, checked: 0 }
+  if (!urls.xii) return out
+  const closed = []
+  for (const n of bp.graph) {
+    if (!["lemma", "theorem"].includes(n.kind)) continue
+    const split = architectSplitSig(n.signature)
+    if (split && !split.binders) closed.push({ node: n, concl: split.concl })
+  }
+  const batch = closed.slice(0, ARCHITECT_SANITY_MAX_NODES)
+  if (!batch.length) return out
+  ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔎 Blueprint sanity: testing ${batch.length} closed node statement(s) for refutation before dispatching any prover.` })
+  let cur = 0
+  const workers = Array.from({ length: Math.max(1, Math.min(ARCHITECT_NODE_CONCURRENCY, batch.length)) }, async () => {
+    while (cur < batch.length) {
+      const { node, concl } = batch[cur++]
+      if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return
+      out.checked++
+      // The node's own prefix: earlier defs real, earlier lemmas sorried — the
+      // same context the node prover would see, so a statement mentioning a
+      // blueprint definition still elaborates.
+      const prefix = architectNodePrefix(bp.graph, node.name)
+      if (await architectRefute(concl, prefix, prelude, urls, ctx, ARCHITECT_SANITY_TIMEOUT_MS)) {
+        if (node.name === targetName) out.targetRefuted = true
+        else out.refuted.push({ name: node.name, signature: node.signature.trim(), concl })
+      }
+    }
+  })
+  await Promise.all(workers)
+  return out
+}
+
+// Generate (or refine) a blueprint, then admit it only if no closed node in it
+// is machine-refutable. A refuted node means the graph is KNOWN wrong, so the
+// stage is re-run with the counterexamples as context rather than sending
+// provers after statements the compiler has already disproved.
+async function architectAdmitBlueprint(ctx, state, urls, { system, user, retries, stageLabel, effort = "" }) {
+  let extra = ""
+  let last = null
+  for (let round = 0; round < Math.max(1, ARCHITECT_SANITY_ROUNDS); round++) {
+    const bp = await architectBlueprintStage(ctx, state, urls, {
+      system,
+      user: user + extra,
+      retries,
+      stageLabel: round ? `${stageLabel} · regenerate ${round}` : stageLabel,
+      effort,
+    })
+    if (!bp) return last ? { bp: last, refuted: [] } : null
+    last = bp
+    const sanity = await architectBlueprintSanity(bp, architectPrelude(bp.code), urls, ctx, state.targetName)
+    if (sanity.targetRefuted) {
+      // The TARGET itself is false. Regenerating cannot help — its signature is
+      // immutable — and the honest outcome is a disproof, not a proof.
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "error",
+        thought: `🧨 The TARGET theorem is machine-refutable — the problem statement itself is false. No blueprint can prove it; the correct outcome here is a disproof of the target.`,
+      })
+      return { bp, refuted: sanity.refuted }
+    }
+    if (!sanity.refuted.length) {
+      if (sanity.checked)
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✔️ Blueprint sanity: ${sanity.checked} closed statement(s) checked, none refutable — admitted.` })
+      return { bp, refuted: [] }
+    }
+    const list = sanity.refuted.map((r) => `- \`${r.signature}\`\n  The compiler proves \`¬ (${r.concl})\`. This statement is FALSE.`).join("\n")
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "error",
+      thought: `🧨 Blueprint REJECTED: ${sanity.refuted.length} node statement(s) machine-refuted (${sanity.refuted.map((r) => r.name).join(", ")}). Regenerating with the counterexamples (round ${round + 1}/${ARCHITECT_SANITY_ROUNDS}).`,
+    })
+    if (round + 1 >= ARCHITECT_SANITY_ROUNDS) {
+      // Out of regeneration rounds. Admit it rather than failing the run, but
+      // hand the refuted set back so those nodes are pre-marked DISPROVED and
+      // no prover is spent rediscovering what the compiler already showed.
+      return { bp, refuted: sanity.refuted }
+    }
+    extra = `\n\n## Statements the compiler REFUTED in your previous graph — do not re-emit them\nEach of these was emitted as a node, and Lean proved its negation. They are false, not merely unproved. Recompute any number they contain before writing a replacement — \`lean_compile\` returns \`#eval\` output, so \`#eval <term>\` (no \`import\` line) gives you the true value.\n\n${list}`
+  }
+  return last ? { bp: last, refuted: [] } : null
+}
+
+function architectDiagnosticSystem() {
+  return `## Task
+You are the DIAGNOSTICIAN for a Lean 4 blueprint pipeline. A node prover failed to close one lemma of a dependency graph. You are given that lemma, its declared parents, and the evidence from the failed attempt. Produce a structured diagnosis that the blueprint-refinement stage can act on.
+
+You are NOT proving anything and you are NOT writing tactics. You are deciding what actually went wrong and what the graph should do about it.
+
+## The one rule that matters
+Everything factual you assert is CHECKED against Lean before the refinement stage sees it, and anything that fails its check is DELETED from your diagnosis. A deleted claim is worse than a claim you never made: it costs a verification round-trip and leaves your analysis referring to something the refiner cannot see. So assert only what the evidence in front of you supports, and route anything you are unsure of through the check fields below instead of stating it as fact.
+
+In particular:
+- Do NOT state that the lemma is false unless a machine-checked disproof is shown in the evidence. "I could not prove it" is not "it is false" — that confusion has deleted true lemmas from this graph before.
+- Do NOT cite a Mathlib declaration from memory. Put every name you want to rely on in \`citedNames\`; each is \`#check\`ed and the ones that do not exist are struck out.
+- Do NOT assert an arithmetic or numeric fact. Put the expression in \`evalChecks\`; it is \`#eval\`ed and the true value is what reaches the refiner.
+- Every helper lemma you propose is typechecked, and closed ones are also tested for refutation. A helper that does not typecheck, or that is refuted, is dropped.
+
+## Output
+Reply with STRICT JSON and nothing else — no prose before or after, no markdown fence:
+
+{
+  "diagnosis": "STATEMENT_WRONG" | "PROOF_TOO_HARD" | "LIBRARY_GAP" | "HARNESS_LIMIT",
+  "analysis": "<= 900 chars. What the evidence shows: what was attempted, where it stalled, and why. Concrete and specific. No speculation presented as fact.",
+  "citedNames": ["Mathlib.Declaration.Name", ...],
+  "evalChecks": ["<Lean term whose value settles a numeric question>", ...],
+  "helpers": [
+    { "signature": "theorem helper_name (binders) : conclusion", "why": "<= 160 chars: what gap this bridges" }
+  ]
+}
+
+Field notes:
+- \`diagnosis\`: use \`LIBRARY_GAP\` when the attempt failed mainly because the prover could not find the right library lemma (repeated unknown-constant errors), \`HARNESS_LIMIT\` when it failed on recursion depth / heartbeats / timeout, \`STATEMENT_WRONG\` only with a disproof in evidence, otherwise \`PROOF_TOO_HARD\`.
+- \`helpers\`: at most ${ARCHITECT_MAX_HELPERS}, each a COMPLETE Lean signature starting with \`theorem\`. Each should be near-trivial given its own premises, and together they should make the failing node routine. Emit \`[]\` when the node does not need decomposition (a resource limit or a missing parent never does).
+- \`evalChecks\`: at most ${ARCHITECT_MAX_EVALS} closed Lean terms, e.g. \`Nat.digits 3 2026\`, \`(4 * 9 : ℕ)\`, \`padicValNat 2 (Nat.factorial 100)\`. Use these aggressively when the node contains a concrete number — a guessed constant is the most expensive error available here.
+- \`citedNames\`: at most ${ARCHITECT_MAX_NAMES}.`
+}
+
+// One diagnostician pass over a failed node: model call, then every claim it
+// made is put to the compiler before any of it reaches refinement.
+async function architectDiagnose(node, cls, ctx, state, urls, evidence, prefix, prelude) {
+  const base = {
+    class: cls,
+    analysis: evidence.selfAnalysis || "",
+    directive: ARCHITECT_CLASSES[cls].directive,
+    helpers: [],
+    facts: [],
+    deadNames: [],
+    rejected: [],
+  }
+  if (!ARCHITECT_DIAGNOSE_CLASSES.has(cls) || !urls.xii) return base
+  if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return base
+
+  const user = `## Failing node
+${node.signature.trim()}
+${node.elaborated ? `As Lean elaborates it (literal types explicit): ${node.elaborated}\n` : ""}
+Natural-language statement: ${node.statement || "(none)"}
+Blueprint proof sketch: ${node.proofSketch || "(none)"}
+
+## Declared parents
+${evidence.parents || "(none)"}
+
+## Harness classification
+${cls} — ${ARCHITECT_CLASSES[cls].label}
+
+## Evidence from the failed attempt
+${evidence.disproof ? `MACHINE-CHECKED DISPROOF: the prover proved the NEGATION of this statement. It is definitively false.\n\n` : ""}Prover's own forfeit (UNVERIFIED — it is the failing agent's self-report, treat as a lead, not as fact):
+${evidence.selfAnalysis || "(none)"}
+
+Prover's own suggested fix (UNVERIFIED):
+${evidence.selfFix || "(none)"}
+
+Last compiler feedback:
+${evidence.lastError || "(none)"}`
+
+  let raw = ""
+  try {
+    if (state.driver === "claude") {
+      // One shot, no tools — the same shape claudeArchitectLoop uses for its
+      // forfeit turn. The diagnostician never needs a tool loop: every check
+      // it might want is run by the harness afterwards, not by the model.
+      const fr = await runClaude(
+        buildArgs(user, {
+          model: state.model,
+          systemPrompt: architectDiagnosticSystem(),
+          disallowedTools: "Bash Read Write Edit Glob Grep WebFetch WebSearch Task",
+          strictMcpConfig: true,
+          excludeDynamicSections: true,
+        }),
+        { cwd: process.cwd(), timeoutMs: 180000 },
+      )
+      if (typeof fr.costUsd === "number") {
+        state.driverCostUsd = Number(state.driverCostUsd || 0) + fr.costUsd
+        architectRecost(ctx, state)
+      }
+      raw = fr.ok ? String(fr.text || "") : ""
+    } else {
+      const msg = await grokCall(
+        state,
+        [
+          { role: "system", content: architectDiagnosticSystem() },
+          { role: "user", content: user },
+        ],
+        [],
+        ctx,
+        { grace: true },
+      )
+      raw = String(msg?.content || "")
+    }
+  } catch (e) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `🩺 diagnostician ⟪${node.name}⟫ unavailable: ${String(e?.message || e)}` })
+    return base
+  }
+
+  let parsed = null
+  try {
+    const m = raw.match(/\{[\s\S]*\}/)
+    parsed = m ? JSON.parse(m[0]) : null
+  } catch {
+    parsed = null
+  }
+  if (!parsed) return base
+
+  if (typeof parsed.analysis === "string" && parsed.analysis.trim())
+    base.analysis = parsed.analysis.trim().slice(0, 900)
+
+  // ---- Verification pass 1: do the cited Mathlib names exist? ----------------
+  const names = (Array.isArray(parsed.citedNames) ? parsed.citedNames : [])
+    .map((s) => String(s || "").trim())
+    .filter((s) => /^[A-Za-z_][A-Za-z0-9_'.]*$/.test(s))
+    .slice(0, ARCHITECT_MAX_NAMES)
+  if (names.length) {
+    try {
+      const r = await architectMcpCall(
+        urls.xii,
+        "lean_compile",
+        { mode: "explore", code: names.map((n) => `#check @${n}`).join("\n") },
+        Number(NODE_TIMEOUT_MS),
+      )
+      // The error text names the offending identifier, so no line mapping.
+      const txt = String(r.report || "")
+      base.deadNames = names.filter((n) =>
+        new RegExp(`unknown (?:constant|identifier) '?${n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'?`, "i").test(txt),
+      )
+    } catch {}
+  }
+
+  // ---- Verification pass 2: evaluate the numeric questions ------------------
+  const evals = (Array.isArray(parsed.evalChecks) ? parsed.evalChecks : [])
+    .map((s) => String(s || "").trim())
+    .filter(Boolean)
+    .slice(0, ARCHITECT_MAX_EVALS)
+  if (evals.length) {
+    try {
+      const r = await architectMcpCall(
+        urls.xii,
+        "lean_compile",
+        {
+          mode: "node",
+          code: evals.map((e) => `#eval ${e}`).join("\n"),
+          target_name: "__architect_eval__",
+          target_signature: "",
+          prefix,
+          prelude,
+        },
+        Number(NODE_TIMEOUT_MS),
+      )
+      const info = Array.isArray(r.info) ? r.info : []
+      base.facts =
+        info.length === evals.length
+          ? evals.map((e, i) => `#eval ${e}  ⇒  ${String(info[i]).replace(/\s+/g, " ").slice(0, 200)}`)
+          : info.map((v) => String(v).replace(/\s+/g, " ").slice(0, 200))
+    } catch {}
+  }
+
+  // ---- Verification pass 3: typecheck + refute the proposed helpers ---------
+  const helpers = (Array.isArray(parsed.helpers) ? parsed.helpers : []).slice(0, ARCHITECT_MAX_HELPERS)
+  for (const h of helpers) {
+    const sig = String(h?.signature || "").trim()
+    const why = String(h?.why || "").trim().slice(0, 160)
+    const split = architectSplitSig(sig)
+    if (!split) {
+      base.rejected.push(`${sig.slice(0, 90)} — not a parseable \`theorem\` signature`)
+      continue
+    }
+    if (deadlinePassed(ctx) || ctx.signal?.aborted) break
+    let ok = false
+    try {
+      const r = await architectMcpCall(
+        urls.xii,
+        "lean_compile",
+        {
+          mode: "node",
+          code: `${sig} := by sorry`,
+          target_name: "__architect_helper__",
+          target_signature: "",
+          prefix,
+          prelude,
+        },
+        Number(NODE_TIMEOUT_MS),
+      )
+      ok = !(r.errors || []).length
+      if (!ok) base.rejected.push(`${split.name} — does not typecheck: ${String(r.report || "").replace(/\s+/g, " ").slice(0, 160)}`)
+    } catch {
+      continue
+    }
+    if (!ok) continue
+    // Closed helper: is it actually FALSE? This is the check that would have
+    // caught `12 = 4 * 9` before refinement built a branch on top of it.
+    if (!split.binders && (await architectRefute(split.concl, prefix, prelude, urls, ctx))) {
+      base.rejected.push(`${split.name} — REFUTED by the compiler: \`${split.concl.slice(0, 100)}\` is false`)
+      continue
+    }
+    // Elaborate the accepted helper so the refiner sees its literal types next
+    // to the failing node's. This is the check that would have caught
+    // `sum_eq_n4 (n : ℕ)` — well-typed, TRUE, and stated over the ℕ-Icc that
+    // can never rewrite the target's ℤ-Icc goal — before refinement rebuilt
+    // the graph around a helper exactly as unreachable as its predecessor.
+    const helperElab = await architectElaborateOne(
+      urls,
+      `${prelude ? prelude + "\n\n" : ""}${prefix || ""}`,
+      sig,
+      split.name,
+    )
+    base.helpers.push({ signature: sig, why, elaborated: helperElab || undefined })
+  }
+
+  // The diagnostician may only DOWNGRADE severity, never escalate to a falsity
+  // claim: STATEMENT_WRONG requires a witness, which only the harness produces.
+  if (cls === "SUSPECT_STATEMENT" && /HARNESS_LIMIT|LIBRARY_GAP/i.test(String(parsed.diagnosis || "")))
+    base.class = String(parsed.diagnosis).toUpperCase() === "HARNESS_LIMIT" ? "HARNESS_LIMIT" : "PROOF_TOO_HARD"
+
+  return base
+}
+
+// The annotated graph the refinement stage consumes: decl + verdict marker
+// (+ Diagnosis block for failures). Compact signals, never transcripts.
+//
+// Decl text is SANITIZED first: refinement models sometimes echo the previous
+// round's `-- PROVED`/`-- UNPROVED` markers (or a whole `/- Diagnosis -/`
+// block) into their revised graph despite the do-not-copy instruction, and the
+// parser keeps trailing comments with the decl — so without stripping, markers
+// stack up round over round (observed live as `-- PROVED\n-- PROVED`, and a
+// stale UNPROVED next to a fresh PROVED would be actively misleading).
+const architectStripVerdicts = (text) =>
+  String(text || "")
+    .replace(/\/-\s*Diagnosis[\s\S]*?-\/\s*/g, "")
+    .replace(/^\s*--\s*(?:PROVED|UNPROVED|ASSEMBLY)\b.*$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd()
+function architectAnnotate(graph, results, verdicts) {
+  const section = (title, body) => (body && String(body).trim() ? `\n## ${title}: ${String(body).trim()}` : "")
+  return graph
+    .map((rawNode) => {
+      const n = { ...rawNode, declText: architectStripVerdicts(rawNode.declText) }
+      if (!["lemma", "theorem"].includes(n.kind)) return n.declText
+      const r = results.get(n.name)
+      if (r?.solved && rawNode.glue)
+        return `${n.declText}\n-- ASSEMBLY (its body IS its proof, verified at admission against sorried parents; if you change its parents, update the body so it still compiles)`
+      if (r?.solved) return `${n.declText}\n-- PROVED (verified proof banked for this exact signature + parent set)`
+      const v = verdicts?.get(n.name)
+      const cls = v?.class || (r?.negated ? "DISPROVED" : "PROOF_TOO_HARD")
+      const meta = ARCHITECT_CLASSES[cls] || ARCHITECT_CLASSES.PROOF_TOO_HARD
+      const analysis =
+        v?.analysis ||
+        r?.forfeit?.analysis ||
+        "Node was not attempted (an upstream failure consumed the budget)."
+      const helpers = (v?.helpers || [])
+        .map((h) => `\n    ${h.signature}${h.elaborated ? `\n      -- as Lean elaborates it: ${h.elaborated}` : ""}${h.why ? `\n      -- ${h.why}` : ""}`)
+        .join("")
+      return (
+        `${n.declText}\n-- UNPROVED\n/- Diagnosis` +
+        `\n## Class: ${cls}` +
+        `\n## Harness directive: ${meta.directive}` +
+        section("Analysis", analysis) +
+        section("Note", v?.note) +
+        section("Machine-verified facts (computed by Lean — these override any number in the sketches above)", (v?.facts || []).join("\n  ")) +
+        section("Names that DO NOT EXIST in this Mathlib (do not use them)", (v?.deadNames || []).join(", ")) +
+        section("Proposals the harness REJECTED (do not reinstate)", (v?.rejected || []).join("\n  ")) +
+        (helpers ? `\n## Verified helper lemmas (each typechecks here and was not refuted):${helpers}` : "") +
+        `\n-/`
+      )
+    })
+    .join("\n\n")
+}
+
+// ---------------------------------------------------------------------------
+// PROVEN-LEMMA VAULT (paper: proven lemmas are never thrown away).
+// Every lemma a node prover closes is banked for the REST OF THE RUN, keyed by
+// (normalized signature, sorted parent set) — NOT by name — so it survives
+// refinements that drop or rename its node. Two consumers:
+//   (a) vaultRestore: a revised-graph node matching an entry's signature AND
+//       parent set inherits the proof instantly under ANY name, so a rename or
+//       a drop-then-readd never costs a prover;
+//   (b) architectVaultSection: entries with no live PROVED node are listed to
+//       the refiner as already-paid-for lemmas it should re-wire, not re-derive.
+// An entry is evicted ONLY when assembly certification implicates its proof
+// (the same evidence that demotes it from `proofs`); a later graph editing the
+// node's signature/parents leaves the vault untouched — the old lemma is still
+// a true, proven statement.
+// ---------------------------------------------------------------------------
+const vaultKeyOf = (sigNorm, dk) => `${sigNorm}||${dk}`
+
+function vaultRestore({ vault, provable, proofs, sigOfProof, depsOfProof, depsKey, emit, metrics }) {
+  let restored = 0
+  for (const n of provable) {
+    if (proofs.has(n.name)) continue
+    if (n.glue && String(n.body || "").trim()) continue // glue bodies are refinement-authored, re-seeded from the graph
+    const hit = vault.get(vaultKeyOf(n.signatureNorm, depsKey(n)))
+    if (!hit) continue
+    proofs.set(n.name, hit.proof)
+    sigOfProof.set(n.name, n.signatureNorm)
+    depsOfProof.set(n.name, depsKey(n))
+    restored++
+    if (metrics) metrics.vault_restores = (metrics.vault_restores || 0) + 1
+    emit?.({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🏛️ Vault restored the proven lemma for ⟪${n.name}⟫${hit.name !== n.name ? ` (originally proved as ⟪${hit.name}⟫)` : ""} — no prover dispatched.`,
+    })
+  }
+  return restored
+}
+
+// The refinement-input section: proven lemmas with NO live PROVED node in the
+// current graph. `liveKeys` is the set of vault keys currently backed by a
+// live proof, so entries the refiner kept intact are not repeated at it.
+function architectVaultSection(vault, liveKeys) {
+  const dormant = [...vault.entries()].filter(([k]) => !liveKeys.has(k)).map(([, v]) => v)
+  if (!dormant.length) return ""
+  return (
+    `\n\n## Proven-lemma vault (verified THIS RUN, already paid for, currently absent from the graph)\n` +
+    `Each lemma below was fully proved by a node prover this run; its proof is banked. Re-emitting a node with EXACTLY this signature and EXACTLY this \`sorry_using\` parent set (under any name) restores the proof automatically — zero prover cost. Prefer re-wiring one of these into your revision over writing a near-duplicate lemma, and never spend a prover re-deriving one.\n` +
+    dormant
+      .map((v) => `- ${String(v.signature).replace(/\s+/g, " ").trim()}  -- sorry_using [${(v.deps || []).join(", ")}]`)
+      .join("\n")
+  )
+}
+
+function architectAssemble(graph, prelude, proofs) {
+  const parts = ["import Mathlib", ""]
+  if (prelude) parts.push(prelude, "")
+  for (const n of graph) {
+    if (["lemma", "theorem"].includes(n.kind)) {
+      const body = proofs.get(n.name)
+      const indented = String(body || "").split("\n").map((l) => (l.trim() ? "  " + l : l)).join("\n")
+      parts.push(`${n.signature.trim()} :=\n${indented}`, "")
+    } else {
+      parts.push(n.declTextNoAttr, "")
+    }
+  }
+  return parts.join("\n")
+}
+
+// Assembly invariant: every declaration the assembler emits must read back as
+// the signature it was built from, with a non-empty body.
+//
+// This is not a mathematical check -- it cannot fail because a proof is wrong.
+// It fails only when the harness has mangled a declaration between "Leak XII
+// registered this solve" and "Leak XIV sees this file". That happened: the
+// `indexOf(":=")` body extraction cut inside the statement's own `let` binder,
+// every node solved, the assembled file was garbage, and the failure surfaced
+// as a `PROOF_TOO_HARD` verdict against an innocent node — so refinement spent
+// the entire budget rewriting a graph that was never the problem. Hence:
+// checked BEFORE certification, and reported as a harness fault rather than
+// attributed to a node.
+//
+// It is a backstop, not a proof of correctness — a split-based mangling can
+// round-trip, which is why architectProofBody cuts against the known signature
+// instead of parsing. What it does catch soundly: a missing body, and a
+// declaration whose signature does not read back as itself.
+function architectAssemblyDefects(graph, proofs) {
+  const flat = (s) => String(s || "").replace(/\s+/g, " ").trim()
+  const defects = []
+  for (const n of graph) {
+    if (!["lemma", "theorem"].includes(n.kind)) continue
+    const body = String(proofs.get(n.name) || "").trim()
+    if (!body) {
+      defects.push(`${n.name}: registered a solve but carries no proof body`)
+      continue
+    }
+    const decl = `${n.signature.trim()} :=\n${body}`
+    const readBack = architectSignatureOf(decl)
+    if (flat(readBack) !== flat(n.signature))
+      defects.push(
+        `${n.name}: assembled declaration does not read back as its own signature\n` +
+          `      expected: ${flat(n.signature).slice(0, 200)}\n` +
+          `      read back: ${flat(readBack).slice(0, 200)}`,
+      )
+  }
+  return defects
+}
+
+// --- Hallucinated-name enforcement --------------------------------------------
+// Grok's failure mode here is the mirror of Claude's on Stronghold/Ultra:
+// Claude over-searches (hence governedSearchCall's rationed search budget,
+// which BLOCKS the tool call once budget hits 0 rather than merely asking
+// nicely), Grok under-searches and instead guesses plausible-sounding Mathlib
+// names that don't exist ("Nat.modEq_of_coprime_three",
+// "Nat.ModEq.exists_mul_add", ...), burning a whole turn on invented API
+// surface instead of one real lookup. Observed live: 8+ consecutive "Unknown
+// constant/identifier" errors on one node before it searched again.
+//
+// Same enforcement shape as governedSearchCall, mirrored: gate the ACTION
+// itself, not just the text around it. Once lean_compile has replied with an
+// unknown-name error ARCHITECT_HALLUCINATION_LOCK times in a row with no
+// search in between, lean_compile is LOCKED -- the next call is
+// refused outright (architectMcpCall never runs) until a search call
+// resets the streak. This is a hard gate, not a prompt nudge: the model
+// cannot get a real compile result while locked, exactly like a Grok-driven
+// search call cannot go through once governedSearchCall's budget is spent.
+const ARCHITECT_HALLUCINATION_LOCK = 3
+const UNKNOWN_NAME_RE = /unknown (constant|identifier)/i
+function architectHallucinationBlockedReport(streakCount) {
+  return `🛑 lean_compile is LOCKED — that's ${streakCount} compile errors in a row citing an unknown Mathlib name, with no search in between. You are guessing lemma names instead of looking them up. This call was refused (no compile ran). Search now and lean_compile unlocks instantly: \`loogle_search\` if you have a candidate name or a type shape (zero hits there PROVES the name is absent), \`moogle_search\` if you only know the mathematics in English.`
+}
+
+// --- Node prover (fresh, isolated conversation per attempt) -----------------
+async function architectProveNode(node, graph, prelude, urls, ctx, state) {
+  const parents = node.deps
+    .map((d) => graph.find((g) => g.name === d))
+    .filter(Boolean)
+    .map((p) => {
+      // Present a clean `name : type` fact line. The raw signature keeps its
+      // modifiers + keyword + name (e.g. "noncomputable def partial_sum (n :
+      // ℕ) : ℚ"), which the old strip missed for modifier-prefixed decls and
+      // double-rendered for lemmas ("sum_13_eq_one : : partial_sum 13 = 1").
+      const sig = p.signature
+        .replace(/^\s*(?:noncomputable\s+|private\s+|protected\s+)*(?:theorem|lemma|def|abbrev|structure|instance|inductive)\s+[A-Za-z0-9_'.]+\s*/, "")
+        .replace(/^:\s*/, "")
+        .trim()
+      return `- ${p.kind} ${p.name} : ${sig}${p.statement ? `\n    (${String(p.statement).slice(0, 240)})` : ""}${p.elaborated ? `\n    as Lean elaborates it: ${p.elaborated}` : ""}`
+    })
+    .join("\n")
+  const negSig = architectNegSignature(node.signature)
+  const prefix = architectNodePrefix(graph, node.name)
+  const graphNames = new Set(graph.map((g) => g.name))
+  const user = `## Target
+Prove this EXACT statement (the signature is immutable — your submission is rebuilt under it):
+
+${node.signature.trim()} := by
+  <your proof>
+${node.elaborated ? `\nAs Lean elaborates it (numeric-literal types explicit — your proof must work at THESE types; compare them against each fact below before writing a rewrite):\n${node.elaborated}\n` : ""}
+## Blueprint context
+Natural-language statement: ${node.statement || "(none)"}
+Proof sketch from the blueprint: ${node.proofSketch || "(none)"}
+
+## Available facts (your declared dependencies — already proved or defined; invoke by name)
+${parents || "(none — this node has no parents)"}
+${negSig ? `\n## Disproof option\nIf you verify the statement is FALSE under its hypotheses, prove instead exactly:\n\n${negSig} := by\n  <your disproof>\n` : ""}`
+
+  const result = {
+    solved: false,
+    negated: false,
+    proofBody: null,
+    forfeit: null,
+    attempts: 0,
+    // Set when the LAST compile of the node failed purely on an elaborator
+    // resource ceiling. Classification treats that as "not a mathematical
+    // failure" — the node is retried, not rewritten.
+    harnessLimit: false,
+    lastError: "",
+    parentsRendered: parents,
+  }
+  // The last compiler feedback of the previous fresh attempt. Fed into the
+  // next attempt's retry note so "fresh" never means "amnesiac": observed
+  // live, a node repeated the exact same broken tactic skeleton across every
+  // fresh attempt because nothing carried the wall it kept hitting.
+  let lastError = ""
+  // The best artifact of any previous attempt: the most recent submission that
+  // COMPILED cleanly with only `sorry` placeholders left. Feeding it to the
+  // next attempt turns "fresh" into a warm start on the node's OWN prior work
+  // — observed live, the blanket "take a structurally different route" note
+  // pushed a retry away from a proof that was one deleted line from complete.
+  let bestPartial = ""
+  for (let attempt = 0; attempt < ARCHITECT_NODE_RETRIES; attempt++) {
+    if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
+    result.attempts = attempt + 1
+    // Rendered per attempt (not once per node) so a node starting late in the
+    // pass — or retrying — sees everything its siblings have learned by then.
+    const deadEnds = ledgerRender(state.ledger, node.name)
+    // Rendered per attempt, like the ledger: a retry is a fresh conversation, so
+    // it must be told the names its own earlier attempts already burned.
+    const deadNames = deadNameRender(state)
+    const retryNote =
+      attempt === 0
+        ? ""
+        : `\n\n(Attempt ${attempt + 1} of ${ARCHITECT_NODE_RETRIES}. A previous fresh attempt failed.${
+            lastError ? ` Its final compiler feedback was:\n${lastError}\n` : " "
+          }${
+            bestPartial
+              ? `Its best submission COMPILED cleanly with only sorry placeholders left. Start from this skeleton and close its holes — do not rebuild from zero:\n\`\`\`lean\n${bestPartial}\n\`\`\``
+              : lastError
+                ? "That approach hit a wall — take a structurally different route."
+                : "Do not repeat the same failing tactic line verbatim."
+          })`
+    let hallucinationStreak = 0
+    const exec = async (name, args) => {
+      // Either search tool clears the hallucination lock: the lock's premise is
+      // "you are guessing names instead of looking them up", and both of these
+      // are looking it up. loogle is the one that can prove absence, but a
+      // moogle call is still a lookup, not another guess.
+      if (name === "loogle_search" || name === "moogle_search") {
+        hallucinationStreak = 0
+        if (!urls.xi) return { report: `${name} is unavailable (Leak XI not configured); reason from Mathlib knowledge and compiler feedback.` }
+        const searchArgs =
+          name === "loogle_search"
+            ? { query: String(args.query || "") }
+            : { concept: String(args.concept || args.query || ""), k: Number(args.k) || 10 }
+        const r = await architectSearchCall(urls.xi, name, searchArgs, 60000)
+        // Deterministic scope guard: searching a LOCALLY-declared name gets a
+        // truthful "not in Mathlib" that two independent provers have misread
+        // as "the statement is ill-formed". Say what the silence means, inline.
+        const caveat = architectLocalScopeCaveat(searchArgs.query || searchArgs.concept, graphNames)
+        if (caveat && r && typeof r.report === "string") r.report += caveat
+        return r
+      }
+      if (name === "lean_compile") {
+        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
+          return { report: architectHallucinationBlockedReport(hallucinationStreak) }
+        const r = await architectMcpCall(urls.xii, "lean_compile", {
+          mode: "node",
+          code: String(args.code || ""),
+          target_name: node.name,
+          target_signature: node.signature,
+          target_neg_signature: negSig || "",
+          prefix,
+          prelude,
+        }, Number(NODE_TIMEOUT_MS))
+        // (5) The daemon compiles a REBUILT file, so its line numbers are not
+        // the model's. Record both and the measured offset. Report only — the
+        // diagnostics handed back to the model are untouched.
+        const offLog = rebuildOffsetReport(String(args.code || ""), r?.rebuilt)
+        if (offLog) ctx.emit({ type: "message-annotation", subtype: "status", thought: offLog })
+        if (r.solve) {
+          // Everything after the `:=` that starts the BODY -- not the first
+          // `:=` in the text, which for a `let`-binding statement belongs to
+          // the statement itself.
+          // Cut against the signature we sent, not at the first `:=` in the
+          // text -- for a `let`-binding statement that `:=` belongs to the
+          // statement itself.
+          const sentSig = r.negated ? negSig || "" : node.signature
+          return { report: r.report, __done: { negated: !!r.negated, body: architectProofBody(r.rebuilt, sentSig) } }
+        }
+        lastError = String(r.report || "").slice(0, 900)
+        result.lastError = lastError
+        result.harnessLimit = architectIsResourceFailure(r, r.report)
+        // A submission that elaborates with only sorries left is the node's
+        // most valuable non-solve artifact — keep the latest for the retry note.
+        if (/Compiles, but the proof still contains sorry/.test(r.report || ""))
+          bestPartial = String(args.code || "").slice(0, 1600)
+        // Pool environment-level facts for sibling nodes (gate/delta only —
+        // state.ledger is null for the control).
+        ledgerHarvest(state.ledger, r.report, node.name)
+        // Blueprint declarations are excluded: a node citing a non-parent
+        // sibling raises "unknown identifier" for a name that does exist.
+        deadNameHarvest(state, r.report, graphNames)
+        hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
+        return { report: r.report }
+      }
+      return { report: `unknown tool ${name}` }
+    }
+    const out = await architectLoop(ctx, state, {
+      system: architectProverSystem(),
+      user: user + deadNames + deadEnds + retryNote,
+      // (2) Declared, not inferred. Sniffing these back out of the assembled
+      // prompt by their headings would silently go wrong the day a heading is
+      // reworded; naming them here means the manifest is right by construction
+      // and an absent block reads as absent instead of as nothing at all.
+      promptBlocks: {
+        target: user,
+        "dead names (run ledger)": deadNames,
+        "dead ends (sibling ledger)": deadEnds,
+        "retry note": retryNote,
+      },
+      tools: [ARCHITECT_COMPILE_TOOL, ...ARCHITECT_SEARCH_TOOLS],
+      exec,
+      // Driver-specific: see ARCHITECT_NODE_HARD_TURNS above for why a shared
+      // cap makes Ultra wait far longer per node than River before a stuck
+      // attempt hands off toward refinement. Pre-scoped in state.nodeHardTurns/
+      // state.nodeTokenBudget — vintage runs these 1/ARCHITECT_VINTAGE_CUTOFF_DIVISOR.
+      hardTurns: state.nodeHardTurns,
+      tokenBudget: state.nodeTokenBudget,
+      forfeitPrompt: ARCHITECT_FORFEIT_REQUEST,
+      label: `node ⟪${node.name}⟫ · attempt ${attempt + 1}/${ARCHITECT_NODE_RETRIES}`,
+      // What the consultant sees when this prover stalls: the node, its
+      // elaborated form, and the facts it was given — enough to judge the
+      // attempts cold, nothing about the current tactic fixation.
+      consultContext: `${node.signature.trim()}${node.elaborated ? `\nAs Lean elaborates it: ${node.elaborated}` : ""}\n\nDeclared facts available to the prover:\n${parents || "(none)"}`,
+      // Per-agent interceptor — river-vintage only (see state.watchers).
+      intercept: !!state.watchers,
+    })
+    if (out.done) {
+      result.solved = !out.done.negated
+      result.negated = !!out.done.negated
+      result.proofBody = out.done.body
+      // Positive side of the ledger: names in an ACCEPTED (or formally negated)
+      // proof provably resolve — share them with siblings still searching.
+      ledgerHarvestProven(state.ledger, out.done.body, node.name)
+      return result
+    }
+    // No solve this attempt: keep the best structured forfeit we saw.
+    if (out.finalText && /##\s*Diagnosis/i.test(out.finalText)) {
+      result.forfeit = architectParseForfeit(out.finalText)
+      break // an explicit forfeit is terminal for this pass — refinement owns it now
+    }
+  }
+  if (!result.solved && !result.negated && !result.forfeit)
+    result.forfeit = architectParseForfeit("")
+  return result
+}
+
+// --- Blueprint / refinement conversation (shared shape) ----------------------
+async function architectBlueprintStage(ctx, state, urls, { system, user, retries, stageLabel = "blueprint", effort = "" }) {
+  let lastReport = ""
+  for (let attempt = 0; attempt < retries; attempt++) {
+    if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return null
+    let captured = null
+    let hallucinationStreak = 0
+    // Names declared in the model's own most recent submission (plus the
+    // target) — the set the local-scope caveat checks search queries against.
+    let localNames = new Set([state.targetName])
+    const exec = async (name, args) => {
+      if (name === "loogle_search" || name === "moogle_search") {
+        hallucinationStreak = 0
+        if (!urls.xi) return { report: `${name} is unavailable; proceed from Mathlib knowledge.` }
+        const searchArgs =
+          name === "loogle_search"
+            ? { query: String(args.query || "") }
+            : { concept: String(args.concept || args.query || ""), k: Number(args.k) || 10 }
+        const r = await architectSearchCall(urls.xi, name, searchArgs, 60000)
+        const caveat = architectLocalScopeCaveat(searchArgs.query || searchArgs.concept, localNames)
+        if (caveat && r && typeof r.report === "string") r.report += caveat
+        return r
+      }
+      if (name === "lean_compile") {
+        if (hallucinationStreak >= ARCHITECT_HALLUCINATION_LOCK)
+          return { report: architectHallucinationBlockedReport(hallucinationStreak) }
+        for (const n of declaredNamesIn(args.code)) localNames.add(n)
+        const r = await architectMcpCall(urls.xii, "lean_compile", {
+          mode: "blueprint",
+          code: String(args.code || ""),
+          target_name: state.targetName,
+          target_signature: state.targetSignature,
+        }, Number(BLUEPRINT_TIMEOUT_MS))
+        lastReport = String(r.report || "").slice(0, 1200)
+        // `ok` alone is not enough to end the stage: an exploration compile also
+        // reports ok (it means "Lean found no errors") and carries no graph.
+        // Capturing that finished the blueprint stage on a bare `#eval` and the
+        // run died downstream on `bp.graph is not iterable`. Require the graph.
+        if (r.ok && Array.isArray(r.graph)) {
+          captured = { graph: r.graph, code: String(args.code || "") }
+          return { report: r.report, __done: captured }
+        }
+        // Whole-file compile: the submission's own declarations are excluded, so
+        // a forward reference or a typo'd `sorry_using` dep can't be recorded as
+        // a Mathlib absence.
+        deadNameHarvest(state, r.report, declaredNamesIn(args.code))
+        hallucinationStreak = UNKNOWN_NAME_RE.test(r.report || "") ? hallucinationStreak + 1 : 0
+        return { report: r.report }
+      }
+      return { report: `unknown tool ${name}` }
+    }
+    const deadNames = deadNameRender(state)
+    const retryNote = attempt === 0 ? "" : `\n\n(Attempt ${attempt + 1} of ${retries}. The previous attempt failed its last gate with:\n${lastReport}\nStart fresh and fix that.)`
+    const out = await architectLoop(ctx, state, {
+      system,
+      user: user + deadNames + retryNote,
+      promptBlocks: { "stage prompt": user, "dead names (run ledger)": deadNames, "retry note": retryNote },
+      tools: [ARCHITECT_COMPILE_TOOL, ...ARCHITECT_SEARCH_TOOLS],
+      exec,
+      // Pre-scoped in state.blueprintTokenBudget — vintage runs this
+      // 1/ARCHITECT_VINTAGE_CUTOFF_DIVISOR, so a stuck attempt resets to a
+      // fresh one (with the watchers now attached, per the fix above) much
+      // sooner instead of burning its whole budget on one syntax loop.
+      tokenBudget: state.blueprintTokenBudget,
+      label: `${stageLabel} · attempt ${attempt + 1}/${retries}`,
+      effort,
+      // Interceptor coverage — river-vintage only (state.watchers). BUG FIXED:
+      // this was previously wired only into node proving (architectProveNode),
+      // so blueprint generation/refinement ran completely unwatched by the
+      // interceptor. Observed live (milestone_pairwise_distance): a blueprint
+      // generator burned its ENTIRE token budget (~30 submissions, several
+      // minutes) looping on one doc-comment delimiter typo before the mechanic
+      // — the only watcher actually attached — finally intervened. The
+      // interceptor's tighter 3-submission cadence would have caught this far
+      // earlier had it been watching this stage at all.
+      intercept: !!state.watchers,
+      consultContext: `${stageLabel} for the target:\n${state.targetSignature}`,
+    })
+    if (out.done) return out.done
+  }
+  return null
+}
+
+// --- Natural-language proof seed (river-delta) --------------------------------
+// One shot, before blueprint generation: ask the LOCAL Claude CLI (Sonnet 5) for
+// an informal proof of the target, and hand it to the blueprint stage as a
+// structural guide (the paper's §4.2 NL guidance, where a separate model writes
+// the informal argument and the pipeline derives the lemma graph from it).
+//
+// Deliberately NOT reused for refinement: refinement's input is the annotated
+// graph plus machine-checked per-node diagnoses, and the paper only ever seeds
+// the INITIAL blueprint. Feeding a static informal proof back in would compete
+// with concrete compiler evidence about what actually failed.
+//
+// Cost: the CLI's own reported total_cost_usd, added to the run's total.
+async function architectNlSeed(theorem, ctx, state) {
+  const system =
+    "You are a research mathematician. Given a Lean 4 theorem signature, write the natural-language proof of the mathematical statement it expresses. Plain mathematical prose only — no Lean code, no tactics, no Mathlib lemma names. State every intermediate claim you rely on explicitly, as a numbered chain of steps a formaliser could turn one-for-one into named lemmas. CITE standard results instead of re-proving them: when a step is a known theorem of the literature (e.g. 'the value of the n-th cyclotomic polynomial at 1', 'Fermat's little theorem', 'the divisor-sum formula for the totient'), state it in ONE line by its standard name and move on — the formalisation stage proves against a large library of standard results, and re-derived textbook theory bloats the lemma graph with steps that are harder to formalise than the target itself. Spell out in full only the reasoning specific to THIS problem: its numeric facts, case analyses, and how the standard results chain together. If you believe the statement is FALSE, say so plainly and give the counterexample. Be complete but do not pad."
+  const prompt = `Write the natural-language proof of this Lean 4 theorem's mathematical content:\n\n${state.targetSignature}\n\nAnswer with the proof only.`
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🌱 NL seed [${ARCHITECT_SEED_MODEL}, local]: writing an informal proof to guide blueprint generation.`,
+  })
+  let r
+  try {
+    r = await runClaude(
+      buildArgs(prompt, {
+        model: ARCHITECT_SEED_MODEL,
+        systemPrompt: system,
+        // Pure reasoning task: no tools, no MCP, no dynamic sections — keeps the
+        // call cheap and makes its cost attributable to the seed alone.
+        disallowedTools: "Bash Read Write Edit Glob Grep WebFetch WebSearch Task",
+        strictMcpConfig: true,
+        excludeDynamicSections: true,
+      }),
+      { cwd: undefined, timeoutMs: Number(BLUEPRINT_TIMEOUT_MS) },
+    )
+  } catch (e) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ NL seed failed (${String(e?.message || e)}) — continuing without it.` })
+    return ""
+  }
+  if (typeof r?.costUsd === "number") {
+    state.seedCostUsd = (state.seedCostUsd || 0) + r.costUsd
+    state.models.add(ARCHITECT_SEED_MODEL)
+    architectRecost(ctx, state)
+  }
+  const text = String(r?.text || "").trim()
+  if (!r?.ok || !text) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ NL seed produced nothing usable — continuing without it.` })
+    return ""
+  }
+  ctx.emit({
+    type: "system",
+    detail: `[NL seed · ${ARCHITECT_SEED_MODEL} · $${(r.costUsd || 0).toFixed(4)}]\n\n${text}`,
+  })
+  return text
+}
+
+// --- The pipeline -------------------------------------------------------------
+async function proveArchitect(theorem, ctx, opts = {}) {
+  const urls = architectUrls(opts, ctx.mcpServers)
+  if (!urls.xii || !urls.xiv) {
+    ctx.emit({ type: "error", message: "Architect needs LEAK_XII_URL and LEAK_XIV_URL set on the bridge (Leak XI optional for search). Set the env vars and restart the bridge." })
+    return { verified: false, proof: "" }
+  }
+  const variant = architectConfigFor(ctx.strategy)
+  // Refinement budget for THIS run, read LIVE off the run state (the UI's
+  // "+1 iter" button raises it via /extend, exactly like "+5 min" raises the
+  // deadline) so a bump lands even while the final iteration is running. Falls
+  // back to opts for callers with no run registry (e.g. direct invocation).
+  const maxIters = () =>
+    (typeof ctx.getMaxIters === "function" ? ctx.getMaxIters() : 0) ||
+    clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS)
+  const driver = architectDriverFor(ctx.strategy)
+  const state = {
+    driver,
+    // Grok driver: force a grok SKU (the River family locks the selector to one).
+    // Claude driver: honour the operator's dropdown choice verbatim — that is the
+    // whole point of Leak Ultra, so no ladder and no substitution here.
+    model:
+      driver === "claude"
+        ? String(ctx.model || "").trim() || ARCHITECT_ULTRA_MODEL
+        : /grok/i.test(String(ctx.model || ""))
+          ? String(ctx.model)
+          : process.env.ARCHITECT_MODEL || ARCHITECT_MODEL_LADDER[0],
+    usage: { prompt: 0, completion: 0, cached: 0 },
+    stageTokens: 0,
+    // Cost accounting: driver (Grok, from token counts) + seed (Sonnet, from the
+    // CLI's reported total_cost_usd). `models` records every model that actually
+    // ran, including ladder fallbacks, for the research row's models_used.
+    seedCostUsd: 0,
+    driverCostUsd: 0,
+    models: new Set(),
+    // Shared environment facts across node provers — gate/delta only. Null for
+    // the control, so its nodes stay exactly as isolated as the paper's.
+    ledger: variant.shareDeadEnds ? makeDeadEndLedger() : null,
+    // Names the compiler has refused, run-scoped. Always on — see deadNameHarvest.
+    deadNames: new Map(),
+    targetName: (theorem.match(/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/) || [])[1] || "target",
+    targetSignature: architectSignatureOf(theorem),
+    // Live-agent registry (agentId → {trace, label}) — the mechanic's address
+    // book — and the mechanic notes queued for the next refinement prompt.
+    liveTraces: new Map(),
+    mechanicNotes: [],
+  }
+  if (ctx.metrics) {
+    ctx.metrics.max_iters = maxIters()
+    ctx.metrics.models_used = []
+    ctx.metrics.driver = driver
+  }
+  // The oversight watchers are a VARIANT property (river-vintage), exactly like
+  // the ledger and the NL seed — stone/gate/delta run without them so the
+  // research tables isolate one change at a time. Grok driver only — Ultra's
+  // CLI owns its own loop, so there is no turn boundary to inject at.
+  state.watchers = !!variant.watchers && driver !== "claude"
+  // Earlier per-attempt cutoff, vintage-only — see ARCHITECT_VINTAGE_CUTOFF_DIVISOR.
+  const cutoffDivisor = state.watchers ? ARCHITECT_VINTAGE_CUTOFF_DIVISOR : 1
+  state.blueprintTokenBudget = Math.round(ARCHITECT_BLUEPRINT_TOKENS / cutoffDivisor)
+  state.nodeHardTurns = Math.max(4, Math.round((ARCHITECT_NODE_HARD_TURNS[driver] || ARCHITECT_NODE_HARD_TURNS.grok) / cutoffDivisor))
+  state.nodeTokenBudget = Math.round((ARCHITECT_NODE_TOKENS_BY_DRIVER[driver] || ARCHITECT_NODE_TOKENS_BY_DRIVER.grok) / cutoffDivisor)
+  if (state.watchers) {
+    if (ctx.metrics) {
+      ctx.metrics.watchers = true
+      ctx.metrics.interceptor_notes = 0
+      ctx.metrics.interceptor_aborts = 0
+      ctx.metrics.mechanic_notes = 0
+      ctx.metrics.consults = 0
+    }
+    const mechanic = architectMechanicStart(ctx, state)
+    ctx.stopWatchers = mechanic.stop
+  }
+
+  // ---- Pre-flight: does the TARGET elaborate on its own? -------------------
+  // ADVISORY, never fatal. The first cut of this killed the run outright on any
+  // Lean error, which was wrong: supporting declarations exist precisely so a
+  // target that does NOT elaborate alone can be made to. `insane_lamp_circle`
+  // needs an `instance : NeZero N` before `Fintype (ZMod N)` exists — a
+  // blueprint can supply that, and the fatal gate rejected the problem one
+  // second in, before the model was ever asked. Killing a run on the exact
+  // condition the other half of the feature was built to repair.
+  //
+  // What the check is actually for is the SILENCE: the blueprint stage cannot
+  // distinguish "my graph is wrong" from "the target needs an instance", so it
+  // re-attempted the same failure until the budget ran out and never announced
+  // an iteration. So: surface the error at second one, and hand it to the
+  // blueprint stage as its first task. The model can then fix it, and if it
+  // truly cannot, the failure is at least legible from the transcript.
+  // Two independent Leak XII round-trips happen here, before the model is ever
+  // called: the pre-flight compile (does the target elaborate alone?) and the
+  // elaboration echo (what does it elaborate TO?). Both used to be silent —
+  // the pre-flight only emits on error, and the echo never emitted at all —
+  // so a slow XII (cold REPL worker, a busy pool) produced a run that looked
+  // hung with no explanation. Observed live: a river-stone run with nothing in
+  // the log for over a minute after "Full agent context captured", which is
+  // emitted at run start and proves nothing about whether the model has been
+  // reached yet. Run them CONCURRENTLY (they don't depend on each other) and
+  // report elapsed time on both, so a slow XII is visible and attributable
+  // instead of indistinguishable from grok itself being slow.
+  const preflightStart = Date.now()
+  const [preflightResult, elabResult] = await Promise.allSettled([
+    architectMcpCall(urls.xii, "lean_compile", {
+      mode: "explore",
+      code: `${state.targetSignature.trim()} := by sorry`,
+    }, Number(NODE_TIMEOUT_MS)),
+    architectElaborateOne(urls, "", state.targetSignature, state.targetName),
+  ])
+  const preflightMs = Date.now() - preflightStart
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🔎 Target pre-flight + elaboration echo against Leak XII: ${preflightMs}ms.`,
+  })
+
+  let targetPreflightNote = ""
+  if (preflightResult.status === "fulfilled") {
+    const pre = preflightResult.value
+    if (Array.isArray(pre?.errors) && pre.errors.length) {
+      const detail = String(pre.report || "").slice(0, 1200)
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought:
+          `🔎 The target does not elaborate on its own — the blueprint must supply what it needs ` +
+          `(an \`instance\`, a helper \`def\`) as a supporting declaration, i.e. WITHOUT an ` +
+          `\`@[blueprint]\` attribute. Handing this to the blueprint stage:\n\n${detail}`,
+      })
+      targetPreflightNote =
+        `\n\n## The target does not elaborate on its own — fix this FIRST\n` +
+        `Compiling the targeted theorem by itself, with no other declarations, Lean reports:\n\n` +
+        `${detail}\n\n` +
+        `Your blueprint must therefore open with whatever declarations the signature needs in order ` +
+        `to typecheck at all — typically an \`instance\`. Write them WITHOUT an \`@[blueprint]\` ` +
+        `attribute so they are supporting declarations rather than graph nodes: they then need no ` +
+        `\`statement\` field, they are exempt from the reachability check, and they are carried into ` +
+        `every node prover and into the final assembled file. Until the file compiles, no graph you ` +
+        `write can be validated.`
+    }
+  } else {
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `⚠️ Target pre-flight could not run (${String(preflightResult.reason?.message || preflightResult.reason).slice(0, 160)}) — continuing anyway.`,
+    })
+  }
+  // The target as Lean ELABORATES it — numeric-literal types explicit. This is
+  // the single source of type truth the whole graph must be stated against:
+  // on sum_quartic_telescope the `(k:ℤ)` ascription forced the Icc over ℤ
+  // while every helper was written over the ℕ-Icc that the default rendering
+  // made look identical, and the run was decided at iteration 0. Discarded (the
+  // empty string) whenever the target needs blueprint-supplied declarations to
+  // elaborate at all — the preflight note above already covers that case, and
+  // an elaboration computed against a target that doesn't compile alone is not
+  // trustworthy anyway.
+  const targetElab = targetPreflightNote || elabResult.status !== "fulfilled" ? "" : elabResult.value
+  const targetElabNote = targetElab
+    ? `\n\n## The target as Lean elaborates it (numeric-literal types explicit)\n${targetElab}\n\nState every node at THESE types. A lemma whose sums, intervals or casts elaborate at a different type than the target's cannot be rewritten or chained into it, however similar the surface syntax looks — and your assembly will fail to compile until the types agree.`
+    : ""
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🏛️ ${pickStrategy(ctx.strategy).label}\n   driver=${driver === "claude" ? "claude CLI" : "grok API"}:${state.model} · refinement budget=${maxIters()} (raise it live with "+1 iter") · dead-end ledger=${variant.shareDeadEnds ? "on" : "off"} · NL seed=${variant.nlSeedLocal ? ARCHITECT_SEED_MODEL : "off"} · watchers=${state.watchers ? "on (interceptor+mechanic)" : "off"}\n   toolchain=${TOOLCHAINS.architect.lean} · Mathlib ${TOOLCHAINS.architect.mathlib} (${TOOLCHAINS.architect.group})`,
+  })
+
+  // NL guidance is a VARIANT property, not a caller option. Honouring a supplied
+  // nlProof on stone/gate would silently hand the "control" a natural-language
+  // solution the paper's pipeline never sees — which is exactly what the ACG
+  // pipeline was doing, making Stone not a control and leaving Delta's local seed
+  // dead code (nlText was always pre-filled, so architectNlSeed never ran).
+  // Variants without nlSeedLocal now ignore opts.nlProof outright, so no caller
+  // can contaminate the control by accident.
+  let nlText = ""
+  if (variant.nlSeedLocal) {
+    nlText = typeof opts.nlProof === "string" && opts.nlProof.trim() ? opts.nlProof.trim() : ""
+    // river-delta's defining intervention: when no informal proof was handed in,
+    // generate one locally with Sonnet from the SIGNATURE ALONE.
+    if (!nlText) nlText = await architectNlSeed(theorem, ctx, state)
+  } else if (typeof opts.nlProof === "string" && opts.nlProof.trim()) {
+    ctx.emit({
+      type: "message-annotation",
+      subtype: "status",
+      thought: `🚫 Ignoring the caller's natural-language proof — ${pickStrategy(ctx.strategy).label.split("—")[0].trim()} runs without NL guidance by design.`,
+    })
+  }
+  const nlSeed = nlText
+    ? `\n\n## Natural-language proof (structural guide — derive the lemma graph from it)\n${nlText.slice(0, 8000)}`
+    : ""
+  if (ctx.metrics) ctx.metrics.nl_seed_used = !!nlSeed
+  const bpUser = `Targeted Lean theorem (the main Theorem node MUST carry this exact name and signature):\n\n${state.targetSignature}${targetElabNote}${nlSeed}${targetPreflightNote}`
+
+  let admitted = await architectAdmitBlueprint(ctx, state, urls, {
+    system: architectBlueprintSystem(),
+    user: bpUser,
+    retries: ARCHITECT_BLUEPRINT_RETRIES,
+    stageLabel: "blueprint generation",
+    // Ultra only — the Grok driver has no CLI and ignores this.
+    effort: driver === "claude" ? ARCHITECT_BLUEPRINT_EFFORT : "",
+  })
+  if (!admitted) {
+    ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: no compiling blueprint within the retry budget." })
+    return { verified: false, proof: "" }
+  }
+  let bp = admitted.bp
+  await architectAttachElaborated(bp, urls, ctx)
+  // Nodes the compiler refuted at admission time. They are skipped by the
+  // prover pool and handed to refinement as DISPROVED with a real witness —
+  // spending a fresh isolated prover on a statement Lean has already
+  // disproved is pure waste (three of them, in the run that motivated this).
+  let preRefuted = new Set(admitted.refuted.map((r) => r.name))
+
+  const proofs = new Map() // name -> proof body ("by ...") for solved nodes
+  const sigOfProof = new Map() // name -> signatureNorm at solve time
+  // name -> sorted-deps key at solve time. Paper Fig. 1: a banked proof is only
+  // reused "while signatures AND PARENTS are unchanged" — signature-only reuse
+  // is unsound. Observed live (factorial_base12_trailing_zeros): refinement
+  // dropped a parent (`v12_eq_min`) from an already-PROVED node's sorry_using
+  // list while leaving its signature untouched; the theorem's stale cached
+  // proof body still called `rw [v12_eq_min, ...]`, so it carried forward as
+  // green for two more iterations, "all nodes solved" fired, assembly emitted
+  // a reference to a name no longer in the file, and Leak XIV's certification
+  // rejected it — costing a full extra refinement round to recover. Comparing
+  // the declared parent SET (order-independent — the refiner may reorder
+  // sorry_using harmlessly) below catches this the instant the revised graph
+  // is read, before any proving or assembly is attempted on it.
+  const depsOfProof = new Map()
+  const depsKey = (n) => [...n.deps].sort().join(",")
+  // Run-wide proven-lemma vault (paper: proven lemmas are never thrown away) —
+  // see vaultRestore / architectVaultSection above for the two consumers.
+  const vault = new Map() // vaultKeyOf(signatureNorm, depsKey) -> {name, signature, deps, proof}
+  // Multiplier on the elaborator resource floor, raised only by the
+  // resource-retry branch below (never lowered within a run).
+  let resourceBoost = 1
+  let resourceRetries = 0
+  const ARCHITECT_MAX_RESOURCE_RETRIES = 2
+  // The exact minimal file the target-standalone check last submitted. Retrying
+  // an identical file can only produce an identical verdict, so the check is
+  // skipped until something about it actually changes (a new target proof, a
+  // new prelude, a changed definition).
+  let lastStandaloneAttempt = null
+
+  // Unbounded loop with a LIVE cap check at the bottom — the budget can grow
+  // mid-iteration, so it can't be baked into the loop condition.
+  for (let iter = 0; ; iter++) {
+    const graph = bp.graph
+    const prelude = architectPrelude(bp.code, resourceBoost)
+    const provable = graph.filter((n) => ["lemma", "theorem"].includes(n.kind))
+    // Proof reuse: byte-identical (whitespace-normalised) signatures AND an
+    // unchanged parent set keep the proof; either changing invalidates it.
+    for (const n of provable) {
+      if (
+        proofs.has(n.name) &&
+        (sigOfProof.get(n.name) !== n.signatureNorm || depsOfProof.get(n.name) !== depsKey(n))
+      ) {
+        proofs.delete(n.name)
+        sigOfProof.delete(n.name)
+        depsOfProof.delete(n.name)
+      }
+    }
+    // Vault restore (paper: proven lemmas are never thrown away): any node the
+    // name-keyed reuse above left unproved but whose signature + parent set
+    // matches a banked lemma inherits that proof — renames and drop-then-readd
+    // included. No-op on the first iteration (vault is empty).
+    vaultRestore({ vault, provable, proofs, sigOfProof, depsOfProof, depsKey, emit: ctx.emit, metrics: ctx.metrics })
+    // Glue nodes (the main theorem always; interior nodes optionally) carry
+    // their proof AS their body, and the admission compile already verified it
+    // against sorried parents — so no prover is ever dispatched at one.
+    // Re-seeded from the CURRENT graph every iteration, after the invalidation
+    // above, so a refined body is never shadowed by a stale entry.
+    for (const n of provable) {
+      if (n.glue && String(n.body || "").trim()) {
+        proofs.set(n.name, n.body)
+        sigOfProof.set(n.name, n.signatureNorm)
+        depsOfProof.set(n.name, depsKey(n))
+      }
+    }
+    const todo = provable.filter((n) => !proofs.has(n.name) && !preRefuted.has(n.name))
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `📐 Blueprint iteration ${iter}: ${graph.length} nodes (${provable.length} provable, ${todo.length} open, ${proofs.size} carried forward${preRefuted.size ? `, ${preRefuted.size} pre-refuted — not dispatched` : ""}).` })
+
+    // ---- Theorem proving: isolated node conversations, capped parallel pool.
+    const results = new Map()
+    // Statements the compiler refuted at blueprint-admission time need no
+    // prover: the disproof already exists. Seed them as machine-witnessed
+    // failures so classification sees DISPROVED and refinement gets the truth.
+    for (const n of provable) {
+      if (!preRefuted.has(n.name) || proofs.has(n.name)) continue
+      results.set(n.name, {
+        solved: false,
+        negated: true,
+        harnessLimit: false,
+        lastError: "",
+        parentsRendered: "",
+        forfeit: {
+          diagnosis: "STATEMENT_WRONG",
+          analysis: "Refuted by the compiler during blueprint admission, before any prover was dispatched: Lean proved the negation of this statement.",
+          fix: "",
+        },
+      })
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${n.name}⟫ pre-refuted at blueprint admission — no prover dispatched.` })
+    }
+    let cursor = 0
+    const workers = Array.from({ length: Math.max(1, Math.min(ARCHITECT_NODE_CONCURRENCY, todo.length)) }, async () => {
+      while (cursor < todo.length) {
+        const node = todo[cursor++]
+        if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `⛏️ node ⟪${node.name}⟫ — fresh isolated prover (${node.deps.length} parent(s)).` })
+        const r = await architectProveNode(node, graph, prelude, urls, ctx, state)
+        results.set(node.name, r)
+        if (r.solved) {
+          proofs.set(node.name, r.proofBody)
+          sigOfProof.set(node.name, node.signatureNorm)
+          depsOfProof.set(node.name, depsKey(node))
+          // Bank it for the rest of the run — survives any later refinement
+          // dropping or renaming this node (paper: never throw away a proof).
+          vault.set(vaultKeyOf(node.signatureNorm, depsKey(node)), {
+            name: node.name,
+            signature: node.signature,
+            deps: [...node.deps].sort(),
+            proof: r.proofBody,
+          })
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ node ⟪${node.name}⟫ solved (attempt ${r.attempts}).` })
+        } else if (r.negated) {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${node.name}⟫ DISPROVED — machine-checked negation registered (STATEMENT_WRONG).` })
+        } else {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏳️ node ⟪${node.name}⟫ forfeited: ${r.forfeit?.diagnosis}.` })
+        }
+      }
+    })
+    await Promise.all(workers)
+
+    // ---- Failure classification + diagnosis -------------------------------
+    // Decide WHAT KIND of failure each unproved node suffered before deciding
+    // what to do about it. The class is the harness's own judgement, derived
+    // from machine-observable facts (was a negation registered? were the
+    // parents proved? was the last error a resource ceiling?) — never from
+    // the failing prover's self-assessment, which is the least reliable
+    // signal in the loop and the one the paper leans on hardest.
+    const verdicts = new Map()
+    const failed = provable.filter((n) => !proofs.has(n.name) && results.has(n.name))
+    for (const n of failed) {
+      const r = results.get(n.name)
+      const unprovedParents = n.deps.filter(
+        (d) => provable.some((p) => p.name === d) && !proofs.has(d),
+      )
+      let cls
+      if (r.negated) cls = "DISPROVED"
+      else if (unprovedParents.length) cls = "PARENTS_MISSING"
+      else if (r.harnessLimit) cls = "HARNESS_LIMIT"
+      else if (r.forfeit?.diagnosis === "STATEMENT_WRONG") cls = "SUSPECT_STATEMENT"
+      else cls = "PROOF_TOO_HARD"
+
+      // A prover's bare assertion of falsity is not evidence — but the
+      // compiler can settle it. Try to refute the node's own conclusion; a
+      // success promotes the claim to a real DISPROVED, a failure leaves it
+      // SUSPECT so refinement cannot delete a true lemma on a hunch. (On
+      // factorial_base12_trailing_zeros this is exactly the missing step: one
+      // node was declared STATEMENT_WRONG and rewritten away while being
+      // true, and another — `¬ 3^1010 ∣ 2026!` — was genuinely false and
+      // could have been settled here in one compile.)
+      if (cls === "SUSPECT_STATEMENT") {
+        const split = architectSplitSig(n.signature)
+        if (split && !split.binders && (await architectRefute(split.concl, architectNodePrefix(graph, n.name), prelude, urls, ctx))) {
+          cls = "DISPROVED"
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🧨 node ⟪${n.name}⟫ — harness refuted the statement; the prover's STATEMENT_WRONG claim is confirmed.` })
+        } else {
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🛡️ node ⟪${n.name}⟫ — prover claimed STATEMENT_WRONG with no disproof and the harness could not refute it; downgraded to SUSPECT_STATEMENT (refinement may not delete it on that basis).` })
+        }
+      }
+      verdicts.set(n.name, {
+        class: cls,
+        analysis: r.forfeit?.analysis || "",
+        directive: ARCHITECT_CLASSES[cls].directive,
+        helpers: [],
+        facts: [],
+        deadNames: [],
+        rejected: [],
+        note: unprovedParents.length ? `unproved parents: ${unprovedParents.join(", ")}` : "",
+      })
+    }
+
+    // Enrich only the classes where a diagnosis changes what refinement does.
+    const toDiagnose = failed.filter((n) => ARCHITECT_DIAGNOSE_CLASSES.has(verdicts.get(n.name).class))
+    if (toDiagnose.length) {
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🩺 Diagnosing ${toDiagnose.length} failed node(s) — every claim is checked against Lean before refinement sees it.` })
+      let dcur = 0
+      const dworkers = Array.from({ length: Math.max(1, Math.min(2, toDiagnose.length)) }, async () => {
+        while (dcur < toDiagnose.length) {
+          const n = toDiagnose[dcur++]
+          if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) return
+          const r = results.get(n.name)
+          const base = verdicts.get(n.name)
+          const v = await architectDiagnose(n, base.class, ctx, state, urls, {
+            parents: r.parentsRendered || "",
+            selfAnalysis: r.forfeit?.analysis || "",
+            selfFix: r.forfeit?.fix || "",
+            lastError: r.lastError || "",
+            disproof: !!r.negated,
+          }, architectNodePrefix(graph, n.name), prelude)
+          verdicts.set(n.name, { ...base, ...v, note: base.note })
+          // `#check`-verified absences — the highest-confidence entries the run
+          // ledger gets. Graph names are excluded: the diagnostician can cite
+          // one, and `#check` sees Mathlib only, so a real node reads as absent.
+          deadNameAdd(state, v.deadNames || [], new Set(graph.map((g) => g.name)))
+          const bits = []
+          if (v.facts?.length) bits.push(`${v.facts.length} verified fact(s)`)
+          if (v.helpers?.length) bits.push(`${v.helpers.length} helper(s) accepted`)
+          if (v.rejected?.length) bits.push(`${v.rejected.length} rejected`)
+          if (v.deadNames?.length) bits.push(`${v.deadNames.length} nonexistent name(s)`)
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🩺 ⟪${n.name}⟫ ${v.class}${bits.length ? ` — ${bits.join(", ")}` : ""}` })
+        }
+      })
+      await Promise.all(dworkers)
+    }
+
+    // Research telemetry (Leak River table): snapshot after every pass so the
+    // FINAL values — whatever they are when this function returns, success or
+    // not — reflect the state at that point. Same `ctx.metrics` object every
+    // SSE frame carries, so this reaches the client's terminal `done` frame for free.
+    ctx.metrics.blueprint_iterations = iter + 1
+    ctx.metrics.max_iters = maxIters()
+    ctx.metrics.nodes_total = provable.length
+    // Count solves WITHIN the current graph. `proofs` is keyed by node name and
+    // deliberately carries entries across refinements (proof reuse), including
+    // nodes a later blueprint dropped — so proofs.size could exceed the node
+    // count and print nonsense like "nodes 9/4".
+    ctx.metrics.nodes_solved = provable.filter((n) => proofs.has(n.name)).length
+    ctx.metrics.nodes_negated = Array.from(results.values()).filter((r) => r.negated).length
+    ctx.metrics.nodes_forfeited = Array.from(results.values()).filter((r) => !r.solved && !r.negated).length
+    // Gate/delta only: how many dead-end facts were injected into node prompts,
+    // and how many distinct ones the run learned. Both 0/absent for the control.
+    if (state.ledger) {
+      ctx.metrics.dead_ends_shared = state.ledger.shared
+      ctx.metrics.dead_ends_known = state.ledger.entries.size
+    }
+    // Proven-lemma vault telemetry: how many lemmas are banked run-wide, and
+    // how many were restored for free (vault_restores accumulates in
+    // vaultRestore itself).
+    ctx.metrics.vault_lemmas = vault.size
+
+    const unsolved = provable.filter((n) => !proofs.has(n.name))
+
+    // ---- EARLY EXIT: is the target already closed WITHOUT its parents? ------
+    // A node prover proves its node in isolation and is free to ignore the
+    // parents the blueprint declared for it — most starkly when it closes the
+    // target outright with `native_decide`. The graph still lists those parents
+    // in `sorry_using`, so `unsolved` stays non-empty and the loop keeps
+    // refining lemmas the finished proof never referenced. Observed live on
+    // count_div24: `native_decide` closed the target 4m19s into a 10m23s run,
+    // and the remaining ~6 minutes went on helper nodes — two of which were
+    // false (`24 ∣ (n-1)*n*(n+1)` fails at n = 2) and could never have been
+    // proved at all.
+    //
+    // Rather than INFER whether the proof needs its parents (reading a tactic
+    // block for name references is exactly the kind of guess that goes wrong),
+    // just compile it without them and let Lean answer. Drop only the other
+    // lemmas/theorems; every definition, instance and prelude line stays, so
+    // anything the target's own signature needs in order to elaborate is still
+    // there. Removing declarations can never change what the target STATES, and
+    // the certification call pins target_name + target_signature, so a pass here
+    // is exactly as strong as a pass on the full assembly. A failure changes
+    // nothing and the normal loop continues untouched.
+    // A glue target with parents can never stand alone — its body references
+    // them by name, so the minimal file is missing declarations by
+    // construction. Skip the probe instead of spending a certification call
+    // discovering that. (A glue target with NO parents legitimately passes.)
+    const targetGraphNode = graph.find((n) => n.name === state.targetName)
+    if (
+      unsolved.length > 0 &&
+      proofs.has(state.targetName) &&
+      !(targetGraphNode?.glue && (targetGraphNode.deps || []).length) &&
+      graph.some((n) => n.name === state.targetName && ["lemma", "theorem"].includes(n.kind))
+    ) {
+      const minimalGraph = graph.filter(
+        (n) => n.name === state.targetName || !["lemma", "theorem"].includes(n.kind),
+      )
+      const minimalCode = architectAssemble(minimalGraph, prelude, proofs)
+      if (minimalCode !== lastStandaloneAttempt && !architectAssemblyDefects(minimalGraph, proofs).length) {
+        lastStandaloneAttempt = minimalCode
+        const dropped = provable.filter(
+          (n) => n.name !== state.targetName && !proofs.has(n.name),
+        ).length
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `🎯 Target ⟪${state.targetName}⟫ is proved while ${dropped} lemma(s) are still open — testing whether its proof stands without them.` })
+        let scert
+        try {
+          scert = await architectMcpCall(urls.xiv, "verify_full_script", {
+            code: minimalCode,
+            target_name: state.targetName,
+            target_signature: state.targetSignature,
+          }, Number(VERIFY_TIMEOUT_MS))
+        } catch (e) {
+          scert = { ok: false, report: String(e?.message || e) }
+        }
+        if (scert.ok) {
+          ctx.metrics.early_exit = "target_standalone"
+          ctx.metrics.early_exit_dropped_nodes = dropped
+          ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏁 Leak XIV certified the target without them — the ${dropped} open lemma(s) were never needed. Stopping instead of refining them.` })
+          return { verified: true, proof: minimalCode }
+        }
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `↩︎ The target does need its lemmas (${oneLine(scert.report || "no report")}) — continuing to refine.` })
+      }
+    }
+
+    if (unsolved.length === 0) {
+      // ---- Assembly + certification (Leak XIV is the only exit).
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: "🧵 All nodes solved — assembling the final proof for Leak XIV certification." })
+      const finalCode = architectAssemble(graph, prelude, proofs)
+      // A harness fault here is not the graph's fault; do not spend the
+      // refinement budget on it, and do not blame a node for it.
+      const defects = architectAssemblyDefects(graph, proofs)
+      if (defects.length) {
+        ctx.emit({
+          type: "message-annotation",
+          subtype: "error",
+          thought:
+            `🧨 HARNESS FAULT — the assembler mangled ${defects.length} declaration(s); the file was NOT sent to Leak XIV. ` +
+            `Every node proved; this is a bug in the bridge, not in the blueprint. Refinement cannot fix it, so the run stops here.\n  - ` +
+            defects.join("\n  - "),
+        })
+        return { verified: false, proof: "" }
+      }
+      let cert
+      try {
+        cert = await architectMcpCall(urls.xiv, "verify_full_script", {
+          code: finalCode,
+          target_name: state.targetName,
+          target_signature: state.targetSignature,
+        }, Number(VERIFY_TIMEOUT_MS))
+      } catch (e) {
+        cert = { ok: false, report: String(e?.message || e) }
+      }
+      if (cert.ok) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: "🏁 Leak XIV certified the assembled proof — no errors, no sorry." })
+        return { verified: true, proof: finalCode }
+      }
+      // Assembly failed: demote every node named in the error report and refine.
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: `⚠️ Assembly failed certification — demoting implicated nodes and refining. ${String(cert.report || "").slice(0, 300)}` })
+      const errText = String(cert.report || "")
+      let demoted = 0
+      for (const n of provable) {
+        if (errText.includes(n.name) && proofs.has(n.name)) {
+          proofs.delete(n.name)
+          sigOfProof.delete(n.name)
+          depsOfProof.delete(n.name)
+          // The certification failure implicates THIS proof — evict it from the
+          // vault too, or refinement could restore a known-bad proof forever.
+          vault.delete(vaultKeyOf(n.signatureNorm, depsKey(n)))
+          results.set(n.name, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `The node's proof passed in isolation but failed during final assembly: ${errText.slice(0, 800)}`, fix: "Adjust this node (or its parents) so the proof also elaborates in the assembled file." } })
+          demoted++
+        }
+      }
+      if (!demoted) {
+        // Nothing attributable — demote the main theorem as the safest restart point.
+        proofs.delete(state.targetName)
+        sigOfProof.delete(state.targetName)
+        depsOfProof.delete(state.targetName)
+        results.set(state.targetName, { solved: false, negated: false, forfeit: { diagnosis: "PROOF_TOO_HARD", analysis: `Final assembly failed: ${errText.slice(0, 800)}`, fix: "Re-derive the main theorem's closing argument." } })
+      }
+    }
+
+    if (iter >= maxIters()) break
+    if (deadlinePassed(ctx) || ctx.signal?.aborted || architectCapStop(ctx)) break
+
+    const stillUnsolved = provable.filter((n) => !proofs.has(n.name))
+
+    // ---- Signal-dependent routing ------------------------------------------
+    // Refinement is the response to a MATHEMATICAL failure. When every node
+    // that failed did so on an elaborator ceiling, nothing about the graph is
+    // implicated — rewriting it would churn a blueprint that was never the
+    // problem, and (worse) hand a refinement model a set of perfectly good
+    // statements with an invitation to "fix" them. Raise the ceiling and
+    // re-prove the SAME graph instead. Bounded, so a genuinely impossible
+    // computation cannot loop.
+    if (
+      stillUnsolved.length &&
+      stillUnsolved.every((n) => verdicts.get(n.name)?.class === "HARNESS_LIMIT") &&
+      resourceRetries < ARCHITECT_MAX_RESOURCE_RETRIES
+    ) {
+      resourceRetries++
+      resourceBoost *= 4
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought: `⚙️ Every unsolved node failed on an elaborator resource ceiling, not on mathematics — skipping refinement and re-proving the same graph with maxRecDepth ${ARCHITECT_MAX_REC_DEPTH * resourceBoost} / maxHeartbeats ${ARCHITECT_MAX_HEARTBEATS * resourceBoost} (retry ${resourceRetries}/${ARCHITECT_MAX_RESOURCE_RETRIES}).`,
+      })
+      continue
+    }
+
+    // ---- Blueprint refinement on the annotated graph.
+    const byClass = new Map()
+    for (const n of stillUnsolved) {
+      const c = verdicts.get(n.name)?.class || "PROOF_TOO_HARD"
+      byClass.set(c, (byClass.get(c) || 0) + 1)
+    }
+    const classSummary = [...byClass.entries()].map(([c, k]) => `${k}×${c}`).join(", ")
+    ctx.emit({ type: "message-annotation", subtype: "status", thought: `🔁 Refinement ${iter + 1}/${maxIters()}: ${stillUnsolved.length} unsolved node(s)${classSummary ? ` (${classSummary})` : ""} — rewriting the graph around the failures.` })
+    const solvedMarks = new Map(provable.map((n) => [n.name, { solved: proofs.has(n.name), ...(results.get(n.name) || {}) }]))
+    const annotated = `import Mathlib\nimport Architect\n\n${prelude ? prelude + "\n\n" : ""}${architectAnnotate(graph, solvedMarks, verdicts)}`
+    // Placed OUTSIDE the graph text so a refiner echoing declarations cannot
+    // drag these lines into its revised file.
+    const elabBlock = graph
+      .filter((n) => n.elaborated)
+      .map((n) => `- ${n.elaborated}`)
+      .join("\n")
+    const elabSection = elabBlock
+      ? `\n\n## Statements as Lean elaborates them (numeric-literal types explicit)\nA node whose sums, intervals or casts elaborate at a DIFFERENT type than the node it must feed cannot be chained into it — restate it at the consumer's types rather than adding helpers that repeat the mismatched shape.\n${elabBlock}`
+      : ""
+    // Systemic observations from the mechanic land in refinement's evidence —
+    // above the per-node diagnostician prose in reliability, because it is the
+    // one source that can correlate ACROSS independent node conversations.
+    const mechSection = state.mechanicNotes.length
+      ? `\n\n## Systemic observations (mechanic — a live watcher over the whole run's stream; cross-agent patterns the per-node diagnoses cannot see)\n${state.mechanicNotes
+          .slice(-10)
+          .map((m) => `- ${m}`)
+          .join("\n")}`
+      : ""
+    state.mechanicNotes = []
+    // Proven-lemma vault → refinement (paper: proven lemmas are never thrown
+    // away): lemmas proved in ANY earlier iteration whose node the current
+    // graph no longer carries as PROVED are offered back to the refiner, which
+    // can re-wire them in at zero prover cost (vaultRestore honors the match).
+    const liveVaultKeys = new Set(
+      provable.filter((n) => proofs.has(n.name)).map((n) => vaultKeyOf(n.signatureNorm, depsKey(n))),
+    )
+    const vaultSection = architectVaultSection(vault, liveVaultKeys)
+    if (vaultSection)
+      ctx.emit({ type: "message-annotation", subtype: "status", thought: `🏛️ Vault: offering ${vaultSection.split("\n- ").length - 1} dropped-but-proven lemma(s) back to refinement.` })
+    const refined = await architectAdmitBlueprint(ctx, state, urls, {
+      system: architectRefineSystem(),
+      user: `Targeted Lean theorem (preserve this signature byte-for-byte):\n\n${state.targetSignature}\n\n## Current dependency graph with per-node verdicts\n\n${annotated}${elabSection}${vaultSection}${mechSection}`,
+      retries: ARCHITECT_REFINE_RETRIES,
+      stageLabel: `refinement ${iter + 1}/${maxIters()}`,
+    })
+    if (!refined) {
+      ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Refinement failed to produce a validated revised blueprint." })
+      break
+    }
+    bp = refined.bp
+    await architectAttachElaborated(bp, urls, ctx)
+    preRefuted = new Set(refined.refuted.map((r) => r.name))
+  }
+
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: "❌ Architect: iteration budget exhausted without a certified proof." })
+  return { verified: false, proof: "" }
+}
+
+
+// ===========================================================================
+// PROOF BANK — a verified proof survives the runs that come after it
+// ---------------------------------------------------------------------------
+// The operator's own workflow exposed the gap: prove a test theorem on Ultra
+// to vet the statement, then A/B the same theorem on River — and if the River
+// run fails or is terminated, Ultra's certified proof is gone, because a
+// run's proof only ever existed in the SSE stream to the browser.
+//
+// So: every verified proof from a tree run is written to a small JSON file on
+// this machine, keyed by (normalized target signature, toolchain). One entry
+// per key — when River later proves what Ultra already proved ON THE SAME
+// TOOLCHAIN the entry is replaced, not duplicated; a proof at a DIFFERENT
+// toolchain is a different certificate and gets its own entry. The bank never
+// short-circuits a run (an A/B run must actually run); it only guarantees the
+// failure of a later run cannot lose the success of an earlier one. A failed
+// or terminated run that has a banked sibling gets that proof replayed into
+// its own transcript and `done` frame.
+const PROOF_BANK_PATH = process.env.LEAK_PROOF_BANK || join(homedir(), ".leak-proof-bank.json")
+
+function proofBankRead() {
+  try {
+    const o = JSON.parse(readFileSync(PROOF_BANK_PATH, "utf8"))
+    return o && typeof o === "object" && o.entries && typeof o.entries === "object" ? o : { entries: {} }
+  } catch {
+    return { entries: {} }
+  }
+}
+
+function proofBankWrite(bank) {
+  // Atomic on POSIX: a crash mid-write can never leave a half-written bank.
+  const tmp = `${PROOF_BANK_PATH}.tmp`
+  writeFileSync(tmp, JSON.stringify(bank, null, 2))
+  renameSync(tmp, PROOF_BANK_PATH)
+}
+
+function proofBankKey(theorem, toolchain) {
+  const sig = architectSignatureOf(theorem) || String(theorem || "")
+  const norm = sig.replace(/\s+/g, " ").replace(/^lemma\b/, "theorem").trim()
+  return { key: `${createHash("sha1").update(norm).digest("hex").slice(0, 16)}|${toolchain}`, sig: norm }
+}
+
+function proofBankStore({ theorem, toolchain, group, strategy, proof, runId }) {
+  try {
+    const { key, sig } = proofBankKey(theorem, toolchain)
+    const bank = proofBankRead()
+    const prior = bank.entries[key] || null
+    const now = new Date().toISOString()
+    bank.entries[key] = {
+      name: (/(?:theorem|lemma)\s+([A-Za-z_][A-Za-z0-9_'.]*)/.exec(sig) || [])[1] || "",
+      signature: sig,
+      toolchain,
+      group: group || "",
+      strategy,
+      proof: String(proof || ""),
+      verifiedAt: now,
+      runId: runId || "",
+      // Provenance survives replacement: the vetting run stays on record even
+      // after a later same-toolchain success takes over the stored proof.
+      firstProvedBy: prior?.firstProvedBy || strategy,
+      firstProvedAt: prior?.firstProvedAt || now,
+    }
+    proofBankWrite(bank)
+    return { stored: true, replaced: !!prior, prior }
+  } catch (e) {
+    return { stored: false, error: String(e?.message || e) }
+  }
+}
+
+function proofBankFind(theorem, toolchain) {
+  try {
+    return proofBankRead().entries[proofBankKey(theorem, toolchain).key] || null
+  } catch {
+    return null
+  }
+}
+
+// ---- RUN LOGS -------------------------------------------------------------
+// The activity stream only ever existed in the browser and in a 600-frame
+// in-memory ring. A run that failed — or whose tab was closed, or that died
+// with the process — took its own diagnosis with it, so two 30-minute runs
+// could burn real money and leave literally nothing to look at afterwards.
+//
+// Every frame is teed to disk as it is rendered, using the SAME text the
+// console shows, so the file reads exactly like the transcript. Written with
+// appendFileSync deliberately: a diagnostic log is worthless if it is buffered
+// in a stream that never flushes because the process was killed, and a
+// sub-millisecond syscall a few hundred times over half an hour costs nothing.
+// Every operation is wrapped — logging must never be able to break a run.
+const RUN_LOG_DIR = join(homedir(), ".leak-runs")
+function slugForRun(theorem) {
+  const m = String(theorem || "").match(/theorem\s+([A-Za-z0-9_'.]+)/)
+  return (m ? m[1] : "run").replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 60) || "run"
+}
+function openRunLog(theorem, opts = {}) {
+  try {
+    mkdirSync(RUN_LOG_DIR, { recursive: true })
+    const started = new Date()
+    const stamp = started.toISOString().replace(/[:.]/g, "-")
+    const file = join(RUN_LOG_DIR, `${stamp}-${slugForRun(theorem)}.jsonl`)
+    const write = (o) => {
+      try {
+        appendFileSync(file, JSON.stringify(o) + "\n")
+      } catch {
+        /* a full or read-only disk must not take the run down */
+      }
+    }
+    write({ kind: "start", at: started.toISOString(), theorem, strategy: opts.strategy || "", model: opts.model || "", bridge_build: BRIDGE_BUILD })
+    return {
+      file,
+      line: (t, text) => write({ kind: "event", t, text }),
+      close: (summary) => {
+        write({ kind: "end", at: new Date().toISOString(), ...summary })
+        try {
+          appendFileSync(
+            join(RUN_LOG_DIR, "index.jsonl"),
+            JSON.stringify({ at: started.toISOString(), file: basename(file), theorem: String(theorem || "").slice(0, 200), ...summary }) + "\n",
+          )
+        } catch {
+          /* index is a convenience; the per-run file is the record */
+        }
+      },
+    }
+  } catch {
+    return null
+  }
 }
 
 // SSE entrypoint for the decomposition orchestrator. Emits the SAME frame shapes
@@ -3232,19 +11953,52 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     }
   }
   const start = Date.now()
-  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0 }
+  const metrics = { tools_invoked: 0, llm_invocations: 0, time_elapsed: 0, bridge_build: BRIDGE_BUILD }
+  // Run-scoped ring of rendered frames — the same content the admin prover
+  // viewer shows. This is the mechanic's window. Frames the mechanic itself
+  // authored are tagged so its next window never contains its own output.
+  const streamLog = []
+  let streamSeq = 0
+  // Same frames, but on disk and uncapped — the ring above is a 600-frame
+  // window for the mechanic, not a record. See openRunLog.
+  const runLog = openRunLog(theorem, opts)
   const emit = (obj) => {
     metrics.time_elapsed = Math.round((Date.now() - start) / 1000)
+    try {
+      const text = renderStreamFrame(obj)
+      if (text) {
+        streamLog.push({ seq: ++streamSeq, t: metrics.time_elapsed, text, mech: String(obj?.watcher || "").startsWith("mechanic") })
+        if (streamLog.length > 600) streamLog.shift()
+        runLog?.line(metrics.time_elapsed, text)
+      }
+    } catch {}
     send({ ...obj, metrics })
   }
 
   const strategy = STRATEGIES[opts.strategy] ? opts.strategy : "hacker"
   const style = styleOf(strategy)
+  // Toolchain provenance: the architect styles are certified by Leak XIV (Lean
+  // 4.32.0), everything else by the Leak II/IV daemon (4.29.1). Reported per run
+  // so the certificate can state what ACTUALLY checked the proof instead of
+  // assuming one group — the two are NOT interchangeable.
+  {
+    const tc = toolchainForStyle(style)
+    metrics.lean_toolchain = tc.lean
+    metrics.mathlib_version = tc.mathlib
+    metrics.verifier_group = tc.group
+  }
   // Admin debug log: the exact prompt(s) the agent(s) receive.
   send({
     type: "prompt",
     prompt:
-      style === "have"
+      style === "architect"
+        ? `[LEAK RIVER — ${pickStrategy(strategy).label}]\n\n=== C.1 BLUEPRINT GENERATION ===\n` +
+          architectBlueprintSystem() +
+          "\n\n=== C.2 THEOREM PROVING (per node) ===\n" +
+          architectProverSystem() +
+          "\n\n=== C.3 BLUEPRINT REFINEMENT ===\n" +
+          architectRefineSystem()
+        : style === "have"
         ? `[DECOMPOSITION MODE — have-based (flat, single agent) · strategy: ${strategy}]\n\n=== PROVER PROMPT ===\n` +
           haveProvePrompt(theorem, mcpServers)
         : style === "have-tree"
@@ -3252,6 +12006,56 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
             haveTreePlannerPrompt(theorem, mcpServers) +
             "\n\n=== HOLE-FILL (MINION) PROMPT ===\n" +
             haveHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
+          : style === "have-surround"
+          ? `[DECOMPOSITION MODE — Stronghold Surround (parallel minion waves ×${SURROUND_MINIONS} over the ghost-army Leak II) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers) +
+            "\n\n=== HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the planner's verified skeleton>", "hN", mcpServers)
+          : style === "finality"
+          ? `[DECOMPOSITION MODE — Leak Finality I (Surround waves ×${SURROUND_MINIONS} + ${Math.round(FINALITY_REFINE_MS / 60000)}-min refinement cadence) · strategy: ${strategy}]\n\n=== PLANNER PROMPT ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers) +
+            "\n\n=== HOLE-FILL (FINALITY MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the current skeleton>", "hN", mcpServers) +
+            "\n\n=== REFINER PROMPT (system-summoned every cadence) ===\n" +
+            finalityRefinerPrompt(theorem, "<the current skeleton>", [], {}, {}, [], mcpServers)
+          : style === "force"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Force (${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root · ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion ×${FORCE_SPLIT_N} to depth ${FORCE_DEPTH} · ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions · failed campaigns return to the decomposer) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (small root) ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers, FORCE_PLAN_NOTE) +
+            "\n\n=== SPLITTER PROMPT (recursive decomposer) ===\n" +
+            forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
+            "\n\n=== HOLE-FILL (CAMPAIGN MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
+          : style === "forte"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Forte (Force's ${FORCE_PLAN_MIN}–${FORCE_PLAN_MAX}-hole root · ${Math.round(FORCE_EXPAND_MS / 60000)}-min recursive expansion ×${FORCE_SPLIT_N} to depth ${FORCE_DEPTH} · ${Math.round(FORCE_CAMPAIGN_MS / 60000)}-min campaigns of ×${FORCE_MINIONS} minions · plus locally-tracked handoff scripts, a cross-hole opening pool, and a near-duplicate cut guard) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (small root) ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers, FORCE_PLAN_NOTE) +
+            "\n\n=== SPLITTER PROMPT (recursive decomposer, + near-duplicate cut guard) ===\n" +
+            forceSplitPrompt("<the current skeleton>", "hN", "<the hole's goal>", null, mcpServers) +
+            "\n\n=== HOLE-FILL (CAMPAIGN MINION, + opening pool hint) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the expanded skeleton>", "hN", mcpServers)
+          : style === "impenetrable"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Impenetrable (breadth-first apply?-driven recon sweep: <=${IMPEN_RECON_DEPTH} levels, <=${IMPEN_RECON_NODES} states, <=${Math.round(IMPEN_RECON_MS / 60000)} min, then Surround with the progress gate on) · strategy: ${strategy}]\n\n=== PLANNER PROMPT (briefed by the recon sweep) ===\n` +
+            haveTreePlannerPrompt(theorem, mcpServers, "<<< THE RECON BRIEFING IS INSERTED HERE AT RUN TIME. This capture is built BEFORE the sweep runs, so it cannot show the real thing — the actual briefing is emitted verbatim as a status event (\"BRIEFING HANDED TO THE PLANNER\") once recon finishes. >>>") +
+            "\n\n=== HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the verified skeleton>", "hN", mcpServers)
+          : style === "keep"
+          ? `[DECOMPOSITION MODE — Leak Stronghold Keep (phase 1 flat vanguard ~${Math.round(KEEP_VANGUARD_FRAC * 100)}% of the clock · phase 2 gated Surround siege ~${Math.round(KEEP_SIEGE_FRAC * 100)}% · phase 3 flat finisher on the guaranteed remainder) · strategy: ${strategy}]\n\n=== PHASE 1 VANGUARD / PHASE 3 KEEP PROMPT (flat, whole theorem) ===\n` +
+            haveProvePrompt(theorem, mcpServers) +
+            "\n\n=== PHASE 2 PLANNER PROMPT (seeded with the vanguard's failed attempt) ===\n" +
+            haveTreePlannerPrompt(theorem, mcpServers, "<the vanguard's last compiled script and the compiler's verdict on it>") +
+            "\n\n=== PHASE 2 HOLE-FILL (SURROUND MINION) PROMPT ===\n" +
+            surroundHoleFillPrompt("<the verified skeleton>", "hN", mcpServers)
+          : style === "control"
+          ? `[FLAT BASELINE — Leak Control I (one continuous agent, one-shot, Leak IV only, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
+            controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url === resolveVerifyUrl(mcpServers)))
+          : style === "control2"
+          ? `[FLAT BASELINE — Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
+            controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url && s.url !== resolvePantographUrl(mcpServers)), 1, null, true)
+          : style === "control3"
+          ? `[BLIND BASELINE — Leak Control III (toolless prover, no compiler feedback; separate Leak IV gate returns only pass/fail) · strategy: ${strategy}]\n\n=== BLIND PROVER PROMPT ===\n` +
+            blindControlPrompt(theorem)
+          : style === "control4"
+          ? `[FLAT BASELINE — Leak Control IV (one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph, no decomposition) · strategy: ${strategy}]\n\n=== AGENT PROMPT ===\n` +
+            controlPrompt(theorem, (mcpServers || []).filter((s) => s?.url), 1, null, true, true)
           : `[DECOMPOSITION MODE — proof tree · strategy: ${strategy}]\n\n=== NODE-PROVER PROMPT ===\n` +
             nodePromptFor(strategy, theorem, mcpServers, "(+ optional early-DECOMPOSE handoff)") +
             "\n\n=== DECOMPOSER PROMPT ===\n" +
@@ -3269,8 +12073,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
   })
 
   const verifyUrl = resolveVerifyUrl(mcpServers)
-  if (!verifyUrl) {
+  if (!verifyUrl && style !== "architect") {
     emit({ type: "error", message: "No verify_full_script MCP server is connected — decomposition needs one to gate scaffolds." })
+    runLog?.close({ ok: false, reason: "startup", seconds: metrics.time_elapsed, cost_usd: metrics.cost_usd || 0 })
     send({ type: "done", metrics, verified: false, proof: "" })
     res.end()
     return
@@ -3284,10 +12089,17 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     Number.isFinite(rawBudget) && rawBudget > 0
       ? Math.min(Math.max(rawBudget, 60000), 21600000)
       : 0
-  const { runId, st: runState } = registerRun(budgetMs)
-  // Tell the client its runId + current deadline so it can render the limit
-  // indicator and target /extend. Only meaningful when a budget was requested.
-  if (budgetMs > 0) send({ type: "run", runId, deadlineMs: runState.deadlineMs, budgetMs: runState.budgetMs })
+  // Leak River's refinement budget lives on the run state too, so the UI's
+  // "+1 iter" button can raise it mid-flight (see /extend). Meaningless for the
+  // other styles, which have no blueprint loop.
+  const iterBudget = style === "architect" ? clampNum(opts.maxIters, 1, 32, ARCHITECT_MAX_ITERS) : 0
+  const { runId, st: runState } = registerRun(budgetMs, iterBudget)
+  // Tell the client its runId + current budgets so it can render the limit
+  // indicators and target /extend. Architect runs always get the frame (the
+  // iteration button needs a runId even on an uncapped clock); the others only
+  // when a wall-clock budget was requested.
+  if (budgetMs > 0 || iterBudget > 0)
+    send({ type: "run", runId, deadlineMs: runState.deadlineMs, budgetMs: runState.budgetMs, maxIters: runState.maxIters })
 
   const abort = new AbortController()
   const ctx = {
@@ -3309,7 +12121,12 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     // killers poll it, so the "+5 min" /extend rescues whichever stage is running.
     // No turn caps anywhere on these paths — TIME alone bounds them.
     getDeadline: () => runState.deadlineMs,
+    // Live refinement budget for the architect loop — same mutable-state trick as
+    // getDeadline, so "+1 iter" reaches a run already on its last iteration.
+    getMaxIters: () => runState.maxIters,
     computeGoverned: budgetMs > 0,
+    // The mechanic's window: run-scoped ring of rendered stream frames.
+    streamLog,
     // Turn budgets below are used ONLY by the lemma-style prove-or-split tree
     // (proveNode), where the budget doubles as a "force a decomposition after N
     // turns" trigger. The have-tree/have paths ignore them (time-governed).
@@ -3350,25 +12167,67 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
     try {
       let ok = false
       let proof = ""
-      if (style === "have" || style === "have-tree") {
+      if (style === "architect") {
+        const r = await proveArchitect(theorem, ctx, opts)
+        ok = r.verified
+        proof = r.proof
+        if (ok && proof) {
+          emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — Leak XIV certified the assembled blueprint proof." })
+          send({ type: "text-delta", content: `✅ **Verified proof** (Goedel-Architect blueprint, certified by Leak XIV):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+        } else {
+          emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the architect pipeline did not produce a certified proof." })
+          send({ type: "text-delta", content: "⚠️ Not accepted — the architect run did not produce a certified, sorry-free proof of the target." })
+        }
+      } else if (style === "have" || style === "have-tree" || style === "have-surround" || style === "finality" || style === "force" || style === "forte" || style === "keep" || style === "impenetrable" || style === "control" || style === "control2" || style === "control3" || style === "control4") {
         // `have`: one agent, whole proof in one context. `have-tree`: planner +
         // isolated per-hole minions (linear context), falling back to `have`.
-        // Resuming from a saved checkpoint short-circuits both: finish the
-        // remaining holes straight from the seed (proven work is handed in, not
-        // rediscovered). The independent verify gate is unchanged, so soundness
-        // is identical to a from-scratch run.
+        // `have-surround`: have-tree with the minion phase parallelized over
+        // the ghost-army Leak II. Resuming from a saved checkpoint
+        // short-circuits all three: finish the remaining holes straight from
+        // the seed (proven work is handed in, not rediscovered). The
+        // independent verify gate is unchanged, so soundness is identical to a
+        // from-scratch run.
         let r
         if (ctx.seed) {
           emit({ type: "message-annotation", subtype: "status", thought: "▶️ Resuming from a saved checkpoint — finishing the remaining hole(s) from banked progress." })
           r = await proveHaveFlat(theorem, ctx, { seed: ctx.seed })
         } else {
-          r = style === "have-tree" ? await proveHaveTree(theorem, ctx) : await proveHaveFlat(theorem, ctx)
+          r =
+            style === "have-tree"
+              ? await proveHaveTree(theorem, ctx)
+              : style === "have-surround"
+                ? await proveHaveSurround(theorem, ctx)
+                : style === "finality"
+                  ? await proveFinality(theorem, ctx)
+                  : style === "force"
+                    ? await proveForce(theorem, ctx)
+                    : style === "forte"
+                      ? await proveForte(theorem, ctx)
+                      : style === "keep"
+                        ? await proveStrongholdKeep(theorem, ctx)
+                        : style === "impenetrable"
+                          ? await proveStrongholdImpenetrable(theorem, ctx)
+                          : style === "control"
+                            ? await proveControl(theorem, ctx, 1)
+                            : style === "control2"
+                              ? await proveControl(theorem, ctx, 2)
+                              : style === "control3"
+                                ? await proveControlBlind(theorem, ctx)
+                                : style === "control4"
+                                  ? await proveControl(theorem, ctx, 4)
+                                  : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof
         if (ok && proof) {
           emit({ type: "message-annotation", subtype: "status", thought: "✅ System check passed — have-based proof verified sorry-free." })
           send({ type: "text-delta", content: `✅ **Verified proof** (in-context \`have\` decomposition, confirmed by verify_full_script):\n\n\`\`\`lean\n${proof}\n\`\`\`` })
+        } else if (usageBlocked()) {
+          // Distinct from a proof failure on purpose: reporting "did not verify"
+          // for a run that was never allowed to run its stages is a false
+          // negative, and it is the kind that quietly poisons a benchmark.
+          emit({ type: "message-annotation", subtype: "error", thought: `🛑 Run abandoned — ${usageBlock.message}. The problem was NOT attempted; this is not evidence about its difficulty.` })
+          send({ type: "text-delta", content: `🛑 **Not attempted** — ${usageBlock.message}. The run stopped as soon as the account was refused, so no conclusion about this problem should be drawn. Re-run it after the reset.` })
         } else {
           emit({ type: "message-annotation", subtype: "error", thought: "❌ System check failed — the have-based proof did not verify." })
           send({ type: "text-delta", content: "⚠️ Not accepted — the have-based run did not produce a verified, sorry-free proof of the target." })
@@ -3386,12 +12245,53 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
           send({ type: "text-delta", content: "⚠️ Not accepted — the decomposition tree did not produce a verified, sorry-free proof of the target." })
         }
       }
-      send({ type: "done", metrics, verified: !!(ok && proof), proof })
+      const tc = `${metrics.lean_toolchain || "?"} / Mathlib ${metrics.mathlib_version || "?"}`
+      let banked = null
+      if (ok && proof) {
+        const b = proofBankStore({ theorem, toolchain: tc, group: metrics.verifier_group, strategy, proof, runId })
+        if (b.stored)
+          emit({
+            type: "message-annotation",
+            subtype: "status",
+            thought: b.replaced
+              ? `🏦 Proof banked (${tc}) — replaced the earlier same-toolchain entry (${b.prior.strategy}, ${b.prior.verifiedAt}); one proof per theorem per toolchain, first proved by ${b.prior.firstProvedBy || b.prior.strategy}.`
+              : `🏦 Proof banked (${tc}) — this certificate now survives any later failed run of the same theorem.`,
+          })
+        else emit({ type: "message-annotation", subtype: "status", thought: `⚠️ Proof bank write failed (${b.error}) — the proof is still in this transcript and the done frame.` })
+      } else {
+        banked = proofBankFind(theorem, tc)
+        if (banked) {
+          emit({
+            type: "message-annotation",
+            subtype: "status",
+            thought: `🏦 This run failed, but the theorem is NOT lost — a verified proof from an earlier run is banked (${banked.strategy}, ${banked.verifiedAt}, ${tc}).`,
+          })
+          send({
+            type: "text-delta",
+            content: `ℹ️ This run did not produce a proof, but an earlier run already did — banked on the same toolchain (strategy \`${banked.strategy}\`, ${banked.verifiedAt}), so nothing is lost:\n\n\`\`\`lean\n${banked.proof}\n\`\`\``,
+          })
+        }
+      }
+      runLog?.close({ ok: !!(ok && proof), reason: ok && proof ? "verified" : usageBlocked() ? "usage-limit" : "unverified", seconds: metrics.time_elapsed, cost_usd: metrics.cost_usd || 0 })
+      send({ type: "done", metrics, verified: !!(ok && proof), proof, bankedProof: banked || undefined })
     } catch (e) {
       emit({ type: "error", message: `tree error: ${String(e?.message || e)}` })
-      send({ type: "done", metrics, verified: false, proof: "" })
+      // A terminated run lands here too — exactly the case the bank exists for.
+      let banked = null
+      try {
+        banked = proofBankFind(theorem, `${metrics.lean_toolchain || "?"} / Mathlib ${metrics.mathlib_version || "?"}`)
+      } catch {}
+      if (banked)
+        emit({
+          type: "message-annotation",
+          subtype: "status",
+          thought: `🏦 Run ended without a proof, but the theorem is NOT lost — a verified proof from an earlier run is banked (${banked.strategy}, ${banked.verifiedAt}).`,
+        })
+      runLog?.close({ ok: false, reason: usageBlocked() ? "usage-limit" : "error", seconds: metrics.time_elapsed, cost_usd: metrics.cost_usd || 0 })
+      send({ type: "done", metrics, verified: false, proof: "", bankedProof: banked || undefined })
     } finally {
       ACTIVE_RUNS.delete(runId)
+      ctx.stopWatchers?.()
       res.end()
     }
   })()
@@ -3430,6 +12330,53 @@ const server = createServer(async (req, res) => {
       const v = await getVersion()
       return json(res, 200, { ok: v.ok, version: v.version, error: v.error })
     }
+    // Read-only view of the proof bank. Default lists metadata (proof length
+    // in place of the proof text); ?full=1 includes the proofs themselves.
+    if (req.method === "GET" && url.pathname === "/proof-bank") {
+      const entries = Object.values(proofBankRead().entries).sort((a, b) =>
+        String(b.verifiedAt || "").localeCompare(String(a.verifiedAt || "")),
+      )
+      const full = url.searchParams.get("full") === "1"
+      return json(res, 200, {
+        path: PROOF_BANK_PATH,
+        count: entries.length,
+        entries: full ? entries : entries.map(({ proof, ...rest }) => ({ ...rest, proofChars: String(proof || "").length })),
+      })
+    }
+
+    // Compile a Lean script on the Lean daemon over MCP-SSE and hand back the
+    // raw verdict. NO claude process, no tokens — here the bridge is acting
+    // purely as the browser's MCP client, which is the whole point: the app can
+    // typecheck a generated statement with nothing running but this bridge.
+    //
+    // Server choice is by TOOL, never by server name (the user renames these).
+    // resolveVerifyUrl picks a server that advertises the verifier when the
+    // caller supplied tool metadata; otherwise every server is tried in turn.
+    // Probing is cheap because a server lacking the tool fails inside
+    // tools/list, before any Lean work happens.
+    if (req.method === "POST" && url.pathname === "/verify-statement") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      const script = body.script
+      if (typeof script !== "string" || !script.trim()) {
+        return json(res, 400, { error: "script_required" })
+      }
+      const servers = (Array.isArray(body.mcpServers) ? body.mcpServers : []).filter((s) => s && s.url)
+      if (!servers.length) return json(res, 400, { error: "no_mcp_servers" })
+      const timeoutMs = Math.min(Math.max(Number(body.timeoutMs) || 180000, 5000), 600000)
+      const preferred = resolveVerifyUrl(servers)
+      const urls = [...new Set([preferred, ...servers.map((s) => s.url)].filter(Boolean))]
+      let last = { ok: false, text: "", error: "no reachable MCP server" }
+      for (const sseUrl of urls) {
+        const r = await verifyViaDaemon(script, sseUrl, { timeoutMs })
+        if (r?.ok) return json(res, 200, { ...r, serverUrl: sseUrl })
+        last = { ...r, serverUrl: sseUrl }
+        // "tool not found" means WRONG SERVER — keep looking. Any other error
+        // (daemon down, timeout) is a real failure and must surface as itself
+        // rather than being masked by probing the remaining servers.
+        if (!/tool not found on server/i.test(String(r?.error || ""))) break
+      }
+      return json(res, 200, last)
+    }
 
     if (req.method === "POST" && url.pathname === "/run") {
       const body = JSON.parse((await readBody(req)) || "{}")
@@ -3462,6 +12409,12 @@ const server = createServer(async (req, res) => {
       return json(res, 200, result)
     }
 
+    // Streaming /run — same contract, but live SSE progress. See runStream.
+    if (req.method === "POST" && url.pathname === "/run-stream") {
+      const body = JSON.parse((await readBody(req)) || "{}")
+      return runStream(res, body)
+    }
+
     if (req.method === "POST" && url.pathname === "/prove") {
       const body = JSON.parse((await readBody(req)) || "{}")
       const theorem = body.theorem || body.prompt
@@ -3478,34 +12431,79 @@ const server = createServer(async (req, res) => {
       if (typeof theorem !== "string" || !theorem.trim()) {
         return json(res, 400, { error: "theorem_required" })
       }
+      clearUsageBlock() // see /prove-tree — a new run re-evaluates the quota
       proveStream(res, theorem, body.mcpServers || [], body.options || {})
       return
     }
 
-    // Push out a running prove's wall-clock budget (the UI's "+5 min" button).
-    // Mutates the live deadline the subprocess killers poll, so it rescues even
-    // the stage currently executing. Behind the same token + CORS gate above.
+    // Push out a running prove's budget: wall-clock (the UI's "+5 min" button)
+    // and/or Leak River refinement iterations (the "+1 iter" button). Mutates the
+    // live values the run polls, so either rescues even the stage currently
+    // executing. Behind the same token + CORS gate above.
     if (req.method === "POST" && url.pathname === "/extend") {
       const body = JSON.parse((await readBody(req)) || "{}")
       const runId = String(body.runId || "")
-      const addMs = clampNum(body.addMs, 60000, 3600000, 300000) // +5 min default, 1–60 min
+      const addIters = clampNum(body.addIters, 0, 32, 0)
+      // Absent addMs means "+5 min" for back-compat, EXCEPT on a pure iteration
+      // bump — clicking "+1 iter" must not silently buy wall-clock time too.
+      const addMs =
+        body.addMs == null && addIters > 0 ? 0 : clampNum(body.addMs, 60000, 3600000, 300000)
       const st = ACTIVE_RUNS.get(runId)
       if (!st) return json(res, 404, { error: "run_not_found" })
-      // If the run was uncapped, base the fresh deadline on now.
-      const base = Number.isFinite(st.deadlineMs) ? st.deadlineMs : Date.now()
-      st.deadlineMs = base + addMs
-      st.budgetMs = (Number.isFinite(st.budgetMs) ? st.budgetMs : 0) + addMs
-      return json(res, 200, { ok: true, runId, deadlineMs: st.deadlineMs, budgetMs: st.budgetMs, addedMs: addMs })
+      if (addMs > 0) {
+        // If the run was uncapped, base the fresh deadline on now.
+        const base = Number.isFinite(st.deadlineMs) ? st.deadlineMs : Date.now()
+        st.deadlineMs = base + addMs
+        st.budgetMs = (Number.isFinite(st.budgetMs) ? st.budgetMs : 0) + addMs
+      }
+      if (addIters > 0) st.maxIters = Math.min((st.maxIters || 0) + addIters, 64)
+      return json(res, 200, {
+        ok: true,
+        runId,
+        deadlineMs: st.deadlineMs,
+        budgetMs: st.budgetMs,
+        addedMs: addMs,
+        maxIters: st.maxIters,
+        addedIters: addIters,
+      })
     }
 
     // Decomposition orchestrator: prove-or-split proof tree. Same SSE shape as
     // /prove-stream, so the same client renders it.
+    // Where did that run go? Newest first, with outcome + cost, so a failed run
+    // can be found and pasted without hunting through ~/.leak-runs by hand.
+    if (req.method === "GET" && url.pathname === "/runs") {
+      try {
+        const raw = readFileSync(join(RUN_LOG_DIR, "index.jsonl"), "utf8")
+        const rows = raw
+          .split("\n")
+          .filter(Boolean)
+          .map((l) => {
+            try {
+              return JSON.parse(l)
+            } catch {
+              return null
+            }
+          })
+          .filter(Boolean)
+          .reverse()
+          .slice(0, Number(url.searchParams.get("limit") || 30))
+        return json(res, 200, { dir: RUN_LOG_DIR, runs: rows })
+      } catch {
+        return json(res, 200, { dir: RUN_LOG_DIR, runs: [] })
+      }
+    }
+
     if (req.method === "POST" && url.pathname === "/prove-tree") {
       const body = JSON.parse((await readBody(req)) || "{}")
       const theorem = body.theorem || body.prompt
       if (typeof theorem !== "string" || !theorem.trim()) {
         return json(res, 400, { error: "theorem_required" })
       }
+      // A fresh run gets a fresh verdict on the account: the previous run may
+      // have been refused hours ago and the quota has since reset. One stage
+      // re-detects it in seconds if it has not.
+      clearUsageBlock()
       proveTreeStream(res, theorem, body.mcpServers || [], body.options || {})
       return
     }
