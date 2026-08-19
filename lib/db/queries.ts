@@ -550,8 +550,10 @@ export async function getCreditBalance({
 
 export async function getOrCreateCreditBalance({
   userId,
+  email,
 }: {
   userId: string;
+  email?: string | null;
 }): Promise<number> {
   try {
     return await db.transaction(async (tx) => {
@@ -561,6 +563,18 @@ export async function getOrCreateCreditBalance({
         .where(eq(userCredits.userId, userId));
 
       if (existing) return existing.balance;
+
+      // A session minted by competemath.com can reach a credits-bearing page
+      // before ANYTHING has created this user's row in this database — a
+      // fresh database, or a user who never went through the explicit
+      // /api/auth/provision flow. UserCredits.userId references User.id, so
+      // self-provision the row here instead of crashing the page on the FK.
+      // (An email-orphan row can't exist at this point: the jwt callback's
+      // reconcileLeakAccount migrates those before any page renders.)
+      await tx
+        .insert(user)
+        .values({ id: userId, email: email ?? null })
+        .onConflictDoNothing();
 
       await tx.insert(userCredits).values({
         userId,

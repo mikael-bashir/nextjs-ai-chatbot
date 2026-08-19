@@ -74,6 +74,10 @@ export interface StagedProblem {
   proof: string;
   toolchain?: string;
   createdAt: string;
+  // Every distinct-toolchain certificate accumulated pre-publish (see
+  // GeneratedRecord.certs — same shape). Promote pushes ALL of them, not
+  // just the single flat proof/toolchain above.
+  certs?: GeneratedRecord['certs'];
 }
 
 export async function pushProblem(
@@ -140,7 +144,35 @@ export interface GeneratedRecord {
   // DB-backed membership of the verification queue, so a queued problem survives
   // reloads and the verifier can resume it later.
   queued?: boolean;
+  // Provenance of the verification, all stamped the instant the kernel confirmed
+  // the proof and carried through staging → prod so CompeteMath stores these
+  // exact values rather than re-deriving (or re-signing) them later.
   toolchain?: string;
+  /** Mathlib version of the group that certified it — pairs with `toolchain`. */
+  mathlib?: string;
+  /** Specific strategy that enforced this proof, for the certificate's
+   *  Enforcer line (e.g. "Leak Ultra Fleeting" instead of bland "Leak"). */
+  enforcer?: string;
+  verifiedAt?: string;
+  signature?: string;
+  signatureKeyId?: string;
+  certMintedAt?: string;
+  // Every distinct-toolchain certificate accumulated across re-verifies of
+  // this item, upserted by toolchain — lets an admin verify on several
+  // toolchains BEFORE ever promoting, and ship all of them as independent
+  // certificates the first time this problem goes live. The flat fields
+  // above always mirror the MOST RECENT verify (unchanged, for every
+  // existing reader); this is the full accumulated set.
+  certs?: Array<{
+    toolchain: string;
+    mathlib?: string | null;
+    enforcer?: string | null;
+    proof: string;
+    verifiedAt?: string | null;
+    signature?: string | null;
+    signatureKeyId?: string | null;
+    certMintedAt?: string | null;
+  }>;
   // Cost-estimator display state, persisted so the estimate (made on enqueue)
   // and the actual (recorded on verify) survive a page refresh. The learning
   // history lives separately in proof_cost_history; these mirror it per-card.
@@ -246,6 +278,60 @@ function serializeGeneratedWrite<T>(fn: () => Promise<T>): Promise<T> {
   return next;
 }
 
+// A patch is about to REPLACE a verified proof with an unverified/blank one.
+// Recognizes both an explicit `verified: false` (a failed re-verify PATCH
+// always sends this) and a patch that blanks `proof` outright. A `lean` edit
+// in the SAME patch is a deliberate, legitimate invalidation (the statement
+// itself changed — the old proof no longer applies to anything), so that case
+// is excluded — updateGenerated() lets THAT one through.
+function isDestructiveVerifyPatch(
+  rec: GeneratedRecord,
+  patch: Partial<GeneratedRecord>,
+): boolean {
+  if (!rec.verified || !rec.proof?.trim()) return false;
+  if ('lean' in patch && patch.lean !== rec.lean) return false;
+  const goingUnverified = patch.verified === false;
+  const blankingProof = 'proof' in patch && !patch.proof?.trim();
+  return goingUnverified || blankingProof;
+}
+
+// Snapshot every certificate this record currently carries — the flat
+// verified/proof/toolchain fields (always present when `verified`) plus any
+// additional toolchains already accumulated in `certs[]`. Called whenever a
+// destructive patch is caught (belt-and-braces: updateGenerated() no longer
+// lets it touch the live record, but this keeps a durable copy regardless).
+// Fire-and-forget: a backup failure must never block or fail the actual
+// re-verify PATCH the operator is waiting on.
+function backupBeforeOverwrite(rec: GeneratedRecord): void {
+  void (async () => {
+    try {
+      const { backupProof } = await import('./db/proof-backup-queries');
+      const seen = new Set<string>();
+      const attempts = [
+        { toolchain: rec.toolchain, proof: rec.proof, strategy: rec.enforcer },
+        ...(rec.certs ?? []).map((c) => ({
+          toolchain: c.toolchain,
+          proof: c.proof,
+          strategy: c.enforcer,
+        })),
+      ];
+      for (const a of attempts) {
+        if (!a.toolchain || !a.proof?.trim() || seen.has(a.toolchain)) continue;
+        seen.add(a.toolchain);
+        await backupProof({
+          lean: rec.lean,
+          toolchain: a.toolchain,
+          proof: a.proof,
+          questionTitle: rec.questionTitle ?? null,
+          strategy: a.strategy ?? null,
+        });
+      }
+    } catch {
+      /* best-effort — see comment above */
+    }
+  })();
+}
+
 export async function updateGenerated(
   id: string,
   patch: Partial<GeneratedRecord>,
@@ -257,7 +343,18 @@ export async function updateGenerated(
       try {
         const rec = JSON.parse(raws[i]) as GeneratedRecord;
         if (rec.id === id) {
-          const updated = { ...rec, ...patch, id: rec.id };
+          const destructive = isDestructiveVerifyPatch(rec, patch);
+          if (destructive) backupBeforeOverwrite(rec);
+          // A failed re-verify (or any patch that would blank a live
+          // certificate) must never destroy it — keep verified/proof exactly
+          // as they were; everything else in the patch (error message, cost
+          // fields, etc.) still applies. Without this, staging/promote read
+          // straight off these flat fields and a re-verify failure silently
+          // erased an already-proven problem's certificate.
+          const safePatch = destructive
+            ? { ...patch, verified: rec.verified, proof: rec.proof }
+            : patch;
+          const updated = { ...rec, ...safePatch, id: rec.id };
           await redis.lset(GENERATED_STORE_KEY, i, JSON.stringify(updated));
           return updated;
         }

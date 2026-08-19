@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Loader2,
   Play,
@@ -25,6 +25,21 @@ import type { ProverEvent, ProverOutcome } from '@/lib/prover/types';
 // governs by TIME when this is set and reports a runId so "+5 min" can push it
 // out; the single-agent path ignores it. Never a cap on the prover otherwise.
 const PLAYGROUND_COMPUTE_BUDGET_MS = 30 * 60_000;
+// The architect strategy is governed much tighter — fail fast/cheap while
+// it's under test — and extends one minute at a time instead of five.
+const ARCHITECT_COMPUTE_BUDGET_MS = 5 * 60_000;
+const ARCHITECT_EXTEND_MS = 1 * 60_000;
+// Grok is the only driver proveArchitect supports — lock the model selector
+// to this value whenever a Leak River strategy is active.
+const ARCHITECT_MODEL = 'grok-4-1-fast-reasoning';
+const ARCHITECT_DEFAULT_ITERS = 5;
+const isRiverStrategy = (s: string) =>
+  s === 'architect' || s.startsWith('river-');
+// Leak Ultra runs the same blueprint pipeline with the local Claude CLI as
+// driver, so it inherits the model selector instead of locking it.
+const isUltraStrategy = (s: string) => s.startsWith('ultra-');
+const isArchitectStrategy = (s: string) =>
+  isRiverStrategy(s) || isUltraStrategy(s);
 
 // A minimal "message the prover" surface. It reuses the exact same runner +
 // console as the admin queue resolver — send a statement, watch every step,
@@ -43,6 +58,13 @@ export function ProverPlayground() {
   const [strategy, setStrategy] = useState('hacker');
   // Model the prover runs on ('' = the bridge/CLI default).
   const [model, setModel] = useState('');
+  // Architect strategy always drives Grok directly — force + lock the model.
+  useEffect(() => {
+    if (isRiverStrategy(strategy)) setModel(ARCHITECT_MODEL);
+    else setModel((m) => (m === ARCHITECT_MODEL ? '' : m));
+  }, [strategy]);
+  // Refinement-iteration budget for Leak River runs (+1 per click).
+  const [maxIters, setMaxIters] = useState(ARCHITECT_DEFAULT_ITERS);
 
   // Live compute-budget state for the tree path: the bridge reports a runId +
   // deadline via onRunId; the "+5 min" button (extend) pushes the deadline out.
@@ -51,6 +73,7 @@ export function ProverPlayground() {
     budgetMs: number;
   } | null>(null);
   const [extending, setExtending] = useState(false);
+  const [extendingIters, setExtendingIters] = useState(false);
   const runIdRef = useRef<string | null>(null);
   // Latest saved checkpoint (a partially-filled skeleton) from a decompose run.
   // Persists in component state so you can Resume after a Terminate or a stop.
@@ -90,7 +113,13 @@ export function ProverPlayground() {
           seed,
           // Tree path runs under an extendable wall-clock budget; the single-agent
           // path ignores it (and never fires onRunId), so no indicator shows.
-          computeBudgetMs: asTree ? PLAYGROUND_COMPUTE_BUDGET_MS : undefined,
+          // Architect gets a much tighter budget (see ARCHITECT_COMPUTE_BUDGET_MS).
+          computeBudgetMs: asTree
+            ? isArchitectStrategy(strategy)
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : PLAYGROUND_COMPUTE_BUDGET_MS
+            : undefined,
+          maxIters: isArchitectStrategy(strategy) ? maxIters : undefined,
           onRunId: ({ runId, deadlineMs, budgetMs }) => {
             runIdRef.current = runId;
             setComputeLimit({ deadlineMs, budgetMs });
@@ -107,21 +136,38 @@ export function ProverPlayground() {
         abortRef.current = null;
       }
     },
-    [problem, decompose, strategy, model],
+    [problem, decompose, strategy, model, maxIters],
   );
 
-  // "+5 min" — push the running prove's wall-clock budget out. Best-effort.
+  // Push the running prove's wall-clock budget out. Best-effort.
   const extend = useCallback(async () => {
     const runId = runIdRef.current;
     if (!runId || extending) return;
     setExtending(true);
     try {
-      const r = await extendProverRun({ runId, addMs: 5 * 60_000 });
+      const addMs = isArchitectStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000;
+      const r = await extendProverRun({ runId, addMs });
       if (r) setComputeLimit(r);
     } finally {
       setExtending(false);
     }
-  }, [extending]);
+  }, [extending, strategy]);
+
+  // "+1 iter": raise the refinement budget for the NEXT run and, while a River
+  // run is live, for that run too (the bridge re-reads the budget each iteration).
+  const extendIters = useCallback(async () => {
+    if (extendingIters) return;
+    setExtendingIters(true);
+    try {
+      setMaxIters((n) => Math.min(32, n + 1));
+      const runId = runIdRef.current;
+      if (!runId) return;
+      const r = await extendProverRun({ runId, addIters: 1 });
+      if (r?.maxIters) setMaxIters(r.maxIters);
+    } finally {
+      setExtendingIters(false);
+    }
+  }, [extendingIters]);
 
   const terminate = useCallback(() => {
     abortRef.current?.abort();
@@ -184,16 +230,29 @@ export function ProverPlayground() {
         <label className="inline-flex items-center gap-1.5 text-sm text-muted-foreground">
           Model
           <select
-            value={model}
+            value={isRiverStrategy(strategy) ? ARCHITECT_MODEL : model}
             onChange={(e) => setModel(e.target.value)}
-            disabled={running}
-            className="rounded-md border bg-background px-2 py-1.5 text-sm"
+            disabled={running || isRiverStrategy(strategy)}
+            className="rounded-md border bg-background px-2 py-1.5 text-sm disabled:opacity-60"
+            title={
+              isRiverStrategy(strategy)
+                ? 'Leak River strategies always drive Grok directly — model is locked.'
+                : undefined
+            }
           >
-            <option value="">Default</option>
-            <option value="claude-opus-4-8">Opus 4.8</option>
-            <option value="claude-sonnet-5">Sonnet 5</option>
-            <option value="claude-fable-5">Fable 5</option>
-            <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+            {isRiverStrategy(strategy) ? (
+              <option value={ARCHITECT_MODEL}>
+                Grok 4.1 Fast Reasoning (forced)
+              </option>
+            ) : (
+              <>
+                <option value="">Default</option>
+                <option value="claude-opus-4-8">Opus 4.8</option>
+                <option value="claude-sonnet-5">Sonnet 5</option>
+                <option value="claude-fable-5">Fable 5</option>
+                <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
+              </>
+            )}
           </select>
         </label>
         {decompose && (
@@ -211,10 +270,61 @@ export function ProverPlayground() {
               <option value="sketch">Sketch (plan then formalize)</option>
               <option value="brute">Brute (automation only)</option>
               <option value="have">Have (in-context, no top-level lemmas)</option>
-              <option value="have-tree">Have-tree (isolated per-hole minions · linear context)</option>
+              <option value="control-oneshot">
+                Leak Control I (one continuous agent, one-shot, Leak IV only — no decomposition)
+              </option>
+              <option value="control-oneshot-2">
+                Leak Control II (one continuous agent, one-shot, Leak IV + Leak I search — no decomposition)
+              </option>
+              <option value="control-oneshot-4">
+                Leak Control IV (one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph — no decomposition)
+              </option>
+              <option value="control-oneshot-3">
+                Leak Control III (blind prover — no tools / no error feedback — + separate Leak IV gate)
+              </option>
+              {/* value stays `have-tree` — renaming it would orphan saved
+                  checkpoints and every existing research row. */}
+              <option value="have-tree">
+                Leak Stronghold Dark (planner + isolated per-hole minions)
+              </option>
+              <option value="have-surround">
+                Leak Stronghold Surround (parallel minion waves, ghost-army Leak II)
+              </option>
+              <option value="finality-1">
+                Leak Finality I (Surround + timed skeleton refinement)
+              </option>
+              <option value="stronghold-force">
+                Leak Stronghold Force (dedicated recursive decomposer, no finisher)
+              </option>
+              <option value="stronghold-forte">
+                Leak Stronghold Forte (Force + reliable handoff, opening pool, duplicate-cut guard)
+              </option>
+              <option value="stronghold-keep">
+                Leak Stronghold Keep (flat first, bounded gated siege, guaranteed
+                flat finisher)
+              </option>
+              <option value="stronghold-impenetrable">
+                Leak Stronghold Impenetrable (apply?-driven recon sweep, then
+                Surround)
+              </option>
+              <optgroup label="Leak Ultra (Goedel blueprint · claude driver)">
+                <option value="ultra-fleeting">
+                  Leak Ultra Fleeting (model from the selector)
+                </option>
+              </optgroup>
+              <optgroup label="Leak River (Goedel blueprint · grok driver)">
+                <option value="river-stone">Leak River Stone (control)</option>
+                <option value="river-gate">Leak River Gate (+ dead-end ledger)</option>
+                <option value="river-delta">Leak River Delta (+ Sonnet 5 NL seed)</option>
+                <option value="river-vintage">
+                  Leak River Vintage (+ oversight watchers)
+                </option>
+              </optgroup>
             </select>
           </label>
         )}
+        {/* The refinement-budget control lives on the console below, alongside the
+            clock control, so it can be raised MID-FLIGHT and not just per run. */}
       </div>
       {decompose && (
         <p className="text-xs text-muted-foreground">
@@ -225,8 +335,21 @@ export function ProverPlayground() {
             ? 'Pantograph mode builds proofs interactively in Leak II; Leak IV is used only as the final guardrail.'
             : 'Hacker mode leads with the compiler (verify_full_script) and strong automation.'}{' '}
           Needs a verify_full_script MCP server connected. Runs under a{' '}
-          {Math.round(PLAYGROUND_COMPUTE_BUDGET_MS / 60_000)}-minute compute
-          budget you can extend live (+5 min).
+          {Math.round(
+            (isArchitectStrategy(strategy)
+              ? ARCHITECT_COMPUTE_BUDGET_MS
+              : PLAYGROUND_COMPUTE_BUDGET_MS) / 60_000,
+          )}
+          -minute compute budget you can extend live (+
+          {Math.round(
+            (isArchitectStrategy(strategy) ? ARCHITECT_EXTEND_MS : 5 * 60_000) /
+              60_000,
+          )}{' '}
+          min)
+          {isArchitectStrategy(strategy)
+            ? `, with ${maxIters} refinement iteration(s) — raise either live from the console header`
+            : ''}
+          .
         </p>
       )}
 
@@ -236,6 +359,17 @@ export function ProverPlayground() {
         computeLimit={computeLimit}
         onExtend={extend}
         extending={extending}
+        extendLabel={isArchitectStrategy(strategy) ? '1 min' : '5 min'}
+        iterLimit={
+          decompose && isArchitectStrategy(strategy) ? { budget: maxIters } : null
+        }
+        onExtendIters={extendIters}
+        extendingIters={extendingIters}
+        onResetIters={
+          maxIters === ARCHITECT_DEFAULT_ITERS
+            ? undefined
+            : () => setMaxIters(ARCHITECT_DEFAULT_ITERS)
+        }
       />
 
       {outcome && (

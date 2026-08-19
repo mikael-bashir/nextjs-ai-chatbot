@@ -15,7 +15,10 @@ async function DashboardContent() {
 
   const [keys, balance] = await Promise.all([
     listApiKeys({ userId: session.user.id }),
-    getOrCreateCreditBalance({ userId: session.user.id }),
+    getOrCreateCreditBalance({
+      userId: session.user.id,
+      email: session.user.email,
+    }),
   ]);
 
   const safeKeys = keys.map((k) => ({

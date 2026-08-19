@@ -7,8 +7,9 @@ burr
 mem0ai
 python-dotenv
 nest_asyncio
-mcp[cli]
+mcp[cli]==1.28.1
 httpx
 sse-starlette
 redis
-fastmcp
+fastmcp==3.4.4
+pydantic-settings==2.14.2

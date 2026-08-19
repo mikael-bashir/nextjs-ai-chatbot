@@ -115,11 +115,36 @@ export async function POST(request: NextRequest) {
       insight: body.insight ?? null,
       lean: body.lean,
       proof: body.proof ?? '',
+      // The verifier group that certified this proof. Only the fallback is the
+      // legacy pin — architect-certified items carry 4.32.0 and must keep it.
       toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+      mathlib: body.mathlib ?? 'v4.29.1',
+      // Which specific strategy enforced this proof, for the certificate's
+      // Enforcer line. No fallback pin (unlike toolchain/mathlib) — an absent
+      // value just means the pre-attribution certificate constant applies.
+      enforcer: body.enforcer ?? null,
       verifiedAt: body.verifiedAt ?? null,
       signature: body.signature ?? null,
       signatureKeyId: body.signatureKeyId ?? null,
       certMintedAt: body.certMintedAt ?? null,
+      // Every distinct-toolchain certificate accumulated pre-publish. Falls
+      // back to a single-entry list from the flat fields above if the caller
+      // didn't send one (defensive — the client always does via
+      // certsOrFallback), so promote always has something to iterate.
+      certs: Array.isArray(body.certs) && body.certs.length
+        ? body.certs
+        : body.proof
+          ? [{
+              toolchain: body.toolchain ?? 'leanprover/lean4:v4.29.1',
+              mathlib: body.mathlib ?? 'v4.29.1',
+              enforcer: body.enforcer ?? null,
+              proof: body.proof,
+              verifiedAt: body.verifiedAt ?? null,
+              signature: body.signature ?? null,
+              signatureKeyId: body.signatureKeyId ?? null,
+              certMintedAt: body.certMintedAt ?? null,
+            }]
+          : [],
       createdAt: new Date().toISOString(),
     };
     const staged = await pushProblem(record);

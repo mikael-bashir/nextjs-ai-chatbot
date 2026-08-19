@@ -1,7 +1,7 @@
 import type { NextRequest } from 'next/server';
 import { auth } from '@/app/(auth)/auth';
 import { isAdminEmail } from '@/lib/admin';
-import { fullCertificate } from '@/lib/certificate';
+import { fullCertificate, certKeyGroup } from '@/lib/certificate';
 import { signCertificate } from '@/lib/certificate-sign';
 
 // Sign a proof certificate RIGHT AFTER the kernel verifies it, from the admin
@@ -25,6 +25,16 @@ export async function POST(request: NextRequest) {
   const title = typeof body?.title === 'string' ? body.title : null;
   const verifiedAt =
     typeof body?.verifiedAt === 'string' ? body.verifiedAt : null;
+  // The toolchain that actually certified this proof. Signed INTO the canonical
+  // bytes, so the toolchain claim is covered by the signature and can't be
+  // swapped afterwards. Absent ⇒ the certificate constant, which reproduces the
+  // exact bytes of every certificate signed before this field existed.
+  const toolchain = typeof body?.toolchain === 'string' ? body.toolchain : null;
+  const mathlib = typeof body?.mathlib === 'string' ? body.mathlib : null;
+  // Which specific strategy enforced this proof (e.g. "Leak Ultra Fleeting"),
+  // for the certificate's Enforcer line. Absent ⇒ the bland "Leak" constant,
+  // matching every certificate signed before this field existed.
+  const enforcer = typeof body?.enforcer === 'string' ? body.enforcer : null;
   if (!proof.trim()) {
     return Response.json({ error: 'proof required' }, { status: 400 });
   }
@@ -34,8 +44,13 @@ export async function POST(request: NextRequest) {
     title,
     mintedAt: certMintedAt, // signing moment (this call)
     provedAt: verifiedAt, // real kernel-verify moment
+    toolchain,
+    mathlib,
+    enforcer,
   }).trimEnd();
-  const sig = signCertificate(canonical);
+  // Different toolchain groups sign with different keys — certificates are
+  // independent artifacts even for the same problem (see CERT_KEYS).
+  const sig = signCertificate(canonical, certKeyGroup(toolchain));
   if (!sig) {
     // No signing key on this host — caller degrades to an unsigned certificate.
     return Response.json({ signature: null, keyId: null, certMintedAt: null });

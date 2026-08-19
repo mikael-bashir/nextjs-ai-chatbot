@@ -9,7 +9,10 @@ export async function GET() {
   }
 
   try {
-    const balance = await getOrCreateCreditBalance({ userId: session.user.id });
+    const balance = await getOrCreateCreditBalance({
+      userId: session.user.id,
+      email: session.user.email,
+    });
     return Response.json({ balance });
   } catch (error) {
     console.error('[GET /api/credits] Failed to get credit balance', error);

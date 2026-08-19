@@ -300,6 +300,8 @@ BUILD PROCEDURE (follow in order):
 ${INSANE_QUALITY_BARS}
 ${avoidBlock}
 LEAN THEOREM: a GENERAL/closed-form Lean 4 statement encoding the exact integer answer (NOT decide/native_decide over an enumerable domain), provable in Mathlib with substantive reasoning. Assume "import Mathlib"; no imports. It should be true — it will be machine-checked afterward, so do not re-derive it by hand.
+DO NOT PROVE IT. The body must be exactly \`:= by sorry\` — never \`decide\`, \`native_decide\`, \`norm_num\`, \`simp\`, \`rfl\` or any other tactic or term. State-of-the-art provers run downstream and proving is their job; attempting it here only burns your budget and gives them a target that is not a clean goal.
+SELF-CONTAINMENT (hard requirement): "lean" must be ONE single theorem declaration, never a separate top-level \`def\`/\`abbrev\` that the theorem then references (e.g. a helper recursive function for a hidden sequence). Fold any auxiliary function or recurrence INTO the theorem's own signature — a bound variable plus hypotheses stating its defining equations, e.g. \`theorem foo (f : ℕ → ℕ) (hf0 : f 0 = 0) (hf : ∀ n, f (n + 1) = ...) : f 2026 = 9769\`. The proof verifier compares the target signature verbatim against exactly this one declaration; a leading def makes the problem permanently unprovable.
 
 TITLE RULES: genuinely curious and alluring, 2-6 words, varied shape (question / scenario / teaser). HARD BANS: the "The <Adjective> <Noun>" template, and any title that reveals or hints at the answer's value.
 
