@@ -1,10 +1,10 @@
 # Leak — an agentic theorem-proving stack for Lean 4
 
-Leak is the automated theorem prover behind [competemath.com](https://www.competemath.com) — it produces **formal, machine-checked Lean 4 + Mathlib proofs** for competition problems, and it is what generates the proofs for the 200+ problems on [competemath.com/practice](https://www.competemath.com/practice).
+Leak is the automated theorem prover behind [competemath.com](https://www.competemath.com) - it produces **formal, machine-checked Lean 4 + Mathlib proofs** for competition problems, and it is what generates the proofs for the 200+ problems on [competemath.com/practice](https://www.competemath.com/practice).
 
-On **FATE-X** (a 100-problem benchmark whose difficulty exceeds PhD-qualifying exams), Leak's prover scores **38%**, ahead of the published state-of-the-art (Leanstral 1.5, 34%).
+On **FATE-X** (a 100-problem benchmark whose difficulty exceeds PhD-qualifying exams), Leak's best prover scores **38%**, ahead of the current state-of-the-art (Leanstral 1.5, 34%).
 
-The core design finding: driving the pipeline with a frontier **agent** (Claude Sonnet 5's CLI) rather than a raw LLM inverts a lot of the received wisdom — the fashionable decomposition scaffolding in recent papers (e.g. Goedel-Architect's DeepSeek-V4-Flash blueprint pipeline) *degrades* performance when the driver is already an agent. A simpler design that hands the agent **context-rich tools** — library search, a compiler, and an interactive proof assistant — beats it outright. That simpler design is what runs today.
+The core design finding: driving the pipeline with a frontier **agent** (Claude Sonnet 5's CLI) rather than a raw LLM inverts a lot of the received wisdom - the awesome decomposition scaffolding in recent papers (e.g. Goedel-Architect's DeepSeek-V4-Flash blueprint pipeline) *degrades* performance when the driver is already an agent, as might be expected from scaffolding too complex. A simpler design that hands the agent **context-rich tools** - library search, a compiler, and an interactive proof assistant - beats it outright. That simpler design is what runs today. It should be clear that this insight only applies when studying **agent-driven** pipelines, as opposed to **llm-driven** pipelines, like the Goedel-Architect prover.
 
 ---
 
@@ -17,11 +17,11 @@ Four pieces cooperate:
 | **Dashboard** (this repo) | Next.js app: benchmark console, prover playground, research views, the competemath surfaces | Your machine / any Node host (`:3000`) |
 | **Python service** (`app/api/index.py`) | Quart backend: the MCP connection manager that proxies the agent to the verifier services | Your machine (`:5328`) |
 | **Local bridge** (`public/local-claude-bridge.mjs`) | Spawns the `claude` CLI, streams its tool calls, and enforces the independent proof gate | Your machine (Node) |
-| **6 remote MCP services** | The Lean verification / search / interaction tools the agent calls (see below) | Hugging Face Docker Spaces (fork-and-deploy) |
+| **remote MCP services** | The Lean verification / search / interaction tools the agent calls (see below) | Hugging Face Docker Spaces (fork-and-deploy) |
 
 The agent never self-reports success: every proof is re-verified by an independent Leak IV/XIV compile of the submitted script, so soundness is the toolchain's, not the model's.
 
-## The 6 MCP services
+## The MCP services
 
 All six are collected under the [**`leak-services`**](https://github.com/mikael-bashir/leak-services) umbrella repo (each its own repo, mirrored from its Hugging Face Space). Two verifier **groups**, pinned to different toolchains:
 
@@ -36,7 +36,7 @@ All six are collected under the [**`leak-services`**](https://github.com/mikael-
 
 > The Leak I/II/IV group gates the flat control arms; the XI/XII/XIV group serves the decomposition (architect) pipeline. A run only ever uses one group.
 
-Each service is a self-contained **Docker** app (`Dockerfile` + `server.py`) exposing an MCP endpoint over SSE.
+Each service is a self-contained **Docker** app (`Dockerfile` + `server.py`) exposing an unsecure MCP endpoint over SSE. We recommend you add authentication layers if hosting the services publically, and if required authorization.
 
 ### Forking / deploying a service
 
@@ -72,7 +72,7 @@ Fill in `.env`:
 | `POSTGRES_URL` | Postgres / Neon connection string |
 | `AUTH_SECRET` | any random 32-byte secret (`openssl rand -base64 32`) |
 | `AUTH_URL` | the app's own origin, e.g. `http://localhost:3000` — **must match the port you run on**, or sign-in redirects break |
-| `XAI_API_KEY` | xAI key (used by the base chat model / Grok driver) |
+| `XAI_API_KEY` | xAI key (used by the base chat model / Grok driver, not needed if you want to focus on agent-driven pipelines) |
 | `BLOB_READ_WRITE_TOKEN` | Vercel Blob token (file storage) |
 | `REDIS_URL` | e.g. `redis://localhost:6379` (Python service) |
 
