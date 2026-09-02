@@ -6,6 +6,8 @@ On **FATE-X** (a 100-problem benchmark whose difficulty exceeds PhD-qualifying e
 
 The core design finding: driving the pipeline with a frontier **agent** (Claude Sonnet 5's CLI) rather than a raw LLM inverts a lot of the received wisdom - the awesome decomposition scaffolding in recent papers (e.g. Goedel-Architect's DeepSeek-V4-Flash blueprint pipeline) *degrades* performance when the driver is already an agent, as might be expected from scaffolding too complex. A simpler design that hands the agent **context-rich tools** - library search, a compiler, and an interactive proof assistant - beats it outright. That simpler design is what runs today. It should be clear that this insight only applies when studying **agent-driven** pipelines, as opposed to **llm-driven** pipelines, like the Goedel-Architect prover.
 
+The app was intended as a commercial project, thus it is mostly **unusable locally** - if you are interested in the proving logic, we highly suggest checking out the file here: https://github.com/mikael-bashir/nextjs-ai-chatbot/blob/main/public/local-claude-bridge.mjs. Truly, this file is huge, and wasn't developed with maintenance in mind - we highly encourage use of AI tools to interpret and modularise this file. You will have to develop your own UI to interact with the harness, or modify the Leak repo to not break locally.
+
 ---
 
 ## Architecture
@@ -49,65 +51,6 @@ The services are published as Hugging Face **Docker Spaces**. To run your own:
 
 ---
 
-## Running locally
-
-### Prerequisites
-
-- **Node 18+** and **pnpm** (repo uses a pnpm lockfile; `npm` works too)
-- **Python 3.11+** (for the Quart service)
-- **Redis** (the Python service uses it for session state)
-- A **Postgres** database (Neon serverless recommended)
-- The **`claude` CLI** installed and authenticated (the bridge spawns it)
-
-### 1. Environment
-
-```bash
-cp .env.example .env
-```
-
-Fill in `.env`:
-
-| Var | What |
-|---|---|
-| `POSTGRES_URL` | Postgres / Neon connection string |
-| `AUTH_SECRET` | any random 32-byte secret (`openssl rand -base64 32`) |
-| `AUTH_URL` | the app's own origin, e.g. `http://localhost:3000` — **must match the port you run on**, or sign-in redirects break |
-| `XAI_API_KEY` | xAI key (used by the base chat model / Grok driver, not needed if you want to focus on agent-driven pipelines) |
-| `BLOB_READ_WRITE_TOKEN` | Vercel Blob token (file storage) |
-| `REDIS_URL` | e.g. `redis://localhost:6379` (Python service) |
-
-### 2. Install + migrate the database
-
-```bash
-pnpm install && pnpm tsx lib/db/migrate
-```
-
-### 3. Run the three local processes (three terminals)
-
-**Python service (`:5328`)** — its exact run command is in `app/api/index.py`:
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt && hypercorn app.api.index:app --bind 0.0.0.0:5328 --reload
-```
-
-**Dashboard (`:3000`)**:
-
-```bash
-pnpm dev
-```
-
-**Local bridge** (drives the `claude` CLI; needed to actually run proofs):
-
-```bash
-node public/local-claude-bridge.mjs
-```
-
-### 4. Connect the services
-
-Open the dashboard, go to the **MCP connection manager**, and connect the Leak service group you want (I/II/IV for the flat controls, XI/XII/XIV for the architect pipeline). Then head to the **prover playground** or the **benchmark console** and run.
-
----
-
 ## Repo layout
 
 - `app/`, `components/`, `lib/` — the Next.js dashboard (benchmark console, playground, research, competemath surfaces)
@@ -119,7 +62,6 @@ Open the dashboard, go to the **MCP connection manager**, and connect the Leak s
 ## Related
 
 - Benchmark records & proofs: [competemath/LRR](https://github.com/competemath/LRR)
-- Write-up: the FATE-X capability report (in the whitepaper).
 
 ## License / provenance
 
