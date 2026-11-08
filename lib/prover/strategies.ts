@@ -204,8 +204,9 @@ export const isArchitectStrategy = (s: string) =>
 // Which toolchain actually certifies a run. The architect group (Leak XI/XII/
 // XIV) is a different, newer Lean than the Claude-driven group (Leak I/II/IV),
 // so a row must never assume one.
-export const TOOLCHAIN = 'leanprover/lean4:v4.29.1';
-export const MATHLIB_VERSION = 'v4.29.1';
+// Leak I/II/IV run on the Tengoku tree: its lean-toolchain, and the tree in place of a library tag.
+export const TOOLCHAIN = 'leanprover/lean4:v4.34.0-rc2';
+export const MATHLIB_VERSION = 'tengoku';
 export const ARCHITECT_TOOLCHAIN = 'leanprover/lean4:v4.32.0';
 export const ARCHITECT_MATHLIB_VERSION = 'v4.32.0';
 

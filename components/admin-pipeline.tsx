@@ -3430,7 +3430,7 @@ export function AdminPipeline() {
             sorry-free proof. Slower but closes goals a single run stalls on.
             Verified on{' '}
             <span className="font-mono">{TOOLCHAIN.replace(/^.*:/, '')}</span> ·
-            Mathlib {MATHLIB_VERSION} (Leak I/II/IV).
+            the Tengoku tree (Leak I/II/IV).
           </p>
         )}
         {verifyDecompose && isArchitectStrategy(verifyStrategy) && (
