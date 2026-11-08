@@ -84,6 +84,16 @@ export const STRONGHOLD_STRATEGIES: StrategyDef[] = [
     note: 'Control II plus Leak II (Pantograph): the same flat one-shot agent — Leak IV verify + Leak I search, no decomposition — now also given the interactive proof assistant (init_proof/apply_tactic) to step a goal one tactic at a time. Isolates whether interactive goal-state stepping alone moves the needle over Control II. Requires the Leak II server to be connected.',
   },
   {
+    // Control II's surface driven incrementally (sorry-skeleton, the goal at
+    // every hole from Leak IV's [[LEAK_GOALS]] block, one hole per compile,
+    // #eval/#check probes) in ONE conversation resumed across attempts, at high
+    // effort. Same budget, model and gates as Control II, so a row differs from
+    // a Control II row in the harness alone. Control II itself is unchanged.
+    value: 'control-oneshot-6',
+    label: 'Leak Control VI (one continuous agent, incremental sorry-skeleton + goals, Leak IV + Leak I search — no decomposition)',
+    note: 'Control II\'s surface (Leak IV verify + Leak I search, no decomposition, no give-up state) driven the way the strong single-agent harnesses work: a skeleton with sorry holes, the goal at every hole read back from Leak IV, one hole filled per compile, probes via #eval/#check, and one conversation resumed across attempts instead of a fresh context. Isolates the harness: same model, budget and gates as Control II.',
+  },
+  {
     // value stays `have-tree` — renaming it would orphan saved checkpoints,
     // queued items and every existing research row (matches admin-pipeline.tsx
     // and prover-playground.tsx, which already show the same display name).
@@ -222,6 +232,7 @@ const STRONGHOLD_ENFORCER_LABELS: Record<string, string> = {
   'control-oneshot-2': 'Leak Control II',
   'control-oneshot-3': 'Leak Control III',
   'control-oneshot-4': 'Leak Control IV',
+  'control-oneshot-6': 'Leak Control VI',
   'have-tree': 'Leak Stronghold Dark',
   'have-surround': 'Leak Stronghold Surround',
   'finality-1': 'Leak Finality I',
@@ -338,7 +349,8 @@ export function benchmarkBudgetFor(strategy: string): {
     strategy === 'control-oneshot' ||
     strategy === 'control-oneshot-2' ||
     strategy === 'control-oneshot-3' ||
-    strategy === 'control-oneshot-4'
+    strategy === 'control-oneshot-4' ||
+    strategy === 'control-oneshot-6'
   ) {
     return { computeBudgetMs: BENCHMARK_DEEP_BUDGET_MS };
   }
