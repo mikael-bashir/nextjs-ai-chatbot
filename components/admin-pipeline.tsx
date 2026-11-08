@@ -3347,6 +3347,9 @@ export function AdminPipeline() {
                   <option value="control-oneshot-4">
                     Leak Control IV (one continuous agent, one-shot, Leak IV + Leak I search + Leak II Pantograph — no decomposition)
                   </option>
+                  <option value="control-oneshot-6">
+                    Leak Control VI (one continuous agent, incremental sorry-skeleton + goals, Leak IV + Leak I search — no decomposition)
+                  </option>
                   <option value="control-oneshot-3">
                     Leak Control III (blind prover, one continuous session — no tools / no error feedback — + separate Leak IV gate)
                   </option>
@@ -3430,7 +3433,7 @@ export function AdminPipeline() {
             sorry-free proof. Slower but closes goals a single run stalls on.
             Verified on{' '}
             <span className="font-mono">{TOOLCHAIN.replace(/^.*:/, '')}</span> ·
-            Mathlib {MATHLIB_VERSION} (Leak I/II/IV).
+            the Tengoku tree (Leak I/II/IV).
           </p>
         )}
         {verifyDecompose && isArchitectStrategy(verifyStrategy) && (

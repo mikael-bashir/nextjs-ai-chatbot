@@ -2219,6 +2219,21 @@ const STRATEGIES = {
     search: GOV_INITIAL,
     style: "control4",
   },
+  // Leak Control VI: Control II's surface (Leak IV + Leak I search, no
+  // decomposition) driven INCREMENTALLY, the way the strong single-agent
+  // harnesses work (h1, Maestro): a skeleton with `sorry` holes, the goal at
+  // every hole read back from Leak IV's [[LEAK_GOALS]] block, one hole filled
+  // per compile, `#eval`/`#check` probes read from [[LEAK_INFO]], and ONE
+  // conversation resumed across attempts instead of a fresh context each time.
+  // Control II itself is left exactly as it was (its rows stay comparable).
+  // See proveControlIncremental.
+  "control-oneshot-6": {
+    label: "Leak Control VI — one continuous agent, incremental (sorry-skeleton + goals), Leak IV + Leak I search (no decomposition)",
+    node: (t, m, x) => controlIncrementalPrompt(t, m),
+    decompose: (t, m, x) => controlIncrementalPrompt(t, m), // unused; keeps the registry shape
+    search: GOV_INITIAL,
+    style: "control6",
+  },
   // Phase-1 linear context: planner writes a `have`-skeleton, isolated minions
   // fill each hole, an assembler stitches + re-verifies. Bounded context per
   // agent; falls back to `have` on any failure. See proveHaveTree.
@@ -6178,7 +6193,7 @@ Theorem (its signature is immutable):
 ${theorem}`
 }
 
-const CONTROL_LABELS = { 1: "Leak Control I", 2: "Leak Control II", 4: "Leak Control IV" }
+const CONTROL_LABELS = { 1: "Leak Control I", 2: "Leak Control II", 4: "Leak Control IV", 6: "Leak Control VI" }
 
 // Loop-until-deadline across FRESH attempts (same shape as the architect
 // stages' own attempt loop): a single spawnProverStream call is one
@@ -6260,6 +6275,145 @@ async function proveControl(theorem, ctx, tier = 1) {
         emit: ctx.emit,
       },
     )
+    if (gate.verifiedScript) {
+      const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
+      if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
+        ctx.emit({ type: "message-annotation", subtype: "status", thought: `✅ ${label} closed it on attempt ${attempt} — verified sorry-free against Leak IV.` })
+        return { verified: true, proof: gate.verifiedScript }
+      }
+    }
+  }
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.emit({ type: "message-annotation", subtype: "error", thought: `🎯 ${label} ran out of clock after ${attempt} attempt(s) without a verified proof.` })
+  return { verified: false, proof: "" }
+}
+
+// ---- Leak Control VI: incremental one-shot --------------------------------------------------------------------------------------
+// Control II's exact surface (Leak IV verify + Leak I search; no decomposition, no give-up state) with two changes, both taken from
+// what the LRR Control II transcripts showed (2026-08, Sonnet 5, 38/98): unsolved items carried a median 6.5 `declaration uses sorry`
+// warnings each, every one of them empty (Leak IV then returned no goal at a sorry), and the agent re-guessed lemma names 7 times per
+// item; and each 15-minute session ended with a FRESH context that kept only the last script and error (a median one such restart per
+// unsolved hour, up to eight).
+//   1. The loop is incremental: a skeleton with `sorry` holes, the goal at every hole read from Leak IV's [[LEAK_GOALS]] block, one
+//      hole filled per compile, `exact?` for names, `#eval`/`#check` probes read from [[LEAK_INFO]]. Only a sorry-free success counts.
+//   2. ONE conversation, resumed across attempts (`--resume`, as Control III does): when the model ends its turn without a verified
+//      proof and clock remains, the same session is continued with a short follow-up, so every earlier attempt stays in context.
+//      A lost session falls back to a fresh one with the last attempt carried, exactly as Control II.
+// Reasoning effort is set high (the published 80-90% FATE-X single-agent runs are at high effort; Control II runs at the CLI default).
+// The budget, the model and the gates are Control II's, so a Control VI row differs from a Control II row in the harness alone.
+function controlIncrementalPrompt(theorem, mcpServers, attempt = 1, lastAttempt = null) {
+  const toolSection = mcpToolSection(mcpServers)
+  const lastBlock = lastAttempt
+    ? `\nYOUR MOST RECENT ATTEMPT (from a session that was lost — this block is the ONLY thing carried forward; treat it as established fact about what was already tried):\n\`\`\`lean\n${String(lastAttempt.script || "").slice(0, 6000)}\n\`\`\`\nLeak IV's response to it:\n${String(lastAttempt.result || "").slice(0, 4000)}\n\nDo not resubmit it unchanged: fill or fix the hole the goals point at, or take a different route for that hole.\n`
+    : ""
+  return `You are proving ONE Lean 4 theorem, in ONE continuous session, against the Tengoku tree (a superset of Mathlib). There is no decomposition here: no top-level helper lemmas, no handing a piece to anyone else, no "too hard" outcome. You build the proof INCREMENTALLY and the compiler shows you the goal at every hole.
+
+YOUR TOOLS
+- verify_full_script (Leak IV) IS the compiler. It returns the verdict first — "✅ Compilation Successful! The proof is 100% verified." or "❌ Compilation Failed:" with one "Line N (Error|Warning): …" per diagnostic — and then, on a failure, up to three blocks:
+    [[LEAK_GOALS]]        for EVERY \`sorry\` in your script, the hypotheses and the goal at that exact point (and every "unsolved goals" error with its line breaks). This is your proof state. Read it before writing anything.
+    [[LEAK_INFO]]         the output of \`#eval\`, \`#check\`, \`#print\`, \`trace_state\`: a probe script is how you ask the environment a question.
+    [[LEAK_SUGGESTIONS]]  the hits of \`exact?\`, \`apply?\`, \`rw?\`, \`simp?\`: put one of them at a hole and the exact lemma name comes back.
+  A script with a \`sorry\` in it ALWAYS fails — that is the point: a failure with goals is a step, not a dead end. Only a success with zero \`sorry\` is the end.
+- loogle_search / moogle_search (Leak I): library search by TYPE PATTERN or concept, never by a guessed name. A plausible name goes straight into a script; the compiler's "unknown identifier — did you mean …?" corrects it in one step.
+
+${toolSection}
+
+THE LOOP
+1. SKELETON. Write the theorem with its proof as a sequence of \`have\` steps (or \`refine ⟨?_, ?_⟩\` / \`constructor\` / \`induction\` structure) that states the route, with \`sorry\` at every step you cannot write yet. Submit it. The goals at each \`sorry\` come back.
+2. ONE HOLE AT A TIME. Pick one hole (the smallest, or the one that decides whether the route works), write its proof, submit, read the goals again. Keep every hole you have closed; never rewrite a part that already compiles.
+3. WHEN A HOLE RESISTS. Read its goal, not the whole script. Try \`exact?\`/\`apply?\` there, probe with \`#check\` or a tiny \`example\`, search by type pattern, or restate the \`have\` so the goal is easier. If one hole has failed three different ways, change the ROUTE around it (a different skeleton), not the whole project.
+4. FINISH. Done only when verify_full_script reports success with ZERO \`sorry\` anywhere. Then stop: that script is the proof.
+
+RULES
+- No top-level \`theorem\`/\`lemma\` other than the target itself; every intermediate fact is a \`have\` INSIDE the one proof (or a local \`let\`/\`set\`).
+- Never conclude the theorem is too hard, open, or out of reach, and never ask to split it: a repeatedly failing approach means a different route for THAT hole.
+- Never stop before a sorry-free success. If you end your turn, this same conversation is resumed and you continue from where you were.
+- Never resubmit a script you already submitted unchanged.
+- Be quantitative about progress: after each compile say in one line how many holes remain and which one you take next.
+${SEARCH_USAGE_NOTE}
+
+This is attempt ${attempt} of an unbounded series that ends only with a verified proof or the run's own wall clock — not you.
+${lastBlock}
+Theorem (its signature is immutable):
+${theorem}`
+}
+
+// The follow-up when the SAME conversation is resumed: the skeleton, the goals and every earlier compile are already in its context.
+function controlIncrementalFollowup(attempt, lastAttempt) {
+  const tail = lastAttempt
+    ? `Your last compile is in this conversation (it ended: ${String(lastAttempt.result || "").split("\n")[0].slice(0, 160)}).`
+    : "You ended your last turn without calling verify_full_script."
+  return `The run continues — attempt ${attempt}, same theorem, same session, same tools. ${tail} Nothing is finished until verify_full_script reports success with zero \`sorry\`. Pick up at the current skeleton: read the goals you already have, close the next hole, submit. One line of status, then work.`
+}
+
+async function proveControlIncremental(theorem, ctx) {
+  if (ctx.signal?.aborted) return { verified: false, proof: "" }
+  ctx.stage = "🎯"
+  const sig = theoremSignature(theorem)
+  const label = CONTROL_LABELS[6]
+  // Control II's servers: everything connected except the Pantograph server (Leak II).
+  const pantographUrl = resolvePantographUrl(ctx.mcpServers)
+  const allowedServers = (ctx.mcpServers || []).filter((s) => s?.url && s.url !== pantographUrl)
+  ctx.emit({
+    type: "message-annotation",
+    subtype: "status",
+    thought: `🎯 ${label}: one continuous agent builds the proof incrementally — a sorry-skeleton, the goal at every hole from Leak IV, one hole per compile — against Leak IV + Leak I search, in ONE conversation resumed across attempts; no decomposition, no give-up state.`,
+  })
+  let attempt = 0
+  let sessionId = "" // the single continuous conversation; "" until attempt 1 opens it (or after a lost session)
+  let lastAttempt = null // { script, result } of the last verify_full_script call seen, for a lost session's fresh prompt
+  while (!ctx.signal?.aborted && !deadlinePassed(ctx)) {
+    attempt++
+    if (attempt > 1)
+      ctx.emit({
+        type: "message-annotation",
+        subtype: "status",
+        thought: sessionId
+          ? `🎯 Attempt ${attempt} — resuming the SAME conversation (every earlier compile and goal is still in context).`
+          : `🎯 Attempt ${attempt} — the session was lost; fresh conversation${lastAttempt ? ", carrying the last script + compiler response" : ""}.`,
+      })
+    const gate = makeProofGate(theorem)
+    const pendingVerify = new Map()
+    const r = await spawnProverStream(
+      {
+        prompt: sessionId ? controlIncrementalFollowup(attempt, lastAttempt) : controlIncrementalPrompt(theorem, allowedServers, attempt, lastAttempt),
+        resumeSessionId: sessionId || undefined,
+        mcpServers: allowedServers,
+        model: ctx.model,
+        effort: "high",
+        maxTurns: 0,
+        timeoutMs: ctx.nodeTimeoutMs,
+        getDeadline: ctx.getDeadline,
+        stage: "🎯",
+        metrics: ctx.metrics,
+        signal: ctx.signal,
+        searchBudget: ctx.searchBudget,
+      },
+      {
+        onObject: (o) => {
+          const ev = gate.observe(o)
+          try {
+            if (o?.type === "assistant" && Array.isArray(o.message?.content)) {
+              for (const c of o.message.content) {
+                if (c?.type === "tool_use" && c.id && String(c.name || "").endsWith("verify_full_script") && c.input && typeof c.input.script === "string")
+                  pendingVerify.set(c.id, c.input.script)
+              }
+            } else if (o?.type === "user" && Array.isArray(o.message?.content)) {
+              for (const c of o.message.content) {
+                if (c?.type !== "tool_result" || !c.tool_use_id || !pendingVerify.has(c.tool_use_id)) continue
+                const t = Array.isArray(c.content) ? c.content.map((x) => x?.text || "").join("\n") : String(c.content ?? "")
+                lastAttempt = { script: pendingVerify.get(c.tool_use_id), result: t }
+              }
+            }
+          } catch {
+            /* tracking must never break the run */
+          }
+          return !!ev?.verified
+        },
+        emit: ctx.emit,
+      },
+    )
+    if (r.sessionId) sessionId = r.sessionId
     if (gate.verifiedScript) {
       const v = await verifyViaDaemon(gate.verifiedScript, ctx.verifyUrl, { timeoutMs: ctx.verifyTimeoutMs })
       if (v.ok && isHoleFreeProof(parseVerifyOutput(v.text)) && scriptProvesTarget(gate.verifiedScript, sig)) {
@@ -12215,7 +12369,9 @@ function proveTreeStream(res, theorem, mcpServers, opts = {}) {
                                 ? await proveControlBlind(theorem, ctx)
                                 : style === "control4"
                                   ? await proveControl(theorem, ctx, 4)
-                                  : await proveHaveFlat(theorem, ctx)
+                                  : style === "control6"
+                                    ? await proveControlIncremental(theorem, ctx)
+                                    : await proveHaveFlat(theorem, ctx)
         }
         ok = r.verified
         proof = r.proof
